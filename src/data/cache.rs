@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use starknet::core::types::{ContractClass, Felt};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::DataSource;
 #[allow(unused_imports)]
@@ -338,7 +338,9 @@ impl CachingDataSource {
         let db = self.db.lock().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
-            .prepare("SELECT deploy_tx_hash, deploy_block, deployer FROM deploy_info WHERE address = ?1")
+            .prepare(
+                "SELECT deploy_tx_hash, deploy_block, deployer FROM deploy_info WHERE address = ?1",
+            )
             .ok()?;
         stmt.query_row(params![addr_hex], |row| {
             let tx_hex: String = row.get(0)?;
@@ -354,7 +356,13 @@ impl CachingDataSource {
         })
     }
 
-    fn cache_deploy_info(&self, address: &Felt, tx_hash: &Felt, block: u64, deployer: Option<&Felt>) {
+    fn cache_deploy_info(
+        &self,
+        address: &Felt,
+        tx_hash: &Felt,
+        block: u64,
+        deployer: Option<&Felt>,
+    ) {
         if let Ok(db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
             let tx_hex = format!("{:#x}", tx_hash);
@@ -547,10 +555,15 @@ impl DataSource for CachingDataSource {
 
     async fn get_class_hash(&self, address: Felt) -> Result<Felt> {
         // Class hash is mostly stable but CAN change via replace_class syscall.
-        // Cache with the block at which we fetched it; serve from cache immediately.
-        if let Some((class_hash, _fetched_at)) = self.get_cached_class_hash(&address) {
-            trace!(address = %format!("{:#x}", address), "cache hit: class_hash");
-            return Ok(class_hash);
+        // Cache with the block at which we fetched it; refetch if stale (>1000 blocks).
+        const CLASS_HASH_STALE_BLOCKS: u64 = 1000;
+        if let Some((class_hash, fetched_at)) = self.get_cached_class_hash(&address) {
+            let latest = self.upstream.get_latest_block_number().await.unwrap_or(0);
+            if latest.saturating_sub(fetched_at) < CLASS_HASH_STALE_BLOCKS {
+                trace!(address = %format!("{:#x}", address), "cache hit: class_hash");
+                return Ok(class_hash);
+            }
+            debug!(address = %format!("{:#x}", address), age = latest - fetched_at, "class_hash cache stale, refetching");
         }
         let class_hash = self.upstream.get_class_hash(address).await?;
         let block = self.upstream.get_latest_block_number().await.unwrap_or(0);
@@ -594,7 +607,9 @@ impl DataSource for CachingDataSource {
         let mut merged = new_events;
         for event in cached {
             let exists = merged.iter().any(|e| {
-                e.transaction_hash == event.transaction_hash && e.block_number == event.block_number
+                e.transaction_hash == event.transaction_hash
+                    && e.block_number == event.block_number
+                    && e.event_index == event.event_index
             });
             if !exists {
                 merged.push(event);
@@ -794,16 +809,27 @@ impl DataSource for CachingDataSource {
             from_block
         };
 
-        let new_events = self
+        let new_events = match self
             .upstream
             .get_contract_events(address, fetch_from, limit)
             .await
-            .unwrap_or_default();
+        {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(address = %format!("{:#x}", address), error = %e, "RPC error fetching events, using cache only");
+                if cached.is_empty() {
+                    return Err(e);
+                }
+                vec![]
+            }
+        };
 
         let mut merged = new_events;
         for event in cached {
             let exists = merged.iter().any(|e| {
-                e.transaction_hash == event.transaction_hash && e.block_number == event.block_number
+                e.transaction_hash == event.transaction_hash
+                    && e.block_number == event.block_number
+                    && e.event_index == event.event_index
             });
             if !exists {
                 merged.push(event);
@@ -812,6 +838,7 @@ impl DataSource for CachingDataSource {
 
         merged.sort_by(|a, b| b.block_number.cmp(&a.block_number));
         self.save_contract_events(&address, &merged);
+        merged.truncate(limit);
 
         Ok(merged)
     }
@@ -820,7 +847,13 @@ impl DataSource for CachingDataSource {
         self.get_cached_deploy_info(address)
     }
 
-    fn save_deploy_info(&self, address: &Felt, tx_hash: &Felt, block: u64, deployer: Option<&Felt>) {
+    fn save_deploy_info(
+        &self,
+        address: &Felt,
+        tx_hash: &Felt,
+        block: u64,
+        deployer: Option<&Felt>,
+    ) {
         self.cache_deploy_info(address, tx_hash, block, deployer);
     }
 

@@ -96,7 +96,14 @@ pub trait DataSource: Send + Sync {
         None
     }
     /// Save deploy tx info for an address.
-    fn save_deploy_info(&self, _address: &Felt, _tx_hash: &Felt, _block: u64, _deployer: Option<&Felt>) {}
+    fn save_deploy_info(
+        &self,
+        _address: &Felt,
+        _tx_hash: &Felt,
+        _block: u64,
+        _deployer: Option<&Felt>,
+    ) {
+    }
 
     // --- Nonce cache ---
     /// Load cached nonce + block number for an address.

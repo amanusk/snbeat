@@ -323,7 +323,9 @@ pub(super) async fn fetch_and_send_address_info(
         u64::MAX // unknown — do full search
     };
     let cached_nonce_block = cached_nonce_info.map(|(_, b)| b).unwrap_or(0);
-    // Save current nonce for next visit
+    // Save current nonce for next visit — but only if non-zero.
+    // A nonce=0 contract might gain account functionality later, so we must
+    // always re-check rather than locking in "no txs" from a cached zero.
     if nonce != starknet::core::types::Felt::ZERO {
         let latest = ds.get_latest_block_number().await.unwrap_or(0);
         ds.save_cached_nonce(&address, &nonce, latest);
