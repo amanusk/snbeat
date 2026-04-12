@@ -312,6 +312,23 @@ pub(super) async fn fetch_and_send_address_info(
     // Detect contract type early: nonce == 0 + has class_hash = likely a contract, not an account
     let is_contract = nonce == starknet::core::types::Felt::ZERO && class_hash.is_some();
 
+    // Compute nonce delta: how many new txs since last visit?
+    // This tells us whether we can skip fetching entirely (delta=0) or narrow the search.
+    let cached_nonce_info = ds.load_cached_nonce(&address);
+    let nonce_delta = if let Some((prev_nonce, _prev_block)) = &cached_nonce_info {
+        let prev = crate::utils::felt_to_u64(prev_nonce);
+        let curr = crate::utils::felt_to_u64(&nonce);
+        curr.saturating_sub(prev)
+    } else {
+        u64::MAX // unknown — do full search
+    };
+    let cached_nonce_block = cached_nonce_info.map(|(_, b)| b).unwrap_or(0);
+    // Save current nonce for next visit
+    if nonce != starknet::core::types::Felt::ZERO {
+        let latest = ds.get_latest_block_number().await.unwrap_or(0);
+        ds.save_cached_nonce(&address, &nonce, latest);
+    }
+
     // Fire-and-forget: fetch class history from PF if available
     if let Some(pf_client) = pf {
         let pf_c = Arc::clone(pf_client);
@@ -849,12 +866,40 @@ pub(super) async fn fetch_and_send_address_info(
         tokio::spawn(async move {
             let latest_block = ds_c.get_latest_block_number().await.unwrap_or(0);
 
-            // --- Phase 1: Small window from tip, no waiting for probe ---
-            let initial_window = if is_contract { 10_000u64 } else { 5_000u64 };
-            let from_block = latest_block.saturating_sub(initial_window);
+            // --- Use cached search progress + nonce delta to narrow the window ---
+            let search_progress = ds_c.load_search_progress(&address);
+
+            // If nonce hasn't changed and we've already searched up to near the tip,
+            // skip the full search — only check the small delta.
+            let from_block = if let Some((_min_searched, max_searched)) = search_progress {
+                if !is_contract && nonce_delta == 0 && max_searched + 100 >= latest_block {
+                    // No new txs — skip TASK C entirely
+                    debug!(
+                        address = %format!("{:#x}", address),
+                        "Nonce unchanged & search progress up-to-date, skipping RPC event scan"
+                    );
+                    let _ = tx_c.send(Action::AddressTxsStreamed {
+                        address,
+                        source: Source::Rpc,
+                        tx_summaries: Vec::new(),
+                        complete: true,
+                    });
+                    return;
+                }
+                // Search only from where we left off
+                max_searched + 1
+            } else if !is_contract && cached_nonce_block > 0 && nonce_delta < 50 {
+                // We know the nonce block — start from there
+                cached_nonce_block
+            } else {
+                let initial_window = if is_contract { 10_000u64 } else { 5_000u64 };
+                latest_block.saturating_sub(initial_window)
+            };
+
+            let window_size = latest_block.saturating_sub(from_block);
             let _ = tx_c.send(Action::LoadingStatus(format!(
-                "RPC: scanning last {}k blocks for events...",
-                initial_window / 1000
+                "RPC: scanning {}k blocks for events...",
+                (window_size + 999) / 1000
             )));
             let phase1_limit = if is_contract { 500 } else { 100 };
 
@@ -1024,6 +1069,7 @@ pub(super) async fn fetch_and_send_address_info(
             // --- Phase 2: If phase 1 found nothing, do ONE probe-guided search ---
             // No more eager progressive window expansion — pagination handles deeper history.
             let phase1_found = !unique_hashes.is_empty();
+            let mut any_events_found = phase1_found;
             if !phase1_found {
                 let probe_timeout = if cached_range.is_some() { 0 } else { 5 };
                 let probe = tokio::time::timeout(
@@ -1061,6 +1107,7 @@ pub(super) async fn fetch_and_send_address_info(
 
                         if let Ok(deeper_events) = deeper_events {
                             if !deeper_events.is_empty() {
+                                any_events_found = true;
                                 // Cache discovered range
                                 let min_b = deeper_events
                                     .iter()
@@ -1172,6 +1219,12 @@ pub(super) async fn fetch_and_send_address_info(
                         ));
                     }
                 }
+            }
+
+            // Save search progress only when events were found — otherwise the initial
+            // window may have been too small and we need to retry with probe guidance.
+            if any_events_found {
+                ds_c.save_search_progress(&address, from_block, latest_block);
             }
 
             // RPC task complete
@@ -1453,7 +1506,29 @@ pub(super) async fn fetch_more_address_txs(
         50_000u64
     };
 
-    let from_block = before_block.saturating_sub(window_size);
+    // Don't fetch before the deploy block — no txs can exist before contract creation
+    let deploy_block = ds
+        .load_cached_deploy_info(&address)
+        .map(|(_, block, _)| block);
+    if let Some(db) = deploy_block {
+        if before_block <= db {
+            debug!(address = %format!("{:#x}", address), deploy_block = db, "Already at deploy block, no more txs to fetch");
+            let _ = tx.send(Action::MoreAddressTxsLoaded {
+                address,
+                tx_summaries: Vec::new(),
+                contract_calls: Vec::new(),
+                oldest_block: db,
+                has_more: false,
+            });
+            return;
+        }
+    }
+
+    let mut from_block = before_block.saturating_sub(window_size);
+    // Clamp to deploy block — no point scanning before contract existed
+    if let Some(db) = deploy_block {
+        from_block = from_block.max(db);
+    }
     if from_block == 0 && before_block <= 1 {
         let _ = tx.send(Action::MoreAddressTxsLoaded {
             address,
@@ -1637,7 +1712,9 @@ pub(super) async fn fetch_more_address_txs(
         .min()
         .unwrap_or(from_block);
 
+    let at_deploy_floor = deploy_block.is_some_and(|db| from_block <= db);
     let has_more = from_block > 0
+        && !at_deploy_floor
         && (summaries.len() >= 50
             || all_calls.len() >= 50
             || cached.is_some_and(|(min_b, _)| min_b < from_block));
@@ -1758,6 +1835,30 @@ pub(super) async fn find_deploy_tx(
     ds: &Arc<dyn DataSource>,
     tx: &mpsc::UnboundedSender<Action>,
 ) {
+    // Check cache first — deploy tx is immutable
+    if let Some((cached_hash, cached_block, cached_deployer)) = ds.load_cached_deploy_info(&addr) {
+        debug!(%addr, cached_block, "Deploy tx found in cache");
+        let summary = crate::data::types::AddressTxSummary {
+            hash: cached_hash,
+            nonce: 0,
+            block_number: cached_block,
+            timestamp: 0,
+            endpoint_names: String::new(),
+            total_fee_fri: 0,
+            tip: 0,
+            tx_type: "DEPLOY".into(),
+            status: "OK".into(),
+            sender: cached_deployer,
+        };
+        let _ = tx.send(Action::AddressTxsStreamed {
+            address: addr,
+            source: Source::Pathfinder,
+            tx_summaries: vec![summary],
+            complete: false,
+        });
+        return;
+    }
+
     info!(%addr, deploy_block, "Looking for deploy tx");
     let txs = match ds.get_block_with_txs(deploy_block).await {
         Ok((_block, txs)) => txs,
@@ -1780,6 +1881,7 @@ pub(super) async fn find_deploy_tx(
             _ => (false, None),
         };
         if is_deploy {
+            ds.save_deploy_info(&addr, &t.hash(), deploy_block, sender.as_ref());
             let summary = crate::data::types::AddressTxSummary {
                 hash: t.hash(),
                 nonce: 0,
@@ -1835,6 +1937,7 @@ pub(super) async fn find_deploy_tx(
             }
             if event.keys.first() == Some(&udc_selector) && event.data.first() == Some(&addr) {
                 let deployer = event.data.get(1).copied();
+                ds.save_deploy_info(&addr, &t.hash(), deploy_block, deployer.as_ref());
                 let summary = crate::data::types::AddressTxSummary {
                     hash: t.hash(),
                     nonce: 0,

@@ -49,6 +49,16 @@ pub enum Action {
     },
     /// Fetch class hash info (ABI, declaration, deployed contracts).
     FetchClassInfo { class_hash: Felt },
+    /// Persist enriched address txs to cache (sent after enrichment completes).
+    PersistAddressTxs {
+        address: Felt,
+        txs: Vec<AddressTxSummary>,
+    },
+    /// Persist enriched address calls to cache (sent after enrichment completes).
+    PersistAddressCalls {
+        address: Felt,
+        calls: Vec<ContractCallSummary>,
+    },
 
     // --- Responses (network → UI) ---
     /// Recent blocks loaded.

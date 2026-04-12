@@ -81,6 +81,38 @@ impl CachingDataSource {
                 event_count INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS class_hashes (
+                address TEXT PRIMARY KEY,
+                class_hash TEXT NOT NULL,
+                fetched_at_block INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS block_hash_index (
+                hash TEXT PRIMARY KEY,
+                number INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deploy_info (
+                address TEXT PRIMARY KEY,
+                deploy_tx_hash TEXT NOT NULL,
+                deploy_block INTEGER NOT NULL,
+                deployer TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cached_nonces (
+                address TEXT PRIMARY KEY,
+                nonce TEXT NOT NULL,
+                block_number INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS address_search_progress (
+                address TEXT PRIMARY KEY,
+                max_searched_block INTEGER NOT NULL,
+                min_searched_block INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS contract_events (
+                address TEXT NOT NULL,
+                event_index INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (address, event_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_contract_events ON contract_events(address);
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -107,6 +139,14 @@ impl CachingDataSource {
                     "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
                     params![block.number, json],
                 );
+                // Also index hash→number for get_block_by_hash cache
+                if block.hash != Felt::ZERO {
+                    let hash_hex = format!("{:#x}", block.hash);
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
+                        params![hash_hex, block.number as i64],
+                    );
+                }
             }
         }
     }
@@ -238,6 +278,205 @@ impl CachingDataSource {
             }
         }
     }
+
+    // --- class_hash cache ---
+
+    fn get_cached_class_hash(&self, address: &Felt) -> Option<(Felt, u64)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT class_hash, fetched_at_block FROM class_hashes WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let ch_hex: String = row.get(0)?;
+            let block: i64 = row.get(1)?;
+            Ok((ch_hex, block as u64))
+        })
+        .ok()
+        .and_then(|(ch_hex, block)| Felt::from_hex(&ch_hex).ok().map(|f| (f, block)))
+    }
+
+    fn cache_class_hash(&self, address: &Felt, class_hash: &Felt, block: u64) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            let ch_hex = format!("{:#x}", class_hash);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO class_hashes (address, class_hash, fetched_at_block) VALUES (?1, ?2, ?3)",
+                params![addr_hex, ch_hex, block as i64],
+            );
+        }
+    }
+
+    // --- block_by_hash cache ---
+
+    fn get_cached_block_number_by_hash(&self, hash: &Felt) -> Option<u64> {
+        let db = self.db.lock().ok()?;
+        let hash_hex = format!("{:#x}", hash);
+        let mut stmt = db
+            .prepare("SELECT number FROM block_hash_index WHERE hash = ?1")
+            .ok()?;
+        stmt.query_row(params![hash_hex], |row| {
+            let n: i64 = row.get(0)?;
+            Ok(n as u64)
+        })
+        .ok()
+    }
+
+    fn cache_block_hash(&self, hash: &Felt, number: u64) {
+        if let Ok(db) = self.db.lock() {
+            let hash_hex = format!("{:#x}", hash);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
+                params![hash_hex, number as i64],
+            );
+        }
+    }
+
+    // --- deploy info cache ---
+
+    fn get_cached_deploy_info(&self, address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT deploy_tx_hash, deploy_block, deployer FROM deploy_info WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let tx_hex: String = row.get(0)?;
+            let block: i64 = row.get(1)?;
+            let deployer_hex: Option<String> = row.get(2)?;
+            Ok((tx_hex, block as u64, deployer_hex))
+        })
+        .ok()
+        .and_then(|(tx_hex, block, deployer_hex)| {
+            let tx_hash = Felt::from_hex(&tx_hex).ok()?;
+            let deployer = deployer_hex.and_then(|h| Felt::from_hex(&h).ok());
+            Some((tx_hash, block, deployer))
+        })
+    }
+
+    fn cache_deploy_info(&self, address: &Felt, tx_hash: &Felt, block: u64, deployer: Option<&Felt>) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            let tx_hex = format!("{:#x}", tx_hash);
+            let deployer_hex = deployer.map(|d| format!("{:#x}", d));
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO deploy_info (address, deploy_tx_hash, deploy_block, deployer) VALUES (?1, ?2, ?3, ?4)",
+                params![addr_hex, tx_hex, block as i64, deployer_hex],
+            );
+        }
+    }
+
+    // --- nonce cache ---
+
+    fn get_cached_nonce_info(&self, address: &Felt) -> Option<(Felt, u64)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT nonce, block_number FROM cached_nonces WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let nonce_hex: String = row.get(0)?;
+            let block: i64 = row.get(1)?;
+            Ok((nonce_hex, block as u64))
+        })
+        .ok()
+        .and_then(|(nonce_hex, block)| Felt::from_hex(&nonce_hex).ok().map(|f| (f, block)))
+    }
+
+    fn cache_nonce_info(&self, address: &Felt, nonce: &Felt, block: u64) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            let nonce_hex = format!("{:#x}", nonce);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO cached_nonces (address, nonce, block_number) VALUES (?1, ?2, ?3)",
+                params![addr_hex, nonce_hex, block as i64],
+            );
+        }
+    }
+
+    // --- search progress cache ---
+
+    fn get_cached_search_progress(&self, address: &Felt) -> Option<(u64, u64)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT min_searched_block, max_searched_block FROM address_search_progress WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let min: i64 = row.get(0)?;
+            let max: i64 = row.get(1)?;
+            Ok((min as u64, max as u64))
+        })
+        .ok()
+    }
+
+    fn cache_search_progress(&self, address: &Felt, min_block: u64, max_block: u64) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            // Merge: expand existing range
+            let existing = db
+                .prepare("SELECT min_searched_block, max_searched_block FROM address_search_progress WHERE address = ?1")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_row(params![addr_hex], |row| {
+                        let min: i64 = row.get(0)?;
+                        let max: i64 = row.get(1)?;
+                        Ok((min as u64, max as u64))
+                    })
+                    .ok()
+                });
+            let (final_min, final_max) = if let Some((old_min, old_max)) = existing {
+                (old_min.min(min_block), old_max.max(max_block))
+            } else {
+                (min_block, max_block)
+            };
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO address_search_progress (address, min_searched_block, max_searched_block) VALUES (?1, ?2, ?3)",
+                params![addr_hex, final_min as i64, final_max as i64],
+            );
+        }
+    }
+
+    // --- contract events cache ---
+
+    fn load_contract_events(&self, address: &Felt) -> Vec<SnEvent> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = match db
+            .prepare("SELECT data FROM contract_events WHERE address = ?1 ORDER BY event_index")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![addr_hex], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect()
+    }
+
+    fn save_contract_events(&self, address: &Felt, events: &[SnEvent]) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            let _ = db.execute(
+                "DELETE FROM contract_events WHERE address = ?1",
+                params![addr_hex],
+            );
+            for (i, event) in events.iter().enumerate() {
+                if let Ok(json) = serde_json::to_string(event) {
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO contract_events (address, event_index, data) VALUES (?1, ?2, ?3)",
+                        params![addr_hex, i as i64, json],
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -259,7 +498,13 @@ impl DataSource for CachingDataSource {
     }
 
     async fn get_block_by_hash(&self, hash: Felt) -> Result<u64> {
-        self.upstream.get_block_by_hash(hash).await
+        if let Some(number) = self.get_cached_block_number_by_hash(&hash) {
+            trace!(hash = %format!("{:#x}", hash), "cache hit: block_by_hash");
+            return Ok(number);
+        }
+        let number = self.upstream.get_block_by_hash(hash).await?;
+        self.cache_block_hash(&hash, number);
+        Ok(number)
     }
 
     async fn get_block_with_txs(&self, number: u64) -> Result<(SnBlock, Vec<SnTransaction>)> {
@@ -301,8 +546,16 @@ impl DataSource for CachingDataSource {
     }
 
     async fn get_class_hash(&self, address: Felt) -> Result<Felt> {
-        // Class hash is immutable once deployed — could cache, but for now upstream
-        self.upstream.get_class_hash(address).await
+        // Class hash is mostly stable but CAN change via replace_class syscall.
+        // Cache with the block at which we fetched it; serve from cache immediately.
+        if let Some((class_hash, _fetched_at)) = self.get_cached_class_hash(&address) {
+            trace!(address = %format!("{:#x}", address), "cache hit: class_hash");
+            return Ok(class_hash);
+        }
+        let class_hash = self.upstream.get_class_hash(address).await?;
+        let block = self.upstream.get_latest_block_number().await.unwrap_or(0);
+        self.cache_class_hash(&address, &class_hash, block);
+        Ok(class_hash)
     }
 
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass> {
@@ -523,6 +776,68 @@ impl DataSource for CachingDataSource {
         self.upstream
             .call_contract(contract_address, selector, calldata)
             .await
+    }
+
+    async fn get_contract_events(
+        &self,
+        address: Felt,
+        from_block: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SnEvent>> {
+        // Incremental caching for contract events (all events, no key filter)
+        let cached = self.load_contract_events(&address);
+
+        let fetch_from = if !cached.is_empty() && from_block.is_none() {
+            let max_block = cached.iter().map(|e| e.block_number).max().unwrap_or(0);
+            Some(max_block + 1)
+        } else {
+            from_block
+        };
+
+        let new_events = self
+            .upstream
+            .get_contract_events(address, fetch_from, limit)
+            .await
+            .unwrap_or_default();
+
+        let mut merged = new_events;
+        for event in cached {
+            let exists = merged.iter().any(|e| {
+                e.transaction_hash == event.transaction_hash && e.block_number == event.block_number
+            });
+            if !exists {
+                merged.push(event);
+            }
+        }
+
+        merged.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+        self.save_contract_events(&address, &merged);
+
+        Ok(merged)
+    }
+
+    fn load_cached_deploy_info(&self, address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {
+        self.get_cached_deploy_info(address)
+    }
+
+    fn save_deploy_info(&self, address: &Felt, tx_hash: &Felt, block: u64, deployer: Option<&Felt>) {
+        self.cache_deploy_info(address, tx_hash, block, deployer);
+    }
+
+    fn load_cached_nonce(&self, address: &Felt) -> Option<(Felt, u64)> {
+        self.get_cached_nonce_info(address)
+    }
+
+    fn save_cached_nonce(&self, address: &Felt, nonce: &Felt, block: u64) {
+        self.cache_nonce_info(address, nonce, block);
+    }
+
+    fn load_search_progress(&self, address: &Felt) -> Option<(u64, u64)> {
+        self.get_cached_search_progress(address)
+    }
+
+    fn save_search_progress(&self, address: &Felt, min_block: u64, max_block: u64) {
+        self.cache_search_progress(address, min_block, max_block);
     }
 
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>> {

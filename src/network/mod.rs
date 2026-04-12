@@ -220,6 +220,12 @@ pub async fn run_network_task(
                 Action::FetchClassInfo { class_hash } => {
                     class::fetch_class_info(class_hash, &ds, &abi_reg, &dune, &pf, &tx).await;
                 }
+                Action::PersistAddressTxs { address, txs } => {
+                    ds.save_address_txs(&address, &txs);
+                }
+                Action::PersistAddressCalls { address, calls } => {
+                    ds.save_address_calls(&address, &calls);
+                }
                 // Response actions are not handled here
                 _ => {}
             }
