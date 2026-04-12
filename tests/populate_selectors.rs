@@ -176,13 +176,7 @@ fn hardcoded_selectors() -> Vec<(Felt, &'static str)> {
     }
 
     // Lending common
-    let lending = [
-        "modify_position",
-        "flash_loan",
-        "supply",
-        "borrow",
-        "repay",
-    ];
+    let lending = ["modify_position", "flash_loan", "supply", "borrow", "repay"];
     for name in lending {
         if let Ok(sel) = get_selector_from_name(name) {
             selectors.push((sel, name));
