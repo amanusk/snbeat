@@ -554,9 +554,7 @@ fn build_color_map(app: &App) -> AddressColorMap {
     }
 
     // Deployed addresses (via UDC) get their own color slots
-    for addr in
-        crate::decode::events::extract_deployed_addresses(&app.tx_detail.decoded_events)
-    {
+    for addr in crate::decode::events::extract_deployed_addresses(&app.tx_detail.decoded_events) {
         cm.register(addr);
     }
 
