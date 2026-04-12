@@ -1,0 +1,516 @@
+#![allow(dead_code)]
+
+mod app;
+mod config;
+mod data;
+mod decode;
+mod error;
+mod network;
+mod registry;
+mod search;
+mod ui;
+mod utils;
+
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+use app::App;
+use app::actions::Action;
+use config::AppConfig;
+use data::cache::CachingDataSource;
+use data::rpc::RpcDataSource;
+use decode::AbiRegistry;
+use decode::class_cache::ClassCache;
+use registry::AddressRegistry;
+use search::SearchEngine;
+
+/// Initialize file-based logging. Returns a guard that must be held alive
+/// for the duration of the program (dropping it flushes pending writes).
+fn init_logging(config: &AppConfig) -> tracing_appender::non_blocking::WorkerGuard {
+    let log_dir = config
+        .log_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| snbeat_config_dir().join("logs"));
+
+    std::fs::create_dir_all(&log_dir).expect("Failed to create log directory");
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "snbeat.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_writer(non_blocking),
+        )
+        .init();
+
+    guard
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
+    let config = AppConfig::parse();
+    let _log_guard = init_logging(&config);
+
+    info!(rpc_url = %config.rpc_url, ws_url = ?config.ws_url, "snbeat starting");
+
+    // Startup checks
+    startup_checks(&config)?;
+
+    // Setup cache directory
+    let cache_dir = snbeat_config_dir();
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache_db = cache_dir.join("cache.db");
+    info!(cache_db = %cache_db.display(), "Using local cache");
+
+    // Create data source with persistent cache
+    let rpc = RpcDataSource::new(&config.rpc_url);
+    let cached = CachingDataSource::new(Box::new(rpc), &cache_db)?;
+    let data_source: Arc<dyn data::DataSource> = Arc::new(cached);
+
+    // ABI registry with persistent class cache
+    let class_cache_db = rusqlite::Connection::open(cache_dir.join("cache.db"))
+        .map_err(|e| anyhow::anyhow!("Failed to open class cache db: {e}"))?;
+    // Ensure the parsed_abis table exists (same DB as data cache)
+    class_cache_db
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS parsed_abis (
+                class_hash TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to init class cache: {e}"))?;
+    let class_cache = ClassCache::new(class_cache_db, 500);
+    let abi_registry = Arc::new(AbiRegistry::new(Arc::clone(&data_source), class_cache));
+
+    // Address registry
+    let user_labels_path = std::path::PathBuf::from(&config.user_labels);
+    let known_addresses_path = std::path::PathBuf::from(&config.known_addresses);
+    let (registry_inner, labels_warning) =
+        AddressRegistry::load(&user_labels_path, &known_addresses_path).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to load address registry, using empty");
+            AddressRegistry::load(
+                std::path::Path::new("/dev/null"),
+                std::path::Path::new("/dev/null"),
+            )
+            .unwrap()
+        });
+    let registry = Arc::new(registry_inner);
+    let search_engine = Arc::new(SearchEngine::new(Arc::clone(&registry)));
+
+    // Channels
+    let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<Action>();
+
+    // Create app
+    let mut app = App::new(action_tx.clone());
+    app.search_engine = Some(Arc::clone(&search_engine));
+    if let Some(w) = labels_warning {
+        app.error_message = Some(w);
+    }
+    app.connection_status = app::state::ConnectionStatus::Connected {
+        network: "mainnet".to_string(),
+    };
+    app.is_loading = true;
+
+    // Create Dune client (optional — only if API key is set)
+    let dune_client = config
+        .dune_api_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .map(|key| {
+            info!("Dune API enabled");
+            Arc::new(network::dune::DuneClient::new(key.clone()))
+        });
+
+    // Create Voyager client (optional — only if API key is set)
+    let voyager_client: Option<Arc<network::voyager::VoyagerClient>> = config
+        .voyager_api_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .and_then(
+            |key| match network::voyager::VoyagerClient::new(key.clone(), &cache_db) {
+                Ok(client) => {
+                    info!("Voyager API enabled");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialize Voyager client");
+                    None
+                }
+            },
+        );
+
+    // Seed the search index with cached Voyager labels so they're searchable immediately
+    if let Some(vc) = &voyager_client {
+        let cached = vc.load_all_cached_labels();
+        if !cached.is_empty() {
+            info!(
+                count = cached.len(),
+                "Seeding search index with cached Voyager labels"
+            );
+            for (address, name) in cached {
+                registry.add_voyager_label(address, &name);
+            }
+        }
+    }
+
+    // Create Pathfinder query service client (optional — only if URL is set)
+    let pf_client = config
+        .pathfinder_service_url
+        .as_ref()
+        .filter(|u| !u.is_empty())
+        .map(|url| {
+            info!(url = %url, "Pathfinder query service enabled");
+            Arc::new(data::pathfinder::PathfinderClient::new(url.clone()))
+        });
+
+    // Record which data sources are configured
+    app.data_sources = app::state::DataSources {
+        rpc: app::state::SourceStatus::Configured,
+        dune: if dune_client.is_some() {
+            app::state::SourceStatus::Configured
+        } else {
+            app::state::SourceStatus::Off
+        },
+        pathfinder: if pf_client.is_some() {
+            app::state::SourceStatus::Configured
+        } else {
+            app::state::SourceStatus::Off
+        },
+        voyager: if voyager_client.is_some() {
+            app::state::SourceStatus::Configured
+        } else {
+            app::state::SourceStatus::Off
+        },
+        ws: app::state::SourceStatus::Off,
+    };
+
+    // Probe Voyager health in background, upgrade to Live if reachable
+    if let Some(vc) = &voyager_client {
+        let vc_c = Arc::clone(vc);
+        let resp_tx_c = response_tx.clone();
+        tokio::spawn(async move {
+            match vc_c.health_check().await {
+                Ok(()) => {
+                    info!("Voyager API reachable");
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Voyager,
+                        status: app::state::SourceStatus::Live,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "Voyager API unreachable");
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Voyager,
+                        status: app::state::SourceStatus::ConnectError(e),
+                    });
+                }
+            }
+        });
+    }
+
+    // Probe PF health in background, upgrade to Live if reachable
+    if let Some(pf) = &pf_client {
+        let pf_c = Arc::clone(pf);
+        let resp_tx_c = response_tx.clone();
+        tokio::spawn(async move {
+            match pf_c.health().await {
+                Ok(_) => {
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Pathfinder,
+                        status: app::state::SourceStatus::Live,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Pathfinder service unreachable");
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Pathfinder,
+                        status: app::state::SourceStatus::ConnectError(e.to_string()),
+                    });
+                }
+            }
+        });
+    }
+
+    // Probe Dune health in background, upgrade to Live if reachable
+    if let Some(dune) = &dune_client {
+        let dune_c = Arc::clone(dune);
+        let resp_tx_c = response_tx.clone();
+        tokio::spawn(async move {
+            match dune_c.health().await {
+                Ok(()) => {
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Dune,
+                        status: app::state::SourceStatus::Live,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Dune API unreachable");
+                    let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                        source: app::actions::Source::Dune,
+                        status: app::state::SourceStatus::ConnectError(e.to_string()),
+                    });
+                }
+            }
+        });
+    }
+
+    // Spawn network task
+    let ds_clone = Arc::clone(&data_source);
+    let abi_clone = Arc::clone(&abi_registry);
+    let resp_tx_clone = response_tx.clone();
+    tokio::spawn(async move {
+        network::run_network_task(
+            ds_clone,
+            abi_clone,
+            dune_client,
+            pf_client,
+            voyager_client,
+            action_rx,
+            resp_tx_clone,
+        )
+        .await;
+    });
+
+    // Spawn block update mechanism: prefer WebSocket, fall back to polling
+    let _block_updater: tokio::task::JoinHandle<()> = if let Some(ws_url) = &config.ws_url {
+        info!(ws_url = %ws_url, "Using WebSocket for new block headers and address streaming");
+        app.data_sources.ws = app::state::SourceStatus::Configured;
+        let (handle, ws_manager) = network::ws::spawn_ws_subscriber(
+            ws_url.clone(),
+            Arc::clone(&data_source),
+            response_tx.clone(),
+        );
+        app.ws_manager = Some(ws_manager);
+        handle
+    } else {
+        info!("No WS URL configured, using HTTP polling (3s interval)");
+        network::spawn_block_poller(
+            Arc::clone(&data_source),
+            response_tx.clone(),
+            Duration::from_secs(3),
+        )
+    };
+
+    // Request initial data
+    info!("Requesting initial block fetch");
+    let _ = action_tx.send(Action::FetchRecentBlocks { count: 30 });
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    info!("TUI initialized, entering event loop");
+
+    // TUI event loop
+    let result = run_loop(&mut terminal, &mut app, &mut response_rx).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+
+    info!("snbeat exiting");
+    result
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    response_rx: &mut mpsc::UnboundedReceiver<Action>,
+) -> anyhow::Result<()> {
+    loop {
+        // Draw
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        // Check for quit
+        if app.should_quit {
+            return Ok(());
+        }
+
+        // Use tokio::select to handle both terminal events and network responses
+        tokio::select! {
+            // Check for terminal events (keyboard input)
+            result = tokio::task::spawn_blocking(|| {
+                if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                    Some(event::read())
+                } else {
+                    None
+                }
+            }) => {
+                match result {
+                    Ok(Some(Ok(Event::Key(key)))) => {
+                        // Clear error on any keypress
+                        app.error_message = None;
+                        if let Some(action) = app::input::handle_key(app, key) {
+                            debug!(?action, "Dispatching action from input");
+                            app.is_loading = true;
+                            let _ = app.action_tx.send(action);
+                        }
+                    }
+                    Ok(Some(Ok(Event::Mouse(mouse)))) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.select_previous(),
+                        MouseEventKind::ScrollDown => app.select_next(),
+                        _ => {} // ignore clicks/motion — text selection works via Shift+drag
+                    },
+                    _ => {}
+                }
+            }
+            // Handle responses from network task
+            Some(action) = response_rx.recv() => {
+                match &action {
+                    Action::BlocksLoaded(blocks) => {
+                        info!(count = blocks.len(), "Blocks loaded");
+                    }
+                    Action::NewBlock(block) => {
+                        debug!(number = block.number, "New block received");
+                    }
+                    Action::BlockDetailLoaded { block, transactions, endpoint_names, .. } => {
+                        let resolved = endpoint_names.iter().filter(|n| n.is_some()).count();
+                        info!(block = block.number, tx_count = transactions.len(), resolved_endpoints = resolved, "Block detail loaded");
+                    }
+                    Action::TransactionLoaded { transaction, receipt, decoded_events, .. } => {
+                        let decoded_count = decoded_events.iter().filter(|e| e.event_name.is_some()).count();
+                        info!(tx = %format!("{:#x}", transaction.hash()), events = receipt.events.len(), decoded = decoded_count, "Transaction loaded");
+                    }
+                    Action::AddressInfoLoaded { info, decoded_events, tx_summaries, .. } => {
+                        info!(address = %format!("{:#x}", info.address), events = decoded_events.len(), txs = tx_summaries.len(), balances = info.token_balances.len(), "Address info loaded");
+                    }
+                    Action::Error(msg) => {
+                        warn!(error = %msg, "Network error");
+                    }
+                    _ => {}
+                }
+                app.handle_action(action);
+            }
+        }
+    }
+}
+
+fn snbeat_config_dir() -> std::path::PathBuf {
+    if let Some(config_dir) = dirs::config_dir() {
+        config_dir.join("snbeat")
+    } else {
+        std::path::PathBuf::from(".snbeat")
+    }
+}
+
+/// Validate prerequisites before starting the app.
+fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
+    let mut warnings = Vec::new();
+
+    // Check RPC URL is set and looks valid
+    if config.rpc_url.is_empty() {
+        anyhow::bail!("APP_RPC_URL is required. Set it in .env or pass --rpc-url");
+    }
+    if !config.rpc_url.starts_with("http://") && !config.rpc_url.starts_with("https://") {
+        anyhow::bail!(
+            "APP_RPC_URL must start with http:// or https://. Got: {}",
+            config.rpc_url
+        );
+    }
+
+    // Validate WS URL if provided
+    if let Some(ws_url) = &config.ws_url {
+        if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
+            anyhow::bail!(
+                "APP_WS_URL must start with ws:// or wss://. Got: {}",
+                ws_url
+            );
+        }
+    }
+
+    // Check config directory is writable
+    let config_dir = snbeat_config_dir();
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        anyhow::bail!(
+            "Cannot create config directory {}: {}",
+            config_dir.display(),
+            e
+        );
+    }
+
+    // Check SQLite works (bundled, should always work)
+    let test_db_path = config_dir.join(".startup_check.db");
+    match rusqlite::Connection::open(&test_db_path) {
+        Ok(db) => {
+            let _ = db.execute_batch("CREATE TABLE IF NOT EXISTS _test (id INTEGER)");
+            drop(db);
+            let _ = std::fs::remove_file(&test_db_path);
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "SQLite check failed: {}. Cache directory: {}",
+                e,
+                config_dir.display()
+            );
+        }
+    }
+
+    // Check optional API keys
+    if config.dune_api_key.as_ref().map_or(true, |k| k.is_empty()) {
+        warnings.push(
+            "DUNE_API_KEY not set — reverted tx detection and contract call discovery will be limited",
+        );
+    }
+    if config
+        .voyager_api_key
+        .as_ref()
+        .map_or(true, |k| k.is_empty())
+    {
+        warnings.push("VOYAGER_API_KEY not set — address metadata enrichment unavailable");
+    }
+
+    // Check labels file
+    let labels_path = std::path::Path::new(&config.user_labels);
+    if !labels_path.exists() {
+        warnings.push("User labels file not found — create labels.toml for address tagging");
+    }
+
+    // Log warnings
+    for w in &warnings {
+        info!("Startup: {}", w);
+    }
+
+    info!(
+        rpc = %config.rpc_url,
+        cache_dir = %config_dir.display(),
+        dune = config.dune_api_key.as_ref().map_or(false, |k| !k.is_empty()),
+        voyager = config.voyager_api_key.as_ref().map_or(false, |k| !k.is_empty()),
+        labels = labels_path.exists(),
+        "Startup checks passed"
+    );
+
+    Ok(())
+}

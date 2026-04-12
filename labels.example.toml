@@ -1,0 +1,46 @@
+# snbeat user labels — tag addresses and transactions with human-readable names
+# User labels take priority over the built-in known.toml registry.
+#
+# Copy this file to labels.toml and customize it:
+#   cp labels.example.toml labels.toml
+
+[addresses]
+
+# ═══ Your Addresses ═══
+# Add your own addresses here. Labels starting with "Our:" or "My:" are just
+# conventions — use whatever naming scheme you like.
+#
+# Simple label:
+# "0x1234..." = "My Main Wallet"
+#
+# Label with searchable tags (searchable via the / search bar):
+# "0x1234..." = { name = "My Deployer", tags = ["deploy", "admin"] }
+
+# ═══ Tokens ═══
+"0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d" = "STRK"
+"0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7" = "ETH"
+"0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8" = "USDC (bridged)"
+"0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb" = "USDC (native)"
+"0x00da114221cb83fa859dbdb4c44beeaa0bb37c7537ad5ae66fe5e0efd20e6eb3" = "DAI"
+"0x028d709c875c0ceac3dce7065bec5328186dc89fe254527084d1689910954b0a" = "xSTRK"
+"0x0124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49" = "wBTC"
+"0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8" = "USDT"
+"0x04c0a5193d58f74fbace4b74dcf65481e734ed1714121bdc571da345540efa05" = "wstETH"
+"0x042b8f0484674ca266ac5d08e4ac6a3fe65bd3129795def2dca5c34ecc5f96d2" = "nstSTRK"
+
+# ═══ DEXes & Protocols ═══
+"0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b" = "Ekubo Core"
+"0x0199741822c2dc722f6f605204f35e56dbc23bceed54818168c4c49e4fb8737e" = "Ekubo Router"
+"0x04270219d365d6b017231b52e92b3fb5d7c8378b05e9abc97724537a80e93b0f" = "AVNU Exchange v1"
+"0x036144f57b3dfeeade600b446be0789c17a04d51e1d10ba00d1e4b37c13f68e3" = "AVNU Exchange v2"
+"0x02545b2e5d519fc230e9cd781046d3a64e092114f07e44771e0d719d148571e3" = "Vesu Singleton"
+"0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf" = "UDC"
+"0x01176a1bd84444c89232ec27754698e5d2e7e1a7f1539f12027f28b23ec9f3d8" = "Sequencer"
+
+# ═══ Oracles ═══
+"0x02a85bd616f912537c50a49a4076db02c00b29b2cdc8a197ce92ed1837fa875b" = "Pragma Oracle"
+"0x03235745f167c21fdc2cc2b17f54b55b73d7f2a399cc10df06d5c7f2a5dd6515" = "Pragma: Summary Stats"
+
+[transactions]
+# Tag specific transactions with labels
+# "0xabc123..." = "Initial deploy"

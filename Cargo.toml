@@ -1,0 +1,68 @@
+[workspace]
+members = [".", "crates/pf-query"]
+
+[package]
+name = "snbeat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Starknet — Software Mansion's starknet-rust (active development, RPC v0.10 spec)
+starknet = { package = "starknet-rust", version = "0.19.0-rc.2" }
+
+# TUI
+ratatui = { version = "0.29", features = ["all-widgets"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures = "0.3"
+
+# HTTP — reqwest 0.13 must match starknet-rust's version and enable TLS
+# (starknet-rust-providers declares reqwest 0.13 with default-features=false, no TLS)
+reqwest = { version = "0.13", features = ["json", "default-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Config
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Time
+chrono = "0.4"
+
+# Misc
+dirs = "6"
+url = "2.5"
+lru = "0.12"
+async-trait = "0.1"
+
+# Local cache (SQLite for persistent storage across restarts)
+rusqlite = { version = "0.33", features = ["bundled"] }
+
+# Pathfinder DB (optional — for direct pathfinder node access)
+r2d2 = { version = "0.8", optional = true }
+r2d2_sqlite = { version = "0.26", optional = true }
+zstd = { version = "0.13", optional = true }
+bincode = { version = "2.0", features = ["serde"], optional = true }
+
+[features]
+default = []
+pathfinder = ["dep:r2d2", "dep:r2d2_sqlite", "dep:zstd", "dep:bincode"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

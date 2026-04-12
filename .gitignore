@@ -1,0 +1,5 @@
+/target
+.env
+labels.toml
+logs/*
+scripts/

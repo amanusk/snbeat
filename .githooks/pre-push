@@ -1,0 +1,28 @@
+#!/bin/bash
+# Pre-push hook: runs the same checks as CI before allowing push.
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "=== Pre-push: checking formatting ==="
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo "ERROR: Code is not formatted. Run 'cargo fmt --all' first."
+    exit 1
+fi
+
+echo "=== Pre-push: building ==="
+cargo build --quiet
+if [ $? -ne 0 ]; then
+    echo "ERROR: Build failed."
+    exit 1
+fi
+
+echo "=== Pre-push: running tests ==="
+cargo test --quiet -- --skip populate_selectors --skip address_flow --skip contract_calls
+if [ $? -ne 0 ]; then
+    echo "ERROR: Tests failed."
+    exit 1
+fi
+
+echo "=== Pre-push: all checks passed ==="
