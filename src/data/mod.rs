@@ -89,4 +89,35 @@ pub trait DataSource: Send + Sync {
         selector: Felt,
         calldata: Vec<Felt>,
     ) -> Result<Vec<Felt>>;
+
+    // --- Deploy info cache ---
+    /// Load cached deploy tx info for an address. Returns (tx_hash, block, deployer).
+    fn load_cached_deploy_info(&self, _address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {
+        None
+    }
+    /// Save deploy tx info for an address.
+    fn save_deploy_info(
+        &self,
+        _address: &Felt,
+        _tx_hash: &Felt,
+        _block: u64,
+        _deployer: Option<&Felt>,
+    ) {
+    }
+
+    // --- Nonce cache ---
+    /// Load cached nonce + block number for an address.
+    fn load_cached_nonce(&self, _address: &Felt) -> Option<(Felt, u64)> {
+        None
+    }
+    /// Save nonce + block number for an address.
+    fn save_cached_nonce(&self, _address: &Felt, _nonce: &Felt, _block: u64) {}
+
+    // --- Search progress cache ---
+    /// Load cached search progress (min_searched_block, max_searched_block).
+    fn load_search_progress(&self, _address: &Felt) -> Option<(u64, u64)> {
+        None
+    }
+    /// Save search progress for an address.
+    fn save_search_progress(&self, _address: &Felt, _min_block: u64, _max_block: u64) {}
 }

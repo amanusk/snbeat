@@ -870,6 +870,13 @@ impl App {
                 }
                 // Merge enrichment data (upgrades existing entries)
                 self.address.merge_tx_summaries(updates);
+                // Persist enriched txs to cache so they survive restarts
+                if !self.address.txs.items.is_empty() {
+                    let _ = self.action_tx.send(Action::PersistAddressTxs {
+                        address,
+                        txs: self.address.txs.items.clone(),
+                    });
+                }
             }
             Action::AddressSourcesPending { address, sources } => {
                 if self.address.context == Some(address) {
@@ -1027,6 +1034,13 @@ impl App {
                             existing.status = enriched.status;
                         }
                     }
+                }
+                // Persist enriched calls to cache so they survive restarts
+                if !self.address.calls.items.is_empty() {
+                    let _ = self.action_tx.send(Action::PersistAddressCalls {
+                        address,
+                        calls: self.address.calls.items.clone(),
+                    });
                 }
             }
             Action::AddressBalancesLoaded { address, balances } => {
