@@ -92,6 +92,13 @@ impl TxDetailState {
             }
         }
 
+        // Deployed contract addresses (via UDC)
+        for addr in crate::decode::events::extract_deployed_addresses(&self.decoded_events) {
+            if seen.insert(addr) {
+                items.push(TxNavItem::Address(addr));
+            }
+        }
+
         // Call contract addresses
         for call in &self.decoded_calls {
             if seen.insert(call.contract_address) {

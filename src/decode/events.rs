@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use starknet::core::types::Felt;
 
 use super::abi::ParsedAbi;
@@ -136,4 +138,23 @@ pub fn group_events_by_contract(events: &[DecodedEvent]) -> Vec<ContractEvents> 
 pub struct ContractEvents {
     pub contract_address: Felt,
     pub events: Vec<DecodedEvent>,
+}
+
+/// UDC `ContractDeployed` event selector.
+static UDC_CONTRACT_DEPLOYED: LazyLock<Felt> = LazyLock::new(|| {
+    Felt::from_hex("0x26b160f10156dea0639bec90696772c640b9706a47f5b8c52ea1abe5858b34d").unwrap()
+});
+
+/// Extract addresses deployed via UDC from decoded events.
+///
+/// The UDC `ContractDeployed` event has:
+///   keys[0] = selector
+///   data[0] = deployed contract address
+///   data[1] = deployer address
+pub fn extract_deployed_addresses(events: &[DecodedEvent]) -> Vec<Felt> {
+    events
+        .iter()
+        .filter(|e| e.raw.keys.first() == Some(&*UDC_CONTRACT_DEPLOYED))
+        .filter_map(|e| e.raw.data.first().copied())
+        .collect()
 }

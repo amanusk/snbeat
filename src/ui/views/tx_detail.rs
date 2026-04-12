@@ -224,6 +224,35 @@ fn draw_scrollable_detail(
         }
     }
 
+    // === CONTRACTS DEPLOYED (via UDC) ===
+    let deployed_addrs =
+        crate::decode::events::extract_deployed_addresses(&app.tx_detail.decoded_events);
+    if !deployed_addrs.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" Contracts Deployed ({})", deployed_addrs.len()),
+            theme::TITLE_STYLE,
+        )));
+        for addr in &deployed_addrs {
+            let style = addr_style(addr, &color_map, selected);
+            record(
+                &TxNavItem::Address(*addr),
+                &lines,
+                &mut line_map,
+                &app.tx_detail.nav_items,
+            );
+            lines.push(Line::from(vec![
+                addr_marker(addr, selected),
+                Span::styled("  ", theme::NORMAL_STYLE),
+                Span::styled(app.format_address_full(addr), style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(format!("{:#x}", addr), style),
+            ]));
+        }
+    }
+
     // === DECODED CALLS ===
     if !app.tx_detail.decoded_calls.is_empty() {
         lines.push(Line::from(""));
@@ -522,6 +551,13 @@ fn build_color_map(app: &App) -> AddressColorMap {
 
     if let Some(tx) = &app.tx_detail.transaction {
         cm.register(tx.sender());
+    }
+
+    // Deployed addresses (via UDC) get their own color slots
+    for addr in
+        crate::decode::events::extract_deployed_addresses(&app.tx_detail.decoded_events)
+    {
+        cm.register(addr);
     }
 
     for call in &app.tx_detail.decoded_calls {
