@@ -501,7 +501,7 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     // Check optional API keys
     if config.dune_api_key.as_ref().map_or(true, |k| k.is_empty()) {
         warnings.push(
-            "DUNE_API_KEY not set — reverted tx detection and contract call discovery will be limited",
+            "DUNE_API_KEY not set — account history and contract call discovery will be limited",
         );
     }
     if config

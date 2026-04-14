@@ -290,10 +290,11 @@ APP_PATHFINDER_SERVICE_URL=http://localhost:8234
 
 ### Dune Analytics (optional)
 
-A Dune API key enables two additional features:
+A Dune API key enables additional address history features:
 
-- **Reverted transaction detection** - reverted txs appear differently from successful ones
+- **Account transaction history** - full transaction list for an account, used as a fallback when Pathfinder is unavailable
 - **Contract call history** - the _Calls_ tab on an address shows all transactions that called that contract
+- **Activity range probe** - detects the active block range for an address
 
 ```
 DUNE_API_KEY=your_key_here
