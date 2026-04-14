@@ -450,7 +450,9 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
 
     // Check RPC URL is set and looks valid
     if config.rpc_url.is_empty() {
-        anyhow::bail!("APP_RPC_URL is required. Set it in .env, ~/.config/snbeat/.env, or pass --rpc-url");
+        anyhow::bail!(
+            "APP_RPC_URL is required. Set it in .env, ~/.config/snbeat/.env, or pass --rpc-url"
+        );
     }
     if !config.rpc_url.starts_with("http://") && !config.rpc_url.starts_with("https://") {
         anyhow::bail!(
@@ -513,7 +515,8 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     // Check labels file (with XDG fallback)
     let labels_path = resolve_config_file(&config.user_labels, "labels.toml");
     if !labels_path.exists() {
-        warnings.push("User labels file not found — create labels.toml in CWD or ~/.config/snbeat/");
+        warnings
+            .push("User labels file not found — create labels.toml in CWD or ~/.config/snbeat/");
     }
 
     // Log warnings

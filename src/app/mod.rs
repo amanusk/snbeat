@@ -812,12 +812,11 @@ impl App {
                             let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                             if current_nonce > 0 {
                                 self.address.sanity_check_dispatched = true;
-                                let _ =
-                                    self.action_tx.send(Action::SanityCheckAddress {
-                                        address,
-                                        current_nonce,
-                                        known_txs: self.address.txs.items.clone(),
-                                    });
+                                let _ = self.action_tx.send(Action::SanityCheckAddress {
+                                    address,
+                                    current_nonce,
+                                    known_txs: self.address.txs.items.clone(),
+                                });
                             }
                         }
                     }
@@ -983,12 +982,11 @@ impl App {
                             if let Some(info) = &self.address.info {
                                 let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                                 self.address.sanity_check_dispatched = true;
-                                let _ =
-                                    self.action_tx.send(Action::SanityCheckAddress {
-                                        address,
-                                        current_nonce,
-                                        known_txs: self.address.txs.items.clone(),
-                                    });
+                                let _ = self.action_tx.send(Action::SanityCheckAddress {
+                                    address,
+                                    current_nonce,
+                                    known_txs: self.address.txs.items.clone(),
+                                });
                             }
                         }
                     }

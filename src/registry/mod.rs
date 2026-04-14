@@ -31,6 +31,8 @@ struct SearchEntry {
     address: Felt,
     hex_lower: String,
     is_user: bool,
+    /// Lowercase tags for search matching (user labels only).
+    tags_lower: Vec<String>,
 }
 
 /// A search result returned to the UI.
@@ -68,6 +70,7 @@ impl AddressRegistry {
                 address: label.address,
                 hex_lower: hex.to_lowercase(),
                 is_user: true,
+                tags_lower: label.tags.iter().map(|t| t.to_lowercase()).collect(),
             });
         }
 
@@ -84,6 +87,7 @@ impl AddressRegistry {
                 address: addr.address,
                 hex_lower: hex.to_lowercase(),
                 is_user: false,
+                tags_lower: Vec::new(),
             });
         }
 
@@ -174,11 +178,17 @@ impl AddressRegistry {
             }
         }
 
-        // Then substring matches
+        // Then substring matches (name or tags)
         for entry in index.iter() {
-            if !entry.name_lower.starts_with(&query_lower)
-                && entry.name_lower.contains(&query_lower)
-            {
+            if results.iter().any(|r| r.address == entry.address) {
+                continue;
+            }
+            let name_match = entry.name_lower.contains(&query_lower);
+            let tag_match = entry
+                .tags_lower
+                .iter()
+                .any(|t| t.starts_with(&query_lower) || t.contains(&query_lower));
+            if name_match || tag_match {
                 results.push(SearchResult {
                     display: format_search_result(entry),
                     address: entry.address,
@@ -236,6 +246,7 @@ impl AddressRegistry {
             address,
             hex_lower: hex.to_lowercase(),
             is_user: false,
+            tags_lower: Vec::new(),
         };
         // Insert sorted by name
         let pos = index

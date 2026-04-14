@@ -1341,7 +1341,10 @@ pub(super) async fn run_sanity_check(
 
     let min_nonce = known_txs.iter().map(|t| t.nonce).min().unwrap_or(0);
     let max_nonce = known_txs.iter().map(|t| t.nonce).max().unwrap_or(0);
-    let empty_endpoints = known_txs.iter().filter(|t| t.endpoint_names.is_empty()).count();
+    let empty_endpoints = known_txs
+        .iter()
+        .filter(|t| t.endpoint_names.is_empty())
+        .count();
     info!(
         address = %format!("{:#x}", address),
         txs = known_txs.len(),
@@ -1354,7 +1357,16 @@ pub(super) async fn run_sanity_check(
     );
 
     // --- Phase 1: Fill nonce gaps ---
-    let gap_txs = fill_nonce_gaps_phase(address, current_nonce, &known_txs, ds, dune, abi_reg, action_tx).await;
+    let gap_txs = fill_nonce_gaps_phase(
+        address,
+        current_nonce,
+        &known_txs,
+        ds,
+        dune,
+        abi_reg,
+        action_tx,
+    )
+    .await;
 
     // Send gap-fill results through existing merge path
     if !gap_txs.is_empty() {
@@ -1420,7 +1432,10 @@ async fn fill_nonce_gaps_phase(
         check_up_to,
         known_nonce_count = known_nonces.len(),
         "Sanity gap check: scanning nonces {}..{} (current_nonce={}, known={})",
-        min_known, check_up_to, current_nonce, known_nonces.len()
+        min_known,
+        check_up_to,
+        current_nonce,
+        known_nonces.len()
     );
 
     // Categorize gaps by block span size
@@ -1468,7 +1483,10 @@ async fn fill_nonce_gaps_phase(
 
     let total_gaps = small_gaps.len() + large_gap_ranges.len();
     if total_gaps == 0 {
-        info!("Sanity gap check: no nonce gaps found in range {}..{}", min_known, check_up_to);
+        info!(
+            "Sanity gap check: no nonce gaps found in range {}..{}",
+            min_known, check_up_to
+        );
         return Vec::new();
     }
 
@@ -1554,10 +1572,13 @@ async fn fill_nonce_gaps_phase(
 
         for (from, to) in &merged {
             info!(
-                from, to,
+                from,
+                to,
                 span = to - from,
                 "Sanity gap-fill: querying Dune for blocks {}..{} (span {})",
-                from, to, to - from
+                from,
+                to,
+                to - from
             );
             match dune_c
                 .query_account_txs_windowed(address, *from, *to, 200)
@@ -1572,9 +1593,13 @@ async fn fill_nonce_gaps_phase(
                     info!(
                         returned = total_returned,
                         new = new.len(),
-                        from, to,
+                        from,
+                        to,
                         "Sanity gap-fill: Dune returned {} txs, {} new for blocks {}..{}",
-                        total_returned, new.len(), from, to
+                        total_returned,
+                        new.len(),
+                        from,
+                        to
                     );
                     if !new.is_empty() {
                         // Send intermediate results so the UI updates progressively
@@ -1614,8 +1639,7 @@ async fn enrich_all_empty_endpoints(
     if missing.is_empty() {
         info!(
             total_invoke,
-            "Sanity check endpoints: all {} INVOKE txs already have endpoints",
-            total_invoke
+            "Sanity check endpoints: all {} INVOKE txs already have endpoints", total_invoke
         );
         return;
     }
@@ -1624,7 +1648,8 @@ async fn enrich_all_empty_endpoints(
         missing = missing.len(),
         total_invoke,
         "Sanity check endpoints: {} of {} INVOKE txs missing endpoints, enriching in batches",
-        missing.len(), total_invoke
+        missing.len(),
+        total_invoke
     );
 
     // Process in batches of 20

@@ -36,11 +36,9 @@ fn test_user_labels_override_known() {
 "#
     ));
 
-    let registry = snbeat::registry::AddressRegistry::load(
-        labels.path(),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(labels.path())
+        .unwrap()
+        .0;
 
     let eth = Felt::from_hex(ETH_TOKEN).unwrap();
     assert_eq!(registry.resolve(&eth), Some("My ETH"));
@@ -48,11 +46,9 @@ fn test_user_labels_override_known() {
 
 #[test]
 fn test_search_prefix_match() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let results = registry.search("ET", 10);
     assert!(!results.is_empty(), "Should find ETH with prefix 'ET'");
@@ -64,11 +60,9 @@ fn test_search_prefix_match() {
 
 #[test]
 fn test_search_substring_match() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let results = registry.search("swap", 10);
     assert!(!results.is_empty(), "Should find swap-related addresses");
@@ -83,11 +77,9 @@ fn test_search_substring_match() {
 
 #[test]
 fn test_search_hex_prefix() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     // Felt strips leading zeros: 0x049d... → 0x49d... in display
     let results = registry.search("0x49d", 10);
@@ -97,22 +89,18 @@ fn test_search_hex_prefix() {
 
 #[test]
 fn test_search_empty_returns_nothing() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     assert!(registry.search("", 10).is_empty());
 }
 
 #[test]
 fn test_search_limit() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     // Search for something that matches many entries
     let results = registry.search("0x0", 3);
@@ -121,11 +109,9 @@ fn test_search_limit() {
 
 #[test]
 fn test_resolve_by_name() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let eth = Felt::from_hex(ETH_TOKEN).unwrap();
     assert_eq!(registry.resolve_by_name("ETH"), Some(eth));
@@ -135,11 +121,9 @@ fn test_resolve_by_name() {
 
 #[test]
 fn test_format_address() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let eth = Felt::from_hex(ETH_TOKEN).unwrap();
     assert_eq!(registry.format_address(&eth), "[ETH]");
@@ -151,11 +135,9 @@ fn test_format_address() {
 
 #[test]
 fn test_get_decimals() {
-    let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),
-    )
-    .unwrap()
-    .0;
+    let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let eth = Felt::from_hex(ETH_TOKEN).unwrap();
     assert_eq!(registry.get_decimals(&eth), Some(18));

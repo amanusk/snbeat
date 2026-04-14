@@ -1,8 +1,17 @@
 # snbeat
 
-snbeat is a local, terminal based , Block explorer for the Starknet Blockchain. It supports multiple data sources, to give the best experience, while prioritizing privacy, recency and caching.
+snbeat is a local, terminal based, Block explorer for the Starknet Blockchain. It supports multiple data sources, to give the best experience, while prioritizing privacy, recency and caching.
 
-![snbeat blocks view](screenshots/blocks_list.png)
+<table>
+  <tr>
+    <td><strong>Block Detail</strong><br><img src="screenshots/block_detail.png" alt="Block detail view" width="400" height="300"></td>
+    <td><strong>Transaction Detail</strong><br><img src="screenshots/tx_detail.png" alt="Transaction detail view" width="400" height="300"></td>
+  </tr>
+  <tr>
+    <td><strong>Address Info</strong><br><img src="screenshots/address_info.png" alt="Address info view" width="400" height="300"></td>
+    <td><strong>Class Info</strong><br><img src="screenshots/class_info.png" alt="Class info view" width="400" height="300"></td>
+  </tr>
+</table>
 
 - Privacy first: snbeat works best with a local RPC node, and can connect directly to the Pathfinder DB. Fully local. External APIs (Dune/Voyager) can be used but are optional. It is open source. Hack any feature you need.
 - Cache first: Every fetched data is cached. Any data visited is cached for subsequent queries. No unnecessary indexing of data that is never used.
@@ -11,62 +20,13 @@ snbeat is a local, terminal based , Block explorer for the Starknet Blockchain. 
 
 ## Features
 
-- **Live block feed** — polls the chain every 3 s (or subscribes via WebSocket)
-- **ABI-aware decoding** — decodes calldata, events, and multicalls using on-chain class ABIs
-- **Data backends** — RPC, WS, Pathfinder query service, Dune and Voyager can be used simultaneously to fetch data
-- **Persistent local cache** — SQLite; blocks, transactions, receipts, and ABIs are cached for instant fetch on subsequent visits
-- **Custom labels** — tag addresses and transactions with human-readable names and searchable tags
-- **Fast search** — prefix/substring search over labelled addresses; navigate by hash or block number
-- **Nonce-based and Block based navigation** — jump to the next/previous transaction by account, by index, or jump to the next block
-
----
-
-## Data Backends
-
-snbeat can draw data from three sources simultaneously. Configure only the ones you have access to.
-
-### RPC (required)
-
-All data fetching starts here. Set `APP_RPC_URL` to any Starknet JSON-RPC v0.7+ endpoint (local node or hosted).
-
-```
-APP_RPC_URL=http://localhost:9545/rpc/v0_10
-```
-
-An optional WebSocket URL enables push-based block, txs and events
-
-```
-APP_WS_URL=ws://localhost:9545/ws
-```
-
-### Pathfinder Query Service (optional, recommended for local nodes)
-
-If you run a [Pathfinder](https://github.com/eqlabs/pathfinder) node, the bundled `pf-query` service exposes its SQLite database over HTTP. This unlocks fast data lookups, which power the address timeline.
-
-See [Setting up pf-query](#setting-up-pf-query) below.
-
-```
-APP_PATHFINDER_SERVICE_URL=http://localhost:8234
-```
-
-### Dune Analytics (optional)
-
-A Dune API key enables two additional features:
-
-- **Reverted transaction detection** — reverted txs appear differently from successful ones
-- **Contract call history** — the _Calls_ tab on an address shows all transactions that called that contract
-
-```
-DUNE_API_KEY=your_key_here
-```
-
-### Voyager API (optional)
-
-Connect to Voyager API to optionally get Voyager tags for addresses, classes etc
-
-```
-VOYAGER_API_KEY=your_key_here
-```
+- **Data backends** - RPC, WS, Pathfinder query service, Dune and Voyager can be used simultaneously to fetch data
+- **ABI-aware decoding** - decodes calldata, events, and multicalls using on-chain class ABIs
+- **Persistent local cache** - SQLite; blocks, transactions, receipts, and ABIs are cached for instant fetch on subsequent visits
+- **Live feed** - Stream new blocks, transactions, and events as they happen (requires WebSocket support from the RPC)
+- **Custom labels** - tag addresses and transactions with human-readable names and searchable tags
+- **Fast search** - prefix/substring search over labelled addresses; navigate by hash or block number
+- **Nonce-based and Block based navigation** - jump to the next/previous transaction by account, by index, or jump to the next block
 
 ---
 
@@ -109,7 +69,7 @@ cargo run --release
 snbeat reads environment variables directly, so you can also export them in your shell or pass them inline:
 
 ```bash
-APP_RPC_URL=http://localhost:9545/rpc/v0_10 snbeat
+APP_RPC_URL=https://api.zan.top/public/starknet-mainnet/rpc/v0_10 snbeat
 ```
 
 ---
@@ -118,8 +78,8 @@ APP_RPC_URL=http://localhost:9545/rpc/v0_10 snbeat
 
 snbeat looks for configuration files in two locations, with local files taking priority:
 
-1. **Current working directory** — for development or per-project setups
-2. **`~/.config/snbeat/`** — for system-wide installs (e.g. `cargo install`)
+1. **Current working directory** - for development or per-project setups
+2. **`~/.config/snbeat/`** - for system-wide installs (e.g. `cargo install`)
 
 This applies to both `.env` and `labels.toml`. If a file exists in the current directory it is used; otherwise snbeat falls back to `~/.config/snbeat/`.
 
@@ -138,10 +98,10 @@ All variables are optional except `APP_RPC_URL`.
 | Variable                     | Default                 | Description                                    |
 | ---------------------------- | ----------------------- | ---------------------------------------------- |
 | `APP_RPC_URL`                | _(required)_            | Starknet JSON-RPC endpoint                     |
-| `APP_WS_URL`                 | —                       | WebSocket endpoint for new-block subscriptions |
-| `APP_PATHFINDER_SERVICE_URL` | —                       | URL of a running `pf-query` instance           |
-| `VOYAGER_API_KEY`            | —                       | Voyager API key for address metadata           |
-| `DUNE_API_KEY`               | —                       | Dune Analytics API key                         |
+| `APP_WS_URL`                 | -                       | WebSocket endpoint for new-block subscriptions |
+| `APP_PATHFINDER_SERVICE_URL` | -                       | URL of a running `pf-query` instance           |
+| `VOYAGER_API_KEY`            | -                       | Voyager API key for address metadata           |
+| `DUNE_API_KEY`               | -                       | Dune Analytics API key                         |
 | `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
 | `APP_LOG_LEVEL`              | `info`                  | `trace` / `debug` / `info` / `warn` / `error`  |
 | `APP_LOG_DIR`                | `~/.config/snbeat/logs` | Log file directory                             |
@@ -173,9 +133,9 @@ User labels take priority over the built-in known address registry (tokens, DEXe
 
 snbeat fetches the class ABI for every contract it encounters and decodes:
 
-- **Calldata** — function arguments with named parameters and typed values (u256, structs, enums, arrays, …)
-- **Multicalls** — account transactions that bundle multiple inner calls are unpacked individually
-- **Events** — keys and data fields are matched against the ABI and rendered with parameter names
+- **Calldata** - function arguments with named parameters and typed values (u256, structs, enums, arrays, …)
+- **Multicalls** - account transactions that bundle multiple inner calls are unpacked individually
+- **Events** - keys and data fields are matched against the ABI and rendered with parameter names
 
 Decoded ABIs are stored in the local SQLite cache (`~/.config/snbeat/cache.db`) and are never re-fetched.
 
@@ -222,7 +182,7 @@ On subsequent visits to the same block or address, data is served from disk with
 
 Press `/` to open the search bar. You can search by:
 
-- Address or transaction hash (0x…)
+- Address, transaction hash, or class hash (0x…)
 - Block number
 - Label name or tag
 
@@ -241,6 +201,105 @@ Arrow keys to navigate suggestions; `Enter` confirms; `Tab` fills in the highlig
 ### Visual Mode
 
 Press `v` in a Transaction or Block detail view to enter visual mode. Use `j`/`k` to cycle through addresses and block references, then `Enter` to navigate to the highlighted item. `Esc` exits.
+
+---
+
+## Data Backends
+
+snbeat can draw data from multiple sources simultaneously. Configure only the ones you have access to.
+
+### Data source matrix
+
+Each cell shows the fetch priority when multiple sources provide the same data (`1` = primary, `2` = fallback, etc.). A dash means the source cannot provide this data.
+
+| Data point                        | RPC            | WS       | PF-query         | Dune | Voyager |
+| --------------------------------- | -------------- | -------- | ---------------- | ---- | ------- |
+| **Blocks**                        |                |          |                  |      |         |
+| Latest block number               | 1 (poll)       | 1 (push) | -                | -    | -       |
+| Block header                      | 1              | -        | -                | -    | -       |
+| Block transactions                | 1              | -        | 1                | -    | -       |
+| **Transactions**                  |                |          |                  |      |         |
+| Transaction by hash               | 1              | -        | -                | -    | -       |
+| Transaction receipt (fee, status) | 1              | -        | -                | -    | -       |
+| Tx hash → block + index lookup    | -              | -        | 1                | -    | -       |
+| Calldata                          | 1              | -        | -                | -    | -       |
+| Multicall decoding                | 1              | -        | -                | -    | -       |
+| **Address - Account history**     |                |          |                  |      |         |
+| Account tx history                | 3 (events)     | -        | 1                | 2    | -       |
+| Nonce history (timeline)          | -              | -        | 1                | -    | -       |
+| Current nonce                     | 1              | -        | -                | -    | -       |
+| **Address - Contract history**    |                |          |                  |      |         |
+| Contract call history             | 2 (events)     | -        | -                | 1    | -       |
+| Contract events                   | 1              | -        | 1                | -    | -       |
+| Activity range probe              | -              | -        | -                | 1    | -       |
+| **Address - General**             |                |          |                  |      |         |
+| Class hash at address             | 1              | -        | -                | -    | -       |
+| Token balances (ETH, STRK, …)     | 1 (call)       | -        | -                | -    | -       |
+| Address label / metadata          | -              | -        | -                | -    | 1       |
+| Deploy tx detection               | 1              | -        | -                | -    | -       |
+| **Classes & ABIs**                |                |          |                  |      |         |
+| Class definition (Sierra ABI)     | 1              | -        | -                | -    | -       |
+| Selector → function/event name    | 1 (via ABI)    | -        | -                | -    | -       |
+| Class declaration block           | -              | -        | 1                | 2    | -       |
+| Declare tx info                   | 1 (block scan) | -        | 1 (block lookup) | 2    | -       |
+| Contracts deployed with class     | -              | -        | 1                | -    | -       |
+| Class upgrade history             | -              | -        | 1                | -    | -       |
+| **WebSocket subscriptions**       |                |          |                  |      |         |
+| New block headers (live)          | -              | 1        | -                | -    | -       |
+| Live events for address           | -              | 1        | -                | -    | -       |
+| Live transactions from address    | -              | 1        | -                | -    | -       |
+| **Search**                        |                |          |                  |      |         |
+| Block number lookup               | 1              | -        | -                | -    | -       |
+| Transaction hash search           | 1              | -        | -                | -    | -       |
+| Address resolution                | 1              | -        | -                | -    | -       |
+| Class hash search                 | 1              | -        | -                | -    | -       |
+| Block hash search                 | 1              | -        | -                | -    | -       |
+| Label / tag search                | -              | -        | -                | -    | -       |
+
+> **Note:** All fetched data is cached locally in SQLite. Subsequent visits serve from cache with no network round-trip. Label/tag search is powered by the local registry (`labels.toml` + built-in known addresses) with no external data source.
+
+### RPC (required)
+
+All data fetching starts here. Set `APP_RPC_URL` to any Starknet JSON-RPC v0.7+ endpoint (local node or hosted).
+
+```
+APP_RPC_URL=http://localhost:9545/rpc/v0_10
+```
+
+An optional WebSocket URL enables push-based block, txs and events
+
+```
+APP_WS_URL=ws://localhost:9545/ws
+```
+
+### Pathfinder Query Service (optional, recommended for local nodes)
+
+If you run a [Pathfinder](https://github.com/eqlabs/pathfinder) node, the bundled `pf-query` service exposes its SQLite database over HTTP. This unlocks fast data lookups, which power the address timeline.
+
+See [Setting up pf-query](#setting-up-pf-query) below.
+
+```
+APP_PATHFINDER_SERVICE_URL=http://localhost:8234
+```
+
+### Dune Analytics (optional)
+
+A Dune API key enables two additional features:
+
+- **Reverted transaction detection** - reverted txs appear differently from successful ones
+- **Contract call history** - the _Calls_ tab on an address shows all transactions that called that contract
+
+```
+DUNE_API_KEY=your_key_here
+```
+
+### Voyager API (optional)
+
+Connect to Voyager API to optionally get Voyager tags for addresses, classes etc
+
+```
+VOYAGER_API_KEY=your_key_here
+```
 
 ---
 
@@ -275,32 +334,17 @@ APP_PATHFINDER_SERVICE_URL=http://192.168.1.10:8234
 
 ### API
 
-| Endpoint                                | Description                                             |
-| --------------------------------------- | ------------------------------------------------------- |
-| `GET /health`                           | Returns `{ "latest_block": N }`                         |
-| `GET /nonce-history/{address}?limit=N`  | Returns ordered nonce update history (max 2000 entries) |
-| `GET /class-history/{address}`          | Returns class hash history for a contract               |
-| `GET /contracts-by-class/{class_hash}`  | Returns contracts deployed with a given class hash      |
-| `GET /class-declaration/{class_hash}`   | Returns declaration info for a class hash               |
+| Endpoint                               | Description                                             |
+| -------------------------------------- | ------------------------------------------------------- |
+| `GET /health`                          | Returns `{ "latest_block": N }`                         |
+| `GET /nonce-history/{address}?limit=N` | Returns ordered nonce update history (max 2000 entries) |
+| `GET /class-history/{address}`         | Returns class hash history for a contract               |
+| `GET /contracts-by-class/{class_hash}` | Returns contracts deployed with a given class hash      |
+| `GET /class-declaration/{class_hash}`  | Returns declaration info for a class hash               |
 | `GET /tx-by-hash/{hash}`               | Looks up a transaction by hash                          |
-| `GET /block-txs/{block_number}`         | Returns decoded transactions in a block                 |
+| `GET /block-txs/{block_number}`        | Returns decoded transactions in a block                 |
 | `GET /sender-txs/{address}`            | Returns transactions sent by an address                 |
-| `GET /contract-events/{address}`        | Returns events emitted by a contract                    |
-
----
-
-## Screenshots
-
-<table>
-  <tr>
-    <td><strong>Block Detail</strong><br><img src="screenshots/block_detail.png" alt="Block detail view" width="400"></td>
-    <td><strong>Transaction Detail</strong><br><img src="screenshots/tx_detail.png" alt="Transaction detail view" width="400"></td>
-  </tr>
-  <tr>
-    <td><strong>Address Info</strong><br><img src="screenshots/address_info.png" alt="Address info view" width="400"></td>
-    <td><strong>Class Info</strong><br><img src="screenshots/class_info.png" alt="Class info view" width="400"></td>
-  </tr>
-</table>
+| `GET /contract-events/{address}`       | Returns events emitted by a contract                    |
 
 ---
 

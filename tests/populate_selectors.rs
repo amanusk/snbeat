@@ -84,9 +84,7 @@ fn collect_all_addresses() -> Vec<(Felt, String)> {
     }
 
     // Load bundled known addresses
-    if let Ok(known) =
-        snbeat::registry::known_addresses::load_known_addresses()
-    {
+    if let Ok(known) = snbeat::registry::known_addresses::load_known_addresses() {
         for addr in known {
             if seen.insert(addr.address) {
                 addresses.push((addr.address, addr.name));
