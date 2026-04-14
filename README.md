@@ -37,7 +37,13 @@ snbeat is a local, terminal based, Block explorer for the Starknet Blockchain. I
 - Rust 1.85+ (edition 2024)
 - A Starknet RPC endpoint
 
-### Install via cargo
+### Install from crates.io
+
+```bash
+cargo install snbeat
+```
+
+### Install from git
 
 ```bash
 cargo install --git https://github.com/amanusk/snbeat
