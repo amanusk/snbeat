@@ -2,6 +2,8 @@
 
 snbeat is a local, terminal based , Block explorer for the Starknet Blockchain. It supports multiple data sources, to give the best experience, while prioritizing privacy, recency and caching.
 
+![snbeat blocks view](screenshots/blocks_list.png)
+
 - Privacy first: snbeat works best with a local RPC node, and can connect directly to the Pathfinder DB. Fully local. External APIs (Dune/Voyager) can be used but are optional. It is open source. Hack any feature you need.
 - Cache first: Every fetched data is cached. Any data visited is cached for subsequent queries. No unnecessary indexing of data that is never used.
 - Recency first: See recent txs first, stream incoming txs, wait longer for full data fetch.
@@ -208,8 +210,8 @@ On subsequent visits to the same block or address, data is served from disk with
 | `]`                 | Jump forward                        |
 | `g`                 | Jump to top                         |
 | `G`                 | Jump to bottom                      |
-| `Ctrl+U` / `PgUp`   | Previous block or transaction       |
-| `Ctrl+D` / `PgDn`   | Next block or transaction           |
+| `Ctrl+U` / `PgUp`   | Next block or transaction           |
+| `Ctrl+D` / `PgDn`   | Previous block or transaction       |
 | `n`                 | Next transaction by same sender     |
 | `N`                 | Previous transaction by same sender |
 | `Tab`               | Cycle tabs (Address Info view)      |
@@ -261,6 +263,7 @@ PF_DB_PATH=/var/lib/pathfinder/pathfinder.db ./target/release/pf-query
 | ------------ | ------------ | -------------------------------------- |
 | `PF_DB_PATH` | _(required)_ | Path to the Pathfinder SQLite database |
 | `PF_PORT`    | `8234`       | Port to listen on                      |
+| `PF_HOST`    | `127.0.0.1`  | Host address to bind to                |
 
 ### Run on a remote server
 
@@ -272,22 +275,32 @@ APP_PATHFINDER_SERVICE_URL=http://192.168.1.10:8234
 
 ### API
 
-| Endpoint                               | Description                                             |
-| -------------------------------------- | ------------------------------------------------------- |
-| `GET /health`                          | Returns `{ "latest_block": N }`                         |
-| `GET /nonce-history/{address}?limit=N` | Returns ordered nonce update history (max 2000 entries) |
+| Endpoint                                | Description                                             |
+| --------------------------------------- | ------------------------------------------------------- |
+| `GET /health`                           | Returns `{ "latest_block": N }`                         |
+| `GET /nonce-history/{address}?limit=N`  | Returns ordered nonce update history (max 2000 entries) |
+| `GET /class-history/{address}`          | Returns class hash history for a contract               |
+| `GET /contracts-by-class/{class_hash}`  | Returns contracts deployed with a given class hash      |
+| `GET /class-declaration/{class_hash}`   | Returns declaration info for a class hash               |
+| `GET /tx-by-hash/{hash}`               | Looks up a transaction by hash                          |
+| `GET /block-txs/{block_number}`         | Returns decoded transactions in a block                 |
+| `GET /sender-txs/{address}`            | Returns transactions sent by an address                 |
+| `GET /contract-events/{address}`        | Returns events emitted by a contract                    |
 
 ---
 
-## Populating the Selector Registry
+## Screenshots
 
-The `populate_selectors` script fetches all declared class hashes from Dune and pre-populates the local ABI cache, so function and event names resolve immediately without waiting for individual contract lookups.
-
-Requires both `APP_RPC_URL` and `DUNE_API_KEY`.
-
-```bash
-cargo test populate_selectors
-```
+<table>
+  <tr>
+    <td><strong>Block Detail</strong><br><img src="screenshots/block_detail.png" alt="Block detail view" width="400"></td>
+    <td><strong>Transaction Detail</strong><br><img src="screenshots/tx_detail.png" alt="Transaction detail view" width="400"></td>
+  </tr>
+  <tr>
+    <td><strong>Address Info</strong><br><img src="screenshots/address_info.png" alt="Address info view" width="400"></td>
+    <td><strong>Class Info</strong><br><img src="screenshots/class_info.png" alt="Class info view" width="400"></td>
+  </tr>
+</table>
 
 ---
 
@@ -300,6 +313,12 @@ cargo test
 # RPC-dependent integration tests (requires APP_RPC_URL in .env)
 cargo test -- --ignored
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 
