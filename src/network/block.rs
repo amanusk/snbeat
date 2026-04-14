@@ -6,10 +6,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+use starknet::core::types::Felt;
+
 use crate::app::actions::Action;
 use crate::data::DataSource;
 use crate::decode::AbiRegistry;
 use crate::decode::functions::parse_multicall;
+use crate::decode::outside_execution::{
+    OutsideExecutionVersion, is_avnu_forwarder, is_outside_execution, looks_like_outside_execution,
+    parse_forwarder_call, parse_outside_execution,
+};
 
 use super::rpc_source_update;
 use super::voyager;
@@ -27,7 +33,8 @@ pub(super) async fn fetch_and_send_block_detail(
     match ds.get_block_with_txs(number).await {
         Ok((block, mut transactions)) => {
             let _ = tx.send(rpc_source_update(crate::app::state::SourceStatus::Live));
-            let endpoint_names = resolve_endpoint_names(&transactions, abi_reg).await;
+            let (endpoint_names, meta_tx_info) =
+                resolve_endpoint_names(&transactions, abi_reg).await;
 
             // Batch-fetch receipts for execution status + actual fee (chunks of 20)
             let mut tx_statuses = vec!["?".to_string(); transactions.len()];
@@ -70,6 +77,7 @@ pub(super) async fn fetch_and_send_block_detail(
                 transactions,
                 endpoint_names,
                 tx_statuses,
+                meta_tx_info,
             });
         }
         Err(e) => {
@@ -102,21 +110,29 @@ pub(super) fn spawn_voyager_prefetch(
     }
 }
 
-/// Resolve function endpoint names for a list of transactions.
-/// Parses multicall calldata to extract ALL calls per tx, formats as:
+/// Resolve function endpoint names and detect outside execution (meta tx) for a list of transactions.
+/// Returns (endpoint_names, meta_tx_info).
+///
+/// Endpoint names are formatted as:
 ///   "transfer, approve" or "transfer, approve, swap, ... +2 more"
 /// Uses the persistent selector DB for instant lookups, then batch-fetches
 /// class ABIs for unknown selectors.
 async fn resolve_endpoint_names(
     transactions: &[crate::data::types::SnTransaction],
     abi_registry: &AbiRegistry,
-) -> Vec<Option<String>> {
+) -> (
+    Vec<Option<String>>,
+    Vec<Option<crate::app::views::block_detail::MetaTxSummary>>,
+) {
     use std::collections::HashSet;
 
-    // Step 1: Parse all multicall selectors and collect unknown targets
-    let mut tx_calls: Vec<Vec<(starknet::core::types::Felt, starknet::core::types::Felt)>> =
-        Vec::with_capacity(transactions.len()); // per tx: vec of (target_addr, selector)
-    let mut unknown_targets: HashSet<starknet::core::types::Felt> = HashSet::new();
+    use crate::decode::functions::RawCall;
+
+    // Step 1: Parse all multicall selectors and collect unknown targets.
+    // Also store the parsed RawCalls for outside execution detection.
+    let mut tx_calls: Vec<Vec<(Felt, Felt)>> = Vec::with_capacity(transactions.len());
+    let mut tx_raw_calls: Vec<Vec<RawCall>> = Vec::with_capacity(transactions.len());
+    let mut unknown_targets: HashSet<Felt> = HashSet::new();
 
     for tx in transactions {
         match tx {
@@ -133,9 +149,11 @@ async fn resolve_endpoint_names(
                         .map(|c| (c.contract_address, c.selector))
                         .collect(),
                 );
+                tx_raw_calls.push(calls);
             }
             crate::data::types::SnTransaction::L1Handler(l1) => {
                 tx_calls.push(vec![(l1.contract_address, l1.entry_point_selector)]);
+                tx_raw_calls.push(Vec::new());
                 if abi_registry
                     .get_selector_name(&l1.entry_point_selector)
                     .is_none()
@@ -145,6 +163,7 @@ async fn resolve_endpoint_names(
             }
             _ => {
                 tx_calls.push(Vec::new());
+                tx_raw_calls.push(Vec::new());
             }
         }
     }
@@ -165,18 +184,21 @@ async fn resolve_endpoint_names(
         }
     }
 
-    // Step 3: Format endpoint names per tx
-    tx_calls
-        .iter()
-        .map(|calls| {
-            if calls.is_empty() {
-                return None;
-            }
+    use crate::app::views::block_detail::MetaTxSummary;
+
+    // Step 3: Format endpoint names per tx + detect outside execution
+    let mut endpoint_names = Vec::with_capacity(tx_calls.len());
+    let mut meta_tx_info: Vec<Option<MetaTxSummary>> = vec![None; tx_calls.len()];
+
+    for (i, (calls, raw_calls)) in tx_calls.iter().zip(tx_raw_calls.iter()).enumerate() {
+        // Endpoint names
+        if calls.is_empty() {
+            endpoint_names.push(None);
+        } else {
             let resolved: Vec<String> = calls
                 .iter()
                 .map(|(_addr, selector)| {
                     abi_registry.get_selector_name(selector).unwrap_or_else(|| {
-                        // Show short hex for unknown selectors
                         let hex = format!("{:#x}", selector);
                         if hex.len() > 10 {
                             format!("{}…", &hex[..10])
@@ -188,11 +210,57 @@ async fn resolve_endpoint_names(
                 .collect();
 
             if resolved.len() <= 3 {
-                Some(resolved.join(", "))
+                endpoint_names.push(Some(resolved.join(", ")));
             } else {
                 let shown: Vec<_> = resolved[..3].to_vec();
-                Some(format!("{}, … +{}", shown.join(", "), resolved.len() - 3))
+                endpoint_names.push(Some(format!(
+                    "{}, … +{}",
+                    shown.join(", "),
+                    resolved.len() - 3
+                )));
             }
-        })
-        .collect()
+        }
+
+        // Outside execution detection (lightweight — no inner call ABI resolution)
+        for call in raw_calls {
+            let resolved_name = call
+                .function_name
+                .clone()
+                .or_else(|| abi_registry.get_selector_name(&call.selector));
+            let fname = resolved_name.as_deref().unwrap_or("");
+
+            // Method 1: by function name
+            if let Some(version) = is_outside_execution(fname) {
+                if let Some(oe) = parse_outside_execution(call, version) {
+                    meta_tx_info[i] = Some(MetaTxSummary {
+                        intender: oe.intender,
+                        version: oe.version,
+                    });
+                    break;
+                }
+            }
+            // Method 2: by calldata heuristic (ANY_CALLER + valid struct)
+            if fname.is_empty() && looks_like_outside_execution(call) {
+                if let Some(oe) = parse_outside_execution(call, OutsideExecutionVersion::V2) {
+                    meta_tx_info[i] = Some(MetaTxSummary {
+                        intender: oe.intender,
+                        version: oe.version,
+                    });
+                    break;
+                }
+            }
+            // Method 3: by known AVNU forwarder address
+            if is_avnu_forwarder(&call.contract_address) {
+                if let Some(oe) = parse_forwarder_call(call) {
+                    meta_tx_info[i] = Some(MetaTxSummary {
+                        intender: oe.intender,
+                        version: oe.version,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    (endpoint_names, meta_tx_info)
 }

@@ -94,6 +94,7 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 # AVNU internals
 "0x06cad934ec5c48d9cdebe63e3139017fa01af101b4c5eff49f30fd6d57d3eebe" = { name = "AVNU Owner", type = "Account", verified = true, source = "bundled" }
 "0x0360fb3a51bd291e5db0892b6249918a5689bc61760adcb350fe39cd725e1d22" = { name = "AVNU Fee Recipient", type = "Account", verified = true, source = "bundled" }
+"0x0127021a1b5a52d3174c2ab077c2b043c80369250d29428cee956d76ee51584f" = { name = "AVNU Forwarder", type = "Paymaster", verified = true, source = "bundled" }
 
 # Lending
 "0x02545b2e5d519fc230e9cd781046d3a64e092114f07e44771e0d719d148571e3" = { name = "Vesu Singleton", type = "Lending", verified = true, source = "bundled" }

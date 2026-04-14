@@ -34,8 +34,22 @@ pub fn parse_multicall(calldata: &[Felt]) -> Vec<RawCall> {
     }
 
     let num_calls = felt_to_u64(&calldata[0]) as usize;
+    parse_call_array(calldata, 1, num_calls).0
+}
+
+/// Parse a sequence of Call structs from a flat felt array starting at `offset`.
+/// Each call is: contract_address, selector, data_length, data[0..data_length].
+/// Returns (parsed_calls, new_offset_after_all_calls).
+pub fn parse_call_array(
+    calldata: &[Felt],
+    mut offset: usize,
+    num_calls: usize,
+) -> (Vec<RawCall>, usize) {
+    // Cap to the maximum possible calls given available data (each call needs ≥3 felts).
+    let remaining = calldata.len().saturating_sub(offset);
+    let max_possible = remaining / 3;
+    let num_calls = num_calls.min(max_possible);
     let mut calls = Vec::with_capacity(num_calls);
-    let mut offset = 1;
 
     for _ in 0..num_calls {
         if offset + 2 >= calldata.len() {
@@ -65,7 +79,7 @@ pub fn parse_multicall(calldata: &[Felt]) -> Vec<RawCall> {
         });
     }
 
-    calls
+    (calls, offset)
 }
 
 /// A raw call extracted from multicall calldata.
@@ -80,4 +94,44 @@ pub struct RawCall {
     pub function_def: Option<FunctionDef>,
     /// Parsed ABI for the target contract (for resolving struct/enum types during decoding).
     pub contract_abi: Option<Arc<ParsedAbi>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: parse_call_array must not OOM when num_calls is absurdly large.
+    #[test]
+    fn test_parse_call_array_huge_num_calls() {
+        // 6 felts of data but claiming billions of calls.
+        let data = vec![
+            Felt::from(1u64),
+            Felt::from(2u64),
+            Felt::from(0u64), // data_len = 0
+            Felt::from(3u64),
+            Felt::from(4u64),
+            Felt::from(0u64), // data_len = 0
+        ];
+        // Request usize::MAX calls — must not panic or OOM.
+        let (calls, _offset) = parse_call_array(&data, 0, usize::MAX);
+        // Can parse at most 2 calls from 6 felts (each needs ≥3).
+        assert!(calls.len() <= 2);
+    }
+
+    #[test]
+    fn test_parse_multicall_normal() {
+        let data = vec![
+            Felt::from(1u64),   // 1 call
+            Felt::from(0xAu64), // to
+            Felt::from(0xBu64), // selector
+            Felt::from(2u64),   // data_len
+            Felt::from(0xCu64),
+            Felt::from(0xDu64),
+        ];
+        let calls = parse_multicall(&data);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].contract_address, Felt::from(0xAu64));
+        assert_eq!(calls[0].selector, Felt::from(0xBu64));
+        assert_eq!(calls[0].data.len(), 2);
+    }
 }

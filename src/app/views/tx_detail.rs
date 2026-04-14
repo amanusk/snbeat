@@ -6,6 +6,7 @@ use super::super::state::TxNavItem;
 use crate::data::types::{SnReceipt, SnTransaction};
 use crate::decode::events::DecodedEvent;
 use crate::decode::functions::RawCall;
+use crate::decode::outside_execution::OutsideExecutionInfo;
 
 /// All state related to the transaction detail view.
 pub struct TxDetailState {
@@ -26,6 +27,10 @@ pub struct TxDetailState {
     pub show_calldata: bool,
     /// Whether to show ABI-decoded calldata under each call.
     pub show_decoded_calldata: bool,
+    /// Detected outside executions: (call_index in decoded_calls, parsed info).
+    pub outside_executions: Vec<(usize, OutsideExecutionInfo)>,
+    /// Whether to show the expanded outside execution intent view.
+    pub show_outside_execution: bool,
 }
 
 impl Default for TxDetailState {
@@ -42,6 +47,8 @@ impl Default for TxDetailState {
             visual_mode: false,
             show_calldata: false,
             show_decoded_calldata: false,
+            outside_executions: Vec::new(),
+            show_outside_execution: false,
         }
     }
 }
@@ -53,8 +60,10 @@ impl TxDetailState {
         self.receipt = None;
         self.decoded_events = Vec::new();
         self.decoded_calls = Vec::new();
+        self.outside_executions = Vec::new();
         self.scroll = 0;
         self.visual_mode = false;
+        self.show_outside_execution = false;
         self.nav_items = Vec::new();
         self.nav_cursor = 0;
         self.nav_item_lines = Vec::new();
@@ -103,6 +112,18 @@ impl TxDetailState {
         for call in &self.decoded_calls {
             if seen.insert(call.contract_address) {
                 items.push(TxNavItem::Address(call.contract_address));
+            }
+        }
+
+        // Outside execution intender and inner call addresses
+        for (_, oe) in &self.outside_executions {
+            if seen.insert(oe.intender) {
+                items.push(TxNavItem::Address(oe.intender));
+            }
+            for inner in &oe.inner_calls {
+                if seen.insert(inner.contract_address) {
+                    items.push(TxNavItem::Address(inner.contract_address));
+                }
             }
         }
 

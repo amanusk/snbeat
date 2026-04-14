@@ -10,6 +10,7 @@ use crate::data::types::{ExecutionStatus, SnTransaction};
 use crate::decode::calldata::{self, DecodedValue};
 use crate::decode::events::DecodedParam;
 use crate::decode::functions::RawCall;
+use crate::decode::outside_execution;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
@@ -132,6 +133,31 @@ fn draw_scrollable_detail(
         Span::styled(" Type:   ", theme::NORMAL_STYLE),
         Span::styled(tx.type_name(), type_style),
     ]));
+
+    // META TX indicator for outside executions
+    if !app.tx_detail.outside_executions.is_empty() {
+        for (_, oe) in &app.tx_detail.outside_executions {
+            let intender_style = addr_style(&oe.intender, &color_map, selected);
+            record(
+                &TxNavItem::Address(oe.intender),
+                &lines,
+                &mut line_map,
+                &app.tx_detail.nav_items,
+            );
+            lines.push(Line::from(vec![
+                addr_marker(&oe.intender, selected),
+                Span::styled("Meta:   ", theme::NORMAL_STYLE),
+                Span::styled(format!("META TX ({})", oe.version), theme::META_TX_STYLE),
+                Span::styled("  Intender: ", theme::NORMAL_STYLE),
+                Span::styled(app.format_address_full(&oe.intender), intender_style),
+                Span::styled(format!("  Nonce: {:#x}", oe.nonce), theme::SUGGESTION_STYLE),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(format!(" {:#x}", oe.intender), intender_style),
+            ]));
+        }
+    }
 
     // Sender + Nonce — colored with slot 0
     let sender = tx.sender();
@@ -256,12 +282,22 @@ fn draw_scrollable_detail(
     // === DECODED CALLS ===
     if !app.tx_detail.decoded_calls.is_empty() {
         lines.push(Line::from(""));
-        let calldata_hint = if app.tx_detail.show_decoded_calldata {
-            " [d: hide decoded] [c: raw]"
-        } else if app.tx_detail.show_calldata {
-            " [c: hide calldata] [d: decode]"
+        let has_oe = !app.tx_detail.outside_executions.is_empty();
+        let oe_hint = if has_oe {
+            if app.tx_detail.show_outside_execution {
+                " [o: hide intent]"
+            } else {
+                " [o: intent]"
+            }
         } else {
-            " [c: raw calldata] [d: decode]"
+            ""
+        };
+        let calldata_hint = if app.tx_detail.show_decoded_calldata {
+            format!(" [d: hide decoded] [c: raw]{oe_hint}")
+        } else if app.tx_detail.show_calldata {
+            format!(" [c: hide calldata] [d: decode]{oe_hint}")
+        } else {
+            format!(" [c: raw calldata] [d: decode]{oe_hint}")
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -298,6 +334,31 @@ fn draw_scrollable_detail(
                     theme::SUGGESTION_STYLE,
                 ),
             ]));
+            // Inline annotation for outside execution calls
+            if let Some((_, oe)) = app
+                .tx_detail
+                .outside_executions
+                .iter()
+                .find(|(idx, _)| *idx == i)
+            {
+                let caller_str = outside_execution::format_caller(&oe.caller);
+                lines.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(
+                        format!("Outside Execution ({})", oe.version),
+                        theme::META_TX_STYLE,
+                    ),
+                    Span::styled(
+                        format!(
+                            "  nonce: {:#x}  caller: {}  inner calls: {}",
+                            oe.nonce,
+                            caller_str,
+                            oe.inner_calls.len()
+                        ),
+                        theme::SUGGESTION_STYLE,
+                    ),
+                ]));
+            }
             if app.tx_detail.show_decoded_calldata {
                 render_decoded_calldata(call, app, &color_map, selected, &mut lines);
             } else if app.tx_detail.show_calldata {
@@ -306,6 +367,86 @@ fn draw_scrollable_detail(
                         Span::raw("        "),
                         Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
                     ]));
+                }
+            }
+        }
+    }
+
+    // === OUTSIDE EXECUTION INTENT (toggled with `o`) ===
+    if app.tx_detail.show_outside_execution && !app.tx_detail.outside_executions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" Outside Execution Intent", theme::TITLE_STYLE),
+            Span::styled(" [o: hide]", theme::SUGGESTION_STYLE),
+        ]));
+        for (_, oe) in &app.tx_detail.outside_executions {
+            let intender_style = addr_style(&oe.intender, &color_map, selected);
+            let caller_str = outside_execution::format_caller(&oe.caller);
+            lines.push(Line::from(vec![
+                Span::styled("   Intender: ", theme::NORMAL_STYLE),
+                Span::styled(app.format_address_full(&oe.intender), intender_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("             "),
+                Span::styled(format!("{:#x}", oe.intender), intender_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Caller:   ", theme::NORMAL_STYLE),
+                Span::raw(caller_str),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
+                Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Window:   ", theme::NORMAL_STYLE),
+                Span::raw(format!(
+                    "after: {}  before: {}",
+                    oe.execute_after, oe.execute_before
+                )),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("   Inner Calls ({})", oe.inner_calls.len()),
+                theme::TITLE_STYLE,
+            )));
+            for (ci, inner_call) in oe.inner_calls.iter().enumerate() {
+                let inner_name = inner_call.function_name.clone().unwrap_or_else(|| {
+                    let hex = format!("{:#x}", inner_call.selector);
+                    if hex.len() > 18 {
+                        format!("{}…", &hex[..18])
+                    } else {
+                        hex
+                    }
+                });
+                let inner_target = app.format_address(&inner_call.contract_address);
+                let inner_style = addr_style(&inner_call.contract_address, &color_map, selected);
+                record(
+                    &TxNavItem::Address(inner_call.contract_address),
+                    &lines,
+                    &mut line_map,
+                    &app.tx_detail.nav_items,
+                );
+                lines.push(Line::from(vec![
+                    addr_marker(&inner_call.contract_address, selected),
+                    Span::styled(format!("    {ci}: "), theme::NORMAL_STYLE),
+                    Span::styled(format!("{:<20}", inner_target), inner_style),
+                    Span::raw(" → "),
+                    Span::styled(inner_name, theme::TX_HASH_STYLE),
+                    Span::styled(
+                        format!(" ({} args)", inner_call.data.len()),
+                        theme::SUGGESTION_STYLE,
+                    ),
+                ]));
+                if app.tx_detail.show_decoded_calldata {
+                    render_decoded_calldata(inner_call, app, &color_map, selected, &mut lines);
+                } else if app.tx_detail.show_calldata {
+                    for (di, felt) in inner_call.data.iter().enumerate() {
+                        lines.push(Line::from(vec![
+                            Span::raw("          "),
+                            Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
+                        ]));
+                    }
                 }
             }
         }
@@ -560,6 +701,14 @@ fn build_color_map(app: &App) -> AddressColorMap {
 
     for call in &app.tx_detail.decoded_calls {
         cm.register(call.contract_address);
+    }
+
+    // Outside execution intender and inner call addresses
+    for (_, oe) in &app.tx_detail.outside_executions {
+        cm.register(oe.intender);
+        for inner in &oe.inner_calls {
+            cm.register(inner.contract_address);
+        }
     }
 
     for event in &app.tx_detail.decoded_events {

@@ -8,6 +8,7 @@ use crate::data::types::{
 };
 use crate::decode::events::DecodedEvent;
 use crate::decode::functions::RawCall;
+use crate::decode::outside_execution::OutsideExecutionInfo;
 use crate::network::dune::AddressActivityProbe;
 
 /// Actions dispatched from the UI to the network task, or responses back.
@@ -79,6 +80,8 @@ pub enum Action {
         endpoint_names: Vec<Option<String>>,
         /// Execution status per tx: "OK", "REV", or "?"
         tx_statuses: Vec<String>,
+        /// Outside execution summary per tx. Some for meta txs, None otherwise.
+        meta_tx_info: Vec<Option<crate::app::views::block_detail::MetaTxSummary>>,
     },
     /// Transaction + receipt + decoded events loaded.
     TransactionLoaded {
@@ -86,6 +89,8 @@ pub enum Action {
         receipt: SnReceipt,
         decoded_events: Vec<DecodedEvent>,
         decoded_calls: Vec<RawCall>,
+        /// Detected outside executions: (call_index, parsed_info).
+        outside_executions: Vec<(usize, OutsideExecutionInfo)>,
     },
     /// Address info loaded.
     AddressInfoLoaded {

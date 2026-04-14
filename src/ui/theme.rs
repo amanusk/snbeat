@@ -13,6 +13,9 @@ pub const TX_TYPE_DECLARE: Style = Style::new().fg(Color::Blue);
 pub const TX_TYPE_DEPLOY: Style = Style::new().fg(Color::Magenta);
 pub const TX_TYPE_L1HANDLER: Style = Style::new().fg(Color::Yellow);
 pub const TX_FEE_STYLE: Style = Style::new().fg(Color::DarkGray);
+pub const META_TX_STYLE: Style = Style::new()
+    .fg(Color::LightMagenta)
+    .add_modifier(Modifier::BOLD);
 
 // Status
 pub const STATUS_OK: Style = Style::new().fg(Color::Green);

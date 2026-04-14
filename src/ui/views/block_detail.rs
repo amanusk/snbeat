@@ -8,8 +8,8 @@ use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fee, format_fri, short_hash};
-use crate::utils::felt_to_u64;
 use crate::ui::widgets::{search_bar, status_bar};
+use crate::utils::felt_to_u64;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
@@ -115,8 +115,10 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Span::styled("      Idx  ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
+        Span::styled("Meta      ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Sender               ", theme::SUGGESTION_STYLE),
+        Span::styled("Intender             ", theme::SUGGESTION_STYLE),
         Span::styled("Endpoint                     ", theme::SUGGESTION_STYLE),
         Span::styled("Nonce      ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
@@ -246,16 +248,60 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 "  "
             };
 
+            // Meta TX indicator and intender
+            let meta_info = app
+                .block_detail
+                .meta_tx_info
+                .get(i)
+                .and_then(|m| m.as_ref());
+            let meta_str = match meta_info {
+                Some(m) => format!("Meta({})", m.version),
+                None => String::new(),
+            };
+            let meta_intender = meta_info.map(|m| &m.intender);
+            let intender_display = if let Some(intender) = meta_intender {
+                let label = app.format_address(intender);
+                if label.chars().count() > 20 {
+                    let truncated: String = label.chars().take(19).collect();
+                    format!("{truncated}…")
+                } else {
+                    label
+                }
+            } else {
+                String::new()
+            };
+            let intender_style = if let Some(intender) = meta_intender {
+                match focused_sender {
+                    Some(focused) if *intender == focused => theme::VISUAL_SELECTED_STYLE,
+                    _ => {
+                        let is_intender_known = app
+                            .search_engine
+                            .as_ref()
+                            .map(|e| e.registry().is_known(intender))
+                            .unwrap_or(false);
+                        if is_intender_known {
+                            theme::LABEL_STYLE
+                        } else {
+                            color_map.style_for(intender)
+                        }
+                    }
+                }
+            } else {
+                theme::NORMAL_STYLE
+            };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<4} ", tx.index()), theme::BLOCK_NUMBER_STYLE),
                 Span::styled(format!("{:<4}", status), status_style),
                 Span::styled(format!("{:<15}", tx.type_name()), type_style),
+                Span::styled(format!("{:<10}", meta_str), theme::META_TX_STYLE),
                 Span::styled(
                     format!("{:<14}", short_hash(&tx.hash())),
                     theme::TX_HASH_STYLE,
                 ),
                 Span::styled(format!("{:<21}", sender_display), sender_style),
+                Span::styled(format!("{:<21}", intender_display), intender_style),
                 Span::styled(format!("{:<28} ", endpoint_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<11}", nonce_str), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),

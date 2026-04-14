@@ -11,6 +11,10 @@ use crate::data::types::SnTransaction;
 use crate::decode::AbiRegistry;
 use crate::decode::events::decode_event;
 use crate::decode::functions::parse_multicall;
+use crate::decode::outside_execution::{
+    OutsideExecutionInfo, OutsideExecutionVersion, is_avnu_forwarder, is_outside_execution,
+    looks_like_outside_execution, parse_forwarder_call, parse_outside_execution,
+};
 
 /// Resolve selector names, function definitions, and contract ABIs for a list of calls.
 /// Shared by all code paths that produce a `TransactionLoaded` action.
@@ -51,12 +55,51 @@ pub(super) async fn decode_and_send_transaction(
         _ => Vec::new(),
     };
     resolve_call_abis(&mut decoded_calls, abi_reg).await;
+    let outside_executions = detect_and_resolve_outside_executions(&decoded_calls, abi_reg).await;
     let _ = action_tx.send(Action::TransactionLoaded {
         transaction,
         receipt,
         decoded_events,
         decoded_calls,
+        outside_executions,
     });
+}
+
+/// Detect outside execution calls, parse their inner calls, and resolve inner call ABIs.
+///
+/// Detection uses three methods:
+/// 1. By function name (when ABI selector resolution works)
+/// 2. By calldata heuristic (ANY_CALLER + valid struct, for component-based selectors)
+/// 3. By known forwarder address (AVNU paymaster wraps outside execution in execute/execute_sponsored)
+async fn detect_and_resolve_outside_executions(
+    calls: &[crate::decode::functions::RawCall],
+    abi_reg: &Arc<AbiRegistry>,
+) -> Vec<(usize, OutsideExecutionInfo)> {
+    let mut results = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        let fname = call.function_name.as_deref().unwrap_or("");
+
+        let mut oe = None;
+
+        // Method 1: detect by resolved function name
+        if let Some(version) = is_outside_execution(fname) {
+            oe = parse_outside_execution(call, version);
+        }
+        // Method 2: detect by calldata pattern (ANY_CALLER + valid struct)
+        if oe.is_none() && fname.is_empty() && looks_like_outside_execution(call) {
+            oe = parse_outside_execution(call, OutsideExecutionVersion::V2);
+        }
+        // Method 3: detect by known AVNU forwarder address
+        if oe.is_none() && is_avnu_forwarder(&call.contract_address) {
+            oe = parse_forwarder_call(call);
+        }
+
+        if let Some(mut oe) = oe {
+            resolve_call_abis(&mut oe.inner_calls, abi_reg).await;
+            results.push((i, oe));
+        }
+    }
+    results
 }
 
 /// Fetch tx + receipt in parallel, decode, and send `TransactionLoaded`.
