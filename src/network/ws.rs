@@ -21,7 +21,8 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use starknet::core::types::{
-    AddressFilter, EmittedEventWithFinality, Felt, SubscriptionId, Transaction,
+    AddressFilter, EmittedEventWithFinality, Felt, L2TransactionFinalityStatus,
+    L2TransactionStatus, SubscriptionId, Transaction,
     requests::{
         SubscribeEventsRequest, SubscribeNewHeadsRequest, SubscribeNewTransactionsRequest,
         UnsubscribeRequest,
@@ -417,7 +418,7 @@ async fn send_subscribe_cmd(
                 from_address: Some(AddressFilter::Single(*address)),
                 keys: None,
                 block_id: None,
-                finality_status: None,
+                finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
             };
             let msg =
                 build_subscribe_msg(id, "starknet_subscribeEvents", serde_json::to_value(req)?);
@@ -431,7 +432,7 @@ async fn send_subscribe_cmd(
             let id = state.next_id();
             let req = SubscribeNewTransactionsRequest {
                 sender_address: Some(vec![*address]),
-                finality_status: None,
+                finality_status: Some(vec![L2TransactionStatus::AcceptedOnL2]),
                 tags: None,
             };
             let msg = build_subscribe_msg(
@@ -812,7 +813,7 @@ mod tests {
             from_address: Some(AddressFilter::Single(address)),
             keys: None,
             block_id: None,
-            finality_status: None,
+            finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
         };
         let params = serde_json::to_value(req).unwrap();
         let msg = build_subscribe_msg(2, "starknet_subscribeEvents", params);
@@ -829,7 +830,7 @@ mod tests {
         );
         let req = SubscribeNewTransactionsRequest {
             sender_address: Some(vec![address]),
-            finality_status: None,
+            finality_status: Some(vec![L2TransactionStatus::AcceptedOnL2]),
             tags: None,
         };
         let params = serde_json::to_value(req).unwrap();

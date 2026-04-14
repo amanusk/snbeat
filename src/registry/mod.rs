@@ -51,14 +51,11 @@ pub struct AddressMeta {
 }
 
 impl AddressRegistry {
-    /// Load from user labels and known addresses files.
+    /// Load from user labels file and bundled known addresses.
     /// Returns (registry, optional_warning) — warning is set when labels file is corrupt.
-    pub fn load(
-        user_labels_path: &Path,
-        known_addresses_path: &Path,
-    ) -> Result<(Self, Option<String>)> {
+    pub fn load(user_labels_path: &Path) -> Result<(Self, Option<String>)> {
         let (user, warning) = load_user_labels(user_labels_path)?;
-        let known = load_known_addresses(known_addresses_path)?;
+        let known = load_known_addresses()?;
 
         let mut search_index = Vec::with_capacity(user.len() + known.len());
 

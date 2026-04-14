@@ -5,7 +5,6 @@ const ETH_TOKEN: &str = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b
 fn registry() -> snbeat::registry::AddressRegistry {
     snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0
@@ -128,7 +127,7 @@ fn test_user_labels_prioritized() {
     .unwrap();
 
     let reg =
-        snbeat::registry::AddressRegistry::load(f.path(), std::path::Path::new("/nonexistent"))
+        snbeat::registry::AddressRegistry::load(f.path())
             .unwrap()
             .0;
 

@@ -57,6 +57,8 @@ pub struct AddressInfoState {
     pub rpc_has_more: bool,
     /// Whether a WS subscription is currently active for this address.
     pub ws_subscribed: bool,
+    /// Whether the post-display sanity check has already been dispatched.
+    pub sanity_check_dispatched: bool,
 }
 
 impl Default for AddressInfoState {
@@ -85,6 +87,7 @@ impl Default for AddressInfoState {
             dune_has_more: false,
             rpc_has_more: false,
             ws_subscribed: false,
+            sanity_check_dispatched: false,
         }
     }
 }
@@ -113,6 +116,7 @@ impl AddressInfoState {
         self.dune_has_more = false;
         self.rpc_has_more = false;
         self.ws_subscribed = false;
+        self.sanity_check_dispatched = false;
     }
 
     /// Whether any source thinks there is more data to fetch.
@@ -256,6 +260,9 @@ impl AddressInfoState {
 
 /// Upgrade an existing tx summary with better data from an incoming one.
 pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxSummary) {
+    if existing.block_number == 0 && incoming.block_number > 0 {
+        existing.block_number = incoming.block_number;
+    }
     if existing.status == "?" && incoming.status != "?" {
         existing.status.clone_from(&incoming.status);
     }

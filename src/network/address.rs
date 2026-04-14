@@ -1317,21 +1317,90 @@ pub(super) async fn enrich_address_txs(
     }
 }
 
-/// Fill nonce gaps by scanning blocks between known nonces.
-/// Reverted txs don't emit events, so they appear as gaps in the nonce sequence.
-/// We scan blocks in the gap range to find them.
-pub(super) async fn fill_nonce_gaps(
+/// Post-display sanity check: fill nonce gaps and enrich all txs with missing endpoints.
+/// Runs once after all data sources complete, as a background pass.
+pub(super) async fn run_sanity_check(
+    address: starknet::core::types::Felt,
+    current_nonce: u64,
+    known_txs: Vec<crate::data::types::AddressTxSummary>,
+    ds: &Arc<dyn DataSource>,
+    dune: &Option<Arc<dune::DuneClient>>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    if known_txs.is_empty() || current_nonce == 0 {
+        info!(
+            address = %format!("{:#x}", address),
+            txs = known_txs.len(),
+            current_nonce,
+            "Sanity check: skipping nonce gaps (empty txs or nonce=0), running endpoint enrichment only"
+        );
+        enrich_all_empty_endpoints(address, &known_txs, ds, abi_reg, action_tx).await;
+        return;
+    }
+
+    let min_nonce = known_txs.iter().map(|t| t.nonce).min().unwrap_or(0);
+    let max_nonce = known_txs.iter().map(|t| t.nonce).max().unwrap_or(0);
+    let empty_endpoints = known_txs.iter().filter(|t| t.endpoint_names.is_empty()).count();
+    info!(
+        address = %format!("{:#x}", address),
+        txs = known_txs.len(),
+        current_nonce,
+        min_nonce,
+        max_nonce,
+        empty_endpoints,
+        "Sanity check: starting (nonce range {}..{}, {} txs, {} missing endpoints)",
+        min_nonce, max_nonce, known_txs.len(), empty_endpoints
+    );
+
+    // --- Phase 1: Fill nonce gaps ---
+    let gap_txs = fill_nonce_gaps_phase(address, current_nonce, &known_txs, ds, dune, abi_reg, action_tx).await;
+
+    // Send gap-fill results through existing merge path
+    if !gap_txs.is_empty() {
+        let gap_nonces: Vec<u64> = gap_txs.iter().map(|t| t.nonce).collect();
+        info!(
+            found = gap_txs.len(),
+            nonces = ?gap_nonces,
+            "Sanity check: filled {} nonce gaps, sending to UI",
+            gap_txs.len()
+        );
+        let _ = action_tx.send(Action::AddressTxsEnriched {
+            address,
+            updates: gap_txs.clone(),
+        });
+    } else {
+        info!("Sanity check: no nonce gaps to fill");
+    }
+
+    // --- Phase 2: Enrich all txs with missing endpoint names ---
+    // Combine original known_txs + newly found gap txs for a complete picture
+    let mut all_txs = known_txs;
+    for gt in &gap_txs {
+        if !all_txs.iter().any(|t| t.hash == gt.hash) {
+            all_txs.push(gt.clone());
+        }
+    }
+    enrich_all_empty_endpoints(address, &all_txs, ds, abi_reg, action_tx).await;
+
+    debug!(
+        address = %format!("{:#x}", address),
+        "Sanity check complete"
+    );
+}
+
+/// Phase 1 of sanity check: detect and fill nonce gaps.
+/// Small gaps (≤50 blocks) are filled via RPC block scanning.
+/// Large gaps use Dune windowed queries when available.
+async fn fill_nonce_gaps_phase(
     address: starknet::core::types::Felt,
     current_nonce: u64,
     known_txs: &[crate::data::types::AddressTxSummary],
     ds: &Arc<dyn DataSource>,
+    dune: &Option<Arc<dune::DuneClient>>,
     abi_reg: &Arc<AbiRegistry>,
-    status_tx: &mpsc::UnboundedSender<Action>,
+    action_tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::AddressTxSummary> {
-    if known_txs.is_empty() || current_nonce == 0 {
-        return Vec::new();
-    }
-
     // Build a set of known nonces and their block numbers
     let known_nonces: std::collections::HashMap<u64, u64> = known_txs
         .iter()
@@ -1339,20 +1408,29 @@ pub(super) async fn fill_nonce_gaps(
         .map(|t| (t.nonce, t.block_number))
         .collect();
 
-    // Find gaps in the nonce sequence (only in the range we have data for)
     let min_known = known_txs.iter().map(|t| t.nonce).min().unwrap_or(0);
     let max_known = known_txs.iter().map(|t| t.nonce).max().unwrap_or(0);
+    // Check up to current_nonce but cap how far past max_known we look
+    let check_up_to = current_nonce.min(max_known + 20);
 
-    // Also check gap between max_known and current_nonce
-    let check_up_to = current_nonce.min(max_known + 20); // don't scan too far ahead
+    info!(
+        min_known,
+        max_known,
+        current_nonce,
+        check_up_to,
+        known_nonce_count = known_nonces.len(),
+        "Sanity gap check: scanning nonces {}..{} (current_nonce={}, known={})",
+        min_known, check_up_to, current_nonce, known_nonces.len()
+    );
 
-    let mut gaps: Vec<(u64, u64, u64)> = Vec::new(); // (missing_nonce, scan_from_block, scan_to_block)
+    // Categorize gaps by block span size
+    let mut small_gaps: Vec<(u64, u64, u64)> = Vec::new(); // (nonce, from_block, to_block)
+    let mut large_gap_ranges: Vec<(u64, u64)> = Vec::new(); // (from_block, to_block) for Dune
 
     for nonce in min_known..check_up_to {
         if known_nonces.contains_key(&nonce) {
             continue;
         }
-        // Find the block range to scan: between the nearest known nonces
         let block_before = known_nonces
             .iter()
             .filter(|(n, _)| **n < nonce)
@@ -1381,40 +1459,185 @@ pub(super) async fn fill_nonce_gaps(
             block_before + 10
         };
 
-        // Skip if the range is too large (> 50 blocks) — Dune will handle these
-        if scan_to - scan_from > 50 {
-            continue;
+        if scan_to.saturating_sub(scan_from) <= 50 {
+            small_gaps.push((nonce, scan_from, scan_to));
+        } else {
+            large_gap_ranges.push((scan_from, scan_to));
         }
-
-        gaps.push((nonce, scan_from, scan_to));
     }
 
-    if gaps.is_empty() {
+    let total_gaps = small_gaps.len() + large_gap_ranges.len();
+    if total_gaps == 0 {
+        info!("Sanity gap check: no nonce gaps found in range {}..{}", min_known, check_up_to);
         return Vec::new();
     }
 
-    debug!(gaps = gaps.len(), "Scanning blocks to fill nonce gaps");
+    // Log the first few missing nonces for debugging
+    let small_nonces: Vec<u64> = small_gaps.iter().map(|(n, _, _)| *n).take(10).collect();
+    info!(
+        small = small_gaps.len(),
+        large = large_gap_ranges.len(),
+        total = total_gaps,
+        first_small_nonces = ?small_nonces,
+        large_ranges = ?large_gap_ranges.iter().take(5).collect::<Vec<_>>(),
+        "Sanity check: detected {} nonce gaps ({} small, {} large)",
+        total_gaps, small_gaps.len(), large_gap_ranges.len()
+    );
 
-    // Collect unique blocks to scan
-    let mut blocks_to_scan: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for (_, from, to) in &gaps {
-        for b in *from..=*to {
-            blocks_to_scan.insert(b);
+    let _ = action_tx.send(Action::LoadingStatus(format!(
+        "Filling {} nonce gaps...",
+        total_gaps
+    )));
+
+    let mut found_txs = Vec::new();
+
+    // Small gaps: RPC block scan
+    if !small_gaps.is_empty() {
+        let mut blocks_to_scan: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (_, from, to) in &small_gaps {
+            for b in *from..=*to {
+                blocks_to_scan.insert(b);
+            }
+        }
+        // Cap RPC block scan to 200 blocks
+        if blocks_to_scan.len() <= 200 {
+            let blocks_vec: Vec<u64> = blocks_to_scan.into_iter().collect();
+            info!(
+                blocks = blocks_vec.len(),
+                "Sanity gap-fill: scanning {} blocks via RPC for small gaps",
+                blocks_vec.len()
+            );
+            let rpc_found =
+                fetch_txs_from_blocks(address, &blocks_vec, known_txs, ds, abi_reg, action_tx)
+                    .await;
+            info!(
+                found = rpc_found.len(),
+                "Sanity gap-fill: RPC scan found {} txs",
+                rpc_found.len()
+            );
+            found_txs.extend(rpc_found);
+        } else {
+            info!(
+                blocks = blocks_to_scan.len(),
+                "Sanity gap-fill: too many small-gap blocks ({}), skipping RPC scan",
+                blocks_to_scan.len()
+            );
         }
     }
 
-    // Cap total blocks to scan
-    if blocks_to_scan.len() > 200 {
-        debug!(
-            blocks = blocks_to_scan.len(),
-            "Too many blocks to scan for gaps, deferring to Dune"
+    // Large gaps: Dune windowed query — merge adjacent ranges into bigger windows
+    if let Some(dune_c) = dune {
+        large_gap_ranges.sort();
+        // Merge overlapping/adjacent ranges (within 500 blocks of each other)
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (from, to) in large_gap_ranges {
+            if let Some(last) = merged.last_mut() {
+                if from <= last.1 + 500 {
+                    last.1 = last.1.max(to);
+                    continue;
+                }
+            }
+            merged.push((from, to));
+        }
+
+        info!(
+            merged_ranges = merged.len(),
+            "Sanity gap-fill: merged large gaps into {} Dune queries",
+            merged.len()
         );
-        return Vec::new();
+
+        let known_hashes: std::collections::HashSet<_> = known_txs
+            .iter()
+            .chain(found_txs.iter())
+            .map(|t| t.hash)
+            .collect();
+
+        for (from, to) in &merged {
+            info!(
+                from, to,
+                span = to - from,
+                "Sanity gap-fill: querying Dune for blocks {}..{} (span {})",
+                from, to, to - from
+            );
+            match dune_c
+                .query_account_txs_windowed(address, *from, *to, 200)
+                .await
+            {
+                Ok(dune_txs) => {
+                    let total_returned = dune_txs.len();
+                    let new: Vec<_> = dune_txs
+                        .into_iter()
+                        .filter(|t| !known_hashes.contains(&t.hash))
+                        .collect();
+                    info!(
+                        returned = total_returned,
+                        new = new.len(),
+                        from, to,
+                        "Sanity gap-fill: Dune returned {} txs, {} new for blocks {}..{}",
+                        total_returned, new.len(), from, to
+                    );
+                    if !new.is_empty() {
+                        // Send intermediate results so the UI updates progressively
+                        let _ = action_tx.send(Action::AddressTxsEnriched {
+                            address,
+                            updates: new.clone(),
+                        });
+                        found_txs.extend(new);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, from, to, "Sanity gap-fill: Dune query failed for blocks {}..{}", from, to);
+                }
+            }
+        }
     }
 
-    // Batch fetch blocks and filter for our sender
-    let blocks_vec: Vec<u64> = blocks_to_scan.into_iter().collect();
-    fetch_txs_from_blocks(address, &blocks_vec, known_txs, ds, abi_reg, status_tx).await
+    found_txs
+}
+
+/// Phase 2 of sanity check: enrich ALL txs that have empty endpoint names.
+/// Batches in chunks of 20 and sends progressive updates.
+async fn enrich_all_empty_endpoints(
+    address: starknet::core::types::Felt,
+    all_txs: &[crate::data::types::AddressTxSummary],
+    ds: &Arc<dyn DataSource>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    let total_invoke = all_txs.iter().filter(|t| t.tx_type == "INVOKE").count();
+    let missing: Vec<starknet::core::types::Felt> = all_txs
+        .iter()
+        .filter(|t| t.endpoint_names.is_empty() && t.tx_type == "INVOKE")
+        .map(|t| t.hash)
+        .collect();
+
+    if missing.is_empty() {
+        info!(
+            total_invoke,
+            "Sanity check endpoints: all {} INVOKE txs already have endpoints",
+            total_invoke
+        );
+        return;
+    }
+
+    info!(
+        missing = missing.len(),
+        total_invoke,
+        "Sanity check endpoints: {} of {} INVOKE txs missing endpoints, enriching in batches",
+        missing.len(), total_invoke
+    );
+
+    // Process in batches of 20
+    for (i, chunk) in missing.chunks(20).enumerate() {
+        info!(
+            batch = i + 1,
+            size = chunk.len(),
+            "Sanity check endpoints: enriching batch {}/{}",
+            i + 1,
+            (missing.len() + 19) / 20
+        );
+        enrich_address_txs(address, chunk.to_vec(), ds, abi_reg, action_tx).await;
+    }
 }
 
 /// Fetch all txs sent by `address` from specific blocks, skipping any already in `known_txs`.

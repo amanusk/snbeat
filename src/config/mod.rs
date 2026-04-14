@@ -20,10 +20,6 @@ pub struct AppConfig {
     #[arg(long, env = "APP_USER_LABELS", default_value = "labels.toml")]
     pub user_labels: String,
 
-    /// Path to known addresses TOML file
-    #[arg(long, env = "APP_KNOWN_ADDRESSES", default_value = "known.toml")]
-    pub known_addresses: String,
-
     /// Voyager API key
     #[arg(long, env = "VOYAGER_API_KEY")]
     pub voyager_api_key: Option<String>,

@@ -1,29 +1,21 @@
 # snbeat
 
-A terminal-based Starknet block explorer with ABI-aware decoding, multi-source data backends, and a persistent local cache.
+snbeat is a local, terminal based , Block explorer for the Starknet Blockchain. It supports multiple data sources, to give the best experience, while prioritizing privacy, recency and caching.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Block List  │  Transaction Detail  │  Address Info           │
-│──────────────┼──────────────────────┼─────────────────────────│
-│ #1234567     │ Hash: 0xabc…         │ 0xdef…  [My Wallet]│
-│ #1234566     │ From: 0xdef…         │ Events  Calls  Txs       │
-│ #1234565     │ transfer(…)          │  ├─ Transfer(…)          │
-│  …           │   to:  0x049d… ETH  │  ├─ Approval(…)         │
-└──────────────┴──────────────────────┴─────────────────────────┘
-```
-
----
+- Privacy first: snbeat works best with a local RPC node, and can connect directly to the Pathfinder DB. Fully local. External APIs (Dune/Voyager) can be used but are optional. It is open source. Hack any feature you need.
+- Cache first: Every fetched data is cached. Any data visited is cached for subsequent queries. No unnecessary indexing of data that is never used.
+- Recency first: See recent txs first, stream incoming txs, wait longer for full data fetch.
+- Vim!
 
 ## Features
 
 - **Live block feed** — polls the chain every 3 s (or subscribes via WebSocket)
 - **ABI-aware decoding** — decodes calldata, events, and multicalls using on-chain class ABIs
-- **Three data backends** — RPC, Pathfinder query service, and Dune Analytics (mix and match)
-- **Persistent local cache** — SQLite; blocks, transactions, receipts, and ABIs are never re-fetched
+- **Data backends** — RPC, WS, Pathfinder query service, Dune and Voyager can be used simultaneously to fetch data
+- **Persistent local cache** — SQLite; blocks, transactions, receipts, and ABIs are cached for instant fetch on subsequent visits
 - **Custom labels** — tag addresses and transactions with human-readable names and searchable tags
 - **Fast search** — prefix/substring search over labelled addresses; navigate by hash or block number
-- **Nonce-based navigation** — jump to the next/previous transaction by the same sender (`n`/`N`)
+- **Nonce-based and Block based navigation** — jump to the next/previous transaction by account, by index, or jump to the next block
 
 ---
 
@@ -39,7 +31,7 @@ All data fetching starts here. Set `APP_RPC_URL` to any Starknet JSON-RPC v0.7+ 
 APP_RPC_URL=http://localhost:9545/rpc/v0_10
 ```
 
-An optional WebSocket URL enables push-based block subscriptions instead of polling:
+An optional WebSocket URL enables push-based block, txs and events
 
 ```
 APP_WS_URL=ws://localhost:9545/ws
@@ -47,7 +39,7 @@ APP_WS_URL=ws://localhost:9545/ws
 
 ### Pathfinder Query Service (optional, recommended for local nodes)
 
-If you run a [Pathfinder](https://github.com/eqlabs/pathfinder) node, the bundled `pf-query` service exposes its SQLite database over HTTP. This unlocks fast nonce-history lookups, which power the `n`/`N` navigation keys and the address timeline.
+If you run a [Pathfinder](https://github.com/eqlabs/pathfinder) node, the bundled `pf-query` service exposes its SQLite database over HTTP. This unlocks fast data lookups, which power the address timeline.
 
 See [Setting up pf-query](#setting-up-pf-query) below.
 
@@ -60,10 +52,18 @@ APP_PATHFINDER_SERVICE_URL=http://localhost:8234
 A Dune API key enables two additional features:
 
 - **Reverted transaction detection** — reverted txs appear differently from successful ones
-- **Contract call history** — the *Calls* tab on an address shows all transactions that called that contract
+- **Contract call history** — the _Calls_ tab on an address shows all transactions that called that contract
 
 ```
 DUNE_API_KEY=your_key_here
+```
+
+### Voyager API (optional)
+
+Connect to Voyager API to optionally get Voyager tags for addresses, classes etc
+
+```
+VOYAGER_API_KEY=your_key_here
 ```
 
 ---
@@ -75,10 +75,18 @@ DUNE_API_KEY=your_key_here
 - Rust 1.85+ (edition 2024)
 - A Starknet RPC endpoint
 
-### Build
+### Install via cargo
 
 ```bash
-git clone https://github.com/yourorg/snbeat
+cargo install --git https://github.com/amanusk/snbeat
+```
+
+Then place your config in `~/.config/snbeat/` (see [Configuration](#configuration) below).
+
+### Build from source
+
+```bash
+git clone https://github.com/amanusk/snbeat
 cd snbeat
 cargo build --release
 ```
@@ -88,42 +96,59 @@ The binary is at `target/release/snbeat`.
 ### Run
 
 ```bash
+# From the repo (uses local .env)
 cp .env.example .env
-# Edit .env with your settings
 cargo run --release
-# or
+
+# Or directly
 ./target/release/snbeat
 ```
 
 snbeat reads environment variables directly, so you can also export them in your shell or pass them inline:
 
 ```bash
-APP_RPC_URL=http://localhost:9545/rpc/v0_10 ./target/release/snbeat
+APP_RPC_URL=http://localhost:9545/rpc/v0_10 snbeat
 ```
 
 ---
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in the variables you need. All variables are optional except `APP_RPC_URL`.
+snbeat looks for configuration files in two locations, with local files taking priority:
 
-| Variable | Default | Description |
-|---|---|---|
-| `APP_RPC_URL` | *(required)* | Starknet JSON-RPC endpoint |
-| `APP_WS_URL` | — | WebSocket endpoint for new-block subscriptions |
-| `APP_PATHFINDER_SERVICE_URL` | — | URL of a running `pf-query` instance |
-| `VOYAGER_API_KEY` | — | Voyager API key for address metadata |
-| `DUNE_API_KEY` | — | Dune Analytics API key |
-| `APP_USER_LABELS` | `labels.toml` | Path to your custom labels file |
-| `APP_KNOWN_ADDRESSES` | `known.toml` | Path to the curated address registry |
-| `APP_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
-| `APP_LOG_DIR` | `~/.config/snbeat/logs` | Log file directory |
+1. **Current working directory** — for development or per-project setups
+2. **`~/.config/snbeat/`** — for system-wide installs (e.g. `cargo install`)
+
+This applies to both `.env` and `labels.toml`. If a file exists in the current directory it is used; otherwise snbeat falls back to `~/.config/snbeat/`.
+
+### Quick setup (cargo install)
+
+```bash
+mkdir -p ~/.config/snbeat
+cp .env.example ~/.config/snbeat/.env
+# Edit ~/.config/snbeat/.env with your settings
+```
+
+### Environment variables
+
+All variables are optional except `APP_RPC_URL`.
+
+| Variable                     | Default                 | Description                                    |
+| ---------------------------- | ----------------------- | ---------------------------------------------- |
+| `APP_RPC_URL`                | _(required)_            | Starknet JSON-RPC endpoint                     |
+| `APP_WS_URL`                 | —                       | WebSocket endpoint for new-block subscriptions |
+| `APP_PATHFINDER_SERVICE_URL` | —                       | URL of a running `pf-query` instance           |
+| `VOYAGER_API_KEY`            | —                       | Voyager API key for address metadata           |
+| `DUNE_API_KEY`               | —                       | Dune Analytics API key                         |
+| `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
+| `APP_LOG_LEVEL`              | `info`                  | `trace` / `debug` / `info` / `warn` / `error`  |
+| `APP_LOG_DIR`                | `~/.config/snbeat/logs` | Log file directory                             |
 
 ---
 
 ## Custom Labels
 
-Create a `labels.toml` file (or set `APP_USER_LABELS`) to tag addresses and transactions with names and searchable tags.
+Create a `labels.toml` file to tag addresses and transactions with names and searchable tags. Place it in the current directory or in `~/.config/snbeat/labels.toml` for a global install.
 
 ```toml
 [addresses]
@@ -138,7 +163,7 @@ Create a `labels.toml` file (or set `APP_USER_LABELS`) to tag addresses and tran
 "0xabc123..." = "Initial deploy"
 ```
 
-User labels take priority over the built-in `known.toml` registry. The file is loaded at startup; a malformed file prints a warning but does not prevent startup.
+User labels take priority over the built-in known address registry (tokens, DEXes, bridges, etc.). The file is loaded at startup; a malformed file prints a warning but does not prevent startup.
 
 ---
 
@@ -173,23 +198,23 @@ On subsequent visits to the same block or address, data is served from disk with
 
 ### Navigation
 
-| Key | Action |
-|---|---|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `l` / `→` / `Enter` | Drill in / navigate forward |
-| `h` / `←` / `Esc` | Go back |
-| `Ctrl+O` | Jump back (vim-style) |
-| `]` | Jump forward |
-| `g` | Jump to top |
-| `G` | Jump to bottom |
-| `Ctrl+U` / `PgUp` | Previous block or transaction |
-| `Ctrl+D` / `PgDn` | Next block or transaction |
-| `n` | Next transaction by same sender |
-| `N` | Previous transaction by same sender |
-| `Tab` | Cycle tabs (Address Info view) |
-| `q` | Jump to home / quit |
-| `Ctrl+C` | Quit |
+| Key                 | Action                              |
+| ------------------- | ----------------------------------- |
+| `j` / `↓`           | Move down                           |
+| `k` / `↑`           | Move up                             |
+| `l` / `→` / `Enter` | Drill in / navigate forward         |
+| `h` / `←` / `Esc`   | Go back                             |
+| `Ctrl+O`            | Jump back (vim-style)               |
+| `]`                 | Jump forward                        |
+| `g`                 | Jump to top                         |
+| `G`                 | Jump to bottom                      |
+| `Ctrl+U` / `PgUp`   | Previous block or transaction       |
+| `Ctrl+D` / `PgDn`   | Next block or transaction           |
+| `n`                 | Next transaction by same sender     |
+| `N`                 | Previous transaction by same sender |
+| `Tab`               | Cycle tabs (Address Info view)      |
+| `q`                 | Jump to home / quit                 |
+| `Ctrl+C`            | Quit                                |
 
 ### Search
 
@@ -199,17 +224,17 @@ Press `/` to open the search bar. You can search by:
 - Block number
 - Label name or tag
 
-`j`/`k` navigate suggestions; `Enter` confirms; `Tab` fills in the highlighted suggestion; `Esc` closes.
+Arrow keys to navigate suggestions; `Enter` confirms; `Tab` fills in the highlighted suggestion; `Esc` closes.
 
 ### Transaction Detail
 
-| Key | Action |
-|---|---|
-| `c` | Toggle raw calldata |
-| `d` | Toggle ABI-decoded calldata |
+| Key | Action                                               |
+| --- | ---------------------------------------------------- |
+| `c` | Toggle raw calldata                                  |
+| `d` | Toggle ABI-decoded calldata                          |
 | `v` | Enter visual mode (highlight addresses / block refs) |
-| `r` | Refresh |
-| `?` | Toggle help overlay |
+| `r` | Refresh                                              |
+| `?` | Toggle help overlay                                  |
 
 ### Visual Mode
 
@@ -232,10 +257,10 @@ PF_DB_PATH=/var/lib/pathfinder/pathfinder.db ./target/release/pf-query
 # Listening on 0.0.0.0:8234 by default
 ```
 
-| Variable | Default | Description |
-|---|---|---|
-| `PF_DB_PATH` | *(required)* | Path to the Pathfinder SQLite database |
-| `PF_PORT` | `8234` | Port to listen on |
+| Variable     | Default      | Description                            |
+| ------------ | ------------ | -------------------------------------- |
+| `PF_DB_PATH` | _(required)_ | Path to the Pathfinder SQLite database |
+| `PF_PORT`    | `8234`       | Port to listen on                      |
 
 ### Run on a remote server
 
@@ -247,9 +272,9 @@ APP_PATHFINDER_SERVICE_URL=http://192.168.1.10:8234
 
 ### API
 
-| Endpoint | Description |
-|---|---|
-| `GET /health` | Returns `{ "latest_block": N }` |
+| Endpoint                               | Description                                             |
+| -------------------------------------- | ------------------------------------------------------- |
+| `GET /health`                          | Returns `{ "latest_block": N }`                         |
 | `GET /nonce-history/{address}?limit=N` | Returns ordered nonce update history (max 2000 entries) |
 
 ---

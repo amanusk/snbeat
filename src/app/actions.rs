@@ -34,6 +34,12 @@ pub enum Action {
     },
     /// Enrich visible address txs that are missing endpoint/timestamp data.
     EnrichAddressTxs { address: Felt, hashes: Vec<Felt> },
+    /// Post-load sanity check: fill nonce gaps + enrich all empty endpoints.
+    SanityCheckAddress {
+        address: Felt,
+        current_nonce: u64,
+        known_txs: Vec<AddressTxSummary>,
+    },
     /// Enrich WS-streamed call stubs (missing sender/function/fee/timestamp).
     EnrichAddressCalls {
         address: Felt,

@@ -801,6 +801,26 @@ impl App {
                             .action_tx
                             .send(Action::EnrichAddressTxs { address, hashes });
                     }
+
+                    // Sanity check cached data: fill nonce gaps + enrich endpoints
+                    // from what we already have in the cache, even before sources complete.
+                    if !self.address.is_contract
+                        && !self.address.txs.items.is_empty()
+                        && !self.address.sanity_check_dispatched
+                    {
+                        if let Some(info) = &self.address.info {
+                            let current_nonce = crate::utils::felt_to_u64(&info.nonce);
+                            if current_nonce > 0 {
+                                self.address.sanity_check_dispatched = true;
+                                let _ =
+                                    self.action_tx.send(Action::SanityCheckAddress {
+                                        address,
+                                        current_nonce,
+                                        known_txs: self.address.txs.items.clone(),
+                                    });
+                            }
+                        }
+                    }
                 }
             }
             Action::MoreAddressTxsLoaded {
@@ -956,6 +976,21 @@ impl App {
                     if self.address.sources_pending.is_empty() {
                         self.is_loading = false;
                         self.loading_detail = None;
+
+                        // Post-display sanity check: fill nonce gaps + enrich all endpoints.
+                        // Reset the flag so we run again with the full merged dataset.
+                        if !self.address.is_contract {
+                            if let Some(info) = &self.address.info {
+                                let current_nonce = crate::utils::felt_to_u64(&info.nonce);
+                                self.address.sanity_check_dispatched = true;
+                                let _ =
+                                    self.action_tx.send(Action::SanityCheckAddress {
+                                        address,
+                                        current_nonce,
+                                        known_txs: self.address.txs.items.clone(),
+                                    });
+                            }
+                        }
                     }
                 }
 

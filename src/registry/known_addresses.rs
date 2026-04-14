@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use serde::Deserialize;
 use starknet::core::types::Felt;
 use tracing::{debug, warn};
 
-use crate::error::{Result, SnbeatError};
+use crate::error::Result;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KnownAddressEntry {
@@ -36,15 +35,9 @@ pub struct KnownAddress {
     pub decimals: Option<u8>,
 }
 
-/// Load known addresses from a TOML file. Falls back to bundled baseline on missing file.
-pub fn load_known_addresses(path: &Path) -> Result<Vec<KnownAddress>> {
-    let content = if path.exists() {
-        std::fs::read_to_string(path)
-            .map_err(|e| SnbeatError::Config(format!("Failed to read known addresses: {e}")))?
-    } else {
-        debug!(path = %path.display(), "Known addresses file not found, using bundled baseline");
-        BUNDLED_KNOWN_ADDRESSES.to_string()
-    };
+/// Load known addresses from the bundled baseline.
+pub fn load_known_addresses() -> Result<Vec<KnownAddress>> {
+    let content = BUNDLED_KNOWN_ADDRESSES;
 
     let file: KnownAddressesFile = toml::from_str(&content)?;
     let mut addresses = Vec::new();

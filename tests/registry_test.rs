@@ -14,8 +14,7 @@ fn make_user_labels(content: &str) -> tempfile::NamedTempFile {
 #[test]
 fn test_load_bundled_known_addresses() {
     let registry = snbeat::registry::AddressRegistry::load(
-        std::path::Path::new("/dev/null"),    // no user labels
-        std::path::Path::new("/nonexistent"), // triggers bundled baseline
+        std::path::Path::new("/dev/null"), // no user labels
     )
     .unwrap()
     .0;
@@ -39,7 +38,6 @@ fn test_user_labels_override_known() {
 
     let registry = snbeat::registry::AddressRegistry::load(
         labels.path(),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -52,7 +50,6 @@ fn test_user_labels_override_known() {
 fn test_search_prefix_match() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -69,7 +66,6 @@ fn test_search_prefix_match() {
 fn test_search_substring_match() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -89,7 +85,6 @@ fn test_search_substring_match() {
 fn test_search_hex_prefix() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -104,7 +99,6 @@ fn test_search_hex_prefix() {
 fn test_search_empty_returns_nothing() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -116,7 +110,6 @@ fn test_search_empty_returns_nothing() {
 fn test_search_limit() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -130,7 +123,6 @@ fn test_search_limit() {
 fn test_resolve_by_name() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -145,7 +137,6 @@ fn test_resolve_by_name() {
 fn test_format_address() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;
@@ -162,7 +153,6 @@ fn test_format_address() {
 fn test_get_decimals() {
     let registry = snbeat::registry::AddressRegistry::load(
         std::path::Path::new("/dev/null"),
-        std::path::Path::new("/nonexistent"),
     )
     .unwrap()
     .0;

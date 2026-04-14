@@ -186,6 +186,22 @@ pub async fn run_network_task(
                 Action::EnrichAddressTxs { address, hashes } => {
                     address::enrich_address_txs(address, hashes, &ds, &abi_reg, &tx).await;
                 }
+                Action::SanityCheckAddress {
+                    address,
+                    current_nonce,
+                    known_txs,
+                } => {
+                    address::run_sanity_check(
+                        address,
+                        current_nonce,
+                        known_txs,
+                        &ds,
+                        &dune,
+                        &abi_reg,
+                        &tx,
+                    )
+                    .await;
+                }
                 Action::EnrichAddressCalls {
                     address,
                     hashes_with_blocks,

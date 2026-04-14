@@ -70,7 +70,13 @@ fn init_logging(config: &AppConfig) -> tracing_appender::non_blocking::WorkerGua
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    // Load .env: try CWD first, then ~/.config/snbeat/.env
+    if dotenvy::dotenv().is_err() {
+        let global_env = snbeat_config_dir().join(".env");
+        if global_env.exists() {
+            dotenvy::from_path(&global_env).ok();
+        }
+    }
 
     let config = AppConfig::parse();
     let _log_guard = init_logging(&config);
@@ -106,17 +112,12 @@ async fn main() -> anyhow::Result<()> {
     let class_cache = ClassCache::new(class_cache_db, 500);
     let abi_registry = Arc::new(AbiRegistry::new(Arc::clone(&data_source), class_cache));
 
-    // Address registry
-    let user_labels_path = std::path::PathBuf::from(&config.user_labels);
-    let known_addresses_path = std::path::PathBuf::from(&config.known_addresses);
+    // Address registry — resolve labels path with XDG fallback
+    let user_labels_path = resolve_config_file(&config.user_labels, "labels.toml");
     let (registry_inner, labels_warning) =
-        AddressRegistry::load(&user_labels_path, &known_addresses_path).unwrap_or_else(|e| {
+        AddressRegistry::load(&user_labels_path).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to load address registry, using empty");
-            AddressRegistry::load(
-                std::path::Path::new("/dev/null"),
-                std::path::Path::new("/dev/null"),
-            )
-            .unwrap()
+            AddressRegistry::load(std::path::Path::new("/dev/null")).unwrap()
         });
     let registry = Arc::new(registry_inner);
     let search_engine = Arc::new(SearchEngine::new(Arc::clone(&registry)));
@@ -426,13 +427,30 @@ fn snbeat_config_dir() -> std::path::PathBuf {
     }
 }
 
+/// Resolve a config file path: if the user set a custom value, use it as-is.
+/// Otherwise (default), try CWD first, then fall back to ~/.config/snbeat/.
+fn resolve_config_file(configured: &str, default_name: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(configured);
+    // User explicitly set a path (not the default) — use as-is
+    if configured != default_name {
+        return path;
+    }
+    // Default name: prefer CWD, fall back to config dir
+    if path.exists() {
+        path
+    } else {
+        let global = snbeat_config_dir().join(default_name);
+        if global.exists() { global } else { path }
+    }
+}
+
 /// Validate prerequisites before starting the app.
 fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     let mut warnings = Vec::new();
 
     // Check RPC URL is set and looks valid
     if config.rpc_url.is_empty() {
-        anyhow::bail!("APP_RPC_URL is required. Set it in .env or pass --rpc-url");
+        anyhow::bail!("APP_RPC_URL is required. Set it in .env, ~/.config/snbeat/.env, or pass --rpc-url");
     }
     if !config.rpc_url.starts_with("http://") && !config.rpc_url.starts_with("https://") {
         anyhow::bail!(
@@ -492,10 +510,10 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
         warnings.push("VOYAGER_API_KEY not set — address metadata enrichment unavailable");
     }
 
-    // Check labels file
-    let labels_path = std::path::Path::new(&config.user_labels);
+    // Check labels file (with XDG fallback)
+    let labels_path = resolve_config_file(&config.user_labels, "labels.toml");
     if !labels_path.exists() {
-        warnings.push("User labels file not found — create labels.toml for address tagging");
+        warnings.push("User labels file not found — create labels.toml in CWD or ~/.config/snbeat/");
     }
 
     // Log warnings
