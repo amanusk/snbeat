@@ -25,11 +25,11 @@ pub(super) async fn fetch_and_send_block_detail(
     let start = std::time::Instant::now();
     debug!(number, "Fetching block detail");
     match ds.get_block_with_txs(number).await {
-        Ok((block, transactions)) => {
+        Ok((block, mut transactions)) => {
             let _ = tx.send(rpc_source_update(crate::app::state::SourceStatus::Live));
             let endpoint_names = resolve_endpoint_names(&transactions, abi_reg).await;
 
-            // Batch-fetch receipts for execution status (chunks of 20)
+            // Batch-fetch receipts for execution status + actual fee (chunks of 20)
             let mut tx_statuses = vec!["?".to_string(); transactions.len()];
             for chunk_start in (0..transactions.len()).step_by(20) {
                 let chunk_end = (chunk_start + 20).min(transactions.len());
@@ -48,6 +48,7 @@ pub(super) async fn fetch_and_send_block_detail(
                             crate::data::types::ExecutionStatus::Reverted(_) => "REV".into(),
                             _ => "?".into(),
                         };
+                        transactions[idx].set_actual_fee(receipt.actual_fee);
                     }
                 }
             }

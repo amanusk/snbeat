@@ -68,6 +68,25 @@ impl SnTransaction {
         }
     }
 
+    pub fn set_actual_fee(&mut self, fee: Felt) {
+        match self {
+            SnTransaction::Invoke(tx) => tx.actual_fee = Some(fee),
+            SnTransaction::Declare(tx) => tx.actual_fee = Some(fee),
+            SnTransaction::DeployAccount(tx) => tx.actual_fee = Some(fee),
+            SnTransaction::L1Handler(tx) => tx.actual_fee = Some(fee),
+            SnTransaction::Deploy(tx) => tx.actual_fee = Some(fee),
+        }
+    }
+
+    pub fn tip(&self) -> u64 {
+        match self {
+            SnTransaction::Invoke(tx) => tx.tip,
+            SnTransaction::Declare(tx) => tx.tip,
+            SnTransaction::DeployAccount(tx) => tx.tip,
+            SnTransaction::L1Handler(_) | SnTransaction::Deploy(_) => 0,
+        }
+    }
+
     pub fn block_number(&self) -> u64 {
         match self {
             SnTransaction::Invoke(tx) => tx.block_number,

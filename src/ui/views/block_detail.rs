@@ -7,7 +7,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
-use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash};
+use crate::ui::widgets::hex_display::{format_commas, format_fee, format_fri, short_hash};
+use crate::utils::felt_to_u64;
 use crate::ui::widgets::{search_bar, status_bar};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -117,7 +118,9 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Sender               ", theme::SUGGESTION_STYLE),
         Span::styled("Endpoint                     ", theme::SUGGESTION_STYLE),
-        Span::styled("Fee(STRK)       ", theme::SUGGESTION_STYLE),
+        Span::styled("Nonce      ", theme::SUGGESTION_STYLE),
+        Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
+        Span::styled("Tip             ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
 
@@ -175,7 +178,14 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             let fee_str = tx
                 .actual_fee()
                 .map(|f| format_fee(&f).trim_end_matches(" STRK").to_string())
+                .unwrap_or_else(|| "0".to_string());
+
+            let nonce_str = tx
+                .nonce()
+                .map(|n| felt_to_u64(&n).to_string())
                 .unwrap_or_default();
+
+            let tip_str = format_fri(tx.tip() as u128);
 
             // Decoded endpoint names from the ABI (may be multicall)
             let endpoint = app
@@ -247,7 +257,9 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 ),
                 Span::styled(format!("{:<21}", sender_display), sender_style),
                 Span::styled(format!("{:<28} ", endpoint_display), theme::LABEL_STYLE),
-                Span::styled(format!("{:<16} ", fee_str), theme::TX_FEE_STYLE),
+                Span::styled(format!("{:<11}", nonce_str), theme::NORMAL_STYLE),
+                Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+                Span::styled(format!("{:<16}", tip_str), theme::TX_FEE_STYLE),
             ]);
             ListItem::new(line)
         })
