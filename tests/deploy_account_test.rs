@@ -1,6 +1,4 @@
-use starknet::core::types::{
-    DeployAccountTransaction, Felt, Transaction, TransactionReceipt,
-};
+use starknet::core::types::{DeployAccountTransaction, Felt, Transaction, TransactionReceipt};
 use starknet::core::utils::get_contract_address;
 use starknet::providers::{JsonRpcClient, Provider, jsonrpc::HttpTransport};
 use url::Url;
@@ -27,8 +25,7 @@ fn rpc_ds() -> RpcDataSource {
 
 /// Well-known DEPLOY_ACCOUNT tx on Starknet mainnet (Argent account).
 /// The ETH token contract is the deployer-free reference.
-const DEPLOY_ACCOUNT_TX: &str =
-    "0x568c996e5828e933d366f8750138e729eeb178c53572f21e9b96aef48eb09ff";
+const DEPLOY_ACCOUNT_TX: &str = "0x568c996e5828e933d366f8750138e729eeb178c53572f21e9b96aef48eb09ff";
 const DEPLOY_BLOCK: u64 = 8745245;
 
 /// Verify that starknet-rs `get_contract_address` computes the correct deployed

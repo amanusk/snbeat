@@ -480,31 +480,29 @@ fn convert_transaction(tx: &Transaction, block_number: u64, index: u64) -> SnTra
             })
         }
         Transaction::DeployAccount(deploy_account) => {
-            let (hash, class_hash, calldata, salt, version, nonce, tip, rb) =
-                match deploy_account {
-                    DeployAccountTransaction::V1(v) => (
-                        v.transaction_hash,
-                        v.class_hash,
-                        v.constructor_calldata.clone(),
-                        v.contract_address_salt,
-                        Felt::ONE,
-                        v.nonce,
-                        0u64,
-                        None,
-                    ),
-                    DeployAccountTransaction::V3(v) => (
-                        v.transaction_hash,
-                        v.class_hash,
-                        v.constructor_calldata.clone(),
-                        v.contract_address_salt,
-                        Felt::THREE,
-                        v.nonce,
-                        v.tip,
-                        Some(convert_resource_bounds(&v.resource_bounds)),
-                    ),
-                };
-            let contract_address =
-                get_contract_address(salt, class_hash, &calldata, Felt::ZERO);
+            let (hash, class_hash, calldata, salt, version, nonce, tip, rb) = match deploy_account {
+                DeployAccountTransaction::V1(v) => (
+                    v.transaction_hash,
+                    v.class_hash,
+                    v.constructor_calldata.clone(),
+                    v.contract_address_salt,
+                    Felt::ONE,
+                    v.nonce,
+                    0u64,
+                    None,
+                ),
+                DeployAccountTransaction::V3(v) => (
+                    v.transaction_hash,
+                    v.class_hash,
+                    v.constructor_calldata.clone(),
+                    v.contract_address_salt,
+                    Felt::THREE,
+                    v.nonce,
+                    v.tip,
+                    Some(convert_resource_bounds(&v.resource_bounds)),
+                ),
+            };
+            let contract_address = get_contract_address(salt, class_hash, &calldata, Felt::ZERO);
             SnTransaction::DeployAccount(DeployAccountTx {
                 hash,
                 contract_address,
