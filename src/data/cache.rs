@@ -117,6 +117,26 @@ impl CachingDataSource {
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
 
+        // --- Migrations (keyed on PRAGMA user_version) ---
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if version < 4 {
+            // v4: DEPLOY_ACCOUNT txs had wrong contract_address. Clear all
+            // tx/block/address caches so they are re-fetched with correct data.
+            db.execute_batch(
+                "DELETE FROM transactions;
+                 DELETE FROM block_transactions;
+                 DELETE FROM blocks;
+                 DELETE FROM address_txs;
+                 DELETE FROM deploy_info;
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(|e| SnbeatError::Config(format!("Migration v4 failed: {e}")))?;
+            debug!("Migration v4: cleared tx/block/address caches");
+        }
+
         Ok(Self {
             upstream,
             db: Mutex::new(db),
