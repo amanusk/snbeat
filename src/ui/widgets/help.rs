@@ -34,6 +34,8 @@ pub fn draw_help_overlay(f: &mut Frame, app: &App) {
         Line::from("   PgUp/Ctrl+U      Next block (or next tx in TxDetail)"),
         Line::from("   PgDn/Ctrl+D      Prev block (or prev tx in TxDetail)"),
         Line::from("   n/N              Next/prev tx by nonce (same sender)"),
+        Line::from("   c/d              Raw calldata / decoded calldata"),
+        Line::from("   o                Outside execution intent (meta tx)"),
         Line::from("   Ctrl+o / h / Esc  Go back one view"),
         Line::from("   ]                Forward in jump history"),
         Line::from(""),
@@ -69,7 +71,8 @@ pub fn hint_for_view(app: &App) -> String {
             " /search  j/k scroll  Enter open  h back  PgUp/PgDn blocks  ? help".into()
         }
         crate::app::state::View::TxDetail => {
-            " /search  h back  PgUp/PgDn txs  n/N nonce  v visual  c/d calldata  ? help".into()
+            " /search  h back  PgUp/PgDn txs  n/N nonce  v visual  c/d calldata  o intent  ? help"
+                .into()
         }
         crate::app::state::View::AddressInfo => {
             " /search  j/k scroll  Tab switch  Enter open  r refresh  h back  ? help".into()

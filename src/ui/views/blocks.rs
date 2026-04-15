@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::ui::theme;
-use crate::ui::widgets::hex_display::short_hash;
+use crate::ui::widgets::hex_display::{format_fri, short_hash};
 use crate::ui::widgets::{search_bar, status_bar};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -43,6 +43,9 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Txs  ", theme::SUGGESTION_STYLE),
         Span::styled("Age       ", theme::SUGGESTION_STYLE),
+        Span::styled("L2 Gas Price      ", theme::SUGGESTION_STYLE),
+        Span::styled("L1 Gas Price      ", theme::SUGGESTION_STYLE),
+        Span::styled("L1 Data Price     ", theme::SUGGESTION_STYLE),
         Span::styled("Sequencer", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
@@ -54,6 +57,9 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|block| {
             let age = format_age(block.timestamp);
             let sequencer = app.format_address(&block.sequencer_address);
+            let l2_gas = format_fri(block.l2_gas_price_fri);
+            let l1_gas = format_fri(block.l1_gas_price_fri);
+            let l1_data = format_fri(block.l1_data_gas_price_fri);
             let line = Line::from(vec![
                 Span::styled(format!(" #{:<8}", block.number), theme::BLOCK_NUMBER_STYLE),
                 Span::styled(
@@ -65,6 +71,9 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::BLOCK_TX_COUNT_STYLE,
                 ),
                 Span::styled(format!("{:>8}  ", age), theme::BLOCK_AGE_STYLE),
+                Span::styled(format!("{:<18}", l2_gas), theme::NORMAL_STYLE),
+                Span::styled(format!("{:<18}", l1_gas), theme::NORMAL_STYLE),
+                Span::styled(format!("{:<18}", l1_data), theme::NORMAL_STYLE),
                 Span::styled(sequencer, theme::LABEL_STYLE),
             ]);
             ListItem::new(line)

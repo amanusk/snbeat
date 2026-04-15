@@ -604,15 +604,18 @@ impl App {
                 mut transactions,
                 mut endpoint_names,
                 mut tx_statuses,
+                mut meta_tx_info,
             } => {
                 self.block_detail.block = Some(block);
                 // Reverse to show highest index first (descending order)
                 transactions.reverse();
                 endpoint_names.reverse();
                 tx_statuses.reverse();
+                meta_tx_info.reverse();
                 self.block_detail.txs = StatefulList::with_items(transactions);
                 self.block_detail.endpoint_names = endpoint_names;
                 self.block_detail.tx_statuses = tx_statuses;
+                self.block_detail.meta_tx_info = meta_tx_info;
                 if !self.block_detail.txs.items.is_empty() {
                     self.block_detail.txs.select_first();
                 }
@@ -628,11 +631,13 @@ impl App {
                 receipt,
                 decoded_events,
                 decoded_calls,
+                outside_executions,
             } => {
                 self.tx_detail.transaction = Some(transaction);
                 self.tx_detail.receipt = Some(receipt);
                 self.tx_detail.decoded_events = decoded_events;
                 self.tx_detail.decoded_calls = decoded_calls;
+                self.tx_detail.outside_executions = outside_executions;
                 self.tx_detail.scroll = 0;
                 self.tx_detail.visual_mode = false;
                 self.build_tx_nav_items();

@@ -215,6 +215,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
+        // o: toggle outside execution intent view in TxDetail
+        KeyCode::Char('o') if app.current_view() == View::TxDetail => {
+            if !app.tx_detail.outside_executions.is_empty() {
+                app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+            }
+            None
+        }
+
         _ => None,
     }
 }
@@ -244,6 +252,12 @@ fn handle_tx_visual_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
         KeyCode::Char('d') => {
             app.tx_detail.show_decoded_calldata = !app.tx_detail.show_decoded_calldata;
+            None
+        }
+        KeyCode::Char('o') => {
+            if !app.tx_detail.outside_executions.is_empty() {
+                app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+            }
             None
         }
         KeyCode::Esc => {

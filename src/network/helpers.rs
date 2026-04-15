@@ -74,7 +74,9 @@ pub fn extract_nonce_tip(tx: &SnTransaction) -> (u64, u64) {
     match tx {
         SnTransaction::Invoke(i) => (i.nonce.map(|n| felt_to_u64(&n)).unwrap_or(0), i.tip),
         SnTransaction::Declare(d) => (0, d.tip),
-        SnTransaction::DeployAccount(da) => (0, da.tip),
+        SnTransaction::DeployAccount(da) => {
+            (da.nonce.map(|n| felt_to_u64(&n)).unwrap_or(0), da.tip)
+        }
         _ => (0, 0),
     }
 }

@@ -94,6 +94,8 @@ fn extract_nonce_tip_deploy_account() {
         contract_address: Felt::ZERO,
         class_hash: Felt::ZERO,
         constructor_calldata: Vec::new(),
+        contract_address_salt: Felt::ZERO,
+        nonce: Some(Felt::ZERO),
         version: Felt::from(3u64),
         actual_fee: None,
         execution_status: ExecutionStatus::Succeeded,

@@ -3,6 +3,7 @@ pub mod calldata;
 pub mod class_cache;
 pub mod events;
 pub mod functions;
+pub mod outside_execution;
 
 use std::sync::Arc;
 

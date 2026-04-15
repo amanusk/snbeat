@@ -111,7 +111,7 @@ impl SnTransaction {
         match self {
             SnTransaction::Invoke(tx) => tx.nonce,
             SnTransaction::Declare(_) => None,
-            SnTransaction::DeployAccount(_) => None,
+            SnTransaction::DeployAccount(tx) => tx.nonce,
             SnTransaction::L1Handler(tx) => tx.nonce,
             SnTransaction::Deploy(_) => None,
         }
@@ -189,6 +189,9 @@ pub struct DeployAccountTx {
     pub contract_address: Felt,
     pub class_hash: Felt,
     pub constructor_calldata: Vec<Felt>,
+    #[serde(default)]
+    pub contract_address_salt: Felt,
+    pub nonce: Option<Felt>,
     pub version: Felt,
     pub actual_fee: Option<Felt>,
     pub execution_status: ExecutionStatus,
