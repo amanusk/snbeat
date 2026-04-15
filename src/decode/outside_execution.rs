@@ -119,10 +119,7 @@ pub fn parse_outside_execution(
     let header_size = 1 + nonce_size + 2 + 1; // caller + nonce + after/before + num_calls
     let execute_after = felt_to_u64(&data[1 + nonce_size]);
     let execute_before = felt_to_u64(&data[1 + nonce_size + 1]);
-    let (inner_calls, signature) = (nonce, header_size); // reuse parsed result below
 
-    // Re-parse with the validated nonce_size
-    let _ = (inner_calls, signature); // discard shadowed bindings
     let num_inner_calls = felt_to_u64(&data[header_size - 1]) as usize;
     let (inner_calls, offset_after_calls) = parse_call_array(data, header_size, num_inner_calls);
 
