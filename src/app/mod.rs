@@ -916,10 +916,11 @@ impl App {
                 if self.address.context != Some(address) {
                     return;
                 }
-                let had_deploy_before = self.address.deployment.is_some();
+                let old_deploy_hash = self.address.deployment.as_ref().map(|d| d.hash);
                 let tx_summaries = self.filter_deployment_txs(address, tx_summaries);
-                // Rebuild nav items if deployment info just arrived
-                if !had_deploy_before && self.address.deployment.is_some() {
+                let new_deploy_hash = self.address.deployment.as_ref().map(|d| d.hash);
+                // Rebuild nav items if deployment info arrived or hash was upgraded
+                if old_deploy_hash != new_deploy_hash {
                     self.build_address_nav_items();
                 }
                 self.address.merge_tx_summaries(tx_summaries);
