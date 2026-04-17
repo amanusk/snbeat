@@ -43,6 +43,7 @@ impl RpcDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
         keys: Option<Vec<Vec<Felt>>>,
         debug_label: &str,
@@ -52,6 +53,9 @@ impl RpcDataSource {
             .block_number()
             .await
             .map_err(|e| SnbeatError::Provider(e.to_string()))?;
+        // Upper bound for the reverse walk. Caller-specified `to_block` is
+        // clamped to `latest` so requests for future blocks don't error out.
+        let upper = to_block.map(|b| b.min(latest)).unwrap_or(latest);
 
         // Resolve the lower bound of the search range.
         // - Caller-provided: use as-is (cache-driven incremental).
@@ -63,10 +67,10 @@ impl RpcDataSource {
             let windows = [50_000u64, 200_000, 1_000_000, latest];
             let mut found_from = 0;
             for window in windows {
-                let test_from = latest.saturating_sub(window);
+                let test_from = upper.saturating_sub(window);
                 let test_filter = EventFilter {
                     from_block: Some(BlockId::Number(test_from)),
-                    to_block: Some(BlockId::Tag(BlockTag::Latest)),
+                    to_block: Some(BlockId::Number(upper)),
                     address: Some(AddressFilter::Single(address)),
                     keys: keys.clone(),
                 };
@@ -90,7 +94,7 @@ impl RpcDataSource {
         const CHUNK_SIZE: u64 = 1000;
 
         let mut collected: Vec<SnEvent> = Vec::new();
-        let mut to = latest;
+        let mut to = upper;
 
         'outer: while to >= lower && collected.len() < limit {
             let win_from = lower.max(to.saturating_sub(WINDOW));
@@ -332,17 +336,18 @@ impl DataSource for RpcDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
         // Use transaction_executed selector to get exactly 1 event per account tx.
         // This is emitted by every account contract on every invoke.
         let tx_executed_selector =
-            Felt::from_hex("0x01dcde06aabdbca2f80aa51392b345d7549d7757aa855f7e37f5d335ac8243b1")
-                .unwrap();
+            Felt::from_hex(crate::data::pathfinder::TRANSACTION_EXECUTED_SELECTOR).unwrap();
         let keys = Some(vec![vec![tx_executed_selector]]);
         self.fetch_events_paginated(
             address,
             from_block,
+            to_block,
             limit,
             keys,
             "Fetched events for address",
@@ -354,11 +359,19 @@ impl DataSource for RpcDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
         // No key filter — get ALL events from this contract
-        self.fetch_events_paginated(address, from_block, limit, None, "Fetched contract events")
-            .await
+        self.fetch_events_paginated(
+            address,
+            from_block,
+            to_block,
+            limit,
+            None,
+            "Fetched contract events",
+        )
+        .await
     }
 
     async fn call_contract(

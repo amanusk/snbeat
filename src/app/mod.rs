@@ -840,8 +840,7 @@ impl App {
                         if let Some(info) = &self.address.info {
                             let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                             if current_nonce > 0 {
-                                self.address.unfilled_gap =
-                                    self.address.detect_unfilled_gap();
+                                self.address.unfilled_gap = self.address.detect_unfilled_gap();
                                 self.address.sanity_check_dispatched = true;
                                 let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                     address,

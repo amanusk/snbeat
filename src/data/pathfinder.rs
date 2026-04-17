@@ -58,6 +58,38 @@ pub struct TxHashLookup {
     pub tx_index: u64,
 }
 
+/// Per-tx data returned by `POST /txs-by-hash`.
+///
+/// Covers everything the address-view enrichment path needs without an RPC
+/// round trip: multicall calldata (for endpoint name decoding), sender,
+/// nonce, fee, status, and block timestamp.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TxByHashData {
+    pub hash: String,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    #[allow(dead_code)]
+    pub tx_index: u64,
+    pub sender: String,
+    pub nonce: Option<u64>,
+    pub tx_type: String,
+    /// Calldata felts, `0x`-prefixed hex. For invoke txs this is the multicall
+    /// payload (matches RPC `InvokeTransaction.calldata`); empty for declare.
+    pub calldata: Vec<String>,
+    pub actual_fee: String,
+    #[allow(dead_code)]
+    pub tip: u64,
+    pub status: String,
+    pub revert_reason: Option<String>,
+}
+
+/// Entry from `GET /block-timestamps`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockTimestamp {
+    pub block_number: u64,
+    pub timestamp: u64,
+}
+
 /// A contract deployed with a given class hash.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContractByClassEntry {
@@ -231,6 +263,50 @@ impl PathfinderClient {
         Ok(resp)
     }
 
+    /// Bulk-fetch tx + receipt data by hash in one round trip.
+    ///
+    /// Hashes not present in the Pathfinder DB are silently omitted from the
+    /// response — callers should diff requested vs returned and fall back
+    /// (e.g. to RPC) for missing ones.
+    pub async fn get_txs_by_hash(&self, hashes: &[Felt]) -> anyhow::Result<Vec<TxByHashData>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/txs-by-hash", self.base_url);
+        let hashes_hex: Vec<String> = hashes.iter().map(|h| format!("{:#x}", h)).collect();
+        let body = serde_json::json!({ "hashes": hashes_hex });
+        debug!(url = %url, count = hashes.len(), "Fetching txs by hash from pf-query");
+        let entries = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<TxByHashData>>()
+            .await?;
+        Ok(entries)
+    }
+
+    /// Bulk-fetch block timestamps over an inclusive range.
+    pub async fn get_block_timestamps(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> anyhow::Result<Vec<BlockTimestamp>> {
+        let url = format!("{}/block-timestamps?from={}&to={}", self.base_url, from, to);
+        debug!(url = %url, "Fetching block timestamps from pf-query");
+        let entries = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<BlockTimestamp>>()
+            .await?;
+        Ok(entries)
+    }
+
     /// Fetch all contracts deployed with a given class hash.
     pub async fn get_contracts_by_class(
         &self,
@@ -334,8 +410,15 @@ impl PathfinderClient {
         let selector = Felt::from_hex(TRANSACTION_EXECUTED_SELECTOR)
             .expect("TRANSACTION_EXECUTED_SELECTOR is a valid felt");
         let keys = vec![vec![selector]];
-        self.get_contract_events(address, from_block, to_block, &keys, limit, continuation_token)
-            .await
+        self.get_contract_events(
+            address,
+            from_block,
+            to_block,
+            &keys,
+            limit,
+            continuation_token,
+        )
+        .await
     }
 
     pub async fn health(&self) -> anyhow::Result<HealthResponse> {
@@ -504,121 +587,142 @@ mod tests {
         );
 
         for (scenario, acct_win, ctr_win) in scenarios.iter() {
-        for case in &cases {
-            let Case { addr, role, label } = case;
-            let window = match role {
-                Role::Account => *acct_win,
-                Role::Contract => *ctr_win,
-            };
-            let from_block = latest.saturating_sub(window);
+            for case in &cases {
+                let Case { addr, role, label } = case;
+                let window = match role {
+                    Role::Account => *acct_win,
+                    Role::Contract => *ctr_win,
+                };
+                let from_block = latest.saturating_sub(window);
 
-            // --- TTFE: fetch the very first event only. ---
-            let rpc_ttfe = {
-                let t = Instant::now();
-                let res = match role {
-                    Role::Account => {
-                        rpc.get_events_for_address(*addr, Some(from_block), TTFE_LIMIT as usize)
+                // --- TTFE: fetch the very first event only. ---
+                let rpc_ttfe = {
+                    let t = Instant::now();
+                    let res = match role {
+                        Role::Account => {
+                            rpc.get_events_for_address(
+                                *addr,
+                                Some(from_block),
+                                None,
+                                TTFE_LIMIT as usize,
+                            )
                             .await
-                    }
-                    Role::Contract => {
-                        rpc.get_contract_events(*addr, Some(from_block), TTFE_LIMIT as usize)
+                        }
+                        Role::Contract => {
+                            rpc.get_contract_events(
+                                *addr,
+                                Some(from_block),
+                                None,
+                                TTFE_LIMIT as usize,
+                            )
                             .await
+                        }
+                    };
+                    match res {
+                        Ok(_) => Some(t.elapsed().as_millis()),
+                        Err(e) => {
+                            eprintln!("rpc ttfe error for {label}: {e}");
+                            None
+                        }
                     }
                 };
-                match res {
-                    Ok(_) => Some(t.elapsed().as_millis()),
-                    Err(e) => {
-                        eprintln!("rpc ttfe error for {label}: {e}");
-                        None
-                    }
-                }
-            };
-            let pf_ttfe = {
-                let t = Instant::now();
-                let res = match role {
-                    Role::Account => {
-                        pf.get_events_for_address(*addr, from_block, Some(latest), TTFE_LIMIT, None)
+                let pf_ttfe = {
+                    let t = Instant::now();
+                    let res = match role {
+                        Role::Account => {
+                            pf.get_events_for_address(
+                                *addr,
+                                from_block,
+                                Some(latest),
+                                TTFE_LIMIT,
+                                None,
+                            )
                             .await
+                        }
+                        Role::Contract => {
+                            pf.get_contract_events(
+                                *addr,
+                                from_block,
+                                Some(latest),
+                                &[],
+                                TTFE_LIMIT,
+                                None,
+                            )
+                            .await
+                        }
+                    };
+                    match res {
+                        Ok(_) => Some(t.elapsed().as_millis()),
+                        Err(e) => {
+                            eprintln!("pf ttfe error for {label}: {e}");
+                            None
+                        }
                     }
-                    Role::Contract => {
-                        pf.get_contract_events(
+                };
+
+                // --- Full page: fetch up to PAGE_LIMIT events. ---
+                let t = Instant::now();
+                let rpc_events = match role {
+                    Role::Account => {
+                        rpc.get_events_for_address(
                             *addr,
-                            from_block,
-                            Some(latest),
-                            &[],
-                            TTFE_LIMIT,
+                            Some(from_block),
                             None,
+                            PAGE_LIMIT as usize,
                         )
                         .await
                     }
-                };
-                match res {
-                    Ok(_) => Some(t.elapsed().as_millis()),
-                    Err(e) => {
-                        eprintln!("pf ttfe error for {label}: {e}");
-                        None
+                    Role::Contract => {
+                        rpc.get_contract_events(*addr, Some(from_block), None, PAGE_LIMIT as usize)
+                            .await
                     }
                 }
-            };
+                .unwrap_or_else(|e| {
+                    eprintln!("rpc page error for {label}: {e}");
+                    Vec::new()
+                });
+                let rpc_page_ms = t.elapsed().as_millis();
 
-            // --- Full page: fetch up to PAGE_LIMIT events. ---
-            let t = Instant::now();
-            let rpc_events = match role {
-                Role::Account => {
-                    rpc.get_events_for_address(*addr, Some(from_block), PAGE_LIMIT as usize)
+                let t = Instant::now();
+                let (pf_events, _tok) = match role {
+                    Role::Account => pf
+                        .get_events_for_address(*addr, from_block, Some(latest), PAGE_LIMIT, None)
                         .await
-                }
-                Role::Contract => {
-                    rpc.get_contract_events(*addr, Some(from_block), PAGE_LIMIT as usize)
+                        .unwrap_or_else(|e| {
+                            eprintln!("pf page error for {label}: {e}");
+                            (Vec::new(), None)
+                        }),
+                    Role::Contract => pf
+                        .get_contract_events(*addr, from_block, Some(latest), &[], PAGE_LIMIT, None)
                         .await
-                }
+                        .unwrap_or_else(|e| {
+                            eprintln!("pf page error for {label}: {e}");
+                            (Vec::new(), None)
+                        }),
+                };
+                let pf_page_ms = t.elapsed().as_millis();
+
+                let (matched, rpc_only, pf_only) = diff_sets(&rpc_events, &pf_events);
+                let role_s = match role {
+                    Role::Account => "account",
+                    Role::Contract => "contract",
+                };
+                let ttfe_str = |v: Option<u128>| match v {
+                    Some(ms) => ms.to_string(),
+                    None => "ERR".to_string(),
+                };
+
+                println!(
+                    "| {scenario} | {label} | {role_s} | {window} | rpc | {} | {rpc_page_ms} | {} | {matched} | {rpc_only} | {pf_only} |",
+                    ttfe_str(rpc_ttfe),
+                    rpc_events.len()
+                );
+                println!(
+                    "| {scenario} | {label} | {role_s} | {window} | pf  | {} | {pf_page_ms} | {} |         |          |         |",
+                    ttfe_str(pf_ttfe),
+                    pf_events.len()
+                );
             }
-            .unwrap_or_else(|e| {
-                eprintln!("rpc page error for {label}: {e}");
-                Vec::new()
-            });
-            let rpc_page_ms = t.elapsed().as_millis();
-
-            let t = Instant::now();
-            let (pf_events, _tok) = match role {
-                Role::Account => pf
-                    .get_events_for_address(*addr, from_block, Some(latest), PAGE_LIMIT, None)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("pf page error for {label}: {e}");
-                        (Vec::new(), None)
-                    }),
-                Role::Contract => pf
-                    .get_contract_events(*addr, from_block, Some(latest), &[], PAGE_LIMIT, None)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("pf page error for {label}: {e}");
-                        (Vec::new(), None)
-                    }),
-            };
-            let pf_page_ms = t.elapsed().as_millis();
-
-            let (matched, rpc_only, pf_only) = diff_sets(&rpc_events, &pf_events);
-            let role_s = match role {
-                Role::Account => "account",
-                Role::Contract => "contract",
-            };
-            let ttfe_str = |v: Option<u128>| match v {
-                Some(ms) => ms.to_string(),
-                None => "ERR".to_string(),
-            };
-
-            println!(
-                "| {scenario} | {label} | {role_s} | {window} | rpc | {} | {rpc_page_ms} | {} | {matched} | {rpc_only} | {pf_only} |",
-                ttfe_str(rpc_ttfe),
-                rpc_events.len()
-            );
-            println!(
-                "| {scenario} | {label} | {role_s} | {window} | pf  | {} | {pf_page_ms} | {} |         |          |         |",
-                ttfe_str(pf_ttfe),
-                pf_events.len()
-            );
-        }
         }
 
         Ok(())
@@ -646,5 +750,44 @@ mod tests {
             "0x1;;0x3",
             "empty middle group is a wildcard"
         );
+    }
+
+    /// Local re-implementation of `pf-query::parse_keys_filter` used as a
+    /// contract check: anything `encode_keys_filter` produces must be parseable
+    /// by the pf-query side with the same semantics. The two live in separate
+    /// crates, so we mirror the parser here and assert round-trip equivalence.
+    /// If this ever drifts, update both sides at once.
+    fn parse_keys_filter_mirror(raw: &str) -> Vec<Vec<Felt>> {
+        raw.split(';')
+            .map(|group_str| {
+                group_str
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|k| Felt::from_hex(k).expect("valid hex"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encode_keys_filter_round_trips_through_pf_query_parser() {
+        let f1 = Felt::from_hex("0x1").unwrap();
+        let f2 = Felt::from_hex("0x2").unwrap();
+        let f3 = Felt::from_hex("0x3").unwrap();
+        let cases: Vec<Vec<Vec<Felt>>> = vec![
+            vec![vec![f1]],
+            vec![vec![f1, f2]],
+            vec![vec![f1], vec![], vec![f3]],
+            vec![vec![f1, f2, f3]],
+        ];
+        for input in cases {
+            let encoded = encode_keys_filter(&input).expect("non-empty filter encodes");
+            let round_tripped = parse_keys_filter_mirror(&encoded);
+            assert_eq!(
+                round_tripped, input,
+                "round-trip mismatch for {input:?} (encoded = {encoded:?})"
+            );
+        }
     }
 }

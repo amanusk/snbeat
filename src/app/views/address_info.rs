@@ -12,6 +12,13 @@ use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
 use crate::ui::widgets::stateful_list::StatefulList;
 
+/// Maximum block span a nonce gap can cover before we stop auto-filling it
+/// via RPC block scans. Gaps wider than this are deferred to on-demand Dune
+/// queries (`run_nonce_gap_fill`). Shared between the detector
+/// (`detect_unfilled_gap`) and the filler (`fill_small_nonce_gaps_phase`) so
+/// they stay aligned — drift between the two causes silent data loss.
+pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
+
 /// A detected, unfilled nonce gap in the tx list that has been deferred
 /// for on-demand filling (issue #10). We do NOT auto-fill large gaps on
 /// address load; instead we wait until the user scrolls toward the gap
@@ -331,15 +338,11 @@ impl AddressInfoState {
         }
         let gap = best?;
 
-        // Only defer when the gap is "large". Small gaps fall through to the
-        // existing enrichment path (RPC block scan or small Dune query).
-        // Thresholds picked to match the existing small/large split in
-        // fill_nonce_gaps_phase (50-block small path) while leaving slack for
-        // genuinely benign gaps that the endpoint-enrichment phase will absorb.
-        const LARGE_MISSING_COUNT: u64 = 50;
-        const LARGE_BLOCK_SPAN: u64 = 1000;
+        // Defer any gap the RPC small-gap path can't handle. `fill_small_nonce_gaps_phase`
+        // only scans spans ≤ `SMALL_GAP_SPAN_BLOCKS` — anything wider must be
+        // filled via Dune on-demand or it would otherwise be dropped silently.
         let span = gap.hi_block.saturating_sub(gap.lo_block);
-        if gap.missing_count < LARGE_MISSING_COUNT && span < LARGE_BLOCK_SPAN {
+        if span <= SMALL_GAP_SPAN_BLOCKS {
             return None;
         }
         Some(gap)
@@ -400,45 +403,54 @@ mod tests {
 
     #[test]
     fn no_gap_when_contiguous() {
-        let state = state_with(vec![
-            summary(10, 100),
-            summary(11, 102),
-            summary(12, 104),
-        ]);
+        let state = state_with(vec![summary(10, 100), summary(11, 102), summary(12, 104)]);
         assert!(state.detect_unfilled_gap().is_none());
     }
 
     #[test]
-    fn no_gap_for_small_missing_count_and_narrow_span() {
-        // 5 missing nonces across 30 blocks — well below the large thresholds.
+    fn no_gap_for_small_span() {
+        // Gap spans only 30 blocks — RPC small-gap path handles this.
         let state = state_with(vec![summary(10, 100), summary(16, 130)]);
         assert!(state.detect_unfilled_gap().is_none());
     }
 
     #[test]
-    fn detects_gap_by_missing_count() {
-        // 100 missing nonces — exceeds LARGE_MISSING_COUNT.
-        let state = state_with(vec![
-            summary(10, 100),
-            summary(11, 105),
-            summary(112, 210), // 100 missing (12..=111)
-            summary(113, 215),
-        ]);
-        let g = state.detect_unfilled_gap().expect("large gap expected");
-        assert_eq!(g.lo_nonce, 11);
-        assert_eq!(g.hi_nonce, 112);
-        assert_eq!(g.missing_count, 100);
+    fn detects_wide_gap_even_with_few_missing() {
+        // Only 2 missing nonces but span = 100 blocks > SMALL_GAP_SPAN_BLOCKS.
+        // This is the medium-gap case that would otherwise be silently dropped.
+        let state = state_with(vec![summary(10, 100), summary(13, 200)]);
+        let g = state.detect_unfilled_gap().expect("wide-span gap expected");
+        assert_eq!(g.lo_nonce, 10);
+        assert_eq!(g.hi_nonce, 13);
+        assert_eq!(g.missing_count, 2);
         assert!(!g.fill_dispatched);
     }
 
     #[test]
     fn detects_gap_by_block_span() {
-        // Only 10 missing nonces but spanning >1000 blocks.
+        // Large block span well above the RPC small-gap limit.
         let state = state_with(vec![summary(10, 100), summary(21, 2000)]);
         let g = state.detect_unfilled_gap().expect("wide-span gap expected");
         assert_eq!(g.lo_nonce, 10);
         assert_eq!(g.hi_nonce, 21);
         assert_eq!(g.missing_count, 10);
+    }
+
+    #[test]
+    fn gap_threshold_boundary() {
+        // Exactly at the threshold: span == SMALL_GAP_SPAN_BLOCKS → no defer.
+        let state = state_with(vec![
+            summary(10, 100),
+            summary(12, 100 + SMALL_GAP_SPAN_BLOCKS),
+        ]);
+        assert!(state.detect_unfilled_gap().is_none());
+
+        // One over: span == SMALL_GAP_SPAN_BLOCKS + 1 → deferred.
+        let state = state_with(vec![
+            summary(10, 100),
+            summary(12, 100 + SMALL_GAP_SPAN_BLOCKS + 1),
+        ]);
+        assert!(state.detect_unfilled_gap().is_some());
     }
 
     #[test]
@@ -449,14 +461,36 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_unfilled_gap() {
+        // Guards the 'r'-refresh path: `NavigateToAddress` calls `reset()`, and
+        // the UI hint "retry with 'r'" only works if this wipes
+        // `unfilled_gap` + `fill_dispatched` so the next load re-detects.
+        let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        state.unfilled_gap = Some(UnfilledGap {
+            lo_nonce: 10,
+            hi_nonce: 21,
+            lo_block: 100,
+            hi_block: 2000,
+            missing_count: 10,
+            fill_dispatched: true,
+        });
+        state.sanity_check_dispatched = true;
+        state.clear();
+        assert!(state.unfilled_gap.is_none());
+        assert!(!state.sanity_check_dispatched);
+    }
+
+    #[test]
     fn biggest_gap_wins_when_multiple() {
         let state = state_with(vec![
             summary(10, 100),
-            summary(20, 110),    // 9 missing
-            summary(200, 5000),  // 179 missing — winner
+            summary(20, 110),   // 9 missing
+            summary(200, 5000), // 179 missing — winner
             summary(201, 5001),
         ]);
-        let g = state.detect_unfilled_gap().expect("should pick biggest gap");
+        let g = state
+            .detect_unfilled_gap()
+            .expect("should pick biggest gap");
         assert_eq!(g.lo_nonce, 20);
         assert_eq!(g.hi_nonce, 200);
         assert_eq!(g.missing_count, 179);

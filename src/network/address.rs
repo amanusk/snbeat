@@ -3,9 +3,17 @@
 
 use std::sync::Arc;
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
+
+/// Caps concurrent RPC `get_transaction` / `get_receipt` calls fired from the
+/// background enrichment path so that a user-initiated `FetchTransaction`
+/// never queues behind dozens of enrichment round trips. Only applies when
+/// pf-query is unavailable (or didn't return the requested hash). User clicks
+/// bypass this semaphore entirely.
+static ENRICH_RPC_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 
 use crate::app::actions::{Action, Source};
 use crate::data::DataSource;
@@ -25,76 +33,130 @@ use super::voyager;
 const UDC_CONTRACT_DEPLOYED: &str =
     "0x26b160f10156dea0639bec90696772c640b9706a47f5b8c52ea1abe5858b34d";
 
-/// Fetch contract events via pathfinder when available, falling back to RPC.
+/// Whether we're fetching events for a contract or a user account.
 ///
-/// Pathfinder wins on all contract event benchmarks (1-2ms TTFE vs ~1s cold RPC
-/// probe, 36-138ms page vs ~230ms RPC) thanks to its bloom-filter index on
-/// `from_address`. RPC is only exercised when PF is absent or the PF request
-/// fails (service down, transient error).
-async fn fetch_contract_events_routed(
+/// Determines both the event filter (accounts use the `transaction_executed`
+/// selector key filter; contracts fetch everything the contract emitted) and
+/// the preferred primary data source — see [`fetch_events_routed`].
+#[derive(Debug, Clone, Copy)]
+pub(super) enum EventQueryKind {
+    /// Account address — we want one event per invoke (`transaction_executed`).
+    Account,
+    /// Contract address — we want all events emitted by the contract.
+    Contract,
+}
+
+/// Fetch address-scoped events, routing between pathfinder and RPC per benchmark.
+///
+/// Routing (from `bench_events_rpc_vs_pathfinder`):
+///  - **Contracts** → pathfinder primary, RPC fallback.
+///    PF's bloom-filter index on `from_address` makes it 1-2ms TTFE vs ~1s
+///    cold RPC probe; page fetches are 36-138ms vs ~230ms on RPC.
+///  - **Accounts** → RPC primary, PF fallback.
+///    PF's bloom indexes `from_address` but not keys, so the
+///    `transaction_executed` filter doesn't narrow its scan — RPC with the
+///    key filter wins on cold windows (20-30ms vs 165-634ms) and on stale
+///    accounts (11-17ms vs 118-131ms).
+///
+/// `to_block` is an inclusive upper bound (useful for pagination into older
+/// history); `None` means "up to latest".
+pub(super) async fn fetch_events_routed(
+    kind: EventQueryKind,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     ds: &Arc<dyn DataSource>,
     address: starknet::core::types::Felt,
     from_block: Option<u64>,
+    to_block: Option<u64>,
     limit: usize,
 ) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
-    if let Some(pf_client) = pf {
-        match pf_client
-            .get_contract_events(
-                address,
-                from_block.unwrap_or(0),
-                None,
-                &[],
-                limit as u32,
-                None,
-            )
-            .await
-        {
-            Ok((events, _token)) => return Ok(events),
-            Err(e) => {
-                warn!(error = %e, "PF contract events failed, falling back to RPC");
+    // Local helpers capture the `kind`-dependent calls in one place so the
+    // primary/fallback flow below stays agnostic.
+    async fn from_pf(
+        kind: EventQueryKind,
+        pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+        address: starknet::core::types::Felt,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        limit: usize,
+    ) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
+        let res = match kind {
+            EventQueryKind::Contract => {
+                pf.get_contract_events(
+                    address,
+                    from_block.unwrap_or(0),
+                    to_block,
+                    &[],
+                    limit as u32,
+                    None,
+                )
+                .await
+            }
+            EventQueryKind::Account => {
+                pf.get_events_for_address(
+                    address,
+                    from_block.unwrap_or(0),
+                    to_block,
+                    limit as u32,
+                    None,
+                )
+                .await
+            }
+        };
+        res.map(|(events, _token)| events)
+            .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))
+    }
+
+    async fn from_ds(
+        kind: EventQueryKind,
+        ds: &Arc<dyn DataSource>,
+        address: starknet::core::types::Felt,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        limit: usize,
+    ) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
+        match kind {
+            EventQueryKind::Contract => {
+                ds.get_contract_events(address, from_block, to_block, limit)
+                    .await
+            }
+            EventQueryKind::Account => {
+                ds.get_events_for_address(address, from_block, to_block, limit)
+                    .await
             }
         }
     }
-    ds.get_contract_events(address, from_block, limit).await
-}
 
-/// Fetch account `transaction_executed` events via RPC primarily, with PF fallback.
-///
-/// Bench shows RPC wins for account events on cold windows (20-30ms vs
-/// 165-634ms) and on stale accounts (11-17ms vs 118-131ms). PF's bloom filter
-/// indexes only `from_address` (not keys), so the `transaction_executed`
-/// filter doesn't narrow its scan. PF fallback covers RPC outages.
-async fn fetch_account_events_routed(
-    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
-    ds: &Arc<dyn DataSource>,
-    address: starknet::core::types::Felt,
-    from_block: Option<u64>,
-    limit: usize,
-) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
-    match ds.get_events_for_address(address, from_block, limit).await {
-        Ok(events) => Ok(events),
-        Err(rpc_err) => {
+    match kind {
+        EventQueryKind::Contract => {
+            // PF primary, RPC fallback.
             if let Some(pf_client) = pf {
-                warn!(error = %rpc_err, "RPC account events failed, falling back to PF");
-                match pf_client
-                    .get_events_for_address(
-                        address,
-                        from_block.unwrap_or(0),
-                        None,
-                        limit as u32,
-                        None,
-                    )
-                    .await
-                {
-                    Ok((events, _token)) => Ok(events),
-                    Err(pf_err) => {
-                        warn!(error = %pf_err, "PF account events fallback also failed");
+                match from_pf(kind, pf_client, address, from_block, to_block, limit).await {
+                    Ok(events) => return Ok(events),
+                    Err(e) => {
+                        warn!(error = %e, "PF contract events failed, falling back to RPC");
+                    }
+                }
+            }
+            from_ds(kind, ds, address, from_block, to_block, limit).await
+        }
+        EventQueryKind::Account => {
+            // RPC primary, PF fallback.
+            match from_ds(kind, ds, address, from_block, to_block, limit).await {
+                Ok(events) => Ok(events),
+                Err(rpc_err) => {
+                    if let Some(pf_client) = pf {
+                        warn!(error = %rpc_err, "RPC account events failed, falling back to PF");
+                        match from_pf(kind, pf_client, address, from_block, to_block, limit).await {
+                            Ok(events) => Ok(events),
+                            Err(pf_err) => {
+                                warn!(error = %pf_err, "PF account events fallback also failed");
+                                Err(rpc_err)
+                            }
+                        }
+                    } else {
                         Err(rpc_err)
                     }
                 }
-            } else {
-                Err(rpc_err)
             }
         }
     }
@@ -221,6 +283,7 @@ async fn fetch_tx_summaries_from_hashes(
     hashes: &[starknet::core::types::Felt],
     block_map: &std::collections::HashMap<starknet::core::types::Felt, u64>,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     tx: &mpsc::UnboundedSender<Action>,
     progress_prefix: &str,
@@ -267,7 +330,7 @@ async fn fetch_tx_summaries_from_hashes(
         }
     }
 
-    helpers::backfill_timestamps(&mut summaries, ds).await;
+    helpers::backfill_timestamps(&mut summaries, ds, pf).await;
     summaries
 }
 
@@ -277,6 +340,7 @@ pub(super) async fn build_contract_calls_from_hashes(
     address: starknet::core::types::Felt,
     hashes_with_blocks: &[(starknet::core::types::Felt, u64)],
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<crate::data::types::ContractCallSummary> {
     // Pre-fetch ABI for the target contract so selector→name lookups succeed.
@@ -349,7 +413,7 @@ pub(super) async fn build_contract_calls_from_hashes(
         }
     }
 
-    helpers::backfill_call_timestamps(&mut calls_list, ds).await;
+    helpers::backfill_call_timestamps(&mut calls_list, ds, pf).await;
     crate::data::types::deduplicate_contract_calls(calls_list)
 }
 
@@ -647,6 +711,7 @@ pub(super) async fn fetch_and_send_address_info(
         let tx_b = tx.clone();
         let abi_b = Arc::clone(abi_reg);
         let ds_b = Arc::clone(ds);
+        let pf_b = pf.as_ref().map(Arc::clone);
         let mut probe_rx_b = probe_watch_rx.clone();
         const DUNE_PAGE_LIMIT: u32 = 100;
         const INITIAL_WINDOW: u64 = 5_000;
@@ -671,7 +736,8 @@ pub(super) async fn fetch_and_send_address_info(
                         info!(calls = count, "Dune windowed contract calls complete");
 
                         let dune_calls =
-                            enrich_dune_calls(address, calls, &abi_b, &ds_b, &tx_b).await;
+                            enrich_dune_calls(address, calls, &abi_b, &ds_b, pf_b.as_ref(), &tx_b)
+                                .await;
 
                         if !dune_calls.is_empty() {
                             let min_b = dune_calls.last().map(|c| c.block_number).unwrap_or(0);
@@ -742,9 +808,15 @@ pub(super) async fn fetch_and_send_address_info(
                                         let _ = tx_b.send(dune_source_update(
                                             crate::app::state::SourceStatus::Live,
                                         ));
-                                        let dune_calls =
-                                            enrich_dune_calls(address, calls, &abi_b, &ds_b, &tx_b)
-                                                .await;
+                                        let dune_calls = enrich_dune_calls(
+                                            address,
+                                            calls,
+                                            &abi_b,
+                                            &ds_b,
+                                            pf_b.as_ref(),
+                                            &tx_b,
+                                        )
+                                        .await;
                                         if !dune_calls.is_empty() {
                                             let min_b = dune_calls
                                                 .last()
@@ -982,25 +1054,21 @@ pub(super) async fn fetch_and_send_address_info(
             )));
             let phase1_limit = if is_contract { 500 } else { 100 };
 
-            let events_result = if is_contract {
-                fetch_contract_events_routed(
-                    pf_c.as_ref(),
-                    &ds_c,
-                    address,
-                    Some(from_block),
-                    phase1_limit,
-                )
-                .await
+            let kind = if is_contract {
+                EventQueryKind::Contract
             } else {
-                fetch_account_events_routed(
-                    pf_c.as_ref(),
-                    &ds_c,
-                    address,
-                    Some(from_block),
-                    phase1_limit,
-                )
-                .await
+                EventQueryKind::Account
             };
+            let events_result = fetch_events_routed(
+                kind,
+                pf_c.as_ref(),
+                &ds_c,
+                address,
+                Some(from_block),
+                None,
+                phase1_limit,
+            )
+            .await;
             let events = match events_result {
                 Ok(evts) => evts,
                 Err(e) => {
@@ -1079,8 +1147,14 @@ pub(super) async fn fetch_and_send_address_info(
                     .map(|h| (*h, *tx_block_map.get(h).unwrap_or(&0)))
                     .collect();
 
-                let mut contract_calls_list =
-                    build_contract_calls_from_hashes(address, &call_hashes, &ds_c, &abi_c).await;
+                let mut contract_calls_list = build_contract_calls_from_hashes(
+                    address,
+                    &call_hashes,
+                    &ds_c,
+                    pf_c.as_ref(),
+                    &abi_c,
+                )
+                .await;
                 contract_calls_list.sort_by(|a, b| b.block_number.cmp(&a.block_number));
 
                 {
@@ -1131,6 +1205,7 @@ pub(super) async fn fetch_and_send_address_info(
                         &hashes_to_fetch,
                         &tx_block_map,
                         &ds_c,
+                        pf_c.as_ref(),
                         &abi_c,
                         &tx_c,
                         "RPC: fetching txs",
@@ -1188,25 +1263,22 @@ pub(super) async fn fetch_and_send_address_info(
                             search_from, search_to
                         )));
 
-                        let deeper_events = if is_contract {
-                            fetch_contract_events_routed(
-                                pf_c.as_ref(),
-                                &ds_c,
-                                address,
-                                Some(search_from),
-                                500,
-                            )
-                            .await
+                        let kind = if is_contract {
+                            EventQueryKind::Contract
                         } else {
-                            fetch_account_events_routed(
-                                pf_c.as_ref(),
-                                &ds_c,
-                                address,
-                                Some(search_from),
-                                500,
-                            )
-                            .await
+                            EventQueryKind::Account
                         };
+                        // `search_to` is inclusive to match the probe range.
+                        let deeper_events = fetch_events_routed(
+                            kind,
+                            pf_c.as_ref(),
+                            &ds_c,
+                            address,
+                            Some(search_from),
+                            Some(search_to),
+                            500,
+                        )
+                        .await;
 
                         if let Ok(deeper_events) = deeper_events {
                             if !deeper_events.is_empty() {
@@ -1261,6 +1333,7 @@ pub(super) async fn fetch_and_send_address_info(
                                         address,
                                         &call_hashes,
                                         &ds_c,
+                                        pf_c.as_ref(),
                                         &abi_c,
                                     )
                                     .await;
@@ -1299,6 +1372,7 @@ pub(super) async fn fetch_and_send_address_info(
                                             &to_fetch,
                                             &deep_block_map,
                                             &ds_c,
+                                            pf_c.as_ref(),
                                             &abi_c,
                                             &tx_c,
                                             "RPC: fetching probe-guided txs",
@@ -1349,10 +1423,22 @@ pub(super) async fn fetch_and_send_address_info(
 
 /// Enrich a set of address tx summaries that are missing endpoint/timestamp data.
 /// Called lazily after the initial view load for visible transactions.
+///
+/// Prefers pf-query (`/txs-by-hash`) when available: one round trip to the
+/// local Pathfinder DB returns calldata + fee + status + timestamp for every
+/// requested hash. This removes enrichment traffic from the shared RPC pool,
+/// which was saturating on large accounts and making user-initiated
+/// `FetchTransaction` clicks block behind enrichment.
+///
+/// Falls back to RPC (per-hash `get_transaction` + `get_receipt`) for any
+/// hashes pf doesn't return, guarded by `ENRICH_RPC_SEMAPHORE` so that even
+/// RPC-only users never have more than a handful of concurrent enrichment
+/// requests competing with a click.
 pub(super) async fn enrich_address_txs(
     address: starknet::core::types::Felt,
     hashes: Vec<starknet::core::types::Felt>,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -1364,53 +1450,100 @@ pub(super) async fn enrich_address_txs(
         "Enriching address txs (endpoints/timestamps)"
     );
 
-    // Fetch tx + receipt in parallel
-    let futs: Vec<_> = hashes
-        .iter()
-        .map(|hash| {
-            let ds_t = Arc::clone(ds);
-            let ds_r = Arc::clone(ds);
-            let h = *hash;
-            async move {
-                let (tx_r, rx_r) = tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h));
-                (h, tx_r, rx_r)
-            }
-        })
-        .collect();
-    let results = futures::future::join_all(futs).await;
+    let mut updates: Vec<crate::data::types::AddressTxSummary> = Vec::new();
+    let mut missing: Vec<starknet::core::types::Felt> = hashes.clone();
 
-    // Pre-fetch ABIs for all contract addresses referenced in multicall calldata.
-    // This populates the selector→name cache so that format_endpoint_names can
-    // resolve function names instead of showing raw hex selectors.
-    let mut target_addresses = std::collections::HashSet::new();
-    for (_hash, tx_result, _rx_result) in &results {
-        if let Ok(SnTransaction::Invoke(invoke)) = tx_result {
-            for call in parse_multicall(&invoke.calldata) {
-                target_addresses.insert(call.contract_address);
+    // --- Fast path: pf-query ------------------------------------------------
+    if let Some(pf) = pf {
+        match pf.get_txs_by_hash(&hashes).await {
+            Ok(pf_rows) => {
+                debug!(
+                    requested = hashes.len(),
+                    returned = pf_rows.len(),
+                    "enrich_address_txs: pf-query returned"
+                );
+
+                // Pre-warm the ABI registry for every target contract seen in
+                // the multicall calldata so `build_tx_summary_from_pf_data`
+                // can resolve selector names.
+                let mut target_addresses: std::collections::HashSet<starknet::core::types::Felt> =
+                    std::collections::HashSet::new();
+                for row in &pf_rows {
+                    for addr in helpers::pf_tx_target_addresses(row) {
+                        target_addresses.insert(addr);
+                    }
+                }
+                for addr in target_addresses {
+                    let _ = abi_reg.get_abi_for_address(&addr).await;
+                }
+
+                let mut returned_hashes: std::collections::HashSet<starknet::core::types::Felt> =
+                    std::collections::HashSet::new();
+                for row in &pf_rows {
+                    if let Some(summary) = helpers::build_tx_summary_from_pf_data(row, abi_reg) {
+                        returned_hashes.insert(summary.hash);
+                        updates.push(summary);
+                    }
+                }
+
+                missing.retain(|h| !returned_hashes.contains(h));
+            }
+            Err(e) => {
+                warn!(error = %e, "enrich_address_txs: pf-query failed, falling back to RPC for all hashes");
             }
         }
     }
-    for addr in target_addresses {
-        let _ = abi_reg.get_abi_for_address(&addr).await;
-    }
 
-    let mut updates = Vec::new();
-    for (hash, tx_result, rx_result) in results {
-        if let Ok(fetched_tx) = tx_result {
-            let receipt = rx_result.ok();
-            let block_num = receipt.as_ref().map(|r| r.block_number).unwrap_or(0);
-            updates.push(helpers::build_tx_summary(
-                hash,
-                &fetched_tx,
-                receipt.as_ref(),
-                block_num,
-                0,
-                abi_reg,
-            ));
+    // --- Fallback path: RPC (bounded concurrency) --------------------------
+    if !missing.is_empty() {
+        let futs: Vec<_> = missing
+            .iter()
+            .map(|hash| {
+                let ds_t = Arc::clone(ds);
+                let ds_r = Arc::clone(ds);
+                let h = *hash;
+                async move {
+                    // One permit per tx — keeps enrichment from saturating the
+                    // HTTP pool while a user click is in flight.
+                    let _permit = ENRICH_RPC_SEMAPHORE.acquire().await.ok();
+                    let (tx_r, rx_r) = tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h));
+                    (h, tx_r, rx_r)
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(futs).await;
+
+        // Pre-fetch ABIs for every contract address referenced in multicall
+        // calldata (same warmup path as the pf branch).
+        let mut target_addresses = std::collections::HashSet::new();
+        for (_hash, tx_result, _rx_result) in &results {
+            if let Ok(SnTransaction::Invoke(invoke)) = tx_result {
+                for call in parse_multicall(&invoke.calldata) {
+                    target_addresses.insert(call.contract_address);
+                }
+            }
+        }
+        for addr in target_addresses {
+            let _ = abi_reg.get_abi_for_address(&addr).await;
+        }
+
+        for (hash, tx_result, rx_result) in results {
+            if let Ok(fetched_tx) = tx_result {
+                let receipt = rx_result.ok();
+                let block_num = receipt.as_ref().map(|r| r.block_number).unwrap_or(0);
+                updates.push(helpers::build_tx_summary(
+                    hash,
+                    &fetched_tx,
+                    receipt.as_ref(),
+                    block_num,
+                    0,
+                    abi_reg,
+                ));
+            }
         }
     }
 
-    helpers::backfill_timestamps(&mut updates, ds).await;
+    helpers::backfill_timestamps(&mut updates, ds, pf).await;
 
     if !updates.is_empty() {
         let _ =
@@ -1430,6 +1563,7 @@ pub(super) async fn run_endpoint_enrichment(
     known_txs: Vec<crate::data::types::AddressTxSummary>,
     ds: &Arc<dyn DataSource>,
     dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -1440,7 +1574,7 @@ pub(super) async fn run_endpoint_enrichment(
             current_nonce,
             "Endpoint enrich: skipping nonce gaps (empty txs or nonce=0), running endpoint enrichment only"
         );
-        enrich_all_empty_endpoints(address, &known_txs, ds, abi_reg, action_tx).await;
+        enrich_all_empty_endpoints(address, &known_txs, ds, pf.as_ref(), abi_reg, action_tx).await;
         return;
     }
 
@@ -1497,7 +1631,7 @@ pub(super) async fn run_endpoint_enrichment(
             all_txs.push(gt.clone());
         }
     }
-    enrich_all_empty_endpoints(address, &all_txs, ds, abi_reg, action_tx).await;
+    enrich_all_empty_endpoints(address, &all_txs, ds, pf.as_ref(), abi_reg, action_tx).await;
 
     debug!(
         address = %format!("{:#x}", address),
@@ -1516,6 +1650,7 @@ pub(super) async fn run_nonce_gap_fill(
     gap: crate::app::views::address_info::UnfilledGap,
     ds: &Arc<dyn DataSource>,
     dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -1555,7 +1690,7 @@ pub(super) async fn run_nonce_gap_fill(
                 combined.push(t.clone());
             }
         }
-        enrich_all_empty_endpoints(address, &combined, ds, abi_reg, action_tx).await;
+        enrich_all_empty_endpoints(address, &combined, ds, pf.as_ref(), abi_reg, action_tx).await;
     } else {
         info!("Gap fill: no txs returned from Dune for this range");
         let _ = action_tx.send(Action::LoadingStatus(String::new()));
@@ -1607,9 +1742,11 @@ async fn fill_small_nonce_gaps_phase(
         known_nonces.len()
     );
 
-    // Categorize gaps by block span size
+    // Only small-span gaps are handled here; wider gaps are picked up by
+    // `detect_unfilled_gap` and filled on-demand via `run_nonce_gap_fill`.
+    // Both paths share `SMALL_GAP_SPAN_BLOCKS` so they stay aligned.
+    use crate::app::views::address_info::SMALL_GAP_SPAN_BLOCKS;
     let mut small_gaps: Vec<(u64, u64, u64)> = Vec::new(); // (nonce, from_block, to_block)
-    let mut large_gap_ranges: Vec<(u64, u64)> = Vec::new(); // (from_block, to_block) for Dune
 
     for nonce in min_known..check_up_to {
         if known_nonces.contains_key(&nonce) {
@@ -1643,19 +1780,16 @@ async fn fill_small_nonce_gaps_phase(
             block_before + 10
         };
 
-        if scan_to.saturating_sub(scan_from) <= 50 {
+        if scan_to.saturating_sub(scan_from) <= SMALL_GAP_SPAN_BLOCKS {
             small_gaps.push((nonce, scan_from, scan_to));
-        } else {
-            large_gap_ranges.push((scan_from, scan_to));
         }
+        // else: caught by detect_unfilled_gap → run_nonce_gap_fill.
     }
 
     let small_count = small_gaps.len();
-    let large_count = large_gap_ranges.len();
-    let total_gaps = small_count + large_count;
-    if total_gaps == 0 {
+    if small_count == 0 {
         info!(
-            "Sanity gap check: no nonce gaps found in range {}..{}",
+            "Sanity gap check: no small nonce gaps in range {}..{}",
             min_known, check_up_to
         );
         return Vec::new();
@@ -1664,20 +1798,15 @@ async fn fill_small_nonce_gaps_phase(
     let small_nonces: Vec<u64> = small_gaps.iter().map(|(n, _, _)| *n).take(10).collect();
     info!(
         small = small_count,
-        large = large_count,
-        total = total_gaps,
         first_small_nonces = ?small_nonces,
-        large_ranges = ?large_gap_ranges.iter().take(5).collect::<Vec<_>>(),
-        "Sanity check: detected {} nonce gaps ({} small, {} large — large deferred to on-demand fill)",
-        total_gaps, small_count, large_count
+        "Sanity check: filling {} small nonce gaps (wider gaps deferred to on-demand fill)",
+        small_count
     );
 
-    if small_count > 0 {
-        let _ = action_tx.send(Action::LoadingStatus(format!(
-            "Filling {} small nonce gaps...",
-            small_count
-        )));
-    }
+    let _ = action_tx.send(Action::LoadingStatus(format!(
+        "Filling {} small nonce gaps...",
+        small_count
+    )));
 
     let mut found_txs = Vec::new();
 
@@ -1790,6 +1919,7 @@ async fn enrich_all_empty_endpoints(
     address: starknet::core::types::Felt,
     all_txs: &[crate::data::types::AddressTxSummary],
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -1825,7 +1955,7 @@ async fn enrich_all_empty_endpoints(
             i + 1,
             (missing.len() + 19) / 20
         );
-        enrich_address_txs(address, chunk.to_vec(), ds, abi_reg, action_tx).await;
+        enrich_address_txs(address, chunk.to_vec(), ds, pf, abi_reg, action_tx).await;
     }
 }
 
@@ -1971,41 +2101,42 @@ pub(super) async fn fetch_more_address_txs(
     let rpc_ds = Arc::clone(ds);
     let pf_c = pf.as_ref().map(Arc::clone);
     let rpc_addr = address;
-    let rpc_before = before_block;
     let rpc_is_contract = is_contract;
-    // Cap RPC window at 10k blocks — RPC is slow for large ranges.
-    let rpc_window = window_size.min(10_000);
-    let rpc_from = before_block.saturating_sub(rpc_window);
+    // Window size per source:
+    //  - Contracts use pathfinder (bloom-indexed), which can scan the full
+    //    `window_size` cheaply.
+    //  - Accounts use RPC which is slow on wide ranges, so clamp to 10k.
+    let (events_from, events_to) = if rpc_is_contract {
+        (
+            before_block.saturating_sub(window_size),
+            before_block.saturating_sub(1),
+        )
+    } else {
+        (
+            before_block.saturating_sub(window_size.min(10_000)),
+            before_block.saturating_sub(1),
+        )
+    };
 
     let rpc_fut = async move {
-        let events = if rpc_is_contract {
-            // Pathfinder can scan the full window range efficiently via bloom
-            // filters; use window_size directly rather than clamping to 10k.
-            let pf_from = before_block.saturating_sub(window_size);
-            fetch_contract_events_routed(
-                pf_c.as_ref(),
-                &rpc_ds,
-                rpc_addr,
-                Some(pf_from),
-                500,
-            )
-            .await
-            .unwrap_or_default()
+        let kind = if rpc_is_contract {
+            EventQueryKind::Contract
         } else {
-            fetch_account_events_routed(
-                pf_c.as_ref(),
-                &rpc_ds,
-                rpc_addr,
-                Some(rpc_from),
-                500,
-            )
-            .await
-            .unwrap_or_default()
+            EventQueryKind::Account
         };
-        events
-            .into_iter()
-            .filter(|e| e.block_number < rpc_before)
-            .collect::<Vec<_>>()
+        // `to_block = before_block - 1` keeps the scan below the already-known
+        // range, so we don't refetch newer events only to filter them out.
+        fetch_events_routed(
+            kind,
+            pf_c.as_ref(),
+            &rpc_ds,
+            rpc_addr,
+            Some(events_from),
+            Some(events_to),
+            500,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     let dune_c = dune.as_ref().map(Arc::clone);
@@ -2068,7 +2199,8 @@ pub(super) async fn fetch_more_address_txs(
             .iter()
             .map(|h| (*h, *tx_block_map.get(h).unwrap_or(&0)))
             .collect();
-        rpc_calls = build_contract_calls_from_hashes(address, &call_hashes, ds, abi_reg).await;
+        rpc_calls =
+            build_contract_calls_from_hashes(address, &call_hashes, ds, pf.as_ref(), abi_reg).await;
     } else if !unique_hashes.is_empty() {
         // Build tx summaries for accounts
         for chunk in unique_hashes.chunks(20) {
@@ -2105,7 +2237,7 @@ pub(super) async fn fetch_more_address_txs(
                 }
             }
         }
-        helpers::backfill_timestamps(&mut summaries, ds).await;
+        helpers::backfill_timestamps(&mut summaries, ds, pf.as_ref()).await;
     }
 
     // Merge Dune account txs into summaries (dedup by hash)
@@ -2122,7 +2254,7 @@ pub(super) async fn fetch_more_address_txs(
 
     // Enrich + deduplicate Dune contract calls (same as initial fetch)
     let dune_calls = if !dune_calls.is_empty() {
-        enrich_dune_calls(address, dune_calls, abi_reg, ds, tx).await
+        enrich_dune_calls(address, dune_calls, abi_reg, ds, pf.as_ref(), tx).await
     } else {
         Vec::new()
     };
@@ -2189,6 +2321,7 @@ pub(super) async fn enrich_dune_calls(
     mut dune_calls: Vec<crate::data::types::ContractCallSummary>,
     abi_reg: &Arc<AbiRegistry>,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::ContractCallSummary> {
     // Resolve selectors
@@ -2255,7 +2388,7 @@ pub(super) async fn enrich_dune_calls(
         }
     }
 
-    helpers::backfill_call_timestamps(&mut dune_calls, ds).await;
+    helpers::backfill_call_timestamps(&mut dune_calls, ds, pf).await;
 
     dune_calls.sort_by(|a, b| b.block_number.cmp(&a.block_number));
     dune_calls

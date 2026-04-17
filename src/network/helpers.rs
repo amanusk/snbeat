@@ -6,8 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use starknet::core::types::Felt;
+use tracing::{debug, warn};
 
 use crate::data::DataSource;
+use crate::data::pathfinder::{PathfinderClient, TxByHashData};
 use crate::data::types::{
     AddressTxSummary, ContractCallSummary, ExecutionStatus, SnReceipt, SnTransaction,
 };
@@ -110,11 +112,91 @@ pub fn build_tx_summary(
     }
 }
 
+/// Normalize a pf-query tx_type (e.g. "INVOKE_V3") to snbeat's canonical
+/// form (e.g. "INVOKE"). pf returns a versioned string; `SnTransaction::type_name()`
+/// strips the version. Leaves `L1_HANDLER` as-is.
+pub fn normalize_pf_tx_type(pf_type: &str) -> String {
+    // Strip trailing `_V<n>` if present.
+    if let Some(idx) = pf_type.rfind("_V")
+        && pf_type[idx + 2..].chars().all(|c| c.is_ascii_digit())
+        && !pf_type[idx + 2..].is_empty()
+    {
+        return pf_type[..idx].to_string();
+    }
+    pf_type.to_string()
+}
+
+/// Build an `AddressTxSummary` directly from pf-query `TxByHashData`, without
+/// going through an `SnTransaction`. Parses calldata and resolves selectors
+/// via the ABI registry the same way `build_tx_summary` does for RPC-sourced
+/// transactions.
+///
+/// Returns `None` if the response is malformed (bad hex). Callers should
+/// fall through to the RPC path in that case.
+pub fn build_tx_summary_from_pf_data(
+    pf_tx: &TxByHashData,
+    abi_reg: &AbiRegistry,
+) -> Option<AddressTxSummary> {
+    let hash = Felt::from_hex(&pf_tx.hash).ok()?;
+    let sender = Felt::from_hex(&pf_tx.sender).ok()?;
+    let fee_fri = u128::from_str_radix(pf_tx.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
+    let tx_type = normalize_pf_tx_type(&pf_tx.tx_type);
+
+    // Only INVOKE transactions have multicall calldata to decode.
+    let endpoint_names = if tx_type == "INVOKE" {
+        let calldata: Vec<Felt> = pf_tx
+            .calldata
+            .iter()
+            .filter_map(|h| Felt::from_hex(h).ok())
+            .collect();
+        let calls = parse_multicall(&calldata);
+        format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
+    } else {
+        String::new()
+    };
+
+    Some(AddressTxSummary {
+        hash,
+        nonce: pf_tx.nonce.unwrap_or(0),
+        block_number: pf_tx.block_number,
+        timestamp: pf_tx.block_timestamp,
+        endpoint_names,
+        total_fee_fri: fee_fri,
+        tip: pf_tx.tip,
+        tx_type,
+        status: pf_tx.status.clone(),
+        sender: Some(sender),
+    })
+}
+
+/// Collect the set of target contract addresses referenced by a pf tx's
+/// multicall calldata. Used to pre-warm the ABI registry before building
+/// summaries in bulk.
+pub fn pf_tx_target_addresses(pf_tx: &TxByHashData) -> Vec<Felt> {
+    if normalize_pf_tx_type(&pf_tx.tx_type) != "INVOKE" {
+        return Vec::new();
+    }
+    let calldata: Vec<Felt> = pf_tx
+        .calldata
+        .iter()
+        .filter_map(|h| Felt::from_hex(h).ok())
+        .collect();
+    parse_multicall(&calldata)
+        .into_iter()
+        .map(|c| c.contract_address)
+        .collect()
+}
+
 /// Backfill timestamps on address tx summaries by fetching block data.
 ///
 /// Collects all unique block numbers where `timestamp == 0`, fetches them
-/// in parallel, and applies the timestamps.
-pub async fn backfill_timestamps(summaries: &mut [AddressTxSummary], ds: &Arc<dyn DataSource>) {
+/// via pf-query (range query, one round trip) when available, RPC per-block
+/// for anything pf doesn't return.
+pub async fn backfill_timestamps(
+    summaries: &mut [AddressTxSummary],
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
+) {
     let blocks_needing_ts: HashSet<u64> = summaries
         .iter()
         .filter(|s| s.timestamp == 0 && s.block_number > 0)
@@ -123,7 +205,7 @@ pub async fn backfill_timestamps(summaries: &mut [AddressTxSummary], ds: &Arc<dy
     if blocks_needing_ts.is_empty() {
         return;
     }
-    let ts_map = fetch_block_timestamps(blocks_needing_ts, ds).await;
+    let ts_map = fetch_block_timestamps(blocks_needing_ts, ds, pf).await;
     for s in summaries.iter_mut() {
         if s.timestamp == 0 {
             if let Some(&ts) = ts_map.get(&s.block_number) {
@@ -134,7 +216,11 @@ pub async fn backfill_timestamps(summaries: &mut [AddressTxSummary], ds: &Arc<dy
 }
 
 /// Backfill timestamps on contract call summaries by fetching block data.
-pub async fn backfill_call_timestamps(calls: &mut [ContractCallSummary], ds: &Arc<dyn DataSource>) {
+pub async fn backfill_call_timestamps(
+    calls: &mut [ContractCallSummary],
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
+) {
     let blocks_needing_ts: HashSet<u64> = calls
         .iter()
         .filter(|c| c.timestamp == 0 && c.block_number > 0)
@@ -143,7 +229,7 @@ pub async fn backfill_call_timestamps(calls: &mut [ContractCallSummary], ds: &Ar
     if blocks_needing_ts.is_empty() {
         return;
     }
-    let ts_map = fetch_block_timestamps(blocks_needing_ts, ds).await;
+    let ts_map = fetch_block_timestamps(blocks_needing_ts, ds, pf).await;
     for c in calls.iter_mut() {
         if c.timestamp == 0 {
             if let Some(&ts) = ts_map.get(&c.block_number) {
@@ -153,13 +239,51 @@ pub async fn backfill_call_timestamps(calls: &mut [ContractCallSummary], ds: &Ar
     }
 }
 
-/// Fetch timestamps for a set of block numbers in parallel.
+/// Fetch timestamps for a set of block numbers. Prefers pf-query (single
+/// range query over the min..=max span) when available; falls back to
+/// per-block RPC for any gaps.
 async fn fetch_block_timestamps(
     block_numbers: HashSet<u64>,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
 ) -> HashMap<u64, u64> {
     use futures::stream::{self, StreamExt};
-    stream::iter(block_numbers)
+
+    let mut ts_map: HashMap<u64, u64> = HashMap::new();
+
+    if let Some(pf) = pf {
+        let min = *block_numbers.iter().min().unwrap();
+        let max = *block_numbers.iter().max().unwrap();
+        match pf.get_block_timestamps(min, max).await {
+            Ok(entries) => {
+                debug!(
+                    requested = block_numbers.len(),
+                    returned = entries.len(),
+                    range = format!("{min}..={max}"),
+                    "Fetched block timestamps from pf-query"
+                );
+                for e in entries {
+                    if block_numbers.contains(&e.block_number) {
+                        ts_map.insert(e.block_number, e.timestamp);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "pf-query block-timestamps failed, falling back to RPC");
+            }
+        }
+    }
+
+    let missing: Vec<u64> = block_numbers
+        .iter()
+        .copied()
+        .filter(|bn| !ts_map.contains_key(bn))
+        .collect();
+    if missing.is_empty() {
+        return ts_map;
+    }
+
+    let rpc_map: HashMap<u64, u64> = stream::iter(missing)
         .map(|bn| {
             let ds_blk = Arc::clone(ds);
             async move { (bn, ds_blk.get_block(bn).await) }
@@ -167,5 +291,7 @@ async fn fetch_block_timestamps(
         .buffer_unordered(10)
         .filter_map(|(bn, r)| async move { r.ok().map(|b| (bn, b.timestamp)) })
         .collect()
-        .await
+        .await;
+    ts_map.extend(rpc_map);
+    ts_map
 }

@@ -602,8 +602,19 @@ impl DataSource for CachingDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
+        // Bounded (paginating into history) — bypass cache merge and pass through.
+        // The cache only accelerates the "newest events" path; old-window fetches
+        // shouldn't poison the cache with partial windows.
+        if to_block.is_some() {
+            return self
+                .upstream
+                .get_events_for_address(address, from_block, to_block, limit)
+                .await;
+        }
+
         // Load cached events
         let cached = self.load_address_events(&address);
 
@@ -619,7 +630,7 @@ impl DataSource for CachingDataSource {
         // Fetch from upstream
         let new_events = self
             .upstream
-            .get_events_for_address(address, fetch_from, limit)
+            .get_events_for_address(address, fetch_from, None, limit)
             .await
             .unwrap_or_default();
 
@@ -817,8 +828,17 @@ impl DataSource for CachingDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
+        // Bounded pagination: skip cache merge (see `get_events_for_address`).
+        if to_block.is_some() {
+            return self
+                .upstream
+                .get_contract_events(address, from_block, to_block, limit)
+                .await;
+        }
+
         // Incremental caching for contract events (all events, no key filter)
         let cached = self.load_contract_events(&address);
 
@@ -831,7 +851,7 @@ impl DataSource for CachingDataSource {
 
         let new_events = match self
             .upstream
-            .get_contract_events(address, fetch_from, limit)
+            .get_contract_events(address, fetch_from, None, limit)
             .await
         {
             Ok(events) => events,

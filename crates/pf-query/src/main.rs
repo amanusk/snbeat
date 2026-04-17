@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
@@ -130,6 +130,32 @@ struct DecodedTx {
     revert_reason: Option<String>,
 }
 
+/// Per-tx response for `/txs-by-hash` — includes calldata so the client can
+/// decode multicalls/endpoint names without a separate RPC round trip.
+#[derive(Serialize)]
+struct TxByHashEntry {
+    hash: String,
+    block_number: u64,
+    block_timestamp: u64,
+    tx_index: u64,
+    sender: String,
+    nonce: Option<u64>,
+    tx_type: String,
+    /// Calldata as `0x`-prefixed hex felts, matching RPC `InvokeTransaction.calldata`.
+    calldata: Vec<String>,
+    actual_fee: String,
+    tip: u64,
+    status: String,
+    revert_reason: Option<String>,
+}
+
+/// Entry for `/block-timestamps`.
+#[derive(Serialize)]
+struct BlockTimestampEntry {
+    block_number: u64,
+    timestamp: u64,
+}
+
 /// Full transaction summary combining nonce_updates + blob decode.
 #[derive(Serialize)]
 struct SenderTxEntry {
@@ -180,6 +206,27 @@ struct NonceHistoryParams {
 struct SenderTxParams {
     limit: Option<u32>,
 }
+
+#[derive(Deserialize)]
+struct TxsByHashRequest {
+    hashes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockTimestampsParams {
+    from: u64,
+    to: u64,
+}
+
+/// Server-side cap on how many hashes a single /txs-by-hash POST may include.
+/// Generous enough that one enrichment run of ~1000 missing endpoints is a
+/// single request, while bounding memory and decode CPU per request.
+const TXS_BY_HASH_MAX: usize = 10_000;
+
+/// Server-side cap on how many blocks a single /block-timestamps request may
+/// span. 50_000 ≈ ~3 days at 5s block time; the underlying SQL is a single
+/// indexed range scan so this is cheap.
+const BLOCK_TIMESTAMPS_MAX_SPAN: u64 = 50_000;
 
 #[derive(Deserialize)]
 struct ContractEventsParams {
@@ -446,6 +493,197 @@ async fn handler_block_txs(
     Ok(Json(results))
 }
 
+/// POST /txs-by-hash — bulk lookup of tx + receipt data by hash.
+///
+/// Groups input hashes by block_number (single SELECT on `transaction_hashes`),
+/// decompresses each block's `transactions` blob at most once, and returns
+/// calldata + sender + nonce + fee + status + timestamp per tx. This offloads
+/// the address-view enrichment path from Starknet RPC.
+///
+/// Missing hashes are silently omitted from the response. Caller should
+/// diff requested vs returned hashes to decide fallback behavior.
+async fn handler_txs_by_hash(
+    State(state): State<AppState>,
+    Json(req): Json<TxsByHashRequest>,
+) -> ApiResult<Vec<TxByHashEntry>> {
+    if req.hashes.is_empty() {
+        return Ok(Json(vec![]));
+    }
+    if req.hashes.len() > TXS_BY_HASH_MAX {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Too many hashes: {} (max {})",
+                req.hashes.len(),
+                TXS_BY_HASH_MAX
+            ),
+        ));
+    }
+
+    // Parse all hashes up front; reject the whole request on a bad one.
+    let mut wanted: Vec<(Vec<u8>, String)> = Vec::with_capacity(req.hashes.len());
+    for h in &req.hashes {
+        let bytes = parse_address(h)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid hash {h}: {e}")))?;
+        wanted.push((bytes, h.clone()));
+    }
+
+    let conn = open_db(&state.db_path).map_err(db_err)?;
+
+    // Step 1: map each hash → (block_number, idx). One SELECT per hash (fast,
+    // indexed lookup). The transaction_hashes table is keyed on hash so these
+    // are O(log N) B-tree lookups — no wildcard scan.
+    let mut lookup_stmt = conn
+        .prepare("SELECT block_number, idx FROM transaction_hashes WHERE hash = ?1")
+        .map_err(db_err)?;
+
+    // (block_number, tx_idx_in_block, original_hash_hex)
+    let mut locations: Vec<(u64, u64, String)> = Vec::with_capacity(wanted.len());
+    for (hash_bytes, hash_hex) in &wanted {
+        match lookup_stmt.query_row(rusqlite::params![hash_bytes.as_slice()], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+        }) {
+            Ok((block_number, idx)) => locations.push((block_number, idx, hash_hex.clone())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+
+    if locations.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    // Step 2: fetch block timestamps and decode each distinct block blob once.
+    // We decode lazily so blocks with no requested txs are skipped (they won't
+    // appear in `locations`).
+    let mut tx_blob_stmt = conn
+        .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
+        .map_err(db_err)?;
+    let mut timestamp_stmt = conn
+        .prepare("SELECT timestamp FROM block_headers WHERE number = ?1")
+        .map_err(db_err)?;
+
+    let mut decoded_cache: std::collections::HashMap<u64, Vec<dto::TransactionWithReceiptV4>> =
+        std::collections::HashMap::new();
+    let mut timestamp_cache: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
+    let mut results: Vec<TxByHashEntry> = Vec::with_capacity(locations.len());
+    for (block_number, tx_idx, hash_hex) in &locations {
+        // Decode the block blob on first touch.
+        if !decoded_cache.contains_key(block_number) {
+            let blob: Vec<u8> =
+                match tx_blob_stmt.query_row(rusqlite::params![block_number], |row| row.get(0)) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+            let decoded = match decode::decode_transactions(&blob) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(block = block_number, error = %e, "Failed to decode tx blob");
+                    continue;
+                }
+            };
+            decoded_cache.insert(*block_number, decoded);
+        }
+        if !timestamp_cache.contains_key(block_number) {
+            let ts: u64 =
+                match timestamp_stmt.query_row(rusqlite::params![block_number], |row| row.get(0)) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+            timestamp_cache.insert(*block_number, ts);
+        }
+
+        let txs = &decoded_cache[block_number];
+        let timestamp = timestamp_cache[block_number];
+
+        let tr = match txs.get(*tx_idx as usize) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let (status, revert_reason) = match &tr.receipt.execution_status {
+            dto::ExecutionStatus::Succeeded => ("OK".to_string(), None),
+            dto::ExecutionStatus::Reverted { reason } => ("REV".to_string(), Some(reason.clone())),
+        };
+
+        let calldata: Vec<String> = tr
+            .transaction
+            .calldata()
+            .iter()
+            .map(|f| f.to_hex())
+            .collect();
+
+        results.push(TxByHashEntry {
+            hash: hash_hex.clone(),
+            block_number: *block_number,
+            block_timestamp: timestamp,
+            tx_index: *tx_idx,
+            sender: tr
+                .transaction
+                .variant
+                .sender_address()
+                .map(|a| a.to_hex())
+                .unwrap_or_default(),
+            nonce: tr.transaction.nonce(),
+            tx_type: tr.transaction.tx_type().to_string(),
+            calldata,
+            actual_fee: tr.receipt.actual_fee.to_hex(),
+            tip: tr.transaction.tip(),
+            status,
+            revert_reason,
+        });
+    }
+
+    Ok(Json(results))
+}
+
+/// GET /block-timestamps?from=N&to=M — bulk fetch block timestamps in range.
+///
+/// Single indexed range scan on `block_headers.number`. Replaces the per-block
+/// RPC round trip in snbeat's `backfill_timestamps`.
+async fn handler_block_timestamps(
+    Query(params): Query<BlockTimestampsParams>,
+    State(state): State<AppState>,
+) -> ApiResult<Vec<BlockTimestampEntry>> {
+    if params.to < params.from {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("to ({}) must be >= from ({})", params.to, params.from),
+        ));
+    }
+    let span = params.to - params.from + 1;
+    if span > BLOCK_TIMESTAMPS_MAX_SPAN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Range too large: {} blocks (max {})",
+                span, BLOCK_TIMESTAMPS_MAX_SPAN
+            ),
+        ));
+    }
+
+    let conn = open_db(&state.db_path).map_err(db_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT number, timestamp FROM block_headers \
+             WHERE number BETWEEN ?1 AND ?2 ORDER BY number",
+        )
+        .map_err(db_err)?;
+    let entries: Vec<BlockTimestampEntry> = stmt
+        .query_map(rusqlite::params![params.from, params.to], |row| {
+            Ok(BlockTimestampEntry {
+                block_number: row.get(0)?,
+                timestamp: row.get(1)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    Ok(Json(entries))
+}
+
 /// GET /sender-txs/{address} — full tx history for an account via nonce_updates + blob decode.
 ///
 /// Combines nonce_updates (to find blocks) with transaction blob decoding
@@ -589,8 +827,8 @@ fn parse_keys_filter(raw: &str) -> Result<Vec<Vec<[u8; 32]>>, String> {
                 if key_str.is_empty() {
                     continue;
                 }
-                let bytes = parse_address(key_str)
-                    .map_err(|e| format!("Invalid key in filter: {e}"))?;
+                let bytes =
+                    parse_address(key_str).map_err(|e| format!("Invalid key in filter: {e}"))?;
                 let arr: [u8; 32] = bytes
                     .as_slice()
                     .try_into()
@@ -656,9 +894,8 @@ fn process_candidate_block(
     // Fast rejection scan: bloom filters have false positives, so most
     // candidate blocks will have no match.
     let any_match = tx_events.iter().any(|evs| {
-        evs.iter().any(|e| {
-            e.from_address.0 == addr_bytes && event_keys_match(&e.keys, keys_filter)
-        })
+        evs.iter()
+            .any(|e| e.from_address.0 == addr_bytes && event_keys_match(&e.keys, keys_filter))
     });
     if !any_match {
         return;
@@ -962,7 +1199,9 @@ async fn main() -> Result<()> {
             get(handler_class_declaration),
         )
         .route("/tx-by-hash/{hash}", get(handler_tx_by_hash))
+        .route("/txs-by-hash", post(handler_txs_by_hash))
         .route("/block-txs/{block_number}", get(handler_block_txs))
+        .route("/block-timestamps", get(handler_block_timestamps))
         .route("/sender-txs/{address}", get(handler_sender_txs))
         .route("/contract-events/{address}", get(handler_contract_events))
         .with_state(state)
@@ -974,4 +1213,112 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::MinimalFelt;
+
+    fn felt(hex_last_byte: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[31] = hex_last_byte;
+        out
+    }
+
+    fn mfelt(hex_last_byte: u8) -> MinimalFelt {
+        MinimalFelt(felt(hex_last_byte))
+    }
+
+    // ----- parse_keys_filter --------------------------------------------------
+
+    #[test]
+    fn parse_keys_filter_single_group_single_key() {
+        let parsed = parse_keys_filter("0x1").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], vec![felt(1)]);
+    }
+
+    #[test]
+    fn parse_keys_filter_or_within_group() {
+        let parsed = parse_keys_filter("0x1,0x2").unwrap();
+        assert_eq!(parsed, vec![vec![felt(1), felt(2)]]);
+    }
+
+    #[test]
+    fn parse_keys_filter_positional_groups() {
+        let parsed = parse_keys_filter("0x1;;0x3").unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], vec![felt(1)]);
+        assert!(parsed[1].is_empty(), "empty group is a wildcard");
+        assert_eq!(parsed[2], vec![felt(3)]);
+    }
+
+    #[test]
+    fn parse_keys_filter_tolerates_whitespace_and_empty_tail() {
+        // Trailing comma / empty slot is tolerated rather than producing a
+        // phantom zero key — caller typos shouldn't silently match 0x0.
+        let parsed = parse_keys_filter(" 0x1 , 0x2 ;0x3, ").unwrap();
+        assert_eq!(parsed, vec![vec![felt(1), felt(2)], vec![felt(3)]]);
+    }
+
+    #[test]
+    fn parse_keys_filter_rejects_bad_hex() {
+        let err = parse_keys_filter("0xZZZ").unwrap_err();
+        assert!(err.contains("Invalid key"), "err was: {err}");
+    }
+
+    // ----- event_keys_match ---------------------------------------------------
+
+    #[test]
+    fn event_keys_match_empty_filter_matches_anything() {
+        let keys = vec![mfelt(1), mfelt(2)];
+        assert!(event_keys_match(&keys, &[]));
+    }
+
+    #[test]
+    fn event_keys_match_empty_group_is_wildcard() {
+        let keys = vec![mfelt(1), mfelt(2), mfelt(3)];
+        // [*, *, 0x3]
+        let filter = vec![vec![], vec![], vec![felt(3)]];
+        assert!(event_keys_match(&keys, &filter));
+    }
+
+    #[test]
+    fn event_keys_match_exact_positional() {
+        let keys = vec![mfelt(0xAA), mfelt(0xBB)];
+        let filter = vec![vec![felt(0xAA)], vec![felt(0xBB)]];
+        assert!(event_keys_match(&keys, &filter));
+    }
+
+    #[test]
+    fn event_keys_match_or_within_group() {
+        let keys = vec![mfelt(0xBB)];
+        let filter = vec![vec![felt(0xAA), felt(0xBB), felt(0xCC)]];
+        assert!(event_keys_match(&keys, &filter));
+    }
+
+    #[test]
+    fn event_keys_match_mismatch_rejects() {
+        let keys = vec![mfelt(0xAA), mfelt(0xBB)];
+        let filter = vec![vec![felt(0xAA)], vec![felt(0xCC)]];
+        assert!(!event_keys_match(&keys, &filter));
+    }
+
+    #[test]
+    fn event_keys_match_longer_filter_than_event_is_reject() {
+        // Filter requires a key at position 2, event only has 2 keys → no match.
+        let keys = vec![mfelt(0xAA), mfelt(0xBB)];
+        let filter = vec![vec![felt(0xAA)], vec![felt(0xBB)], vec![felt(0xCC)]];
+        assert!(!event_keys_match(&keys, &filter));
+    }
+
+    #[test]
+    fn event_keys_match_trailing_wildcard_ignored() {
+        // Wildcard (empty) groups don't look at event_keys, so a trailing
+        // wildcard beyond the event's key count is harmless.
+        let keys = vec![mfelt(0xAA)];
+        let filter = vec![vec![felt(0xAA)], vec![]];
+        assert!(event_keys_match(&keys, &filter));
+    }
 }
