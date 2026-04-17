@@ -107,16 +107,32 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
         KeyCode::PageDown => handle_cycle(app, -1),
 
-        // Tab: cycle address tabs (AddressInfo), no-op elsewhere
+        // Tab / Shift+Tab: cycle address tabs forward/backward (AddressInfo only).
         KeyCode::Tab => {
             if app.current_view() == View::AddressInfo {
                 app.address.tab = match app.address.tab {
-                    crate::app::AddressTab::Transactions => crate::app::AddressTab::Calls,
+                    crate::app::AddressTab::Transactions => crate::app::AddressTab::MetaTxs,
+                    crate::app::AddressTab::MetaTxs => crate::app::AddressTab::Calls,
                     crate::app::AddressTab::Calls => crate::app::AddressTab::Balances,
                     crate::app::AddressTab::Balances => crate::app::AddressTab::Events,
                     crate::app::AddressTab::Events => crate::app::AddressTab::ClassHistory,
                     crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Transactions,
                 };
+                return maybe_dispatch_meta_txs_on_entry(app);
+            }
+            None
+        }
+        KeyCode::BackTab => {
+            if app.current_view() == View::AddressInfo {
+                app.address.tab = match app.address.tab {
+                    crate::app::AddressTab::Transactions => crate::app::AddressTab::ClassHistory,
+                    crate::app::AddressTab::MetaTxs => crate::app::AddressTab::Transactions,
+                    crate::app::AddressTab::Calls => crate::app::AddressTab::MetaTxs,
+                    crate::app::AddressTab::Balances => crate::app::AddressTab::Calls,
+                    crate::app::AddressTab::Events => crate::app::AddressTab::Balances,
+                    crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Events,
+                };
+                return maybe_dispatch_meta_txs_on_entry(app);
             }
             None
         }
@@ -462,6 +478,35 @@ fn extract_name_from_display(display: &str) -> String {
     }
 }
 
+/// If the user just switched INTO the MetaTxs tab (via Tab/Shift+Tab), fire
+/// the initial pf-query fetch. Idempotent: `meta_txs_dispatched` guards it.
+fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
+    if app.address.tab != crate::app::AddressTab::MetaTxs
+        || app.address.meta_txs_dispatched
+        || app.address.fetching_meta_txs
+    {
+        return None;
+    }
+    let addr = app.address.context?;
+    // Bound the bloom scan to the deploy block when known; without this
+    // pf-query walks from genesis and times out on long-lived accounts.
+    let from_block = app
+        .address
+        .deployment
+        .as_ref()
+        .map(|d| d.block_number)
+        .unwrap_or(0);
+    app.address.fetching_meta_txs = true;
+    app.address.meta_txs_dispatched = true;
+    app.address.meta_tx_from_block = from_block;
+    Some(Action::FetchAddressMetaTxs {
+        address: addr,
+        from_block,
+        continuation_token: None,
+        limit: 50,
+    })
+}
+
 /// Cycle to the next/previous block or transaction depending on active view.
 fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
     match app.current_view() {
@@ -573,6 +618,10 @@ fn handle_enter(app: &mut App) -> Option<Action> {
                 }
                 crate::app::AddressTab::Events => {
                     let hash = app.address.events.selected_item()?.raw.transaction_hash;
+                    return app.navigate_to(NavTarget::Transaction(hash));
+                }
+                crate::app::AddressTab::MetaTxs => {
+                    let hash = app.address.meta_txs.selected_item()?.hash;
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }
                 crate::app::AddressTab::ClassHistory => {

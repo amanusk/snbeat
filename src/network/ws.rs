@@ -609,6 +609,31 @@ fn handle_event(result: &Value, address: Felt, response_tx: &mpsc::UnboundedSend
         address,
         calls: vec![call],
     });
+
+    // If the viewed address is an Argent/Braavos account, every invoke —
+    // including execute_from_outside* — emits TRANSACTION_EXECUTED. Classify
+    // the tx to see whether it's a meta-tx with this address as the intender,
+    // and if so stream it into the MetaTxs tab. Cheap check up front: only
+    // dispatch when the first key matches the selector.
+    if event
+        .emitted_event
+        .keys
+        .first()
+        .map(|k| *k == tx_executed_selector())
+        .unwrap_or(false)
+    {
+        let _ = response_tx.send(Action::ClassifyPotentialMetaTx { address, tx_hash });
+    }
+}
+
+/// Cached `TRANSACTION_EXECUTED` selector as `Felt` (parsed once per process).
+fn tx_executed_selector() -> Felt {
+    use std::sync::OnceLock;
+    static SELECTOR: OnceLock<Felt> = OnceLock::new();
+    *SELECTOR.get_or_init(|| {
+        Felt::from_hex(crate::data::pathfinder::TRANSACTION_EXECUTED_SELECTOR)
+            .expect("TRANSACTION_EXECUTED_SELECTOR is a valid felt")
+    })
 }
 
 fn handle_new_transaction(

@@ -131,6 +131,15 @@ impl CachingDataSource {
                 PRIMARY KEY (address, event_index)
             );
             CREATE INDEX IF NOT EXISTS idx_contract_events ON contract_events(address);
+            CREATE TABLE IF NOT EXISTS address_meta_txs (
+                address TEXT NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (address, tx_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addr_meta_txs
+                ON address_meta_txs(address, block_number DESC);
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -814,6 +823,43 @@ impl DataSource for CachingDataSource {
                     let _ = db.execute(
                         "INSERT OR REPLACE INTO address_calls (address, call_index, data) VALUES (?1, ?2, ?3)",
                         params![addr_hex, i as i64, json],
+                    );
+                }
+            }
+        }
+    }
+
+    fn load_cached_meta_txs(&self, address: &Felt) -> Vec<MetaTxIntenderSummary> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = match db.prepare(
+            "SELECT data FROM address_meta_txs WHERE address = ?1 ORDER BY block_number DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![addr_hex], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect()
+    }
+
+    fn save_meta_txs(&self, address: &Felt, txs: &[MetaTxIntenderSummary]) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            for tx in txs {
+                if let Ok(json) = serde_json::to_string(tx) {
+                    let hash_hex = format!("{:#x}", tx.hash);
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO address_meta_txs \
+                         (address, tx_hash, block_number, data) VALUES (?1, ?2, ?3, ?4)",
+                        params![addr_hex, hash_hex, tx.block_number as i64, json],
                     );
                 }
             }

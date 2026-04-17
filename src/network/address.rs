@@ -2600,6 +2600,302 @@ pub(super) async fn find_deploy_tx(
     debug!(%addr, deploy_block, "Deploy tx not found in block (neither native nor UDC)");
 }
 
+/// Fetch meta-transactions where `address` is the intender (issue #11).
+///
+/// Pipeline:
+/// 1. Pull `TRANSACTION_EXECUTED` events emitted by `address` from pf-query.
+///    Argent/Braavos accounts emit this on every invoke, including
+///    `execute_from_outside*` — so the bloom-indexed event lookup captures
+///    every tx the account executed regardless of on-chain sender.
+/// 2. Bulk-fetch tx data (sender, calldata, fee, status) via `/txs-by-hash`.
+/// 3. Keep rows where `sender != address` (= paymaster) and `tx_type == INVOKE`.
+/// 4. Parse calldata; confirm the tx really is an outside execution of
+///    `address` via one of:
+///      - AVNU forwarder wrapper (`parse_forwarder_call` → intender matches)
+///      - Direct `execute_from_outside*` call on `address` (resolved by name
+///        via ABI, or by heuristic when the account uses component-based
+///        selectors Argent v3)
+/// 5. Build a `MetaTxIntenderSummary` with decoded inner-call endpoint names.
+///
+/// Sends `Action::AddressMetaTxsLoaded` when done. On pf-query failures, sends
+/// an empty result so the UI clears its "loading" state rather than hanging.
+pub(super) async fn fetch_address_meta_txs(
+    address: starknet::core::types::Felt,
+    from_block: u64,
+    continuation_token: Option<u64>,
+    limit: u32,
+    ds: &Arc<dyn crate::data::DataSource>,
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    use std::collections::HashSet;
+
+    use starknet::core::types::Felt;
+
+    use crate::data::types::MetaTxIntenderSummary;
+
+    let send_empty = || {
+        let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+            address,
+            summaries: Vec::new(),
+            next_token: None,
+        });
+    };
+
+    // 1. Fetch TRANSACTION_EXECUTED events for `address`.
+    //    `from_block` bounds the bloom scan (set to deploy block by dispatcher).
+    let (events, next_token) = match pf
+        .get_events_for_address(address, from_block, None, limit, continuation_token)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: get_events_for_address failed");
+            send_empty();
+            return;
+        }
+    };
+
+    if events.is_empty() {
+        debug!(addr = %format!("{:#x}", address), "MetaTxs: no events returned");
+        send_empty();
+        return;
+    }
+
+    // Unique tx hashes, preserving newest-first order.
+    let mut hashes: Vec<Felt> = Vec::with_capacity(events.len());
+    let mut seen_hash: HashSet<Felt> = HashSet::new();
+    for e in &events {
+        if seen_hash.insert(e.transaction_hash) {
+            hashes.push(e.transaction_hash);
+        }
+    }
+
+    // 2. Bulk-fetch tx data.
+    let pf_rows = match pf.get_txs_by_hash(&hashes).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: get_txs_by_hash failed");
+            send_empty();
+            return;
+        }
+    };
+
+    // Pre-warm account ABI once (Argent/Braavos component selectors).
+    let _ = abi_reg.get_abi_for_address(&address).await;
+
+    // Index events by tx_hash so we can fetch the tx_index of the first event
+    // per tx (used as a deterministic tie-breaker for recency ordering).
+    let mut tx_index_by_hash: std::collections::HashMap<Felt, u64> =
+        std::collections::HashMap::new();
+    for e in &events {
+        // Use the minimum event_index as a proxy for tx position (the actual
+        // tx_index isn't in SnEvent after the into_sn_event conversion, but
+        // the events-per-tx ordering is preserved, so event_index strictly
+        // increases with tx_index).
+        tx_index_by_hash
+            .entry(e.transaction_hash)
+            .and_modify(|v| {
+                if e.event_index < *v {
+                    *v = e.event_index;
+                }
+            })
+            .or_insert(e.event_index);
+    }
+
+    // 3. Classify each tx.
+    let mut summaries: Vec<MetaTxIntenderSummary> = Vec::with_capacity(pf_rows.len());
+    for row in &pf_rows {
+        if let Some(mut s) = classify_meta_tx_candidate(address, row, abi_reg).await {
+            // Prefer event-derived tx_index for deterministic ordering when
+            // pf-query's own tx_index isn't authoritative.
+            if let Some(idx) = tx_index_by_hash.get(&s.hash).copied() {
+                s.tx_index = idx;
+            }
+            summaries.push(s);
+        }
+    }
+
+    // Recency ordering: block desc, then tx_index desc.
+    sort_meta_txs_recency(&mut summaries);
+
+    info!(
+        addr = %format!("{:#x}", address),
+        events = events.len(),
+        candidates = pf_rows.len(),
+        meta_txs = summaries.len(),
+        has_more = next_token.is_some(),
+        "MetaTxs: classified"
+    );
+
+    // Persist so the next tab entry can render instantly from cache.
+    if !summaries.is_empty() {
+        ds.save_meta_txs(&address, &summaries);
+    }
+
+    let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+        address,
+        summaries,
+        next_token,
+    });
+}
+
+/// Classify a single pf-query tx row as a meta-tx where `address` is the
+/// intender, or return `None` if it isn't one. Shared between the bulk pipeline
+/// (`fetch_address_meta_txs`) and the WS streaming path
+/// (`Action::ClassifyPotentialMetaTx`).
+///
+/// Pre-warms inner-call target ABIs so the returned `inner_endpoints` resolves
+/// to real names. `row.tx_index` is used as-is; callers can override if they
+/// have a more authoritative source.
+pub(super) async fn classify_meta_tx_candidate(
+    address: starknet::core::types::Felt,
+    row: &crate::data::pathfinder::TxByHashData,
+    abi_reg: &Arc<AbiRegistry>,
+) -> Option<crate::data::types::MetaTxIntenderSummary> {
+    use starknet::core::types::Felt;
+
+    use crate::data::types::MetaTxIntenderSummary;
+    use crate::decode::outside_execution::{
+        OutsideExecutionVersion, is_avnu_forwarder, is_outside_execution,
+        looks_like_outside_execution, parse_forwarder_call, parse_outside_execution,
+    };
+
+    let hash = Felt::from_hex(&row.hash).ok()?;
+    let sender = Felt::from_hex(&row.sender).ok()?;
+    if sender == address {
+        return None; // not a meta-tx: the account self-relayed
+    }
+    if helpers::normalize_pf_tx_type(&row.tx_type) != "INVOKE" {
+        return None;
+    }
+
+    let calldata: Vec<Felt> = row
+        .calldata
+        .iter()
+        .filter_map(|h| Felt::from_hex(h).ok())
+        .collect();
+    let calls = parse_multicall(&calldata);
+
+    // Try each top-level call to find an outside execution of `address`.
+    let mut found: Option<(
+        crate::decode::outside_execution::OutsideExecutionInfo,
+        &'static str,
+    )> = None;
+    for c in &calls {
+        if is_avnu_forwarder(&c.contract_address) {
+            if let Some(oe) = parse_forwarder_call(c) {
+                if oe.intender == address {
+                    found = Some((oe, "avnu"));
+                    break;
+                }
+            }
+            continue;
+        }
+        if c.contract_address != address {
+            continue;
+        }
+        // Try resolving the selector by name first (works for OZ-style
+        // accounts with direct execute_from_outside entrypoints).
+        let version_from_name = abi_reg
+            .get_selector_name(&c.selector)
+            .as_deref()
+            .and_then(is_outside_execution);
+        if let Some(v) = version_from_name {
+            if let Some(oe) = parse_outside_execution(c, v) {
+                let label = match v {
+                    OutsideExecutionVersion::V1 => "v1",
+                    OutsideExecutionVersion::V2 => "v2",
+                    OutsideExecutionVersion::V3 => "v3",
+                };
+                found = Some((oe, label));
+                break;
+            }
+        }
+        // Fallback heuristic for component-based selectors (Argent v3).
+        if looks_like_outside_execution(c) {
+            if let Some(oe) = parse_outside_execution(c, OutsideExecutionVersion::V2) {
+                found = Some((oe, "v?"));
+                break;
+            }
+        }
+    }
+
+    let (oe, version_label) = found?;
+
+    // Pre-warm ABIs for inner-call targets so selector→name resolution works.
+    let targets: Vec<Felt> = oe
+        .inner_calls
+        .iter()
+        .map(|ic| ic.contract_address)
+        .collect();
+    for t in &targets {
+        let _ = abi_reg.get_abi_for_address(t).await;
+    }
+    let inner_endpoints =
+        helpers::format_selector_names(oe.inner_calls.iter().map(|ic| ic.selector), abi_reg);
+
+    let fee_fri = u128::from_str_radix(row.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
+
+    Some(MetaTxIntenderSummary {
+        hash,
+        block_number: row.block_number,
+        tx_index: row.tx_index,
+        timestamp: row.block_timestamp,
+        paymaster: sender,
+        version: version_label.to_string(),
+        oe_nonce: oe.nonce,
+        total_fee_fri: fee_fri,
+        status: row.status.clone(),
+        inner_targets: targets,
+        inner_endpoints,
+        caller: oe.caller,
+    })
+}
+
+/// Recency ordering for meta-tx summaries: block desc, then tx_index desc.
+/// Exposed (pub(super)) purely for unit testing the sort.
+pub(super) fn sort_meta_txs_recency(summaries: &mut [crate::data::types::MetaTxIntenderSummary]) {
+    summaries.sort_by(|a, b| {
+        b.block_number
+            .cmp(&a.block_number)
+            .then(b.tx_index.cmp(&a.tx_index))
+    });
+}
+
+#[cfg(test)]
+mod meta_tx_tests {
+    use super::*;
+    use crate::data::types::MetaTxIntenderSummary;
+    use starknet::core::types::Felt;
+
+    fn s(block: u64, idx: u64) -> MetaTxIntenderSummary {
+        MetaTxIntenderSummary {
+            hash: Felt::from(block * 1000 + idx),
+            block_number: block,
+            tx_index: idx,
+            timestamp: 0,
+            paymaster: Felt::ZERO,
+            version: "v3".into(),
+            oe_nonce: Felt::ZERO,
+            total_fee_fri: 0,
+            status: "OK".into(),
+            inner_targets: vec![],
+            inner_endpoints: String::new(),
+            caller: Felt::ZERO,
+        }
+    }
+
+    #[test]
+    fn sort_orders_by_block_then_tx_index_desc() {
+        let mut v = vec![s(100, 5), s(200, 1), s(100, 7)];
+        sort_meta_txs_recency(&mut v);
+        let coords: Vec<_> = v.iter().map(|m| (m.block_number, m.tx_index)).collect();
+        assert_eq!(coords, vec![(200, 1), (100, 7), (100, 5)]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

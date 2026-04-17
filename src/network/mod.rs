@@ -250,6 +250,80 @@ pub async fn run_network_task(
                     )
                     .await;
                 }
+                Action::FetchAddressMetaTxs {
+                    address,
+                    from_block,
+                    continuation_token,
+                    limit,
+                } => {
+                    // On first page, emit cached rows immediately so the UI
+                    // renders instantly. Uses a separate CacheLoaded action so
+                    // it merges without clearing the in-flight loading flag.
+                    if continuation_token.is_none() {
+                        let cached = ds.load_cached_meta_txs(&address);
+                        if !cached.is_empty() {
+                            let _ = tx.send(Action::AddressMetaTxsCacheLoaded {
+                                address,
+                                summaries: cached,
+                            });
+                        }
+                    }
+                    if let Some(pf) = pf.as_ref() {
+                        address::fetch_address_meta_txs(
+                            address,
+                            from_block,
+                            continuation_token,
+                            limit,
+                            &ds,
+                            pf,
+                            &abi_reg,
+                            &tx,
+                        )
+                        .await;
+                    } else {
+                        // pf-query required for this feature. Send empty result so
+                        // the UI clears its loading state instead of hanging.
+                        let _ = tx.send(Action::AddressMetaTxsLoaded {
+                            address,
+                            summaries: Vec::new(),
+                            next_token: None,
+                        });
+                    }
+                }
+                Action::ClassifyPotentialMetaTx { address, tx_hash } => {
+                    // Streaming path from WS: a TRANSACTION_EXECUTED event for
+                    // `address` arrived. Fetch the single tx via pf-query, run
+                    // it through the shared classifier, and — if it's actually
+                    // a meta-tx where `address` is the intender — emit it to
+                    // merge into the MetaTxs tab. Silent no-op otherwise
+                    // (including when pf-query is unavailable).
+                    let Some(pf) = pf.as_ref() else {
+                        return;
+                    };
+                    match pf.get_txs_by_hash(&[tx_hash]).await {
+                        Ok(rows) => {
+                            let Some(row) = rows.first() else {
+                                return;
+                            };
+                            if let Some(summary) =
+                                address::classify_meta_tx_candidate(address, row, &abi_reg).await
+                            {
+                                // Persist immediately so the row survives
+                                // restart even if the user never scrolls past
+                                // the bulk fetch range. INSERT OR REPLACE
+                                // handles dedup at the DB layer.
+                                ds.save_meta_txs(&address, std::slice::from_ref(&summary));
+                                let _ = tx.send(Action::AddressMetaTxsStreamed {
+                                    address,
+                                    summaries: vec![summary],
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            debug!(tx = %format!("{:#x}", tx_hash), error = %e, "WS meta-tx classify: get_txs_by_hash failed");
+                        }
+                    }
+                }
                 Action::FetchClassInfo { class_hash } => {
                     class::fetch_class_info(class_hash, &ds, &abi_reg, &dune, &pf, &tx).await;
                 }

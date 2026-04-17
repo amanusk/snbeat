@@ -7,7 +7,9 @@ use starknet::core::types::Felt;
 use crate::app::AddressTab;
 use crate::app::actions::Source;
 use crate::app::state::TxNavItem;
-use crate::data::types::{AddressTxSummary, ContractCallSummary, SnAddressInfo};
+use crate::data::types::{
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnAddressInfo,
+};
 use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
 use crate::ui::widgets::stateful_list::StatefulList;
@@ -88,6 +90,20 @@ pub struct AddressInfoState {
     /// Set after the initial load settles; filled on-demand when the user
     /// scrolls near the bottom of the list.
     pub unfilled_gap: Option<UnfilledGap>,
+    /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
+    pub meta_txs: StatefulList<MetaTxIntenderSummary>,
+    /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
+    pub fetching_meta_txs: bool,
+    /// pf-query event cursor (oldest block - 1) for MetaTxs pagination.
+    pub meta_tx_cursor_block: Option<u64>,
+    /// Whether pf-query signaled more meta-tx data is available.
+    pub meta_tx_has_more: bool,
+    /// Whether the initial MetaTxs fetch has been dispatched for the current address.
+    pub meta_txs_dispatched: bool,
+    /// Lower bound for the MetaTxs bloom scan, preserved across pagination.
+    /// Set to deploy block when known; bounds the scan range so pf-query
+    /// doesn't time out walking chunks older than the account.
+    pub meta_tx_from_block: u64,
 }
 
 impl Default for AddressInfoState {
@@ -117,6 +133,12 @@ impl Default for AddressInfoState {
             ws_subscribed: false,
             sanity_check_dispatched: false,
             unfilled_gap: None,
+            meta_txs: StatefulList::new(),
+            fetching_meta_txs: false,
+            meta_tx_cursor_block: None,
+            meta_tx_has_more: false,
+            meta_txs_dispatched: false,
+            meta_tx_from_block: 0,
         }
     }
 }
@@ -146,6 +168,12 @@ impl AddressInfoState {
         self.ws_subscribed = false;
         self.sanity_check_dispatched = false;
         self.unfilled_gap = None;
+        self.meta_txs = StatefulList::new();
+        self.fetching_meta_txs = false;
+        self.meta_tx_cursor_block = None;
+        self.meta_tx_has_more = false;
+        self.meta_txs_dispatched = false;
+        self.meta_tx_from_block = 0;
     }
 
     /// Whether any source thinks there is more data to fetch.

@@ -277,6 +277,37 @@ pub struct AddressTxSummary {
     pub sender: Option<Felt>,
 }
 
+/// A meta-transaction (SNIP-9 outside execution) summary for the MetaTxs tab on
+/// an address view. Represents a tx where the viewed address is the intender
+/// (original signer), not the on-chain sender (paymaster/relayer).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetaTxIntenderSummary {
+    /// On-chain tx hash.
+    pub hash: Felt,
+    /// Block the tx landed in.
+    pub block_number: u64,
+    /// Index within the block (tie-break for recency ordering).
+    pub tx_index: u64,
+    /// Block timestamp (unix seconds).
+    pub timestamp: u64,
+    /// The address that submitted the on-chain tx (relayer / AVNU forwarder / paymaster).
+    pub paymaster: Felt,
+    /// Outside-execution version: "v1" | "v2" | "v3" | "avnu".
+    pub version: String,
+    /// Outside-execution nonce (signed by the intender, not the sender's tx nonce).
+    pub oe_nonce: Felt,
+    /// Total fee paid by the paymaster (FRI).
+    pub total_fee_fri: u128,
+    /// Execution status ("OK" / "REV" / "?").
+    pub status: String,
+    /// Target addresses of every inner call (first rendered in the row, rest shown as "+N").
+    pub inner_targets: Vec<Felt>,
+    /// Comma-joined decoded entrypoint names of the inner calls (e.g. "approve, swap_exact_in").
+    pub inner_endpoints: String,
+    /// The `caller` field from the OE struct (ANY_CALLER sentinel or a specific forwarder).
+    pub caller: Felt,
+}
+
 /// A call to a contract (for the Calls tab on contract addresses).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContractCallSummary {

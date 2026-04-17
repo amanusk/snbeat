@@ -9,7 +9,10 @@ use starknet::core::types::Felt;
 use starknet::core::types::ContractClass;
 
 use crate::error::Result;
-use types::{AddressTxSummary, ContractCallSummary, SnBlock, SnEvent, SnReceipt, SnTransaction};
+use types::{
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt,
+    SnTransaction,
+};
 
 /// Abstraction over different Starknet data sources (RPC, Pathfinder DB).
 #[async_trait]
@@ -49,6 +52,15 @@ pub trait DataSource: Send + Sync {
     }
     /// Save contract call summaries for an address to persistent cache.
     fn save_address_calls(&self, _address: &Felt, _calls: &[ContractCallSummary]) {
+        // Default: no-op. CachingDataSource overrides.
+    }
+    /// Load cached meta-tx (outside-execution) summaries for an address where the
+    /// address is the intender.
+    fn load_cached_meta_txs(&self, _address: &Felt) -> Vec<MetaTxIntenderSummary> {
+        Vec::new()
+    }
+    /// Save meta-tx summaries for an address (intender) to persistent cache.
+    fn save_meta_txs(&self, _address: &Felt, _txs: &[MetaTxIntenderSummary]) {
         // Default: no-op. CachingDataSource overrides.
     }
     /// Load cached activity range for an address (min_block, max_block, event_count).
