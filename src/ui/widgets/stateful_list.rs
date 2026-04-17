@@ -61,6 +61,18 @@ impl<T> StatefulList<T> {
         }
     }
 
+    /// Move the selection by `delta`, clamped to the list bounds.
+    /// Use positive delta to scroll down, negative to scroll up.
+    pub fn scroll_by(&mut self, delta: i64) {
+        if self.items.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0) as i64;
+        let max = self.items.len() as i64 - 1;
+        let next = (cur + delta).clamp(0, max) as usize;
+        self.state.select(Some(next));
+    }
+
     pub fn selected_item(&self) -> Option<&T> {
         self.state.selected().and_then(|i| self.items.get(i))
     }
@@ -80,5 +92,48 @@ impl<T> StatefulList<T> {
 impl<T> Default for StatefulList<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_by_noop_on_empty_list() {
+        let mut list: StatefulList<u32> = StatefulList::new();
+        list.scroll_by(10);
+        assert_eq!(list.state.selected(), None);
+    }
+
+    #[test]
+    fn scroll_by_starts_from_zero_when_unselected() {
+        let mut list = StatefulList::with_items(vec![1, 2, 3, 4, 5]);
+        list.scroll_by(2);
+        assert_eq!(list.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn scroll_by_clamps_to_bottom() {
+        let mut list = StatefulList::with_items(vec![1, 2, 3]);
+        list.state.select(Some(1));
+        list.scroll_by(100);
+        assert_eq!(list.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn scroll_by_clamps_to_top() {
+        let mut list = StatefulList::with_items(vec![1, 2, 3]);
+        list.state.select(Some(1));
+        list.scroll_by(-100);
+        assert_eq!(list.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn scroll_by_handles_negative_from_unselected() {
+        // Unselected defaults to 0; any negative delta clamps to 0.
+        let mut list = StatefulList::with_items(vec![1, 2, 3]);
+        list.scroll_by(-5);
+        assert_eq!(list.state.selected(), Some(0));
     }
 }

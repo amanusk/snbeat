@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create data source with persistent cache
     let rpc = RpcDataSource::new(&config.rpc_url);
-    let cached = CachingDataSource::new(Box::new(rpc), &cache_db)?;
+    let cached = CachingDataSource::new(Arc::new(rpc) as Arc<dyn data::DataSource>, &cache_db)?;
     let data_source: Arc<dyn data::DataSource> = Arc::new(cached);
 
     // ABI registry with persistent class cache

@@ -796,6 +796,9 @@ impl TransactionV3 {
     pub fn tx_type(&self) -> &'static str {
         self.variant.tx_type()
     }
+    pub fn calldata(&self) -> &[MinimalFelt] {
+        self.variant.calldata()
+    }
 }
 
 impl From<TransactionVariantV2> for TransactionVariantV3 {
@@ -900,6 +903,30 @@ impl TransactionVariantV3 {
             Self::InvokeV4(_) => "INVOKE_V4",
             Self::InvokeV5(_) => "INVOKE_V5",
             Self::L1HandlerV0(_) => "L1_HANDLER",
+        }
+    }
+
+    /// The calldata payload for this tx. Invoke txs carry the multicall
+    /// calldata; L1Handler and DeployAccount carry their constructor/entry
+    /// calldata. Declare/Deploy have no calldata payload → empty slice.
+    pub fn calldata(&self) -> &[MinimalFelt] {
+        match self {
+            Self::InvokeV0(tx) => &tx.calldata,
+            Self::InvokeV1(tx) => &tx.calldata,
+            Self::InvokeV3(tx) => &tx.calldata,
+            Self::InvokeV4(tx) => &tx.calldata,
+            Self::InvokeV5(tx) => &tx.calldata,
+            Self::L1HandlerV0(tx) => &tx.calldata,
+            Self::DeployV0(tx) => &tx.constructor_calldata,
+            Self::DeployV1(tx) => &tx.constructor_calldata,
+            Self::DeployAccountV1(tx) => &tx.constructor_calldata,
+            Self::DeployAccountV3(tx) => &tx.constructor_calldata,
+            Self::DeployAccountV4(tx) => &tx.constructor_calldata,
+            Self::DeclareV0(_)
+            | Self::DeclareV1(_)
+            | Self::DeclareV2(_)
+            | Self::DeclareV3(_)
+            | Self::DeclareV4(_) => &[],
         }
     }
 }

@@ -288,6 +288,53 @@ impl App {
         }
     }
 
+    /// Send an `EnrichAddressTxs` for the rows currently visible in the
+    /// address Transactions tab that are missing endpoint names or timestamps.
+    ///
+    /// Idempotent: the cache layer dedups in-flight requests and
+    /// `enrich_address_txs` itself drops hashes that already have data.
+    /// Safe to call on every scroll keystroke.
+    pub fn maybe_enrich_visible_address_txs(&self) {
+        if self.current_view() != View::AddressInfo {
+            return;
+        }
+        if !matches!(self.address.tab, AddressTab::Transactions) {
+            return;
+        }
+        let Some(address) = self.address.context else {
+            return;
+        };
+        let offset = self.address.txs.state.offset();
+        let hashes: Vec<_> = self
+            .address
+            .txs
+            .items
+            .iter()
+            .skip(offset)
+            .take(50)
+            .filter(|t| t.endpoint_names.is_empty() || t.timestamp == 0)
+            .map(|t| t.hash)
+            .collect();
+        if !hashes.is_empty() {
+            let _ = self
+                .action_tx
+                .send(Action::EnrichAddressTxs { address, hashes });
+        }
+    }
+
+    /// Scroll the active address list by a delta and trigger viewport
+    /// enrichment for any rows newly exposed.
+    pub fn address_list_scroll_by(&mut self, delta: i64) {
+        match self.address.tab {
+            AddressTab::Transactions => {
+                self.address.txs.scroll_by(delta);
+                self.maybe_enrich_visible_address_txs();
+            }
+            AddressTab::Calls => self.address.calls.scroll_by(delta),
+            _ => {}
+        }
+    }
+
     pub fn select_next(&mut self) {
         match self.current_view() {
             View::Blocks => {
@@ -305,6 +352,7 @@ impl App {
                 AddressTab::Transactions => {
                     self.address.txs.next();
                     self.maybe_fetch_more_address_txs();
+                    self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
                     self.address.calls.next();
@@ -338,7 +386,10 @@ impl App {
                 self.class.scroll = self.class.scroll.saturating_sub(1);
             }
             View::AddressInfo => match self.address.tab {
-                AddressTab::Transactions => self.address.txs.previous(),
+                AddressTab::Transactions => {
+                    self.address.txs.previous();
+                    self.maybe_enrich_visible_address_txs();
+                }
                 AddressTab::Calls => self.address.calls.previous(),
                 AddressTab::Events => {
                     self.address.event_scroll = self.address.event_scroll.saturating_sub(1);
@@ -363,7 +414,10 @@ impl App {
                 self.class.scroll = 0;
             }
             View::AddressInfo => match self.address.tab {
-                AddressTab::Transactions => self.address.txs.select_first(),
+                AddressTab::Transactions => {
+                    self.address.txs.select_first();
+                    self.maybe_enrich_visible_address_txs();
+                }
                 AddressTab::Calls => self.address.calls.select_first(),
                 AddressTab::Events => self.address.event_scroll = 0,
                 AddressTab::ClassHistory => {
@@ -391,6 +445,7 @@ impl App {
                 AddressTab::Transactions => {
                     self.address.txs.select_last();
                     self.maybe_fetch_more_address_txs();
+                    self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
                     self.address.calls.select_last();
@@ -432,29 +487,52 @@ impl App {
         if self.address.fetching_more_txs {
             return;
         }
-        // Don't fetch if no source thinks there's more data
+        let near_bottom = match self.address.tab {
+            AddressTab::Transactions => self.address.txs.is_near_bottom(5),
+            AddressTab::Calls => self.address.calls.is_near_bottom(5),
+            _ => false,
+        };
+        if !near_bottom {
+            return;
+        }
+
+        // Priority 1: on-demand fill of a deferred large nonce gap (issue #10).
+        // Only fires once per gap; the handler clears `unfilled_gap` on completion.
+        if let Some(gap) = self.address.unfilled_gap.as_ref() {
+            if !gap.fill_dispatched {
+                if let Some(address) = self.address.context {
+                    let gap_clone = gap.clone();
+                    if let Some(g) = self.address.unfilled_gap.as_mut() {
+                        g.fill_dispatched = true;
+                    }
+                    self.address.fetching_more_txs = true;
+                    let _ = self.action_tx.send(Action::FillAddressNonceGaps {
+                        address,
+                        known_txs: self.address.txs.items.clone(),
+                        gap: gap_clone,
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Priority 2: chronological pagination (older than oldest known block).
+        // Don't fetch if no source thinks there's more data.
         if !self.address.has_more_data()
             && self.address.oldest_event_block.is_some()
             && self.address.sources_pending.is_empty()
         {
             return;
         }
-        let near_bottom = match self.address.tab {
-            AddressTab::Transactions => self.address.txs.is_near_bottom(5),
-            AddressTab::Calls => self.address.calls.is_near_bottom(5),
-            _ => false,
-        };
-        if near_bottom {
-            let cursor = self.address.pagination_cursor();
-            if let (Some(address), Some(before_block)) = (self.address.context, cursor) {
-                if before_block > 0 {
-                    self.address.fetching_more_txs = true;
-                    let _ = self.action_tx.send(Action::FetchMoreAddressTxs {
-                        address,
-                        before_block,
-                        is_contract: self.address.is_contract,
-                    });
-                }
+        let cursor = self.address.pagination_cursor();
+        if let (Some(address), Some(before_block)) = (self.address.context, cursor) {
+            if before_block > 0 {
+                self.address.fetching_more_txs = true;
+                let _ = self.action_tx.send(Action::FetchMoreAddressTxs {
+                    address,
+                    before_block,
+                    is_contract: self.address.is_contract,
+                });
             }
         }
     }
@@ -807,8 +885,9 @@ impl App {
                             .send(Action::EnrichAddressTxs { address, hashes });
                     }
 
-                    // Sanity check cached data: fill nonce gaps + enrich endpoints
-                    // from what we already have in the cache, even before sources complete.
+                    // Detect any large nonce gap in cached data and defer it to
+                    // on-demand fill (issue #10). Endpoint enrichment + small gap
+                    // fill still run immediately from cache.
                     if !self.address.is_contract
                         && !self.address.txs.items.is_empty()
                         && !self.address.sanity_check_dispatched
@@ -816,8 +895,9 @@ impl App {
                         if let Some(info) = &self.address.info {
                             let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                             if current_nonce > 0 {
+                                self.address.unfilled_gap = self.address.detect_unfilled_gap();
                                 self.address.sanity_check_dispatched = true;
-                                let _ = self.action_tx.send(Action::SanityCheckAddress {
+                                let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                     address,
                                     current_nonce,
                                     known_txs: self.address.txs.items.clone(),
@@ -892,8 +972,26 @@ impl App {
                 if self.address.context != Some(address) {
                     return;
                 }
+                // If a deferred gap-fill was in-flight, unblock the pagination
+                // trigger now that results have landed.
+                let was_gap_fill = self
+                    .address
+                    .unfilled_gap
+                    .as_ref()
+                    .is_some_and(|g| g.fill_dispatched);
                 // Merge enrichment data (upgrades existing entries)
                 self.address.merge_tx_summaries(updates);
+                // If a gap fill was in flight, re-run detection so we either
+                // clear the gap (filled) or update it to the residual gap.
+                if was_gap_fill {
+                    self.address.unfilled_gap = self.address.detect_unfilled_gap().map(|mut g| {
+                        // Preserve dispatched state so we don't re-fire for the
+                        // same (or similar) gap; require refresh ('r') to retry.
+                        g.fill_dispatched = true;
+                        g
+                    });
+                    self.address.fetching_more_txs = false;
+                }
                 // Persist enriched txs to cache so they survive restarts
                 if !self.address.txs.items.is_empty() {
                     let _ = self.action_tx.send(Action::PersistAddressTxs {
@@ -982,13 +1080,15 @@ impl App {
                         self.is_loading = false;
                         self.loading_detail = None;
 
-                        // Post-display sanity check: fill nonce gaps + enrich all endpoints.
-                        // Reset the flag so we run again with the full merged dataset.
+                        // Post-display: detect any large nonce gap and defer it for
+                        // on-demand fill (issue #10). Small gaps + endpoint
+                        // enrichment still run automatically.
                         if !self.address.is_contract {
                             if let Some(info) = &self.address.info {
                                 let current_nonce = crate::utils::felt_to_u64(&info.nonce);
+                                self.address.unfilled_gap = self.address.detect_unfilled_gap();
                                 self.address.sanity_check_dispatched = true;
-                                let _ = self.action_tx.send(Action::SanityCheckAddress {
+                                let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                     address,
                                     current_nonce,
                                     known_txs: self.address.txs.items.clone(),

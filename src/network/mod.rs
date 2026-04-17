@@ -124,7 +124,7 @@ pub async fn run_network_task(
                     debug!(sender = %format!("{:#x}", sender), current_nonce, target_nonce, "Searching for tx by nonce");
 
                     // Strategy: fetch events for the sender, find tx with target nonce
-                    match ds.get_events_for_address(sender, None, 200).await {
+                    match ds.get_events_for_address(sender, None, None, 200).await {
                         Ok(events) => {
                             // Collect unique tx hashes
                             let mut seen = std::collections::HashSet::new();
@@ -184,21 +184,33 @@ pub async fn run_network_task(
                     search::resolve_search(query, &ds, &abi_reg, &dune, &pf, &voyager, &tx).await;
                 }
                 Action::EnrichAddressTxs { address, hashes } => {
-                    address::enrich_address_txs(address, hashes, &ds, &abi_reg, &tx).await;
+                    address::enrich_address_txs(address, hashes, &ds, pf.as_ref(), &abi_reg, &tx)
+                        .await;
                 }
-                Action::SanityCheckAddress {
+                Action::EnrichAddressEndpoints {
                     address,
                     current_nonce,
                     known_txs,
                 } => {
-                    address::run_sanity_check(
+                    address::run_endpoint_enrichment(
                         address,
                         current_nonce,
                         known_txs,
                         &ds,
                         &dune,
+                        &pf,
                         &abi_reg,
                         &tx,
+                    )
+                    .await;
+                }
+                Action::FillAddressNonceGaps {
+                    address,
+                    known_txs,
+                    gap,
+                } => {
+                    address::run_nonce_gap_fill(
+                        address, known_txs, gap, &ds, &dune, &pf, &abi_reg, &tx,
                     )
                     .await;
                 }
@@ -210,6 +222,7 @@ pub async fn run_network_task(
                         address,
                         &hashes_with_blocks,
                         &ds,
+                        pf.as_ref(),
                         &abi_reg,
                     )
                     .await;
@@ -228,6 +241,7 @@ pub async fn run_network_task(
                         is_contract,
                         &ds,
                         &dune,
+                        &pf,
                         &abi_reg,
                         &tx,
                     )

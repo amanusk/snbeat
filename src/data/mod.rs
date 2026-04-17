@@ -25,10 +25,14 @@ pub trait DataSource: Send + Sync {
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass>;
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>>;
     /// Fetch recent events emitted by or targeting an address.
+    ///
+    /// `to_block` is an inclusive upper bound; `None` means "up to latest".
+    /// Used by pagination to fetch events strictly older than a cursor.
     async fn get_events_for_address(
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>>;
     /// Load cached tx summaries for an address (returns empty if none).
@@ -72,14 +76,17 @@ pub trait DataSource: Send + Sync {
     }
     /// Fetch events emitted by a contract (all events, not just transaction_executed).
     /// Used for finding calls TO a contract.
+    ///
+    /// `to_block` is an inclusive upper bound; `None` means "up to latest".
     async fn get_contract_events(
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
         // Default: same as get_events_for_address (overridden in RPC impl)
-        self.get_events_for_address(address, from_block, limit)
+        self.get_events_for_address(address, from_block, to_block, limit)
             .await
     }
     /// Call a contract view function (e.g., balance_of).

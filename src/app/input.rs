@@ -496,6 +496,15 @@ fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
             app.clear_tx_detail();
             Some(Action::FetchTransaction { hash })
         }
+        View::AddressInfo => {
+            // Half-page-ish scroll inside the active address tab.
+            // direction: +1 = Ctrl+U / PageUp (up), -1 = Ctrl+D / PageDown (down).
+            // Address lists are newest-first, so "up" means lower index.
+            const CHUNK: i64 = 20;
+            let delta = -direction * CHUNK;
+            app.address_list_scroll_by(delta);
+            None
+        }
         _ => None,
     }
 }

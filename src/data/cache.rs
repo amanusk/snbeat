@@ -1,7 +1,12 @@
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::FutureExt;
+use futures::future::Shared;
 use rusqlite::{Connection, params};
 use starknet::core::types::{ContractClass, Felt};
 use tracing::{debug, trace, warn};
@@ -11,16 +16,29 @@ use super::DataSource;
 use super::types::*;
 use crate::error::{Result, SnbeatError};
 
+/// Shared future output: errors are stringified so the future is `Clone`-able
+/// (SnbeatError is not Clone due to `std::io::Error`).
+type SharedTxFut =
+    Shared<Pin<Box<dyn Future<Output = std::result::Result<SnTransaction, String>> + Send>>>;
+type SharedRxFut =
+    Shared<Pin<Box<dyn Future<Output = std::result::Result<SnReceipt, String>> + Send>>>;
+
 /// Persistent cache backed by SQLite + in-memory LRU.
 /// Wraps any DataSource: checks cache first, fetches from upstream on miss,
 /// writes through to cache on fetch. Persists across restarts.
+///
+/// Also deduplicates concurrent in-flight `get_transaction` / `get_receipt`
+/// fetches so that N parallel callers for the same hash produce one RPC round
+/// trip, not N. Prevents the user-click-races-background-enrichment storm.
 pub struct CachingDataSource {
-    upstream: Box<dyn DataSource>,
+    upstream: Arc<dyn DataSource>,
     db: Mutex<Connection>,
+    pending_txs: Mutex<HashMap<Felt, SharedTxFut>>,
+    pending_receipts: Mutex<HashMap<Felt, SharedRxFut>>,
 }
 
 impl CachingDataSource {
-    pub fn new(upstream: Box<dyn DataSource>, cache_path: &Path) -> Result<Self> {
+    pub fn new(upstream: Arc<dyn DataSource>, cache_path: &Path) -> Result<Self> {
         let db = Connection::open(cache_path)
             .map_err(|e| SnbeatError::Config(format!("Failed to open cache db: {e}")))?;
 
@@ -140,6 +158,8 @@ impl CachingDataSource {
         Ok(Self {
             upstream,
             db: Mutex::new(db),
+            pending_txs: Mutex::new(HashMap::new()),
+            pending_receipts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -551,10 +571,47 @@ impl DataSource for CachingDataSource {
             trace!(tx_hash = %format!("{:#x}", hash), "cache hit: transaction");
             return Ok(tx);
         }
-        debug!(tx_hash = %format!("{:#x}", hash), "cache miss: transaction, fetching from RPC");
-        let tx = self.upstream.get_transaction(hash).await?;
-        self.cache_transaction(&tx);
-        Ok(tx)
+
+        // In-flight dedup: if another caller is already fetching this hash,
+        // await their future instead of firing a second RPC.
+        let fut = {
+            let mut pending = self.pending_txs.lock().unwrap();
+            if let Some(existing) = pending.get(&hash) {
+                trace!(tx_hash = %format!("{:#x}", hash), "dedup: joining in-flight transaction fetch");
+                existing.clone()
+            } else {
+                debug!(tx_hash = %format!("{:#x}", hash), "cache miss: transaction, fetching from RPC");
+                let upstream = Arc::clone(&self.upstream);
+                let fut: Pin<
+                    Box<dyn Future<Output = std::result::Result<SnTransaction, String>> + Send>,
+                > = Box::pin(async move {
+                    upstream
+                        .get_transaction(hash)
+                        .await
+                        .map_err(|e| e.to_string())
+                });
+                let shared = fut.shared();
+                pending.insert(hash, shared.clone());
+                shared
+            }
+        };
+
+        let result = fut.await;
+
+        // Leader cleanup: whichever task observes it first removes the entry
+        // so a later miss can start a fresh fetch.
+        {
+            let mut pending = self.pending_txs.lock().unwrap();
+            pending.remove(&hash);
+        }
+
+        match result {
+            Ok(tx) => {
+                self.cache_transaction(&tx);
+                Ok(tx)
+            }
+            Err(e) => Err(SnbeatError::Rpc(e)),
+        }
     }
 
     async fn get_receipt(&self, hash: Felt) -> Result<SnReceipt> {
@@ -562,10 +619,40 @@ impl DataSource for CachingDataSource {
             trace!(tx_hash = %format!("{:#x}", hash), "cache hit: receipt");
             return Ok(receipt);
         }
-        debug!(tx_hash = %format!("{:#x}", hash), "cache miss: receipt, fetching from RPC");
-        let receipt = self.upstream.get_receipt(hash).await?;
-        self.cache_receipt(&receipt);
-        Ok(receipt)
+
+        let fut = {
+            let mut pending = self.pending_receipts.lock().unwrap();
+            if let Some(existing) = pending.get(&hash) {
+                trace!(tx_hash = %format!("{:#x}", hash), "dedup: joining in-flight receipt fetch");
+                existing.clone()
+            } else {
+                debug!(tx_hash = %format!("{:#x}", hash), "cache miss: receipt, fetching from RPC");
+                let upstream = Arc::clone(&self.upstream);
+                let fut: Pin<
+                    Box<dyn Future<Output = std::result::Result<SnReceipt, String>> + Send>,
+                > = Box::pin(
+                    async move { upstream.get_receipt(hash).await.map_err(|e| e.to_string()) },
+                );
+                let shared = fut.shared();
+                pending.insert(hash, shared.clone());
+                shared
+            }
+        };
+
+        let result = fut.await;
+
+        {
+            let mut pending = self.pending_receipts.lock().unwrap();
+            pending.remove(&hash);
+        }
+
+        match result {
+            Ok(receipt) => {
+                self.cache_receipt(&receipt);
+                Ok(receipt)
+            }
+            Err(e) => Err(SnbeatError::Rpc(e)),
+        }
     }
 
     async fn get_nonce(&self, address: Felt) -> Result<Felt> {
@@ -602,8 +689,19 @@ impl DataSource for CachingDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
+        // Bounded (paginating into history) — bypass cache merge and pass through.
+        // The cache only accelerates the "newest events" path; old-window fetches
+        // shouldn't poison the cache with partial windows.
+        if to_block.is_some() {
+            return self
+                .upstream
+                .get_events_for_address(address, from_block, to_block, limit)
+                .await;
+        }
+
         // Load cached events
         let cached = self.load_address_events(&address);
 
@@ -619,7 +717,7 @@ impl DataSource for CachingDataSource {
         // Fetch from upstream
         let new_events = self
             .upstream
-            .get_events_for_address(address, fetch_from, limit)
+            .get_events_for_address(address, fetch_from, None, limit)
             .await
             .unwrap_or_default();
 
@@ -817,8 +915,17 @@ impl DataSource for CachingDataSource {
         &self,
         address: Felt,
         from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SnEvent>> {
+        // Bounded pagination: skip cache merge (see `get_events_for_address`).
+        if to_block.is_some() {
+            return self
+                .upstream
+                .get_contract_events(address, from_block, to_block, limit)
+                .await;
+        }
+
         // Incremental caching for contract events (all events, no key filter)
         let cached = self.load_contract_events(&address);
 
@@ -831,7 +938,7 @@ impl DataSource for CachingDataSource {
 
         let new_events = match self
             .upstream
-            .get_contract_events(address, fetch_from, limit)
+            .get_contract_events(address, fetch_from, None, limit)
             .await
         {
             Ok(events) => events,
