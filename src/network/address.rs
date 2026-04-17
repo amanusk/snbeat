@@ -25,6 +25,81 @@ use super::voyager;
 const UDC_CONTRACT_DEPLOYED: &str =
     "0x26b160f10156dea0639bec90696772c640b9706a47f5b8c52ea1abe5858b34d";
 
+/// Fetch contract events via pathfinder when available, falling back to RPC.
+///
+/// Pathfinder wins on all contract event benchmarks (1-2ms TTFE vs ~1s cold RPC
+/// probe, 36-138ms page vs ~230ms RPC) thanks to its bloom-filter index on
+/// `from_address`. RPC is only exercised when PF is absent or the PF request
+/// fails (service down, transient error).
+async fn fetch_contract_events_routed(
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    ds: &Arc<dyn DataSource>,
+    address: starknet::core::types::Felt,
+    from_block: Option<u64>,
+    limit: usize,
+) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
+    if let Some(pf_client) = pf {
+        match pf_client
+            .get_contract_events(
+                address,
+                from_block.unwrap_or(0),
+                None,
+                &[],
+                limit as u32,
+                None,
+            )
+            .await
+        {
+            Ok((events, _token)) => return Ok(events),
+            Err(e) => {
+                warn!(error = %e, "PF contract events failed, falling back to RPC");
+            }
+        }
+    }
+    ds.get_contract_events(address, from_block, limit).await
+}
+
+/// Fetch account `transaction_executed` events via RPC primarily, with PF fallback.
+///
+/// Bench shows RPC wins for account events on cold windows (20-30ms vs
+/// 165-634ms) and on stale accounts (11-17ms vs 118-131ms). PF's bloom filter
+/// indexes only `from_address` (not keys), so the `transaction_executed`
+/// filter doesn't narrow its scan. PF fallback covers RPC outages.
+async fn fetch_account_events_routed(
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    ds: &Arc<dyn DataSource>,
+    address: starknet::core::types::Felt,
+    from_block: Option<u64>,
+    limit: usize,
+) -> crate::error::Result<Vec<crate::data::types::SnEvent>> {
+    match ds.get_events_for_address(address, from_block, limit).await {
+        Ok(events) => Ok(events),
+        Err(rpc_err) => {
+            if let Some(pf_client) = pf {
+                warn!(error = %rpc_err, "RPC account events failed, falling back to PF");
+                match pf_client
+                    .get_events_for_address(
+                        address,
+                        from_block.unwrap_or(0),
+                        None,
+                        limit as u32,
+                        None,
+                    )
+                    .await
+                {
+                    Ok((events, _token)) => Ok(events),
+                    Err(pf_err) => {
+                        warn!(error = %pf_err, "PF account events fallback also failed");
+                        Err(rpc_err)
+                    }
+                }
+            } else {
+                Err(rpc_err)
+            }
+        }
+    }
+}
+
 /// Fetch token balances for all known tokens for an address.
 async fn fetch_token_balances(
     address: starknet::core::types::Felt,
@@ -855,7 +930,8 @@ pub(super) async fn fetch_and_send_address_info(
     }
 
     // =====================================================================
-    // TASK C: RPC Events — small window first, probe-guided fallback, pagination for deeper
+    // TASK C: Events — pathfinder-first for contracts, RPC-first for accounts.
+    // Probe-guided fallback for sparse addresses; pagination for deeper history.
     // =====================================================================
     {
         let ds_c = Arc::clone(ds);
@@ -863,6 +939,7 @@ pub(super) async fn fetch_and_send_address_info(
         let tx_c = tx.clone();
         let voyager_c2 = voyager_c.clone();
         let _pf_ok = Arc::clone(&pf_succeeded);
+        let pf_c = pf.as_ref().map(Arc::clone);
         let mut probe_rx_c = probe_watch_rx.clone();
 
         tokio::spawn(async move {
@@ -906,11 +983,23 @@ pub(super) async fn fetch_and_send_address_info(
             let phase1_limit = if is_contract { 500 } else { 100 };
 
             let events_result = if is_contract {
-                ds_c.get_contract_events(address, Some(from_block), phase1_limit)
-                    .await
+                fetch_contract_events_routed(
+                    pf_c.as_ref(),
+                    &ds_c,
+                    address,
+                    Some(from_block),
+                    phase1_limit,
+                )
+                .await
             } else {
-                ds_c.get_events_for_address(address, Some(from_block), phase1_limit)
-                    .await
+                fetch_account_events_routed(
+                    pf_c.as_ref(),
+                    &ds_c,
+                    address,
+                    Some(from_block),
+                    phase1_limit,
+                )
+                .await
             };
             let events = match events_result {
                 Ok(evts) => evts,
@@ -1100,11 +1189,23 @@ pub(super) async fn fetch_and_send_address_info(
                         )));
 
                         let deeper_events = if is_contract {
-                            ds_c.get_contract_events(address, Some(search_from), 500)
-                                .await
+                            fetch_contract_events_routed(
+                                pf_c.as_ref(),
+                                &ds_c,
+                                address,
+                                Some(search_from),
+                                500,
+                            )
+                            .await
                         } else {
-                            ds_c.get_events_for_address(address, Some(search_from), 500)
-                                .await
+                            fetch_account_events_routed(
+                                pf_c.as_ref(),
+                                &ds_c,
+                                address,
+                                Some(search_from),
+                                500,
+                            )
+                            .await
                         };
 
                         if let Ok(deeper_events) = deeper_events {
@@ -1317,9 +1418,13 @@ pub(super) async fn enrich_address_txs(
     }
 }
 
-/// Post-display sanity check: fill nonce gaps and enrich all txs with missing endpoints.
-/// Runs once after all data sources complete, as a background pass.
-pub(super) async fn run_sanity_check(
+/// Post-display enrichment: fill only *small* nonce gaps and enrich all txs
+/// with missing endpoint names.
+///
+/// Large gaps (the pathological case from issue #10) are left untouched here;
+/// they are deferred to `run_nonce_gap_fill` which fires only when the user
+/// scrolls toward the gap.
+pub(super) async fn run_endpoint_enrichment(
     address: starknet::core::types::Felt,
     current_nonce: u64,
     known_txs: Vec<crate::data::types::AddressTxSummary>,
@@ -1333,7 +1438,7 @@ pub(super) async fn run_sanity_check(
             address = %format!("{:#x}", address),
             txs = known_txs.len(),
             current_nonce,
-            "Sanity check: skipping nonce gaps (empty txs or nonce=0), running endpoint enrichment only"
+            "Endpoint enrich: skipping nonce gaps (empty txs or nonce=0), running endpoint enrichment only"
         );
         enrich_all_empty_endpoints(address, &known_txs, ds, abi_reg, action_tx).await;
         return;
@@ -1352,12 +1457,13 @@ pub(super) async fn run_sanity_check(
         min_nonce,
         max_nonce,
         empty_endpoints,
-        "Sanity check: starting (nonce range {}..{}, {} txs, {} missing endpoints)",
+        "Endpoint enrich: starting (nonce range {}..{}, {} txs, {} missing endpoints)",
         min_nonce, max_nonce, known_txs.len(), empty_endpoints
     );
 
-    // --- Phase 1: Fill nonce gaps ---
-    let gap_txs = fill_nonce_gaps_phase(
+    // --- Phase 1: Fill only small nonce gaps ---
+    // Large gaps are left for on-demand fill via `run_nonce_gap_fill`.
+    let gap_txs = fill_small_nonce_gaps_phase(
         address,
         current_nonce,
         &known_txs,
@@ -1368,13 +1474,12 @@ pub(super) async fn run_sanity_check(
     )
     .await;
 
-    // Send gap-fill results through existing merge path
     if !gap_txs.is_empty() {
         let gap_nonces: Vec<u64> = gap_txs.iter().map(|t| t.nonce).collect();
         info!(
             found = gap_txs.len(),
             nonces = ?gap_nonces,
-            "Sanity check: filled {} nonce gaps, sending to UI",
+            "Endpoint enrich: filled {} small nonce gaps, sending to UI",
             gap_txs.len()
         );
         let _ = action_tx.send(Action::AddressTxsEnriched {
@@ -1382,11 +1487,10 @@ pub(super) async fn run_sanity_check(
             updates: gap_txs.clone(),
         });
     } else {
-        info!("Sanity check: no nonce gaps to fill");
+        info!("Endpoint enrich: no small nonce gaps to fill");
     }
 
     // --- Phase 2: Enrich all txs with missing endpoint names ---
-    // Combine original known_txs + newly found gap txs for a complete picture
     let mut all_txs = known_txs;
     for gt in &gap_txs {
         if !all_txs.iter().any(|t| t.hash == gt.hash) {
@@ -1397,19 +1501,84 @@ pub(super) async fn run_sanity_check(
 
     debug!(
         address = %format!("{:#x}", address),
-        "Sanity check complete"
+        "Endpoint enrich complete"
     );
 }
 
-/// Phase 1 of sanity check: detect and fill nonce gaps.
-/// Small gaps (≤50 blocks) are filled via RPC block scanning.
-/// Large gaps use Dune windowed queries when available.
-async fn fill_nonce_gaps_phase(
+/// On-demand fill of a single large nonce gap (issue #10).
+///
+/// Queries Dune for the gap's block range (if available) to locate missing
+/// txs, then enriches missing endpoints on the returned set. Progressive
+/// results flow through `AddressTxsEnriched` like the auto path.
+pub(super) async fn run_nonce_gap_fill(
+    address: starknet::core::types::Felt,
+    known_txs: Vec<crate::data::types::AddressTxSummary>,
+    gap: crate::app::views::address_info::UnfilledGap,
+    ds: &Arc<dyn DataSource>,
+    dune: &Option<Arc<dune::DuneClient>>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    info!(
+        address = %format!("{:#x}", address),
+        lo_nonce = gap.lo_nonce,
+        hi_nonce = gap.hi_nonce,
+        lo_block = gap.lo_block,
+        hi_block = gap.hi_block,
+        missing = gap.missing_count,
+        "Gap fill: filling large nonce gap on demand"
+    );
+
+    let _ = action_tx.send(Action::LoadingStatus(format!(
+        "Filling gap of {} txs...",
+        gap.missing_count
+    )));
+
+    let found = fill_specific_large_gap(address, &known_txs, &gap, dune, action_tx).await;
+
+    if !found.is_empty() {
+        info!(
+            found = found.len(),
+            "Gap fill: Dune returned {} new txs, enriching endpoints",
+            found.len()
+        );
+        let _ = action_tx.send(Action::AddressTxsEnriched {
+            address,
+            updates: found.clone(),
+        });
+
+        // Enrich endpoints for the newly discovered txs (they usually arrive from
+        // Dune without endpoint names decoded).
+        let mut combined = known_txs;
+        for t in &found {
+            if !combined.iter().any(|k| k.hash == t.hash) {
+                combined.push(t.clone());
+            }
+        }
+        enrich_all_empty_endpoints(address, &combined, ds, abi_reg, action_tx).await;
+    } else {
+        info!("Gap fill: no txs returned from Dune for this range");
+        let _ = action_tx.send(Action::LoadingStatus(String::new()));
+    }
+
+    debug!(
+        address = %format!("{:#x}", address),
+        "Gap fill complete"
+    );
+}
+
+/// Fill only the *small* nonce gaps (≤50 blocks each) via RPC block scans.
+///
+/// Large gaps are skipped here and deferred to on-demand fill via
+/// `run_nonce_gap_fill` (issue #10). This function retains the same gap
+/// classification the original code used; the only behavior change is the
+/// removal of the Dune-driven large-gap path.
+async fn fill_small_nonce_gaps_phase(
     address: starknet::core::types::Felt,
     current_nonce: u64,
     known_txs: &[crate::data::types::AddressTxSummary],
     ds: &Arc<dyn DataSource>,
-    dune: &Option<Arc<dune::DuneClient>>,
+    _dune: &Option<Arc<dune::DuneClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::AddressTxSummary> {
@@ -1481,7 +1650,9 @@ async fn fill_nonce_gaps_phase(
         }
     }
 
-    let total_gaps = small_gaps.len() + large_gap_ranges.len();
+    let small_count = small_gaps.len();
+    let large_count = large_gap_ranges.len();
+    let total_gaps = small_count + large_count;
     if total_gaps == 0 {
         info!(
             "Sanity gap check: no nonce gaps found in range {}..{}",
@@ -1490,26 +1661,27 @@ async fn fill_nonce_gaps_phase(
         return Vec::new();
     }
 
-    // Log the first few missing nonces for debugging
     let small_nonces: Vec<u64> = small_gaps.iter().map(|(n, _, _)| *n).take(10).collect();
     info!(
-        small = small_gaps.len(),
-        large = large_gap_ranges.len(),
+        small = small_count,
+        large = large_count,
         total = total_gaps,
         first_small_nonces = ?small_nonces,
         large_ranges = ?large_gap_ranges.iter().take(5).collect::<Vec<_>>(),
-        "Sanity check: detected {} nonce gaps ({} small, {} large)",
-        total_gaps, small_gaps.len(), large_gap_ranges.len()
+        "Sanity check: detected {} nonce gaps ({} small, {} large — large deferred to on-demand fill)",
+        total_gaps, small_count, large_count
     );
 
-    let _ = action_tx.send(Action::LoadingStatus(format!(
-        "Filling {} nonce gaps...",
-        total_gaps
-    )));
+    if small_count > 0 {
+        let _ = action_tx.send(Action::LoadingStatus(format!(
+            "Filling {} small nonce gaps...",
+            small_count
+        )));
+    }
 
     let mut found_txs = Vec::new();
 
-    // Small gaps: RPC block scan
+    // Small gaps only: RPC block scan. Large gaps are left for on-demand fill.
     if !small_gaps.is_empty() {
         let mut blocks_to_scan: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (_, from, to) in &small_gaps {
@@ -1543,81 +1715,73 @@ async fn fill_nonce_gaps_phase(
         }
     }
 
-    // Large gaps: Dune windowed query — merge adjacent ranges into bigger windows
-    if let Some(dune_c) = dune {
-        large_gap_ranges.sort();
-        // Merge overlapping/adjacent ranges (within 500 blocks of each other)
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for (from, to) in large_gap_ranges {
-            if let Some(last) = merged.last_mut() {
-                if from <= last.1 + 500 {
-                    last.1 = last.1.max(to);
-                    continue;
-                }
-            }
-            merged.push((from, to));
-        }
+    found_txs
+}
 
-        info!(
-            merged_ranges = merged.len(),
-            "Sanity gap-fill: merged large gaps into {} Dune queries",
-            merged.len()
+/// On-demand Dune query for a single large nonce gap (issue #10).
+///
+/// Caller supplies the known lo/hi block bounds of the gap; we query Dune's
+/// windowed account-tx endpoint for that range, deduplicate against known
+/// hashes, and return the new entries.
+async fn fill_specific_large_gap(
+    address: starknet::core::types::Felt,
+    known_txs: &[crate::data::types::AddressTxSummary],
+    gap: &crate::app::views::address_info::UnfilledGap,
+    dune: &Option<Arc<dune::DuneClient>>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) -> Vec<crate::data::types::AddressTxSummary> {
+    let Some(dune_c) = dune.as_ref() else {
+        warn!(
+            "Gap fill: Dune client unavailable, cannot fill gap {}..{}",
+            gap.lo_block, gap.hi_block
         );
+        let _ = action_tx.send(Action::LoadingStatus(
+            "Gap fill unavailable (Dune not configured)".to_string(),
+        ));
+        return Vec::new();
+    };
 
-        let known_hashes: std::collections::HashSet<_> = known_txs
-            .iter()
-            .chain(found_txs.iter())
-            .map(|t| t.hash)
-            .collect();
+    let from = gap.lo_block;
+    let to = gap.hi_block;
+    info!(
+        from,
+        to,
+        span = to.saturating_sub(from),
+        "Gap fill: querying Dune for blocks {}..{}",
+        from,
+        to
+    );
 
-        for (from, to) in &merged {
+    let known_hashes: std::collections::HashSet<_> = known_txs.iter().map(|t| t.hash).collect();
+
+    match dune_c
+        .query_account_txs_windowed(address, from, to, 1000)
+        .await
+    {
+        Ok(dune_txs) => {
+            let total_returned = dune_txs.len();
+            let new: Vec<_> = dune_txs
+                .into_iter()
+                .filter(|t| !known_hashes.contains(&t.hash))
+                .collect();
             info!(
+                returned = total_returned,
+                new = new.len(),
                 from,
                 to,
-                span = to - from,
-                "Sanity gap-fill: querying Dune for blocks {}..{} (span {})",
+                "Gap fill: Dune returned {} txs, {} new for blocks {}..{}",
+                total_returned,
+                new.len(),
                 from,
-                to,
-                to - from
+                to
             );
-            match dune_c
-                .query_account_txs_windowed(address, *from, *to, 200)
-                .await
-            {
-                Ok(dune_txs) => {
-                    let total_returned = dune_txs.len();
-                    let new: Vec<_> = dune_txs
-                        .into_iter()
-                        .filter(|t| !known_hashes.contains(&t.hash))
-                        .collect();
-                    info!(
-                        returned = total_returned,
-                        new = new.len(),
-                        from,
-                        to,
-                        "Sanity gap-fill: Dune returned {} txs, {} new for blocks {}..{}",
-                        total_returned,
-                        new.len(),
-                        from,
-                        to
-                    );
-                    if !new.is_empty() {
-                        // Send intermediate results so the UI updates progressively
-                        let _ = action_tx.send(Action::AddressTxsEnriched {
-                            address,
-                            updates: new.clone(),
-                        });
-                        found_txs.extend(new);
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, from, to, "Sanity gap-fill: Dune query failed for blocks {}..{}", from, to);
-                }
-            }
+            new
+        }
+        Err(e) => {
+            warn!(error = %e, from, to, "Gap fill: Dune query failed for blocks {}..{}", from, to);
+            Vec::new()
         }
     }
-
-    found_txs
 }
 
 /// Phase 2 of sanity check: enrich ALL txs that have empty endpoint names.
@@ -1732,6 +1896,7 @@ pub(super) async fn fetch_more_address_txs(
     is_contract: bool,
     ds: &Arc<dyn crate::data::DataSource>,
     dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -1796,26 +1961,47 @@ pub(super) async fn fetch_more_address_txs(
         before_block.saturating_sub(1)
     )));
 
-    // Fire RPC + Dune in parallel
+    // Fire events-source + Dune in parallel.
+    //
+    // Events source routing (matches initial fetch):
+    //  - Contracts: pathfinder primary (bloom-indexed, fast for dense contracts),
+    //    RPC fallback on PF error. Used to be skipped entirely because RPC was
+    //    too slow for dense contracts at scroll depth — PF resolves that.
+    //  - Accounts: RPC primary (narrow window + key filter is fast), PF fallback.
     let rpc_ds = Arc::clone(ds);
+    let pf_c = pf.as_ref().map(Arc::clone);
     let rpc_addr = address;
     let rpc_before = before_block;
     let rpc_is_contract = is_contract;
     // Cap RPC window at 10k blocks — RPC is slow for large ranges.
-    // For contracts, skip RPC entirely — Dune is the primary source for contract calls.
     let rpc_window = window_size.min(10_000);
     let rpc_from = before_block.saturating_sub(rpc_window);
 
     let rpc_fut = async move {
-        if rpc_is_contract {
-            // Skip RPC for contract pagination — events are rarely found via RPC
-            // for high-traffic contracts, and the scan blocks the response.
-            return Vec::new();
-        }
-        let events = rpc_ds
-            .get_events_for_address(rpc_addr, Some(rpc_from), 500)
+        let events = if rpc_is_contract {
+            // Pathfinder can scan the full window range efficiently via bloom
+            // filters; use window_size directly rather than clamping to 10k.
+            let pf_from = before_block.saturating_sub(window_size);
+            fetch_contract_events_routed(
+                pf_c.as_ref(),
+                &rpc_ds,
+                rpc_addr,
+                Some(pf_from),
+                500,
+            )
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+        } else {
+            fetch_account_events_routed(
+                pf_c.as_ref(),
+                &rpc_ds,
+                rpc_addr,
+                Some(rpc_from),
+                500,
+            )
+            .await
+            .unwrap_or_default()
+        };
         events
             .into_iter()
             .filter(|e| e.block_number < rpc_before)

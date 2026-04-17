@@ -293,6 +293,15 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // If a large nonce gap is deferred, remember its (hi_nonce → lo_nonce)
+    // boundary so we can render a divider above the row where the jump occurs.
+    let gap_boundary: Option<(u64, u64, u64, bool)> = app
+        .address
+        .unfilled_gap
+        .as_ref()
+        .map(|g| (g.hi_nonce, g.lo_nonce, g.missing_count, g.fill_dispatched));
+
+    let mut prev_nonce: Option<u64> = None;
     let items: Vec<ListItem> = app
         .address
         .txs
@@ -329,7 +338,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => theme::NORMAL_STYLE,
             };
 
-            let line = Line::from(vec![
+            let main_line = Line::from(vec![
                 Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<15}", tx.tx_type), type_style),
                 Span::styled(
@@ -346,17 +355,53 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("{:<4}", &tx.status), status_style),
                 Span::styled(age, theme::BLOCK_AGE_STYLE),
             ]);
-            ListItem::new(line)
+
+            // Insert a dimmed divider above the row that sits on the far side
+            // of the unfilled gap (i.e. when we're about to step from hi_nonce
+            // down to lo_nonce in the descending list).
+            let separator: Option<Line> = match (prev_nonce, gap_boundary) {
+                (Some(prev), Some((hi, lo, missing, dispatched)))
+                    if prev == hi && tx.nonce == lo =>
+                {
+                    let msg = if dispatched {
+                        format!(" ── gap of {missing} txs — loading / retry with 'r' ──")
+                    } else {
+                        format!(" ── {missing} txs hidden — scroll down to load ──")
+                    };
+                    Some(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)))
+                }
+                _ => None,
+            };
+            prev_nonce = Some(tx.nonce);
+
+            let lines = match separator {
+                Some(sep) => vec![sep, main_line],
+                None => vec![main_line],
+            };
+            ListItem::new(lines)
         })
         .collect();
 
+    let gap_suffix = match &app.address.unfilled_gap {
+        Some(g) if !g.fill_dispatched => format!(
+            " — {} older txs deferred (scroll down to load) ",
+            g.missing_count
+        ),
+        Some(g) => format!(" — gap of {} txs (press r to retry) ", g.missing_count),
+        None => String::new(),
+    };
     let title = if app.is_loading {
         format!(
-            " Transactions ({}) fetching... ",
-            app.address.txs.items.len()
+            " Transactions ({}) fetching...{} ",
+            app.address.txs.items.len(),
+            gap_suffix
         )
     } else {
-        format!(" Transactions ({}) ", app.address.txs.items.len())
+        format!(
+            " Transactions ({}){} ",
+            app.address.txs.items.len(),
+            gap_suffix
+        )
     };
 
     let list = List::new(items)

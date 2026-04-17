@@ -12,6 +12,26 @@ use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
 use crate::ui::widgets::stateful_list::StatefulList;
 
+/// A detected, unfilled nonce gap in the tx list that has been deferred
+/// for on-demand filling (issue #10). We do NOT auto-fill large gaps on
+/// address load; instead we wait until the user scrolls toward the gap
+/// boundary before burning RPC/Dune budget on it.
+#[derive(Clone, Debug)]
+pub struct UnfilledGap {
+    /// Last known nonce below the gap.
+    pub lo_nonce: u64,
+    /// First known nonce above the gap.
+    pub hi_nonce: u64,
+    /// Block number of the lo_nonce tx (lower bound for the scan).
+    pub lo_block: u64,
+    /// Block number of the hi_nonce tx (upper bound for the scan).
+    pub hi_block: u64,
+    /// Number of missing nonces between lo and hi (exclusive).
+    pub missing_count: u64,
+    /// Whether the fill action has already been dispatched for this gap.
+    pub fill_dispatched: bool,
+}
+
 /// All state related to the address info view.
 pub struct AddressInfoState {
     pub info: Option<SnAddressInfo>,
@@ -59,6 +79,10 @@ pub struct AddressInfoState {
     pub ws_subscribed: bool,
     /// Whether the post-display sanity check has already been dispatched.
     pub sanity_check_dispatched: bool,
+    /// Detected large nonce gap that has NOT been auto-filled (issue #10).
+    /// Set after the initial load settles; filled on-demand when the user
+    /// scrolls near the bottom of the list.
+    pub unfilled_gap: Option<UnfilledGap>,
 }
 
 impl Default for AddressInfoState {
@@ -88,6 +112,7 @@ impl Default for AddressInfoState {
             rpc_has_more: false,
             ws_subscribed: false,
             sanity_check_dispatched: false,
+            unfilled_gap: None,
         }
     }
 }
@@ -117,6 +142,7 @@ impl AddressInfoState {
         self.rpc_has_more = false;
         self.ws_subscribed = false;
         self.sanity_check_dispatched = false;
+        self.unfilled_gap = None;
     }
 
     /// Whether any source thinks there is more data to fetch.
@@ -256,6 +282,68 @@ impl AddressInfoState {
             self.oldest_event_block = Some(oldest);
         }
     }
+
+    /// Scan the current tx list for a "large" nonce gap that we want to defer
+    /// filling until the user asks for it.
+    ///
+    /// Returns `Some(gap)` when the biggest contiguous missing-nonce run is large
+    /// enough to justify deferring (either many missing entries, or a wide block
+    /// span). Small gaps are left to the normal enrichment path and return `None`
+    /// so the caller can auto-fill them.
+    pub fn detect_unfilled_gap(&self) -> Option<UnfilledGap> {
+        // Only meaningful for account txs (contracts don't have sequential nonces).
+        if self.is_contract {
+            return None;
+        }
+        // Build sorted (nonce, block) pairs for txs that have landed in a block.
+        let mut pairs: Vec<(u64, u64)> = self
+            .txs
+            .items
+            .iter()
+            .filter(|t| t.block_number > 0)
+            .map(|t| (t.nonce, t.block_number))
+            .collect();
+        if pairs.len() < 2 {
+            return None;
+        }
+        pairs.sort_by_key(|(n, _)| *n);
+
+        // Find the biggest missing-nonce run.
+        let mut best: Option<UnfilledGap> = None;
+        for w in pairs.windows(2) {
+            let (lo_nonce, lo_block) = w[0];
+            let (hi_nonce, hi_block) = w[1];
+            let missing = hi_nonce.saturating_sub(lo_nonce).saturating_sub(1);
+            if missing == 0 {
+                continue;
+            }
+            let keep = best.as_ref().is_none_or(|b| missing > b.missing_count);
+            if keep {
+                best = Some(UnfilledGap {
+                    lo_nonce,
+                    hi_nonce,
+                    lo_block,
+                    hi_block,
+                    missing_count: missing,
+                    fill_dispatched: false,
+                });
+            }
+        }
+        let gap = best?;
+
+        // Only defer when the gap is "large". Small gaps fall through to the
+        // existing enrichment path (RPC block scan or small Dune query).
+        // Thresholds picked to match the existing small/large split in
+        // fill_nonce_gaps_phase (50-block small path) while leaving slack for
+        // genuinely benign gaps that the endpoint-enrichment phase will absorb.
+        const LARGE_MISSING_COUNT: u64 = 50;
+        const LARGE_BLOCK_SPAN: u64 = 1000;
+        let span = gap.hi_block.saturating_sub(gap.lo_block);
+        if gap.missing_count < LARGE_MISSING_COUNT && span < LARGE_BLOCK_SPAN {
+            return None;
+        }
+        Some(gap)
+    }
 }
 
 /// Upgrade an existing tx summary with better data from an incoming one.
@@ -280,5 +368,97 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     }
     if existing.tip == 0 && incoming.tip > 0 {
         existing.tip = incoming.tip;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::types::AddressTxSummary;
+    use starknet::core::types::Felt;
+
+    fn summary(nonce: u64, block: u64) -> AddressTxSummary {
+        AddressTxSummary {
+            hash: Felt::from(nonce + 1),
+            nonce,
+            block_number: block,
+            timestamp: 0,
+            endpoint_names: String::new(),
+            total_fee_fri: 0,
+            tip: 0,
+            tx_type: "INVOKE".into(),
+            status: "OK".into(),
+            sender: None,
+        }
+    }
+
+    fn state_with(txs: Vec<AddressTxSummary>) -> AddressInfoState {
+        let mut s = AddressInfoState::default();
+        s.txs.items = txs;
+        s
+    }
+
+    #[test]
+    fn no_gap_when_contiguous() {
+        let state = state_with(vec![
+            summary(10, 100),
+            summary(11, 102),
+            summary(12, 104),
+        ]);
+        assert!(state.detect_unfilled_gap().is_none());
+    }
+
+    #[test]
+    fn no_gap_for_small_missing_count_and_narrow_span() {
+        // 5 missing nonces across 30 blocks — well below the large thresholds.
+        let state = state_with(vec![summary(10, 100), summary(16, 130)]);
+        assert!(state.detect_unfilled_gap().is_none());
+    }
+
+    #[test]
+    fn detects_gap_by_missing_count() {
+        // 100 missing nonces — exceeds LARGE_MISSING_COUNT.
+        let state = state_with(vec![
+            summary(10, 100),
+            summary(11, 105),
+            summary(112, 210), // 100 missing (12..=111)
+            summary(113, 215),
+        ]);
+        let g = state.detect_unfilled_gap().expect("large gap expected");
+        assert_eq!(g.lo_nonce, 11);
+        assert_eq!(g.hi_nonce, 112);
+        assert_eq!(g.missing_count, 100);
+        assert!(!g.fill_dispatched);
+    }
+
+    #[test]
+    fn detects_gap_by_block_span() {
+        // Only 10 missing nonces but spanning >1000 blocks.
+        let state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        let g = state.detect_unfilled_gap().expect("wide-span gap expected");
+        assert_eq!(g.lo_nonce, 10);
+        assert_eq!(g.hi_nonce, 21);
+        assert_eq!(g.missing_count, 10);
+    }
+
+    #[test]
+    fn contract_addresses_never_report_gap() {
+        let mut state = state_with(vec![summary(10, 100), summary(200, 500)]);
+        state.is_contract = true;
+        assert!(state.detect_unfilled_gap().is_none());
+    }
+
+    #[test]
+    fn biggest_gap_wins_when_multiple() {
+        let state = state_with(vec![
+            summary(10, 100),
+            summary(20, 110),    // 9 missing
+            summary(200, 5000),  // 179 missing — winner
+            summary(201, 5001),
+        ]);
+        let g = state.detect_unfilled_gap().expect("should pick biggest gap");
+        assert_eq!(g.lo_nonce, 20);
+        assert_eq!(g.hi_nonce, 200);
+        assert_eq!(g.missing_count, 179);
     }
 }

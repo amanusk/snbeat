@@ -186,12 +186,12 @@ pub async fn run_network_task(
                 Action::EnrichAddressTxs { address, hashes } => {
                     address::enrich_address_txs(address, hashes, &ds, &abi_reg, &tx).await;
                 }
-                Action::SanityCheckAddress {
+                Action::EnrichAddressEndpoints {
                     address,
                     current_nonce,
                     known_txs,
                 } => {
-                    address::run_sanity_check(
+                    address::run_endpoint_enrichment(
                         address,
                         current_nonce,
                         known_txs,
@@ -201,6 +201,14 @@ pub async fn run_network_task(
                         &tx,
                     )
                     .await;
+                }
+                Action::FillAddressNonceGaps {
+                    address,
+                    known_txs,
+                    gap,
+                } => {
+                    address::run_nonce_gap_fill(address, known_txs, gap, &ds, &dune, &abi_reg, &tx)
+                        .await;
                 }
                 Action::EnrichAddressCalls {
                     address,
@@ -228,6 +236,7 @@ pub async fn run_network_task(
                         is_contract,
                         &ds,
                         &dune,
+                        &pf,
                         &abi_reg,
                         &tx,
                     )

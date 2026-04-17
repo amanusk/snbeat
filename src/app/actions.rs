@@ -1,6 +1,7 @@
 use starknet::core::types::Felt;
 
 use crate::app::state::SourceStatus;
+use crate::app::views::address_info::UnfilledGap;
 use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary, SnAddressInfo,
@@ -35,11 +36,19 @@ pub enum Action {
     },
     /// Enrich visible address txs that are missing endpoint/timestamp data.
     EnrichAddressTxs { address: Felt, hashes: Vec<Felt> },
-    /// Post-load sanity check: fill nonce gaps + enrich all empty endpoints.
-    SanityCheckAddress {
+    /// Post-load enrichment: fill small nonce gaps + enrich missing endpoint names.
+    /// Fires automatically once initial sources settle. Large gaps are handled by
+    /// `FillAddressNonceGaps` instead (on-demand, issue #10).
+    EnrichAddressEndpoints {
         address: Felt,
         current_nonce: u64,
         known_txs: Vec<AddressTxSummary>,
+    },
+    /// On-demand large-gap fill: triggered when the user scrolls toward the gap.
+    FillAddressNonceGaps {
+        address: Felt,
+        known_txs: Vec<AddressTxSummary>,
+        gap: UnfilledGap,
     },
     /// Enrich WS-streamed call stubs (missing sender/function/fee/timestamp).
     EnrichAddressCalls {

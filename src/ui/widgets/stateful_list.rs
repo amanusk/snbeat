@@ -61,6 +61,18 @@ impl<T> StatefulList<T> {
         }
     }
 
+    /// Move the selection by `delta`, clamped to the list bounds.
+    /// Use positive delta to scroll down, negative to scroll up.
+    pub fn scroll_by(&mut self, delta: i64) {
+        if self.items.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0) as i64;
+        let max = self.items.len() as i64 - 1;
+        let next = (cur + delta).clamp(0, max) as usize;
+        self.state.select(Some(next));
+    }
+
     pub fn selected_item(&self) -> Option<&T> {
         self.state.selected().and_then(|i| self.items.get(i))
     }
