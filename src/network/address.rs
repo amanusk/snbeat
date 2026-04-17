@@ -1923,10 +1923,20 @@ async fn enrich_all_empty_endpoints(
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
+    // Viewport-scoped: only proactively enrich an initial buffer large enough
+    // to cover the visible list + some scroll-ahead. Rows outside this buffer
+    // get enriched on demand as the user scrolls to them (see
+    // `maybe_enrich_visible_address_txs`). Prevents the 60-batch RPC storm
+    // for accounts with thousands of missing endpoints.
+    const ENRICH_BUFFER: usize = 200;
+
     let total_invoke = all_txs.iter().filter(|t| t.tx_type == "INVOKE").count();
+    // `all_txs` is newest-first, so taking the first N missing items
+    // prioritizes the rows the user will see immediately.
     let missing: Vec<starknet::core::types::Felt> = all_txs
         .iter()
         .filter(|t| t.endpoint_names.is_empty() && t.tx_type == "INVOKE")
+        .take(ENRICH_BUFFER)
         .map(|t| t.hash)
         .collect();
 
@@ -1939,21 +1949,21 @@ async fn enrich_all_empty_endpoints(
     }
 
     info!(
-        missing = missing.len(),
+        enriching = missing.len(),
         total_invoke,
-        "Sanity check endpoints: {} of {} INVOKE txs missing endpoints, enriching in batches",
-        missing.len(),
-        total_invoke
+        buffer = ENRICH_BUFFER,
+        "Sanity check endpoints: enriching top {} missing (viewport buffer), remainder on-demand",
+        missing.len()
     );
 
-    // Process in batches of 20
+    // Process in batches of 20 for streaming UI updates.
     for (i, chunk) in missing.chunks(20).enumerate() {
         info!(
             batch = i + 1,
             size = chunk.len(),
             "Sanity check endpoints: enriching batch {}/{}",
             i + 1,
-            (missing.len() + 19) / 20
+            missing.len().div_ceil(20)
         );
         enrich_address_txs(address, chunk.to_vec(), ds, pf, abi_reg, action_tx).await;
     }

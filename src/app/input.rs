@@ -502,11 +502,7 @@ fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
             // Address lists are newest-first, so "up" means lower index.
             const CHUNK: i64 = 20;
             let delta = -direction * CHUNK;
-            match app.address.tab {
-                crate::app::AddressTab::Transactions => app.address.txs.scroll_by(delta),
-                crate::app::AddressTab::Calls => app.address.calls.scroll_by(delta),
-                _ => {}
-            }
+            app.address_list_scroll_by(delta);
             None
         }
         _ => None,

@@ -288,6 +288,53 @@ impl App {
         }
     }
 
+    /// Send an `EnrichAddressTxs` for the rows currently visible in the
+    /// address Transactions tab that are missing endpoint names or timestamps.
+    ///
+    /// Idempotent: the cache layer dedups in-flight requests and
+    /// `enrich_address_txs` itself drops hashes that already have data.
+    /// Safe to call on every scroll keystroke.
+    pub fn maybe_enrich_visible_address_txs(&self) {
+        if self.current_view() != View::AddressInfo {
+            return;
+        }
+        if !matches!(self.address.tab, AddressTab::Transactions) {
+            return;
+        }
+        let Some(address) = self.address.context else {
+            return;
+        };
+        let offset = self.address.txs.state.offset();
+        let hashes: Vec<_> = self
+            .address
+            .txs
+            .items
+            .iter()
+            .skip(offset)
+            .take(50)
+            .filter(|t| t.endpoint_names.is_empty() || t.timestamp == 0)
+            .map(|t| t.hash)
+            .collect();
+        if !hashes.is_empty() {
+            let _ = self
+                .action_tx
+                .send(Action::EnrichAddressTxs { address, hashes });
+        }
+    }
+
+    /// Scroll the active address list by a delta and trigger viewport
+    /// enrichment for any rows newly exposed.
+    pub fn address_list_scroll_by(&mut self, delta: i64) {
+        match self.address.tab {
+            AddressTab::Transactions => {
+                self.address.txs.scroll_by(delta);
+                self.maybe_enrich_visible_address_txs();
+            }
+            AddressTab::Calls => self.address.calls.scroll_by(delta),
+            _ => {}
+        }
+    }
+
     pub fn select_next(&mut self) {
         match self.current_view() {
             View::Blocks => {
@@ -305,6 +352,7 @@ impl App {
                 AddressTab::Transactions => {
                     self.address.txs.next();
                     self.maybe_fetch_more_address_txs();
+                    self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
                     self.address.calls.next();
@@ -338,7 +386,10 @@ impl App {
                 self.class.scroll = self.class.scroll.saturating_sub(1);
             }
             View::AddressInfo => match self.address.tab {
-                AddressTab::Transactions => self.address.txs.previous(),
+                AddressTab::Transactions => {
+                    self.address.txs.previous();
+                    self.maybe_enrich_visible_address_txs();
+                }
                 AddressTab::Calls => self.address.calls.previous(),
                 AddressTab::Events => {
                     self.address.event_scroll = self.address.event_scroll.saturating_sub(1);
@@ -363,7 +414,10 @@ impl App {
                 self.class.scroll = 0;
             }
             View::AddressInfo => match self.address.tab {
-                AddressTab::Transactions => self.address.txs.select_first(),
+                AddressTab::Transactions => {
+                    self.address.txs.select_first();
+                    self.maybe_enrich_visible_address_txs();
+                }
                 AddressTab::Calls => self.address.calls.select_first(),
                 AddressTab::Events => self.address.event_scroll = 0,
                 AddressTab::ClassHistory => {
@@ -391,6 +445,7 @@ impl App {
                 AddressTab::Transactions => {
                     self.address.txs.select_last();
                     self.maybe_fetch_more_address_txs();
+                    self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
                     self.address.calls.select_last();
