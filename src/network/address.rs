@@ -433,6 +433,17 @@ pub(super) async fn fetch_and_send_address_info(
     let start = std::time::Instant::now();
     debug!(address = %format!("{:#x}", address), "Fetching address info");
 
+    // Kick off token balance fetch immediately — it's independent of nonce/class_hash
+    // and is the primary "is this address active?" signal, so we want it visible ASAP.
+    {
+        let ds_bal = Arc::clone(ds);
+        let tx_bal = tx.clone();
+        tokio::spawn(async move {
+            let balances = fetch_token_balances(address, &ds_bal).await;
+            let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
+        });
+    }
+
     // Kick off Voyager label fetch immediately — runs fully in parallel with all other IO.
     if let Some(vc) = voyager_c {
         let vc = Arc::clone(vc);
@@ -532,16 +543,6 @@ pub(super) async fn fetch_and_send_address_info(
         tx_summaries: ds.load_cached_address_txs(&address),
         contract_calls: ds.load_cached_address_calls(&address),
     });
-
-    // Fetch balances in background
-    {
-        let ds_bal = Arc::clone(ds);
-        let tx_bal = tx.clone();
-        tokio::spawn(async move {
-            let balances = fetch_token_balances(address, &ds_bal).await;
-            let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
-        });
-    }
 
     // Check cached activity range — if fresh, skip Dune probe entirely.
     let cached_range = ds.load_cached_activity_range(&address);
