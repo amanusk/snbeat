@@ -163,11 +163,16 @@ pub(super) async fn fetch_events_routed(
 }
 
 /// Fetch token balances for all known tokens for an address.
+///
+/// Tries `balanceOf` (SNIP-2/Cairo 1 camelCase) first, falls back to legacy
+/// `balance_of` (Cairo 0 snake_case). Most modern tokens expose both; wBTC
+/// and some older tokens only expose camelCase.
 async fn fetch_token_balances(
     address: starknet::core::types::Felt,
     ds: &Arc<dyn DataSource>,
 ) -> Vec<crate::data::types::TokenBalance> {
-    let balance_selector = starknet::core::utils::get_selector_from_name("balance_of").unwrap();
+    let balance_of_camel = starknet::core::utils::get_selector_from_name("balanceOf").unwrap();
+    let balance_of_snake = starknet::core::utils::get_selector_from_name("balance_of").unwrap();
     let known_tokens: &[(&str, &str, u8)] = &[
         (
             "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
@@ -209,9 +214,14 @@ async fn fetch_token_balances(
             let name = name.to_string();
             let decimals = *decimals;
             async move {
-                let result = ds_bal
-                    .call_contract(token, balance_selector, vec![address])
+                let mut result = ds_bal
+                    .call_contract(token, balance_of_camel, vec![address])
                     .await;
+                if result.is_err() {
+                    result = ds_bal
+                        .call_contract(token, balance_of_snake, vec![address])
+                        .await;
+                }
                 (token, name, decimals, result)
             }
         })
@@ -220,10 +230,16 @@ async fn fetch_token_balances(
     let balance_results = futures::future::join_all(balance_futures).await;
     let mut token_balances = Vec::new();
     for (token, name, decimals, result) in balance_results {
-        let balance_felt = result
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(starknet::core::types::Felt::ZERO);
+        let balance_felt = match result {
+            Ok(v) => v
+                .first()
+                .copied()
+                .unwrap_or(starknet::core::types::Felt::ZERO),
+            Err(e) => {
+                warn!(token = %name, error = %e, "balanceOf call failed");
+                starknet::core::types::Felt::ZERO
+            }
+        };
         token_balances.push(crate::data::types::TokenBalance {
             token_address: token,
             token_name: name,
