@@ -476,27 +476,41 @@ mod tests {
 
         let latest = pf.health().await?.latest_block;
 
-        // Bench window: recent ~500k blocks. Wide enough that a stale account
-        // (>1 month inactive, ~86k blocks/week ≈ 350k/month) still has a hit.
-        let from_block = latest.saturating_sub(500_000);
-        // Page-size target. Matches a reasonable UI page; both paths should
-        // return roughly the same count for the same window.
+        // Two scenarios:
+        //  - "cold"  : matches the app's initial fetch window in
+        //              src/network/address.rs (10k blocks for contracts,
+        //              5k for accounts).
+        //  - "scroll": simulates scroll-to-bottom paging over a deeper range.
         const PAGE_LIMIT: u32 = 500;
         // Time-to-first-event probe size (lower = closer to "first byte").
         const TTFE_LIMIT: u32 = 1;
 
-        println!();
-        println!("# events bench — window [{from_block}, {latest}]  (limit={PAGE_LIMIT})");
+        let scenarios: [(&str, u64, u64); 2] = [
+            // name, account_window, contract_window
+            ("cold", 5_000, 10_000),
+            ("scroll", 500_000, 500_000),
+        ];
+
         println!();
         println!(
-            "| label | role | source | ttfe_ms | page_ms | events | matched | rpc_only | pf_only |"
+            "# events bench — latest={latest}, page_limit={PAGE_LIMIT}, ttfe_limit={TTFE_LIMIT}"
+        );
+        println!();
+        println!(
+            "| scenario | label | role | window | source | ttfe_ms | page_ms | events | matched | rpc_only | pf_only |"
         );
         println!(
-            "|-------|------|--------|---------|---------|--------|---------|----------|---------|"
+            "|----------|-------|------|--------|--------|---------|---------|--------|---------|----------|---------|"
         );
 
+        for (scenario, acct_win, ctr_win) in scenarios.iter() {
         for case in &cases {
             let Case { addr, role, label } = case;
+            let window = match role {
+                Role::Account => *acct_win,
+                Role::Contract => *ctr_win,
+            };
+            let from_block = latest.saturating_sub(window);
 
             // --- TTFE: fetch the very first event only. ---
             let rpc_ttfe = {
@@ -595,15 +609,16 @@ mod tests {
             };
 
             println!(
-                "| {label} | {role_s} | rpc | {} | {rpc_page_ms} | {} | {matched} | {rpc_only} | {pf_only} |",
+                "| {scenario} | {label} | {role_s} | {window} | rpc | {} | {rpc_page_ms} | {} | {matched} | {rpc_only} | {pf_only} |",
                 ttfe_str(rpc_ttfe),
                 rpc_events.len()
             );
             println!(
-                "| {label} | {role_s} | pf  | {} | {pf_page_ms} | {} |         |          |         |",
+                "| {scenario} | {label} | {role_s} | {window} | pf  | {} | {pf_page_ms} | {} |         |          |         |",
                 ttfe_str(pf_ttfe),
                 pf_events.len()
             );
+        }
         }
 
         Ok(())
