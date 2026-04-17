@@ -31,6 +31,7 @@ pub struct TxDetailState {
     pub outside_executions: Vec<(usize, OutsideExecutionInfo)>,
     /// Whether to show the expanded outside execution intent view.
     pub show_outside_execution: bool,
+    pub block_timestamp: Option<u64>,
 }
 
 impl Default for TxDetailState {
@@ -49,6 +50,7 @@ impl Default for TxDetailState {
             show_decoded_calldata: false,
             outside_executions: Vec::new(),
             show_outside_execution: false,
+            block_timestamp: None,
         }
     }
 }
@@ -67,6 +69,7 @@ impl TxDetailState {
         self.nav_items = Vec::new();
         self.nav_cursor = 0;
         self.nav_item_lines = Vec::new();
+        self.block_timestamp = None;
     }
 
     /// Build the list of navigable items for the current transaction.

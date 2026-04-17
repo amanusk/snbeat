@@ -147,6 +147,20 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(network::dune::DuneClient::new(key.clone()))
         });
 
+    // DefiLlama needs no API key, so the client is always created when the cache opens.
+    let price_client: Option<Arc<network::prices::PriceClient>> =
+        match network::prices::PriceClient::new(&cache_db) {
+            Ok(client) => {
+                info!("DefiLlama price client enabled");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize price client (USD prices disabled)");
+                None
+            }
+        };
+    app.price_client = price_client.clone();
+
     // Create Voyager client (optional — only if API key is set)
     let voyager_client: Option<Arc<network::voyager::VoyagerClient>> = config
         .voyager_api_key
@@ -291,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
             dune_client,
             pf_client,
             voyager_client,
+            price_client,
             action_rx,
             resp_tx_clone,
         )

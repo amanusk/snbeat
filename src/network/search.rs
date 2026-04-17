@@ -55,8 +55,14 @@ pub(super) async fn resolve_search(
                 // Reuse the fetched transaction, only fetch receipt
                 match ds.get_receipt(felt).await {
                     Ok(receipt) => {
-                        transaction::decode_and_send_transaction(transaction, receipt, abi_reg, tx)
-                            .await;
+                        transaction::decode_and_send_transaction(
+                            transaction,
+                            receipt,
+                            ds,
+                            abi_reg,
+                            tx,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         let _ = tx.send(Action::Error(format!(

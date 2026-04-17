@@ -14,6 +14,7 @@ mod block;
 mod class;
 pub mod dune;
 pub mod helpers;
+pub mod prices;
 mod search;
 mod transaction;
 pub mod voyager;
@@ -36,6 +37,7 @@ pub async fn run_network_task(
     dune_client: Option<Arc<dune::DuneClient>>,
     pf_client: Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_client: Option<Arc<voyager::VoyagerClient>>,
+    price_client: Option<Arc<prices::PriceClient>>,
     mut action_rx: mpsc::UnboundedReceiver<Action>,
     response_tx: mpsc::UnboundedSender<Action>,
 ) {
@@ -47,6 +49,7 @@ pub async fn run_network_task(
         let dune = dune_client.clone();
         let pf = pf_client.clone();
         let voyager = voyager_client.clone();
+        let prices = price_client.clone();
         let tx = response_tx.clone();
 
         // Spawn each request as a separate task for concurrency
@@ -155,7 +158,7 @@ pub async fn run_network_task(
                                             match ds.get_receipt(*hash).await {
                                                 Ok(receipt) => {
                                                     transaction::decode_and_send_transaction(
-                                                        fetched_tx, receipt, &abi_reg, &tx,
+                                                        fetched_tx, receipt, &ds, &abi_reg, &tx,
                                                     )
                                                     .await;
                                                 }
@@ -255,6 +258,20 @@ pub async fn run_network_task(
                 }
                 Action::PersistAddressCalls { address, calls } => {
                     ds.save_address_calls(&address, &calls);
+                }
+                Action::FetchTokenPricesToday { tokens } => {
+                    if let Some(pc) = &prices {
+                        if pc.ensure_today(&tokens).await {
+                            let _ = tx.send(Action::PricesUpdated);
+                        }
+                    }
+                }
+                Action::FetchTokenPricesHistoric { requests } => {
+                    if let Some(pc) = &prices {
+                        if pc.ensure_historic(&requests).await {
+                            let _ = tx.send(Action::PricesUpdated);
+                        }
+                    }
                 }
                 // Response actions are not handled here
                 _ => {}

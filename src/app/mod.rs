@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::data::types::{AddressTxSummary, SnBlock, VoyagerLabelInfo};
+use crate::network::prices::PriceClient;
 use crate::network::ws::WsSubscriptionManager;
 use crate::registry::SearchResult;
 use crate::search::SearchEngine;
@@ -95,6 +96,8 @@ pub struct App {
 
     /// Optional WebSocket subscription manager (present when APP_WS_URL is configured).
     pub ws_manager: Option<WsSubscriptionManager>,
+
+    pub price_client: Option<Arc<PriceClient>>,
 }
 
 impl App {
@@ -135,6 +138,7 @@ impl App {
             forward_history: Vec::new(),
 
             ws_manager: None,
+            price_client: None,
         }
     }
 
@@ -144,6 +148,48 @@ impl App {
         txs: Vec<AddressTxSummary>,
     ) -> Vec<AddressTxSummary> {
         self.address.filter_deployment_txs(address, txs)
+    }
+
+    fn dispatch_balance_price_fetch(&self) {
+        if self.price_client.is_none() {
+            return;
+        }
+        let tokens = crate::network::prices::TRACKED_TOKENS.clone();
+        if tokens.is_empty() {
+            return;
+        }
+        let _ = self
+            .action_tx
+            .send(Action::FetchTokenPricesToday { tokens });
+    }
+
+    fn dispatch_tx_price_fetch(&self) {
+        if self.price_client.is_none() {
+            return;
+        }
+        let mut event_tokens: Vec<starknet::core::types::Felt> = self
+            .tx_detail
+            .decoded_events
+            .iter()
+            .map(|e| e.contract_address)
+            .filter(crate::network::prices::is_tracked)
+            .collect();
+        event_tokens.sort();
+        event_tokens.dedup();
+        if event_tokens.is_empty() {
+            return;
+        }
+
+        let _ = self.action_tx.send(Action::FetchTokenPricesToday {
+            tokens: event_tokens.clone(),
+        });
+
+        if let Some(ts) = self.tx_detail.block_timestamp {
+            let requests: Vec<_> = event_tokens.into_iter().map(|t| (t, ts)).collect();
+            let _ = self
+                .action_tx
+                .send(Action::FetchTokenPricesHistoric { requests });
+        }
     }
 
     pub fn current_view(&self) -> View {
@@ -710,12 +756,14 @@ impl App {
                 decoded_events,
                 decoded_calls,
                 outside_executions,
+                block_timestamp,
             } => {
                 self.tx_detail.transaction = Some(transaction);
                 self.tx_detail.receipt = Some(receipt);
                 self.tx_detail.decoded_events = decoded_events;
                 self.tx_detail.decoded_calls = decoded_calls;
                 self.tx_detail.outside_executions = outside_executions;
+                self.tx_detail.block_timestamp = block_timestamp;
                 self.tx_detail.scroll = 0;
                 self.tx_detail.visual_mode = false;
                 self.build_tx_nav_items();
@@ -724,6 +772,7 @@ impl App {
                 if self.current_view() != View::TxDetail {
                     self.push_view(View::TxDetail);
                 }
+                self.dispatch_tx_price_fetch();
             }
             Action::NavigateToAddress { address } => {
                 // Push view immediately — show cached data while fresh data loads
@@ -1187,7 +1236,11 @@ impl App {
                     if let Some(info) = &mut self.address.info {
                         info.token_balances = balances;
                     }
+                    self.dispatch_balance_price_fetch();
                 }
+            }
+            Action::PricesUpdated => {
+                // Cache reads happen on next draw; no app state to update.
             }
             Action::VoyagerLabelLoaded { address, label } => {
                 // Add to search index so Voyager labels are searchable
