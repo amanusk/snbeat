@@ -14,7 +14,7 @@ use crate::decode::outside_execution;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
-use crate::ui::widgets::{param_display, search_bar, status_bar};
+use crate::ui::widgets::{param_display, price, search_bar, status_bar};
 use crate::utils::felt_to_u128;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -571,6 +571,10 @@ fn draw_scrollable_detail(
             ),
         ]));
 
+        // One price lookup per event contract — params share the same address.
+        let event_prices =
+            price::token_prices(app, &group.contract_address, app.tx_detail.block_timestamp);
+
         for (ei, event) in group.events.iter().enumerate() {
             let is_last = ei == group.events.len() - 1;
             let eb = if is_last { "└─" } else { "├─" };
@@ -614,6 +618,17 @@ fn draw_scrollable_detail(
                         &|a| app.format_address(a),
                     );
                     event_spans.append(&mut param_spans);
+                    let (today, historic) = event_prices;
+                    if today.is_some() || historic.is_some() {
+                        if let Some((amount, _)) =
+                            price::token_amount_from_param(p, &event.contract_address, registry)
+                        {
+                            event_spans.push(Span::styled(
+                                format_usd_pair(amount, today, historic),
+                                theme::SUGGESTION_STYLE,
+                            ));
+                        }
+                    }
                     if pi < all_params.len() - 1 {
                         event_spans.push(Span::raw(", "));
                     }
@@ -914,6 +929,17 @@ fn render_nested_value(
             }
         }
         _ => {} // Leaf values — nothing to nest
+    }
+}
+
+fn format_usd_pair(amount: f64, today: Option<f64>, historic: Option<f64>) -> String {
+    let today_str = today.map(|p| price::format_usd(amount * p));
+    let historic_str = historic.map(|p| price::format_usd(amount * p));
+    match (today_str, historic_str) {
+        (Some(t), Some(h)) => format!(" [{t} ({h})]"),
+        (Some(t), None) => format!(" [{t}]"),
+        (None, Some(h)) => format!(" [({h})]"),
+        (None, None) => String::new(),
     }
 }
 

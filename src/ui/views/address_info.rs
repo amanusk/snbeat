@@ -11,6 +11,7 @@ use crate::app::{AddressTab, App};
 use crate::data::types::TokenBalance;
 use crate::ui::theme;
 use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, short_hash};
+use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
 
@@ -545,7 +546,13 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
 
-    if info.token_balances.is_empty() {
+    let nonzero: Vec<&TokenBalance> = info
+        .token_balances
+        .iter()
+        .filter(|b| felt_to_u128(&b.balance_raw) > 0)
+        .collect();
+
+    if nonzero.is_empty() {
         f.render_widget(
             Paragraph::new(" No token balances found")
                 .style(theme::SUGGESTION_STYLE)
@@ -559,16 +566,21 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = info
-        .token_balances
+    let items: Vec<ListItem> = nonzero
         .iter()
         .map(|bal| {
             let formatted = format_token_balance(bal);
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {:<8}", bal.token_name), theme::LABEL_STYLE),
-                Span::styled(formatted, theme::NORMAL_STYLE),
-            ]);
-            ListItem::new(line)
+                Span::styled(format!("{:<24}", formatted), theme::NORMAL_STYLE),
+            ];
+            if let Some(usd) = balance_usd_value(app, bal) {
+                spans.push(Span::styled(
+                    format!("  {}", price::format_usd(usd)),
+                    theme::SUGGESTION_STYLE,
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -579,6 +591,16 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
             .title(Span::styled(" Token Balances ", theme::TITLE_STYLE)),
     );
     f.render_widget(list, area);
+}
+
+fn balance_usd_value(app: &App, bal: &TokenBalance) -> Option<f64> {
+    let price = app
+        .price_client
+        .as_ref()?
+        .get_today_price(&bal.token_address)?;
+    let raw = felt_to_u128(&bal.balance_raw) as f64;
+    let scale = 10f64.powi(bal.decimals as i32);
+    Some(raw / scale * price)
 }
 
 fn draw_events_tab(f: &mut Frame, app: &App, area: Rect) {

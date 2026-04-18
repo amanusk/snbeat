@@ -162,73 +162,114 @@ pub(super) async fn fetch_events_routed(
     }
 }
 
+/// Well-known tokens whose balances we probe for every address.
+///
+/// `(contract_address, display_name, decimals)`. Extend cautiously: each
+/// entry adds a call to the `balanceOf` batch.
+const KNOWN_TOKENS: &[(&str, &str, u8)] = &[
+    (
+        "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+        "STRK",
+        18,
+    ),
+    (
+        "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+        "ETH",
+        18,
+    ),
+    (
+        "0x0124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49",
+        "wBTC",
+        8,
+    ),
+    (
+        "0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
+        "USDC",
+        6,
+    ),
+    (
+        "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8",
+        "USDC.e",
+        6,
+    ),
+    (
+        "0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8",
+        "USDT",
+        6,
+    ),
+];
+
 /// Fetch token balances for all known tokens for an address.
-async fn fetch_token_balances(
+///
+/// Uses JSON-RPC batching (issue #12) so all `balanceOf` probes land in a
+/// single round trip. Only non-zero balances are returned; the caller uses
+/// the returned length directly for the `Balances(N)` tab counter.
+///
+/// Tries `balanceOf` (SNIP-2/Cairo 1 camelCase) first via the batch. Any
+/// token that errors out (e.g., legacy Cairo 0 token that only exposes
+/// `balance_of`) is retried individually with snake_case selector.
+pub(crate) async fn fetch_token_balances(
     address: starknet::core::types::Felt,
     ds: &Arc<dyn DataSource>,
 ) -> Vec<crate::data::types::TokenBalance> {
-    let balance_selector = starknet::core::utils::get_selector_from_name("balance_of").unwrap();
-    let known_tokens: &[(&str, &str, u8)] = &[
-        (
-            "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
-            "STRK",
-            18,
-        ),
-        (
-            "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
-            "ETH",
-            18,
-        ),
-        (
-            "0x0124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49",
-            "wBTC",
-            8,
-        ),
-        (
-            "0x033068f6539f8e6e6b131e6b2b814e6c34a5224bc66947c47dab9dfee93b35fb",
-            "USDC",
-            6,
-        ),
-        (
-            "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8",
-            "USDC.e",
-            6,
-        ),
-        (
-            "0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8",
-            "USDT",
-            6,
-        ),
-    ];
+    let balance_of_camel = starknet::core::utils::get_selector_from_name("balanceOf").unwrap();
+    let balance_of_snake = starknet::core::utils::get_selector_from_name("balance_of").unwrap();
 
-    let balance_futures: Vec<_> = known_tokens
+    // Build the batched call list (balanceOf for every known token).
+    let tokens: Vec<(starknet::core::types::Felt, &'static str, u8)> = KNOWN_TOKENS
         .iter()
         .map(|(hex, name, decimals)| {
-            let ds_bal = Arc::clone(ds);
-            let token = starknet::core::types::Felt::from_hex(hex).unwrap();
-            let name = name.to_string();
-            let decimals = *decimals;
-            async move {
-                let result = ds_bal
-                    .call_contract(token, balance_selector, vec![address])
-                    .await;
-                (token, name, decimals, result)
-            }
+            (
+                starknet::core::types::Felt::from_hex(hex).unwrap(),
+                *name,
+                *decimals,
+            )
         })
         .collect();
+    let batch_calls: Vec<_> = tokens
+        .iter()
+        .map(|(token, _, _)| (*token, balance_of_camel, vec![address]))
+        .collect();
 
-    let balance_results = futures::future::join_all(balance_futures).await;
+    let batch_results = ds.batch_call_contracts(batch_calls).await;
+
     let mut token_balances = Vec::new();
-    for (token, name, decimals, result) in balance_results {
-        let balance_felt = result
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(starknet::core::types::Felt::ZERO);
+    for ((token, name, decimals), result) in tokens.iter().zip(batch_results.into_iter()) {
+        let balance_felt = match result {
+            Ok(v) => v
+                .first()
+                .copied()
+                .unwrap_or(starknet::core::types::Felt::ZERO),
+            Err(camel_err) => {
+                // Legacy token fallback: retry this single call with snake_case.
+                match ds
+                    .call_contract(*token, balance_of_snake, vec![address])
+                    .await
+                {
+                    Ok(v) => v
+                        .first()
+                        .copied()
+                        .unwrap_or(starknet::core::types::Felt::ZERO),
+                    Err(snake_err) => {
+                        warn!(
+                            token = %name,
+                            camel_error = %camel_err,
+                            snake_error = %snake_err,
+                            "balanceOf/balance_of both failed"
+                        );
+                        starknet::core::types::Felt::ZERO
+                    }
+                }
+            }
+        };
+        if felt_to_u128(&balance_felt) == 0 {
+            continue; // Only surface non-zero balances.
+        }
         token_balances.push(crate::data::types::TokenBalance {
-            token_address: token,
-            token_name: name,
+            token_address: *token,
+            token_name: name.to_string(),
             balance_raw: balance_felt,
-            decimals,
+            decimals: *decimals,
         });
     }
     token_balances
@@ -433,6 +474,17 @@ pub(super) async fn fetch_and_send_address_info(
     let start = std::time::Instant::now();
     debug!(address = %format!("{:#x}", address), "Fetching address info");
 
+    // Kick off token balance fetch immediately — it's independent of nonce/class_hash
+    // and is the primary "is this address active?" signal, so we want it visible ASAP.
+    {
+        let ds_bal = Arc::clone(ds);
+        let tx_bal = tx.clone();
+        tokio::spawn(async move {
+            let balances = fetch_token_balances(address, &ds_bal).await;
+            let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
+        });
+    }
+
     // Kick off Voyager label fetch immediately — runs fully in parallel with all other IO.
     if let Some(vc) = voyager_c {
         let vc = Arc::clone(vc);
@@ -532,16 +584,6 @@ pub(super) async fn fetch_and_send_address_info(
         tx_summaries: ds.load_cached_address_txs(&address),
         contract_calls: ds.load_cached_address_calls(&address),
     });
-
-    // Fetch balances in background
-    {
-        let ds_bal = Arc::clone(ds);
-        let tx_bal = tx.clone();
-        tokio::spawn(async move {
-            let balances = fetch_token_balances(address, &ds_bal).await;
-            let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
-        });
-    }
 
     // Check cached activity range — if fresh, skip Dune probe entirely.
     let cached_range = ds.load_cached_activity_range(&address);
@@ -2541,4 +2583,89 @@ pub(super) async fn find_deploy_tx(
     }
 
     debug!(%addr, deploy_block, "Deploy tx not found in block (neither native nor UDC)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::rpc::RpcDataSource;
+    use starknet::core::types::Felt;
+
+    fn rpc_ds() -> Arc<dyn DataSource> {
+        dotenvy::dotenv().ok();
+        let rpc_url =
+            std::env::var("APP_RPC_URL").expect("APP_RPC_URL must be set for integration tests");
+        Arc::new(RpcDataSource::new(&rpc_url))
+    }
+
+    /// Major public AMM/DEX contracts on Starknet mainnet. Chosen because
+    /// they hold large LP balances across multiple tokens, so at least one
+    /// of the well-known tokens must return non-zero. Pure on-chain public
+    /// addresses — no ownership/activity implication.
+    const WELL_KNOWN_ADDRESSES: &[(&str, &str)] = &[(
+        "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b",
+        "Ekubo Core",
+    )];
+
+    #[tokio::test]
+    #[ignore = "requires APP_RPC_URL"]
+    async fn fetch_balances_for_well_known_addresses() {
+        let ds = rpc_ds();
+        for (hex, label) in WELL_KNOWN_ADDRESSES {
+            let address = Felt::from_hex(hex).unwrap();
+            let balances = fetch_token_balances(address, &ds).await;
+            println!("{} ({}): {} non-zero balances", label, hex, balances.len());
+            for b in &balances {
+                println!("  {} = {:#x}", b.token_name, b.balance_raw);
+            }
+            assert!(
+                !balances.is_empty(),
+                "{} should have at least one non-zero token balance",
+                label
+            );
+            // Invariant enforced by fetch_token_balances: zero balances are filtered out.
+            for b in &balances {
+                assert_ne!(
+                    crate::utils::felt_to_u128(&b.balance_raw),
+                    0,
+                    "{}: {} had zero balance but was returned",
+                    label,
+                    b.token_name
+                );
+            }
+        }
+    }
+
+    /// Smoke test that `batch_call_contracts` matches individual `call_contract`
+    /// results. Guards against regressions where the batched path silently
+    /// returns results in the wrong order.
+    #[tokio::test]
+    #[ignore = "requires APP_RPC_URL"]
+    async fn batch_call_matches_sequential() {
+        let ds = rpc_ds();
+        let balance_of = starknet::core::utils::get_selector_from_name("balanceOf").unwrap();
+        // Ekubo Core — has mixed-token balances.
+        let address = Felt::from_hex(WELL_KNOWN_ADDRESSES[0].0).unwrap();
+
+        let calls: Vec<(Felt, Felt, Vec<Felt>)> = KNOWN_TOKENS
+            .iter()
+            .map(|(hex, _, _)| (Felt::from_hex(hex).unwrap(), balance_of, vec![address]))
+            .collect();
+
+        let batched = ds.batch_call_contracts(calls.clone()).await;
+        assert_eq!(batched.len(), calls.len(), "batch returned wrong count");
+
+        for ((contract, selector, calldata), batch_result) in calls.iter().zip(batched.iter()) {
+            let seq = ds
+                .call_contract(*contract, *selector, calldata.clone())
+                .await;
+            match (batch_result, &seq) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "batched and sequential results diverged"),
+                (Err(_), Err(_)) => {}
+                (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+                    panic!("batched/sequential disagreed on Ok/Err: {}", e);
+                }
+            }
+        }
+    }
 }

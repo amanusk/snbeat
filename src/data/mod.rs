@@ -97,6 +97,24 @@ pub trait DataSource: Send + Sync {
         calldata: Vec<Felt>,
     ) -> Result<Vec<Felt>>;
 
+    /// Batch multiple view-function calls into a single JSON-RPC round trip.
+    ///
+    /// Returns per-call results in the same order as `calls`. The default
+    /// implementation issues each call sequentially — the RPC-backed source
+    /// overrides this to use `starknet_call` batching (issue #12), which
+    /// turns N round trips into one for things like fetching balances across
+    /// a fixed set of tokens.
+    async fn batch_call_contracts(
+        &self,
+        calls: Vec<(Felt, Felt, Vec<Felt>)>,
+    ) -> Vec<Result<Vec<Felt>>> {
+        let mut out = Vec::with_capacity(calls.len());
+        for (contract, selector, calldata) in calls {
+            out.push(self.call_contract(contract, selector, calldata).await);
+        }
+        out
+    }
+
     // --- Deploy info cache ---
     /// Load cached deploy tx info for an address. Returns (tx_hash, block, deployer).
     fn load_cached_deploy_info(&self, _address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {

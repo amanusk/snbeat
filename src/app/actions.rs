@@ -17,17 +17,29 @@ use crate::network::dune::AddressActivityProbe;
 pub enum Action {
     // --- Requests (UI → network) ---
     /// Fetch the N most recent blocks.
-    FetchRecentBlocks { count: usize },
+    FetchRecentBlocks {
+        count: usize,
+    },
     /// Fetch a block with all its transactions.
-    FetchBlockDetail { number: u64 },
+    FetchBlockDetail {
+        number: u64,
+    },
     /// Fetch a transaction and its receipt.
-    FetchTransaction { hash: Felt },
+    FetchTransaction {
+        hash: Felt,
+    },
     /// Fetch address info (nonce, class hash, etc.).
-    FetchAddressInfo { address: Felt },
+    FetchAddressInfo {
+        address: Felt,
+    },
     /// Navigate to address view immediately (before data loads).
-    NavigateToAddress { address: Felt },
+    NavigateToAddress {
+        address: Felt,
+    },
     /// Resolve a search query (may need RPC to disambiguate tx vs address).
-    ResolveSearch { query: String },
+    ResolveSearch {
+        query: String,
+    },
     /// Fetch the next/prev tx by nonce for a given sender address.
     FetchTxByNonce {
         sender: Felt,
@@ -35,7 +47,10 @@ pub enum Action {
         direction: i64,
     },
     /// Enrich visible address txs that are missing endpoint/timestamp data.
-    EnrichAddressTxs { address: Felt, hashes: Vec<Felt> },
+    EnrichAddressTxs {
+        address: Felt,
+        hashes: Vec<Felt>,
+    },
     /// Post-load enrichment: fill small nonce gaps + enrich missing endpoint names.
     /// Fires automatically once initial sources settle. Large gaps are handled by
     /// `FillAddressNonceGaps` instead (on-demand, issue #10).
@@ -56,7 +71,10 @@ pub enum Action {
         hashes_with_blocks: Vec<(Felt, u64)>,
     },
     /// Fetch older blocks (pagination: blocks before `before` block number).
-    FetchOlderBlocks { before: u64, count: usize },
+    FetchOlderBlocks {
+        before: u64,
+        count: usize,
+    },
     /// Fetch more address transactions from before a given block (pagination).
     FetchMoreAddressTxs {
         address: Felt,
@@ -64,7 +82,9 @@ pub enum Action {
         is_contract: bool,
     },
     /// Fetch class hash info (ABI, declaration, deployed contracts).
-    FetchClassInfo { class_hash: Felt },
+    FetchClassInfo {
+        class_hash: Felt,
+    },
     /// Persist enriched address txs to cache (sent after enrichment completes).
     PersistAddressTxs {
         address: Felt,
@@ -74,6 +94,12 @@ pub enum Action {
     PersistAddressCalls {
         address: Felt,
         calls: Vec<ContractCallSummary>,
+    },
+    FetchTokenPricesToday {
+        tokens: Vec<Felt>,
+    },
+    FetchTokenPricesHistoric {
+        requests: Vec<(Felt, u64)>,
     },
 
     // --- Responses (network → UI) ---
@@ -100,6 +126,7 @@ pub enum Action {
         decoded_calls: Vec<RawCall>,
         /// Detected outside executions: (call_index, parsed_info).
         outside_executions: Vec<(usize, OutsideExecutionInfo)>,
+        block_timestamp: Option<u64>,
     },
     /// Address info loaded.
     AddressInfoLoaded {
@@ -141,7 +168,10 @@ pub enum Action {
         probe: AddressActivityProbe,
     },
     /// Tells the UI which data sources will be streaming tx data for this address load.
-    AddressSourcesPending { address: Felt, sources: Vec<Source> },
+    AddressSourcesPending {
+        address: Felt,
+        sources: Vec<Source>,
+    },
     /// Streaming partial tx results from a specific data source (merges, never replaces).
     AddressTxsStreamed {
         address: Felt,
@@ -176,7 +206,9 @@ pub enum Action {
     /// Update the loading status message shown in the status bar.
     LoadingStatus(String),
     /// Navigate to class info view immediately (before data loads).
-    NavigateToClassInfo { class_hash: Felt },
+    NavigateToClassInfo {
+        class_hash: Felt,
+    },
     /// Class ABI loaded from RPC/cache.
     ClassAbiLoaded {
         class_hash: Felt,
@@ -193,6 +225,7 @@ pub enum Action {
         contracts: Vec<ClassContractEntry>,
         declaration_block: Option<u64>,
     },
+    PricesUpdated,
     /// An error occurred in the network task.
     Error(String),
 }

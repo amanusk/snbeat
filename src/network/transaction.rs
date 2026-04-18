@@ -38,10 +38,11 @@ pub(super) async fn resolve_call_abis(
     }
 }
 
-/// Decode already-fetched tx+receipt and send `TransactionLoaded`. No IO.
+/// Decode already-fetched tx+receipt and send `TransactionLoaded`.
 pub(super) async fn decode_and_send_transaction(
     transaction: SnTransaction,
     receipt: crate::data::types::SnReceipt,
+    ds: &Arc<dyn DataSource>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -56,12 +57,28 @@ pub(super) async fn decode_and_send_transaction(
     };
     resolve_call_abis(&mut decoded_calls, abi_reg).await;
     let outside_executions = detect_and_resolve_outside_executions(&decoded_calls, abi_reg).await;
+
+    // Only pay for the block fetch when the tx touches a tracked token —
+    // we'd just discard the timestamp otherwise.
+    let needs_timestamp = decoded_events
+        .iter()
+        .any(|e| crate::network::prices::is_tracked(&e.contract_address));
+    let block_timestamp = if needs_timestamp {
+        ds.get_block(receipt.block_number)
+            .await
+            .ok()
+            .map(|b| b.timestamp)
+    } else {
+        None
+    };
+
     let _ = action_tx.send(Action::TransactionLoaded {
         transaction,
         receipt,
         decoded_events,
         decoded_calls,
         outside_executions,
+        block_timestamp,
     });
 }
 
@@ -120,7 +137,7 @@ pub(super) async fn fetch_and_send_transaction(
     match (tx_result, receipt_result) {
         (Ok(transaction), Ok(receipt)) => {
             info!(tx_hash = %hash_short, elapsed_ms = start.elapsed().as_millis(), "Transaction fetched, decoding");
-            decode_and_send_transaction(transaction, receipt, abi_reg, tx).await;
+            decode_and_send_transaction(transaction, receipt, ds, abi_reg, tx).await;
         }
         (Err(e), _) | (_, Err(e)) => {
             error!(tx_hash = %hash_short, elapsed_ms = start.elapsed().as_millis(), error = %e, "Failed to fetch transaction");
