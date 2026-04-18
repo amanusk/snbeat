@@ -38,16 +38,41 @@ pub(super) async fn fetch_class_info(
     // 2. Declaration info + contracts list
     // Primary: PF for declaration block → RPC for block txs → find declare tx
     // Fallback: Dune for declare tx
+    //
+    // Cache-first: declarations are immutable and contracts-by-class is
+    // TTL'd — checking the local store here turns a repeat visit into zero
+    // upstream round-trips. Each spawned task still emits its tab's action
+    // even on cache hit so the UI never hangs waiting for a "loaded" signal.
+    let cached_declare = ds.load_cached_class_declaration(&class_hash);
+    let cached_contracts = ds.load_cached_class_contracts(&class_hash);
+
     if let Some(pf_client) = pf {
-        // Shared declaration block lookup — fetched once, used by both tasks
+        // Shared declaration block lookup — fetched once, used by both tasks.
+        // Seed from cached declare info so we skip the pf round trip too.
         let decl_block_cell: Arc<tokio::sync::OnceCell<Option<u64>>> =
             Arc::new(tokio::sync::OnceCell::new());
+        if let Some(info) = &cached_declare {
+            let _ = decl_block_cell.set(Some(info.block_number));
+        }
 
         // Spawn contracts-by-class fetch
         let pf_c = Arc::clone(pf_client);
+        let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         let decl_cell_c = Arc::clone(&decl_block_cell);
+        let cached_contracts_c = cached_contracts.clone();
+        let cached_decl_block = cached_declare.as_ref().map(|d| d.block_number);
         tokio::spawn(async move {
+            // Cache hit → emit immediately, no upstream calls.
+            if let Some(entries) = cached_contracts_c {
+                debug!(%class_hash, n = entries.len(), "class contracts: cache hit");
+                let _ = tx_c.send(Action::ClassContractsLoaded {
+                    class_hash,
+                    contracts: entries,
+                    declaration_block: cached_decl_block,
+                });
+                return;
+            }
             let decl_block = *decl_cell_c
                 .get_or_init(|| async { pf_c.get_class_declaration(class_hash).await.ok() })
                 .await;
@@ -75,6 +100,7 @@ pub(super) async fn fetch_class_info(
                     },
                 )
                 .collect();
+            ds_c.save_class_contracts(&class_hash, &contract_entries);
             let _ = tx_c.send(Action::ClassContractsLoaded {
                 class_hash,
                 contracts: contract_entries,
@@ -87,7 +113,17 @@ pub(super) async fn fetch_class_info(
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         let decl_cell_c = Arc::clone(&decl_block_cell);
+        let cached_declare_c = cached_declare.clone();
         tokio::spawn(async move {
+            // Cache hit → emit immediately, no pf + no get_block_with_txs.
+            if let Some(info) = cached_declare_c {
+                debug!(%class_hash, block_number = info.block_number, "class declare: cache hit");
+                let _ = tx_c.send(Action::ClassDeclareLoaded {
+                    class_hash,
+                    declare_info: Some(info),
+                });
+                return;
+            }
             let declare_info = match *decl_cell_c
                 .get_or_init(|| async { pf_c.get_class_declaration(class_hash).await.ok() })
                 .await
@@ -133,22 +169,35 @@ pub(super) async fn fetch_class_info(
                     None
                 }
             };
+            if let Some(info) = &declare_info {
+                ds_c.save_class_declaration(&class_hash, info);
+            }
             let _ = tx_c.send(Action::ClassDeclareLoaded {
                 class_hash,
                 declare_info,
             });
         });
     } else if let Some(dune_client) = dune {
-        // Fallback: Dune for declare tx
+        // Fallback: Dune for declare tx. Cache hit short-circuits upstream.
         let dune_c = Arc::clone(dune_client);
+        let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         tokio::spawn(async move {
-            let declare_info = match dune_c.query_declare_tx(class_hash).await {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!(error = %e, "Dune declare tx query failed");
-                    None
+            let declare_info = if let Some(info) = cached_declare.clone() {
+                debug!(%class_hash, block_number = info.block_number, "class declare: cache hit (dune path)");
+                Some(info)
+            } else {
+                let fetched = match dune_c.query_declare_tx(class_hash).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!(error = %e, "Dune declare tx query failed");
+                        None
+                    }
+                };
+                if let Some(info) = &fetched {
+                    ds_c.save_class_declaration(&class_hash, info);
                 }
+                fetched
             };
             let decl_block = declare_info.as_ref().map(|d| d.block_number);
             let _ = tx_c.send(Action::ClassDeclareLoaded {

@@ -237,17 +237,48 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let ev_count = app.address.events.items.len();
 
     let class_count = app.address.class_history.len();
-    // MetaTxs count is hidden until at least one is found — avoids showing "(0)"
-    // before we've searched. Spinner is shown in the tab body instead.
-    let meta_label = if meta_count > 0 {
-        format!(" MetaTxs ({meta_count}) ")
-    } else {
-        " MetaTxs ".to_string()
+
+    // Probe gives the authoritative total when it's landed. Surface it as
+    // "loaded / total" so the user sees "3 / 27" instead of just "3" and
+    // knows there's more behind pagination.
+    //
+    // For senders (Txs tab), the authoritative total is the on-chain nonce —
+    // Dune's event count counts emitted events, not sender txs, so it
+    // over-counts wildly on hybrid accounts. For callees (Calls tab), the
+    // probe's event-derived count is the right signal.
+    let probe = app.address.activity_probe.as_ref();
+    let tx_total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
+    let call_total = probe.map(|p| p.callee_call_count);
+    let tx_label = match tx_total {
+        Some(total) if (tx_count as u64) < total => {
+            format!(" Txs ({tx_count} / {total}) ")
+        }
+        _ => format!(" Txs ({tx_count}) "),
     };
+    let call_label = match call_total {
+        Some(total) if (call_count as u64) < total => {
+            format!(" Calls ({call_count} / {total}) ")
+        }
+        _ => format!(" Calls ({call_count}) "),
+    };
+
+    // MetaTxs: no upstream count exists (requires classification). Show a
+    // progress indicator instead:
+    //   - before dispatch: " MetaTxs " (body shows spinner)
+    //   - while paging:    " MetaTxs (N+) "  — "+" signals more possible
+    //   - exhausted:       " MetaTxs (N) "   — definitive count
+    let meta_label = if !app.address.meta_txs_dispatched && meta_count == 0 {
+        " MetaTxs ".to_string()
+    } else if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
+        format!(" MetaTxs ({meta_count}+) ")
+    } else {
+        format!(" MetaTxs ({meta_count}) ")
+    };
+
     let titles = vec![
-        Span::raw(format!(" Txs ({tx_count}) ")),
+        Span::raw(tx_label),
         Span::raw(meta_label),
-        Span::raw(format!(" Calls ({call_count}) ")),
+        Span::raw(call_label),
         Span::raw(format!(" Balances ({bal_count}) ")),
         Span::raw(format!(" Events ({ev_count}) ")),
         Span::raw(format!(" Class ({class_count}) ")),

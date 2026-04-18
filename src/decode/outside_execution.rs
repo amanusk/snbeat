@@ -246,6 +246,78 @@ pub fn parse_forwarder_call(call: &RawCall) -> Option<OutsideExecutionInfo> {
     parse_outside_execution(&inner_call, OutsideExecutionVersion::V2)
 }
 
+/// How an outside execution was detected in the cascade.
+///
+/// Preserved alongside the parsed info so callers can build labels that
+/// reflect detection confidence (e.g. the address view distinguishes
+/// `v1`/`v2`/`v3` from the less-certain heuristic-match `v?` and the
+/// forwarder-bridged `avnu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectionMethod {
+    /// Matched on a direct account entrypoint name (`execute_from_outside_v*`).
+    /// Version is authoritative.
+    Name,
+    /// Matched structurally (ANY_CALLER + valid struct). Version is nominal —
+    /// parsed as V2 regardless of the actual variant.
+    Heuristic,
+    /// Matched via a known AVNU forwarder contract address.
+    AvnuForwarder,
+}
+
+/// Shared 3-method outside-execution detector.
+///
+/// Runs the full cascade against a single call and returns the parsed info,
+/// detected version, and which method matched — or `None` if the call is not
+/// an outside execution. Used by both the block view (any intender) and the
+/// address view (filtered by specific intender afterwards).
+///
+/// Cascade (in order):
+///   1. AVNU forwarder by contract address — forwarder calls carry the
+///      intender as `data[0]`, distinct from both name- and heuristic-
+///      detectable layouts.
+///   2. Function-name match (`execute_from_outside_v{1,2,3}`) when the
+///      caller has resolved a name. Direct account entrypoint path.
+///   3. Calldata heuristic (ANY_CALLER + valid struct, parsed as V2).
+///      Catches Argent/Braavos component-based selectors where the name
+///      doesn't resolve to a recognisable string.
+///
+/// The caller decides whether to filter by `oe.intender` — this keeps the
+/// helper useful for both the "any meta-tx in this block" and
+/// "meta-txs where X is the intender" use cases.
+pub fn detect_outside_execution(
+    call: &RawCall,
+    function_name: Option<&str>,
+) -> Option<(OutsideExecutionInfo, DetectionMethod)> {
+    // Method 1: AVNU forwarder (address-based).
+    if is_avnu_forwarder(&call.contract_address) {
+        if let Some(oe) = parse_forwarder_call(call) {
+            return Some((oe, DetectionMethod::AvnuForwarder));
+        }
+        // A call to an AVNU forwarder that doesn't parse as a forwarder call
+        // won't match the other methods either (different data layout), so
+        // short-circuit with `None`.
+        return None;
+    }
+
+    // Method 2: function name match.
+    if let Some(name) = function_name
+        && let Some(version) = is_outside_execution(name)
+        && let Some(oe) = parse_outside_execution(call, version)
+    {
+        return Some((oe, DetectionMethod::Name));
+    }
+
+    // Method 3: calldata heuristic fallback. Runs when the name doesn't
+    // resolve (component selectors on Argent v3, unknown ABIs, etc.).
+    if looks_like_outside_execution(call)
+        && let Some(oe) = parse_outside_execution(call, OutsideExecutionVersion::V2)
+    {
+        return Some((oe, DetectionMethod::Heuristic));
+    }
+
+    None
+}
+
 /// Returns `true` if the caller field is the ANY_CALLER sentinel.
 pub fn is_any_caller(caller: &Felt) -> bool {
     *caller == ANY_CALLER

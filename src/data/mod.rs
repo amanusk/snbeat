@@ -10,8 +10,8 @@ use starknet::core::types::ContractClass;
 
 use crate::error::Result;
 use types::{
-    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt,
-    SnTransaction,
+    AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
+    MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt, SnTransaction,
 };
 
 /// Abstraction over different Starknet data sources (RPC, Pathfinder DB).
@@ -157,4 +157,25 @@ pub trait DataSource: Send + Sync {
     }
     /// Save search progress for an address.
     fn save_search_progress(&self, _address: &Felt, _min_block: u64, _max_block: u64) {}
+
+    // --- Class declaration cache ---
+    /// Load cached declare info for a class hash. Declarations are immutable
+    /// (a class's declaration block/tx never changes), so there is no TTL.
+    fn load_cached_class_declaration(&self, _class_hash: &Felt) -> Option<ClassDeclareInfo> {
+        None
+    }
+    /// Persist the declare info for a class hash.
+    fn save_class_declaration(&self, _class_hash: &Felt, _info: &ClassDeclareInfo) {}
+
+    // --- Class contracts cache ---
+    /// Load cached list of contracts deployed with this class hash. Returns
+    /// `None` if not cached or the cached entry is stale (> 1 hour old) —
+    /// contracts-by-class grows monotonically as new deploys happen, so it
+    /// needs a short TTL unlike the immutable declaration.
+    fn load_cached_class_contracts(&self, _class_hash: &Felt) -> Option<Vec<ClassContractEntry>> {
+        None
+    }
+    /// Persist the full contracts list for a class hash (replaces any prior
+    /// list) and refresh the fetched-at timestamp used for TTL.
+    fn save_class_contracts(&self, _class_hash: &Felt, _contracts: &[ClassContractEntry]) {}
 }

@@ -1071,15 +1071,24 @@ impl App {
                 }
                 self.address.fetching_meta_txs = false;
                 // Progressive fill: keep paging until the visible screen is
-                // full (~50 rows). Once full, pagination goes back to strictly
-                // on-demand via `maybe_fetch_more_meta_txs` on scroll.
+                // full (~FIRST_PAINT_TARGET rows) OR we hit the safety cap
+                // (AUTO_PAGE_CAP). The cap prevents addresses with many events
+                // but zero classified meta-txs from walking their whole
+                // history in the background. Once either limit trips,
+                // pagination goes back to strictly on-demand via
+                // `maybe_fetch_more_meta_txs` on scroll.
+                use crate::app::views::address_info::{
+                    META_TX_AUTO_PAGE_CAP, META_TX_FIRST_PAINT_TARGET,
+                };
                 if self.address.context == Some(address)
                     && self.address.meta_tx_has_more
-                    && self.address.meta_txs.items.len() < 50
+                    && self.address.meta_txs.items.len() < META_TX_FIRST_PAINT_TARGET
+                    && self.address.meta_tx_auto_pages < META_TX_AUTO_PAGE_CAP
                 {
                     let next = self.address.meta_tx_cursor_block;
                     let from_block = self.address.meta_tx_from_block;
                     self.address.fetching_meta_txs = true;
+                    self.address.meta_tx_auto_pages += 1;
                     let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
                         address,
                         from_block,
