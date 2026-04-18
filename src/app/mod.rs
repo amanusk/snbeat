@@ -811,7 +811,22 @@ impl App {
                     info.nonce == starknet::core::types::Felt::ZERO && info.class_hash.is_some();
                 self.address.is_contract = is_contract;
 
+                // Preserve any balances that may have already arrived — the
+                // balance task runs in parallel with the nonce/class_hash
+                // fetch and can land first, and every callsite constructs
+                // `SnAddressInfo` with an empty `token_balances` by default.
+                let preserved_balances = self
+                    .address
+                    .info
+                    .as_ref()
+                    .map(|i| i.token_balances.clone())
+                    .unwrap_or_default();
+
                 // Only update info if it has real data
+                let mut info = info;
+                if info.token_balances.is_empty() && !preserved_balances.is_empty() {
+                    info.token_balances = preserved_balances;
+                }
                 if info.nonce != starknet::core::types::Felt::ZERO
                     || !info.token_balances.is_empty()
                     || info.class_hash.is_some()
@@ -1233,6 +1248,18 @@ impl App {
             }
             Action::AddressBalancesLoaded { address, balances } => {
                 if self.address.context == Some(address) {
+                    // Balances can beat the nonce/class_hash fetch to the UI —
+                    // seed a minimal info so the result isn't dropped while
+                    // `info` is still `None` waiting on `AddressInfoLoaded`.
+                    if self.address.info.is_none() {
+                        self.address.info = Some(crate::data::types::SnAddressInfo {
+                            address,
+                            nonce: starknet::core::types::Felt::ZERO,
+                            class_hash: None,
+                            recent_events: Vec::new(),
+                            token_balances: Vec::new(),
+                        });
+                    }
                     if let Some(info) = &mut self.address.info {
                         info.token_balances = balances;
                     }

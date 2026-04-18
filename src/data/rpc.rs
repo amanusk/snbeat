@@ -1,12 +1,15 @@
 use async_trait::async_trait;
+use starknet::core::types::requests::CallRequest;
 use starknet::core::types::{
     AddressFilter, BlockId, BlockTag, BlockWithTxs, ContractClass, DeclareTransaction,
     DeployAccountTransaction, EventFilter, ExecutionResult, Felt, FunctionCall, InvokeTransaction,
     MaybePreConfirmedBlockWithTxs, Transaction, TransactionReceipt,
 };
 use starknet::core::utils::get_contract_address;
-use starknet::providers::{JsonRpcClient, Provider, jsonrpc::HttpTransport};
-use tracing::debug;
+use starknet::providers::{
+    JsonRpcClient, Provider, ProviderRequestData, ProviderResponseData, jsonrpc::HttpTransport,
+};
+use tracing::{debug, warn};
 use url::Url;
 
 use super::DataSource;
@@ -389,6 +392,52 @@ impl DataSource for RpcDataSource {
             .call(call, BlockId::Tag(BlockTag::Latest))
             .await
             .map_err(|e| SnbeatError::Provider(e.to_string()))
+    }
+
+    async fn batch_call_contracts(
+        &self,
+        calls: Vec<(Felt, Felt, Vec<Felt>)>,
+    ) -> Vec<Result<Vec<Felt>>> {
+        if calls.is_empty() {
+            return Vec::new();
+        }
+        let requests: Vec<ProviderRequestData> = calls
+            .iter()
+            .map(|(contract_address, selector, calldata)| {
+                ProviderRequestData::Call(CallRequest {
+                    request: FunctionCall {
+                        contract_address: *contract_address,
+                        entry_point_selector: *selector,
+                        calldata: calldata.clone(),
+                    },
+                    block_id: BlockId::Tag(BlockTag::Latest),
+                })
+            })
+            .collect();
+
+        match self.provider.batch_requests(&requests).await {
+            Ok(responses) => responses
+                .into_iter()
+                .map(|resp| match resp {
+                    ProviderResponseData::Call(v) => Ok(v),
+                    _ => Err(SnbeatError::Provider(
+                        "unexpected response type in batch".into(),
+                    )),
+                })
+                .collect(),
+            Err(e) => {
+                // `batch_requests` is all-or-nothing — if any single call in the
+                // batch fails, the whole thing errors. Fall back to per-call
+                // requests so one bad call (e.g., a contract without the
+                // expected selector) doesn't sink the rest.
+                warn!(error = %e, "batch_requests failed, falling back to sequential");
+                let mut out = Vec::with_capacity(calls.len());
+                for (contract, selector, calldata) in calls {
+                    out.push(self.call_contract(contract, selector, calldata).await);
+                }
+                out
+            }
+        }
     }
 }
 

@@ -911,6 +911,15 @@ impl DataSource for CachingDataSource {
             .await
     }
 
+    async fn batch_call_contracts(
+        &self,
+        calls: Vec<(Felt, Felt, Vec<Felt>)>,
+    ) -> Vec<Result<Vec<Felt>>> {
+        // Pass through so the upstream's batched implementation is used —
+        // the default trait impl would silently run each call serially.
+        self.upstream.batch_call_contracts(calls).await
+    }
+
     async fn get_contract_events(
         &self,
         address: Felt,
