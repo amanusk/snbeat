@@ -42,7 +42,7 @@ pub struct UnfilledGap {
 /// All state related to the address info view.
 pub struct AddressInfoState {
     pub info: Option<SnAddressInfo>,
-    pub events: Vec<DecodedEvent>,
+    pub events: StatefulList<DecodedEvent>,
     /// Enriched tx summaries for the Transactions tab.
     pub txs: StatefulList<AddressTxSummary>,
     /// The DEPLOY_ACCOUNT tx that created this address (filtered out of txs).
@@ -51,8 +51,6 @@ pub struct AddressInfoState {
     pub calls: StatefulList<ContractCallSummary>,
     /// Whether this address is a contract (nonce == 0) vs an account.
     pub is_contract: bool,
-    /// Scrollable index for events tab.
-    pub event_scroll: usize,
     /// Whether header is in visual (item-selection) mode.
     pub visual_mode: bool,
     /// Navigable items in the address header (class hash, deploy tx, deploy block, deployer).
@@ -96,12 +94,11 @@ impl Default for AddressInfoState {
     fn default() -> Self {
         Self {
             info: None,
-            events: Vec::new(),
+            events: StatefulList::new(),
             txs: StatefulList::new(),
             deployment: None,
             calls: StatefulList::new(),
             is_contract: false,
-            event_scroll: 0,
             visual_mode: false,
             nav_items: Vec::new(),
             nav_cursor: 0,
@@ -128,8 +125,7 @@ impl AddressInfoState {
     /// Clear all address info data. Called when navigating to a new address.
     pub fn clear(&mut self) {
         self.info = None;
-        self.events.clear();
-        self.event_scroll = 0;
+        self.events = StatefulList::new();
         self.class_history.clear();
         self.class_history_scroll = 0;
         self.visual_mode = false;

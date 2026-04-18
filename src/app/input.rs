@@ -571,6 +571,10 @@ fn handle_enter(app: &mut App) -> Option<Action> {
                     let hash = app.address.calls.selected_item()?.tx_hash;
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }
+                crate::app::AddressTab::Events => {
+                    let hash = app.address.events.selected_item()?.raw.transaction_hash;
+                    return app.navigate_to(NavTarget::Transaction(hash));
+                }
                 crate::app::AddressTab::ClassHistory => {
                     let felt = app
                         .address

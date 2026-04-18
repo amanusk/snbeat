@@ -232,7 +232,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|i| i.token_balances.len())
         .unwrap_or(0);
-    let ev_count = app.address.events.len();
+    let ev_count = app.address.events.items.len();
 
     let class_count = app.address.class_history.len();
     let titles = vec![
@@ -603,8 +603,22 @@ fn balance_usd_value(app: &App, bal: &TokenBalance) -> Option<f64> {
     Some(raw / scale * price)
 }
 
-fn draw_events_tab(f: &mut Frame, app: &App, area: Rect) {
-    if app.address.events.is_empty() {
+fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    // Column headers
+    let header_area = Rect { height: 1, ..area };
+    let list_area = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("    Event               ", theme::SUGGESTION_STYLE),
+        Span::styled("Contract         ", theme::SUGGESTION_STYLE),
+        Span::styled("Tx             ", theme::SUGGESTION_STYLE),
+    ]));
+    f.render_widget(header, header_area);
+
+    if app.address.events.items.is_empty() {
         let msg = if app.is_loading {
             " Loading events..."
         } else {
@@ -616,54 +630,47 @@ fn draw_events_tab(f: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(theme::BORDER_STYLE),
             ),
-            area,
+            list_area,
         );
         return;
     }
 
-    let visible_height = area.height.saturating_sub(2) as usize; // -2 for borders
-    let start = app.address.event_scroll;
-    let end = (start + visible_height).min(app.address.events.len());
-
-    let items: Vec<ListItem> = app.address.events[start..end]
+    let items: Vec<ListItem> = app
+        .address
+        .events
+        .items
         .iter()
-        .enumerate()
-        .map(|(i, event)| {
-            let idx = start + i;
+        .map(|event| {
             let contract = app.format_address(&event.contract_address);
             let name = event.event_name.as_deref().unwrap_or("?");
             let tx_short = short_hash(&event.raw.transaction_hash);
 
-            let marker = if idx == app.address.event_scroll {
-                "> "
-            } else {
-                "  "
-            };
-
             let line = Line::from(vec![
-                Span::raw(marker),
-                Span::styled(format!("{:<20}", name), theme::LABEL_STYLE),
-                Span::styled(format!("{:<16} ", contract), theme::BLOCK_HASH_STYLE),
-                Span::styled(format!("tx:{}", tx_short), theme::TX_HASH_STYLE),
+                Span::styled(format!(" {:<20}", name), theme::LABEL_STYLE),
+                Span::styled(format!("{:<17}", contract), theme::BLOCK_HASH_STYLE),
+                Span::styled(tx_short, theme::TX_HASH_STYLE),
             ]);
             ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::BORDER_STYLE)
-            .title(Span::styled(
-                format!(
-                    " Events ({}/{}) ",
-                    app.address.event_scroll + 1,
-                    app.address.events.len()
-                ),
-                theme::TITLE_STYLE,
-            )),
-    );
-    f.render_widget(list, area);
+    let title = if app.is_loading {
+        format!(" Events ({}) fetching... ", app.address.events.items.len())
+    } else {
+        format!(" Events ({}) ", app.address.events.items.len())
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::BORDER_STYLE)
+                .title(Span::styled(title, theme::TITLE_STYLE)),
+        )
+        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, list_area, &mut app.address.events.state);
 }
 
 fn format_token_balance(bal: &TokenBalance) -> String {

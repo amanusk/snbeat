@@ -404,11 +404,7 @@ impl App {
                     self.address.calls.next();
                     self.maybe_fetch_more_address_txs();
                 }
-                AddressTab::Events => {
-                    if self.address.event_scroll < self.address.events.len().saturating_sub(1) {
-                        self.address.event_scroll += 1;
-                    }
-                }
+                AddressTab::Events => self.address.events.next(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll = self
                         .address
@@ -437,9 +433,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => self.address.calls.previous(),
-                AddressTab::Events => {
-                    self.address.event_scroll = self.address.event_scroll.saturating_sub(1);
-                }
+                AddressTab::Events => self.address.events.previous(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll =
                         self.address.class_history_scroll.saturating_sub(1);
@@ -465,7 +459,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => self.address.calls.select_first(),
-                AddressTab::Events => self.address.event_scroll = 0,
+                AddressTab::Events => self.address.events.select_first(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll = 0;
                 }
@@ -497,9 +491,7 @@ impl App {
                     self.address.calls.select_last();
                     self.maybe_fetch_more_address_txs();
                 }
-                AddressTab::Events => {
-                    self.address.event_scroll = self.address.events.len().saturating_sub(1);
-                }
+                AddressTab::Events => self.address.events.select_last(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll =
                         self.address.class_history.len().saturating_sub(1);
@@ -837,7 +829,11 @@ impl App {
                 }
 
                 if !decoded_events.is_empty() {
-                    self.address.events = decoded_events;
+                    let had_selection = self.address.events.state.selected().is_some();
+                    self.address.events.items = decoded_events;
+                    if !had_selection {
+                        self.address.events.select_first();
+                    }
                 }
 
                 // Merge txs (dedup + upgrade existing entries with better data)

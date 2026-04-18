@@ -74,8 +74,10 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d" = { name = "STRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8" = { name = "USDT", type = "ERC20", verified = true, source = "bundled", decimals = 6 }
 "0x00da114221cb83fa859dbdb4c44beeaa0bb37c7537ad5ae66fe5e0efd20e6eb3" = { name = "DAI", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
-"0x0124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49" = { name = "wBTC", type = "ERC20", verified = true, source = "bundled", decimals = 8 }
-"0x04c0a5193d58f74fbace4b74dcf65481e734ed1714121bdc571da345540efa05" = { name = "wstETH", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
+"0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac" = { name = "wBTC", type = "ERC20", verified = true, source = "bundled", decimals = 8 }
+"0x0057912720381af14b0e5c87aa4718ed5e527eab60b3801ebf702ab09139e38b" = { name = "wstETH", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
+"0x075afe6402ad5a5c20dd25e10ec3b3986acaa647b77e4ae24b0cbc9a54a27a87" = { name = "EKUBO", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
+"0x04daa17763b286d1e59b97c283c0b8c949994c361e426a28f743c67bdfe9a32f" = { name = "tBTC", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x028d709c875c0ceac3dce7065bec5328186dc89fe254527084d1689910954b0a" = { name = "xSTRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x042b8f0484674ca266ac5d08e4ac6a3fe65bd3129795def2dca5c34ecc5f96d2" = { name = "nstSTRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 
