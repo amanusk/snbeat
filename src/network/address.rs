@@ -39,7 +39,7 @@ const UDC_CONTRACT_DEPLOYED: &str =
 /// selector key filter; contracts fetch everything the contract emitted) and
 /// the preferred primary data source — see [`fetch_events_routed`].
 #[derive(Debug, Clone, Copy)]
-pub(super) enum EventQueryKind {
+pub(crate) enum EventQueryKind {
     /// Account address — we want one event per invoke (`transaction_executed`).
     Account,
     /// Contract address — we want all events emitted by the contract.
@@ -167,8 +167,8 @@ pub(super) async fn fetch_events_routed(
 /// MetaTxs). Hoisting the common fetch here avoids running
 /// `get_events_for_address` + `get_txs_by_hash` twice — MetaTxs are a classified
 /// subset of the same tx rows the calls/txs tab needs.
-#[derive(Debug)]
-pub(super) struct AddressActivityPage {
+#[derive(Debug, Clone)]
+pub(crate) struct AddressActivityPage {
     /// Raw events for the address (TRANSACTION_EXECUTED for accounts,
     /// from_address filter for contracts).
     pub events: Vec<crate::data::types::SnEvent>,
@@ -201,7 +201,7 @@ pub(super) struct AddressActivityPage {
 /// the returned page and live in their own helpers.
 ///
 /// pf-query-only by design — the RPC fallback keeps the legacy per-tx flow.
-pub(super) async fn fetch_address_activity(
+pub(crate) async fn fetch_address_activity(
     address: starknet::core::types::Felt,
     kind: EventQueryKind,
     from_block: u64,
@@ -805,48 +805,94 @@ pub(super) async fn fetch_and_send_address_info(
         // on-chain nonce in the address info path; leave sender_* at 0.
         probe.callee_call_count = event_count;
         let _ = probe_watch_tx.send(Some(probe));
-    } else if let Some(dune_client) = dune {
-        let dune_p = Arc::clone(dune_client);
+    } else {
+        // No fresh cache — try pf-query first (when available), fall back to
+        // Dune if pf-query is absent or errors. pf-query's count endpoint
+        // walks the full range via bloom filters, so it matches Dune's
+        // activity-probe semantics without the external dependency.
+        let pf_probe: Option<Arc<crate::data::pathfinder::PathfinderClient>> =
+            pf.as_ref().map(Arc::clone);
+        let dune_probe: Option<Arc<dune::DuneClient>> = dune.as_ref().map(Arc::clone);
         let ds_probe = Arc::clone(ds);
         let tx_probe = tx.clone();
+        let probe_watch_tx_c = probe_watch_tx.clone();
         tokio::spawn(async move {
-            let _ = tx_probe.send(Action::LoadingStatus(
-                "Dune: probing activity range (events)...".into(),
-            ));
-            match dune_p.probe_address_activity(address).await {
-                Ok(probe) => {
-                    if probe.has_activity() {
-                        let _ = tx_probe.send(Action::LoadingStatus(format!(
-                            "Dune probe: {} events, blocks {}..{}",
-                            probe.callee_call_count,
-                            probe.min_block(),
-                            probe.max_block(),
-                        )));
-                        // Cache the discovered range + event count for next time.
-                        let total_events = probe.callee_call_count;
-                        ds_probe.save_activity_range_with_count(
-                            &address,
-                            probe.min_block(),
-                            probe.max_block(),
-                            total_events,
-                        );
-                    } else {
-                        let _ = tx_probe.send(Action::LoadingStatus(
-                            "Dune probe: no activity found".into(),
-                        ));
-                    }
-                    // Send probe to UI for pagination window sizing.
-                    let _ = tx_probe.send(Action::AddressProbeLoaded {
-                        address,
-                        probe: probe.clone(),
-                    });
-                    let _ = probe_watch_tx.send(Some(probe));
-                }
-                Err(e) => {
-                    warn!(error = %e, "Dune activity probe failed");
+            // Common post-success step: cache the discovered range, emit the
+            // UI action, and publish on the watch channel so downstream tasks
+            // can size their windows.
+            let publish = |probe: dune::AddressActivityProbe, label: &str| {
+                if probe.has_activity() {
+                    let _ = tx_probe.send(Action::LoadingStatus(format!(
+                        "{label}: {} events, blocks {}..{}",
+                        probe.callee_call_count,
+                        probe.min_block(),
+                        probe.max_block(),
+                    )));
+                    ds_probe.save_activity_range_with_count(
+                        &address,
+                        probe.min_block(),
+                        probe.max_block(),
+                        probe.callee_call_count,
+                    );
+                } else {
                     let _ =
-                        tx_probe.send(Action::LoadingStatus(format!("Dune probe failed: {}", e)));
-                    // Leave watch at None — tasks will use default windows.
+                        tx_probe.send(Action::LoadingStatus(format!("{label}: no activity found")));
+                }
+                let _ = tx_probe.send(Action::AddressProbeLoaded {
+                    address,
+                    probe: probe.clone(),
+                });
+                let _ = probe_watch_tx_c.send(Some(probe));
+            };
+
+            // 1. Try pf-query first.
+            if let Some(pf_c) = pf_probe.as_ref() {
+                let _ = tx_probe.send(Action::LoadingStatus(
+                    "PF: probing activity range (events)...".into(),
+                ));
+                match pf_c
+                    .get_contract_event_count(address, None, None, &[])
+                    .await
+                {
+                    Ok(count) => {
+                        let probe = dune::AddressActivityProbe {
+                            callee_call_count: count.count,
+                            callee_min_block: count.min_block.unwrap_or(0),
+                            callee_max_block: count.max_block.unwrap_or(0),
+                            ..Default::default()
+                        };
+                        if !count.complete {
+                            warn!(
+                                "pf-query event-count hit candidate cap; count={} is a lower bound",
+                                count.count
+                            );
+                        }
+                        publish(probe, "PF probe");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "pf-query activity probe failed, falling back to Dune");
+                        let _ = tx_probe.send(Action::LoadingStatus(format!(
+                            "PF probe failed ({}); trying Dune...",
+                            e
+                        )));
+                    }
+                }
+            }
+
+            // 2. Fall back to Dune.
+            if let Some(dune_c) = dune_probe.as_ref() {
+                let _ = tx_probe.send(Action::LoadingStatus(
+                    "Dune: probing activity range (events)...".into(),
+                ));
+                match dune_c.probe_address_activity(address).await {
+                    Ok(probe) => publish(probe, "Dune probe"),
+                    Err(e) => {
+                        warn!(error = %e, "Dune activity probe failed");
+                        let _ = tx_probe
+                            .send(Action::LoadingStatus(format!("Dune probe failed: {}", e)));
+                        // Leave watch at None — tasks will use default windows.
+                    }
                 }
             }
         });
@@ -925,276 +971,135 @@ pub(super) async fn fetch_and_send_address_info(
     }
 
     // =====================================================================
-    // TASK B: Dune query — narrow windowed fetch for fast initial display
+    // TASK B1: Contract calls — pf-query primary, RPC fallback, always runs
+    // for contracts regardless of Dune availability. The prior Dune-backed
+    // bulk fetch was replaced by the unified event_window path so all three
+    // event-derived tabs share one cursor + additive cache.
     // =====================================================================
-    if let Some(dune_client) = dune {
-        let dune_c = Arc::clone(dune_client);
+    if is_contract {
+        let ds_b = Arc::clone(ds);
         let tx_b = tx.clone();
         let abi_b = Arc::clone(abi_reg);
-        let ds_b = Arc::clone(ds);
         let pf_b = pf.as_ref().map(Arc::clone);
+        tokio::spawn(async move {
+            let _ = tx_b.send(Action::LoadingStatus(
+                "Calls: fetching via event window...".into(),
+            ));
+            fetch_address_contract_calls(
+                address,
+                &ds_b,
+                pf_b.as_ref(),
+                &abi_b,
+                &tx_b,
+                nonce,
+                class_hash,
+            )
+            .await;
+            // Stream completion marker so source tracking clears the loading
+            // flag; tx_summaries is empty because Calls populate via
+            // AddressInfoLoaded.contract_calls, not via AddressTxsStreamed.
+            let _ = tx_b.send(Action::AddressTxsStreamed {
+                address,
+                source: Source::Dune,
+                tx_summaries: Vec::new(),
+                complete: true,
+            });
+        });
+    }
+
+    // =====================================================================
+    // TASK B2: Dune windowed account-tx fetch — unchanged, still opt-in on
+    // Dune availability. Accounts fall back to Dune for the sender-tx tab
+    // when pf-query is unavailable; this is orthogonal to the Calls tab.
+    // =====================================================================
+    if !is_contract && let Some(dune_client) = dune {
+        let dune_c = Arc::clone(dune_client);
+        let tx_b = tx.clone();
+        let ds_b = Arc::clone(ds);
         let mut probe_rx_b = probe_watch_rx.clone();
         const DUNE_PAGE_LIMIT: u32 = 100;
         const INITIAL_WINDOW: u64 = 5_000;
 
-        if is_contract {
-            tokio::spawn(async move {
-                let _ = tx_b.send(Action::LoadingStatus(
-                    "Dune: fetching recent contract calls...".into(),
-                ));
-                let latest_block = ds_b.get_latest_block_number().await.unwrap_or(0);
-                let from = latest_block.saturating_sub(INITIAL_WINDOW);
+        // Account: windowed tx fetch
+        tokio::spawn(async move {
+            let _ = tx_b.send(Action::LoadingStatus(
+                "Dune: fetching recent account txs...".into(),
+            ));
+            let latest_block = ds_b.get_latest_block_number().await.unwrap_or(0);
+            let from = latest_block.saturating_sub(INITIAL_WINDOW);
 
-                let result = dune_c
-                    .query_contract_calls_windowed(address, from, latest_block, DUNE_PAGE_LIMIT)
-                    .await;
+            let result = dune_c
+                .query_account_txs_windowed(address, from, latest_block, DUNE_PAGE_LIMIT)
+                .await;
 
-                match result {
-                    Ok(calls) if !calls.is_empty() => {
-                        let _ =
-                            tx_b.send(dune_source_update(crate::app::state::SourceStatus::Live));
-                        let count = calls.len();
-                        info!(calls = count, "Dune windowed contract calls complete");
-
-                        let dune_calls =
-                            enrich_dune_calls(address, calls, &abi_b, &ds_b, pf_b.as_ref(), &tx_b)
-                                .await;
-
-                        if !dune_calls.is_empty() {
-                            let min_b = dune_calls.last().map(|c| c.block_number).unwrap_or(0);
-                            let max_b = dune_calls.first().map(|c| c.block_number).unwrap_or(0);
-                            let _ = tx_b.send(Action::LoadingStatus(format!(
-                                "Dune: {} calls, blocks {}..{}",
-                                dune_calls.len(),
-                                min_b,
-                                max_b
-                            )));
-                            // Cache calls for next visit
-                            ds_b.save_address_calls(&address, &dune_calls);
-                        }
-
-                        let _ = tx_b.send(Action::AddressInfoLoaded {
-                            info: crate::data::types::SnAddressInfo {
-                                address,
-                                nonce,
-                                class_hash,
-                                recent_events: Vec::new(),
-                                token_balances: Vec::new(),
-                            },
-                            decoded_events: Vec::new(),
-                            tx_summaries: Vec::new(),
-                            contract_calls: dune_calls,
-                        });
-
-                        let _ = tx_b.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Dune,
-                            tx_summaries: Vec::new(),
-                            complete: true,
-                        });
-                    }
-                    Ok(_) | Err(_) => {
-                        if let Err(ref e) = result {
-                            warn!(error = %e, "Dune windowed contract calls failed");
-                        }
-                        // Initial window empty — wait for probe, retry with probe-guided window
-                        let probe = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(10),
-                            probe_rx_b.wait_for(|p| p.is_some()),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .and_then(|p| p.clone());
-
-                        if let Some(p) = probe {
-                            if p.has_activity() {
-                                let window = p.recommended_window();
-                                let probe_from = p.max_block().saturating_sub(window);
-                                let probe_to = p.max_block();
-                                let _ = tx_b.send(Action::LoadingStatus(format!(
-                                    "Dune: retrying blocks {}..{} (probe-guided)...",
-                                    probe_from, probe_to
-                                )));
-                                match dune_c
-                                    .query_contract_calls_windowed(
-                                        address,
-                                        probe_from,
-                                        probe_to,
-                                        DUNE_PAGE_LIMIT,
-                                    )
-                                    .await
-                                {
-                                    Ok(calls) if !calls.is_empty() => {
-                                        let _ = tx_b.send(dune_source_update(
-                                            crate::app::state::SourceStatus::Live,
-                                        ));
-                                        let dune_calls = enrich_dune_calls(
-                                            address,
-                                            calls,
-                                            &abi_b,
-                                            &ds_b,
-                                            pf_b.as_ref(),
-                                            &tx_b,
-                                        )
-                                        .await;
-                                        if !dune_calls.is_empty() {
-                                            let min_b = dune_calls
-                                                .last()
-                                                .map(|c| c.block_number)
-                                                .unwrap_or(0);
-                                            let max_b = dune_calls
-                                                .first()
-                                                .map(|c| c.block_number)
-                                                .unwrap_or(0);
-                                            let _ = tx_b.send(Action::LoadingStatus(format!(
-                                                "Dune: {} calls, blocks {}..{}",
-                                                dune_calls.len(),
-                                                min_b,
-                                                max_b
-                                            )));
-                                            ds_b.save_address_calls(&address, &dune_calls);
-                                        }
-                                        let _ = tx_b.send(Action::AddressInfoLoaded {
-                                            info: crate::data::types::SnAddressInfo {
-                                                address,
-                                                nonce,
-                                                class_hash,
-                                                recent_events: Vec::new(),
-                                                token_balances: Vec::new(),
-                                            },
-                                            decoded_events: Vec::new(),
-                                            tx_summaries: Vec::new(),
-                                            contract_calls: dune_calls,
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        let _ = tx_b.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Dune,
-                            tx_summaries: Vec::new(),
-                            complete: true,
-                        });
-                    }
+            match result {
+                Ok(dune_txs) if !dune_txs.is_empty() => {
+                    let _ = tx_b.send(dune_source_update(crate::app::state::SourceStatus::Live));
+                    info!(
+                        dune_txs = dune_txs.len(),
+                        "Dune windowed account txs complete"
+                    );
+                    let min_b = dune_txs.iter().map(|t| t.block_number).min().unwrap_or(0);
+                    let max_b = dune_txs.iter().map(|t| t.block_number).max().unwrap_or(0);
+                    let _ = tx_b.send(Action::LoadingStatus(format!(
+                        "Dune: {} txs, blocks {}..{}",
+                        dune_txs.len(),
+                        min_b,
+                        max_b
+                    )));
+                    let _ = tx_b.send(Action::AddressTxsStreamed {
+                        address,
+                        source: Source::Dune,
+                        tx_summaries: dune_txs,
+                        complete: true,
+                    });
                 }
-            });
-        } else {
-            // Account: windowed tx fetch
-            tokio::spawn(async move {
-                let _ = tx_b.send(Action::LoadingStatus(
-                    "Dune: fetching recent account txs...".into(),
-                ));
-                let latest_block = ds_b.get_latest_block_number().await.unwrap_or(0);
-                let from = latest_block.saturating_sub(INITIAL_WINDOW);
-
-                let result = dune_c
-                    .query_account_txs_windowed(address, from, latest_block, DUNE_PAGE_LIMIT)
-                    .await;
-
-                match result {
-                    Ok(dune_txs) if !dune_txs.is_empty() => {
-                        let _ =
-                            tx_b.send(dune_source_update(crate::app::state::SourceStatus::Live));
-                        info!(
-                            dune_txs = dune_txs.len(),
-                            "Dune windowed account txs complete"
-                        );
-                        let min_b = dune_txs.iter().map(|t| t.block_number).min().unwrap_or(0);
-                        let max_b = dune_txs.iter().map(|t| t.block_number).max().unwrap_or(0);
-                        let _ = tx_b.send(Action::LoadingStatus(format!(
-                            "Dune: {} txs, blocks {}..{}",
-                            dune_txs.len(),
-                            min_b,
-                            max_b
-                        )));
-                        let _ = tx_b.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Dune,
-                            tx_summaries: dune_txs,
-                            complete: true,
-                        });
+                Ok(_) | Err(_) => {
+                    if let Err(ref e) = result {
+                        warn!(error = %e, "Dune windowed account txs failed");
                     }
-                    Ok(_) | Err(_) => {
-                        if let Err(ref e) = result {
-                            warn!(error = %e, "Dune windowed account txs failed");
-                        }
-                        // Initial window empty — wait for probe, retry with probe-guided window
-                        let probe = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(10),
-                            probe_rx_b.wait_for(|p| p.is_some()),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .and_then(|p| p.clone());
+                    // Initial window empty — wait for probe, retry with probe-guided window
+                    let probe = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(10),
+                        probe_rx_b.wait_for(|p| p.is_some()),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .and_then(|p| p.clone());
 
-                        if let Some(p) = probe {
-                            if p.has_activity() {
-                                let window = p.recommended_window();
-                                let probe_from = p.max_block().saturating_sub(window);
-                                let probe_to = p.max_block();
-                                let _ = tx_b.send(Action::LoadingStatus(format!(
-                                    "Dune: retrying blocks {}..{} (probe-guided)...",
-                                    probe_from, probe_to
-                                )));
-                                match dune_c
-                                    .query_account_txs_windowed(
-                                        address,
-                                        probe_from,
-                                        probe_to,
-                                        DUNE_PAGE_LIMIT,
-                                    )
-                                    .await
-                                {
-                                    Ok(txs) if !txs.is_empty() => {
-                                        let _ = tx_b.send(dune_source_update(
-                                            crate::app::state::SourceStatus::Live,
-                                        ));
-                                        let min_b =
-                                            txs.iter().map(|t| t.block_number).min().unwrap_or(0);
-                                        let max_b =
-                                            txs.iter().map(|t| t.block_number).max().unwrap_or(0);
-                                        let _ = tx_b.send(Action::LoadingStatus(format!(
-                                            "Dune: {} txs, blocks {}..{}",
-                                            txs.len(),
-                                            min_b,
-                                            max_b
-                                        )));
-                                        let _ = tx_b.send(Action::AddressTxsStreamed {
-                                            address,
-                                            source: Source::Dune,
-                                            tx_summaries: txs,
-                                            complete: true,
-                                        });
-                                    }
-                                    _ => {
-                                        let _ = tx_b.send(Action::AddressTxsStreamed {
-                                            address,
-                                            source: Source::Dune,
-                                            tx_summaries: Vec::new(),
-                                            complete: true,
-                                        });
-                                    }
-                                }
-                            } else {
-                                let _ = tx_b.send(Action::AddressTxsStreamed {
+                    if let Some(p) = probe {
+                        if p.has_activity() {
+                            let window = p.recommended_window();
+                            let probe_from = p.max_block().saturating_sub(window);
+                            let probe_to = p.max_block();
+                            let _ = tx_b.send(Action::LoadingStatus(format!(
+                                "Dune: retrying blocks {}..{} (probe-guided)...",
+                                probe_from, probe_to
+                            )));
+                            match dune_c
+                                .query_account_txs_windowed(
                                     address,
-                                    source: Source::Dune,
-                                    tx_summaries: Vec::new(),
-                                    complete: true,
-                                });
-                            }
-                        } else {
-                            // No probe available — fall back to unwindowed query with tight limit
-                            match dune_c.query_account_txs(address, DUNE_PAGE_LIMIT).await {
-                                Ok(txs) => {
+                                    probe_from,
+                                    probe_to,
+                                    DUNE_PAGE_LIMIT,
+                                )
+                                .await
+                            {
+                                Ok(txs) if !txs.is_empty() => {
                                     let _ = tx_b.send(dune_source_update(
                                         crate::app::state::SourceStatus::Live,
                                     ));
+                                    let min_b =
+                                        txs.iter().map(|t| t.block_number).min().unwrap_or(0);
+                                    let max_b =
+                                        txs.iter().map(|t| t.block_number).max().unwrap_or(0);
+                                    let _ = tx_b.send(Action::LoadingStatus(format!(
+                                        "Dune: {} txs, blocks {}..{}",
+                                        txs.len(),
+                                        min_b,
+                                        max_b
+                                    )));
                                     let _ = tx_b.send(Action::AddressTxsStreamed {
                                         address,
                                         source: Source::Dune,
@@ -1202,11 +1107,7 @@ pub(super) async fn fetch_and_send_address_info(
                                         complete: true,
                                     });
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "Dune account txs fallback failed");
-                                    let _ = tx_b.send(dune_source_update(
-                                        crate::app::state::SourceStatus::FetchError(e.to_string()),
-                                    ));
+                                _ => {
                                     let _ = tx_b.send(Action::AddressTxsStreamed {
                                         address,
                                         source: Source::Dune,
@@ -1215,11 +1116,45 @@ pub(super) async fn fetch_and_send_address_info(
                                     });
                                 }
                             }
+                        } else {
+                            let _ = tx_b.send(Action::AddressTxsStreamed {
+                                address,
+                                source: Source::Dune,
+                                tx_summaries: Vec::new(),
+                                complete: true,
+                            });
+                        }
+                    } else {
+                        // No probe available — fall back to unwindowed query with tight limit
+                        match dune_c.query_account_txs(address, DUNE_PAGE_LIMIT).await {
+                            Ok(txs) => {
+                                let _ = tx_b.send(dune_source_update(
+                                    crate::app::state::SourceStatus::Live,
+                                ));
+                                let _ = tx_b.send(Action::AddressTxsStreamed {
+                                    address,
+                                    source: Source::Dune,
+                                    tx_summaries: txs,
+                                    complete: true,
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Dune account txs fallback failed");
+                                let _ = tx_b.send(dune_source_update(
+                                    crate::app::state::SourceStatus::FetchError(e.to_string()),
+                                ));
+                                let _ = tx_b.send(Action::AddressTxsStreamed {
+                                    address,
+                                    source: Source::Dune,
+                                    tx_summaries: Vec::new(),
+                                    complete: true,
+                                });
+                            }
                         }
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     // =====================================================================
@@ -2912,22 +2847,32 @@ pub(super) async fn derive_meta_txs_from_page(
 
 /// Fetch meta-transactions where `address` is the intender (issue #11).
 ///
-/// Thin wrapper over the shared `fetch_address_activity` pipeline plus the
-/// MetaTx-specific `derive_meta_txs_from_page` derivation. Used when the
-/// dispatcher hasn't already produced a shared page for another tab.
+/// Backed by [`crate::network::event_window::ensure_address_events_window`] so
+/// events flow through a single persistent cache shared with the Calls/Events
+/// tabs. The `continuation_token` input is repurposed as a "fetch older" flag:
 ///
-/// Sends `Action::AddressMetaTxsLoaded` when done. On pf-query failures, sends
-/// an empty result so the UI clears its "loading" state rather than hanging.
+/// - `None`           → [`EventWindowPolicy::TopDelta`] (tip-of-chain, cold or delta)
+/// - `Some(_)`        → [`EventWindowPolicy::ExtendDown`] (scan below cached floor)
+///
+/// The returned `next_token` carries `min_searched` when more older events
+/// remain, or `None` when we've reached genesis. The UI treats it as
+/// opaque — whatever lands in the response gets echoed back on the next call.
+///
+/// `from_block` / `limit` are currently ignored; kept in the Action schema
+/// until all three event-derived tabs are on the helper and we can cleanly
+/// collapse the Action surface.
 pub(super) async fn fetch_address_meta_txs(
     address: starknet::core::types::Felt,
-    from_block: u64,
+    _from_block: u64,
     continuation_token: Option<u64>,
-    limit: u32,
+    _limit: u32,
     ds: &Arc<dyn crate::data::DataSource>,
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
+    use crate::network::event_window::{EventWindowPolicy, ensure_address_events_window};
+
     let send_empty = || {
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
@@ -2936,50 +2881,198 @@ pub(super) async fn fetch_address_meta_txs(
         });
     };
 
-    let page = match fetch_address_activity(
-        address,
-        EventQueryKind::Account,
-        from_block,
-        continuation_token,
-        limit,
-        pf,
-    )
-    .await
-    {
-        Ok(p) => p,
+    // Latest block anchors the TopDelta window and all gap math.
+    let latest_block = match ds.get_latest_block_number().await {
+        Ok(b) => b,
         Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: activity fetch failed");
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: latest block fetch failed");
             send_empty();
             return;
         }
     };
 
-    if page.events.is_empty() {
-        debug!(addr = %format!("{:#x}", address), "MetaTxs: no events returned");
-        send_empty();
+    let policy = match continuation_token {
+        None => EventWindowPolicy::TopDelta,
+        Some(_) => EventWindowPolicy::ExtendDown,
+    };
+
+    let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
+    let outcome = match ensure_address_events_window(
+        address,
+        EventQueryKind::Account,
+        policy,
+        Some(pf),
+        &ds_dyn,
+        latest_block,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: event window fetch failed");
+            send_empty();
+            return;
+        }
+    };
+
+    // `ExtendDown` past genesis returns an empty page — still emit an empty
+    // response so the UI clears its loading flag and flips has_more=false.
+    if outcome.page.events.is_empty() {
+        debug!(
+            addr = %format!("{:#x}", address),
+            min_searched = outcome.min_searched,
+            max_searched = outcome.max_searched,
+            "MetaTxs: no new events in this window"
+        );
+        let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+            address,
+            summaries: Vec::new(),
+            next_token: if outcome.min_searched > 0 {
+                Some(outcome.min_searched)
+            } else {
+                None
+            },
+        });
         return;
     }
 
-    let summaries = derive_meta_txs_from_page(address, &page, abi_reg).await;
+    let summaries = derive_meta_txs_from_page(address, &outcome.page, abi_reg).await;
 
     info!(
         addr = %format!("{:#x}", address),
-        events = page.events.len(),
-        candidates = page.tx_rows.len(),
+        events = outcome.page.events.len(),
+        candidates = outcome.page.tx_rows.len(),
         meta_txs = summaries.len(),
-        has_more = page.next_token.is_some(),
+        min_searched = outcome.min_searched,
+        max_searched = outcome.max_searched,
+        deferred_gap = ?outcome.deferred_gap,
         "MetaTxs: classified"
     );
 
-    // Persist so the next tab entry can render instantly from cache.
     if !summaries.is_empty() {
         ds.save_meta_txs(&address, &summaries);
     }
 
+    // Signal "has more older" via Some(min_searched). The UI doesn't interpret
+    // the value — it just checks is_some and echoes it back on the next call.
+    let next_token = if outcome.min_searched > 0 {
+        Some(outcome.min_searched)
+    } else {
+        None
+    };
+
     let _ = action_tx.send(Action::AddressMetaTxsLoaded {
         address,
         summaries,
-        next_token: page.next_token,
+        next_token,
+    });
+}
+
+/// Fetch a window of contract events for `address` and emit the resulting
+/// [`ContractCallSummary`](crate::data::types::ContractCallSummary) rows as
+/// `AddressInfoLoaded { contract_calls, .. }`.
+///
+/// Mirrors [`fetch_address_meta_txs`] but for the Calls tab. Works with or
+/// without pf-query:
+/// - **pf available** → `ensure_address_events_window` bulk-fetches tx rows
+///   alongside events, and we build summaries directly via
+///   [`build_contract_calls_from_pf_rows`] (no per-tx RPC).
+/// - **pf absent** → the window helper returns events with empty `tx_rows`;
+///   we fall back to [`build_contract_calls_from_hashes`] which fetches tx
+///   + receipt per hash through the [`DataSource`].
+///
+/// Emission uses the same `AddressInfoLoaded` merge path that the legacy
+/// Dune bulk fetch used, so the UI reducer in the app state machine needs
+/// no changes.
+pub(super) async fn fetch_address_contract_calls(
+    address: starknet::core::types::Felt,
+    ds: &Arc<dyn crate::data::DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+    nonce: starknet::core::types::Felt,
+    class_hash: Option<starknet::core::types::Felt>,
+) {
+    use crate::network::event_window::{EventWindowPolicy, ensure_address_events_window};
+
+    let latest_block = match ds.get_latest_block_number().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: latest block fetch failed");
+            return;
+        }
+    };
+
+    let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
+    let outcome = match ensure_address_events_window(
+        address,
+        EventQueryKind::Contract,
+        EventWindowPolicy::TopDelta,
+        pf,
+        &ds_dyn,
+        latest_block,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: event window fetch failed");
+            return;
+        }
+    };
+
+    if outcome.page.events.is_empty() {
+        debug!(
+            addr = %format!("{:#x}", address),
+            min_searched = outcome.min_searched,
+            max_searched = outcome.max_searched,
+            "Calls: no new events in this window"
+        );
+        return;
+    }
+
+    // pf path: tx_rows already populated. RPC fallback: derive from (hash, block).
+    let calls = if !outcome.page.tx_rows.is_empty() {
+        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg).await
+    } else {
+        let hashes_with_blocks: Vec<_> = outcome
+            .page
+            .unique_hashes
+            .iter()
+            .map(|h| (*h, *outcome.page.tx_block_map.get(h).unwrap_or(&0)))
+            .collect();
+        build_contract_calls_from_hashes(address, &hashes_with_blocks, ds, pf, abi_reg).await
+    };
+
+    info!(
+        addr = %format!("{:#x}", address),
+        events = outcome.page.events.len(),
+        calls = calls.len(),
+        min_searched = outcome.min_searched,
+        max_searched = outcome.max_searched,
+        deferred_gap = ?outcome.deferred_gap,
+        via_pf = pf.is_some(),
+        "Calls: window fetch complete"
+    );
+
+    if !calls.is_empty() {
+        ds.save_address_calls(&address, &calls);
+    }
+
+    // Emit using the same merge path the Dune bulk fetch used. An empty
+    // SnAddressInfo stub keeps the `AddressInfoLoaded` reducer happy without
+    // disturbing the nonce/class_hash that arrived via the primary info fetch.
+    let _ = action_tx.send(Action::AddressInfoLoaded {
+        info: crate::data::types::SnAddressInfo {
+            address,
+            nonce,
+            class_hash,
+            recent_events: Vec::new(),
+            token_balances: Vec::new(),
+        },
+        decoded_events: Vec::new(),
+        tx_summaries: Vec::new(),
+        contract_calls: calls,
     });
 }
 

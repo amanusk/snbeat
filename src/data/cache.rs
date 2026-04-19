@@ -124,6 +124,10 @@ impl CachingDataSource {
                 max_searched_block INTEGER NOT NULL,
                 min_searched_block INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS address_activity_total (
+                address TEXT PRIMARY KEY,
+                total_known INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS contract_events (
                 address TEXT NOT NULL,
                 event_index INTEGER NOT NULL,
@@ -181,6 +185,20 @@ impl CachingDataSource {
             )
             .map_err(|e| SnbeatError::Config(format!("Migration v4 failed: {e}")))?;
             debug!("Migration v4: cleared tx/block/address caches");
+        }
+
+        if version < 5 {
+            // v5: introduce address_activity_total so we can persist the
+            // upstream event-count total (e.g. Dune probe) and render
+            // "(N / total)" labels across restarts. Kept in its own table so
+            // that seeding a total does not create a bogus (0,0) scan range
+            // on the address_search_progress row.
+            // The CREATE TABLE IF NOT EXISTS above is the DDL; nothing else to
+            // do for existing DBs — just bump the version.
+            db.execute("PRAGMA user_version = 5", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v5 version bump failed: {e}"))
+            })?;
+            debug!("Migration v5: added address_activity_total table");
         }
 
         Ok(Self {
@@ -285,7 +303,7 @@ impl CachingDataSource {
         }
     }
 
-    fn load_address_events(&self, address: &Felt) -> Vec<SnEvent> {
+    fn get_cached_address_events(&self, address: &Felt) -> Vec<SnEvent> {
         let db = match self.db.lock() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
@@ -323,6 +341,32 @@ impl CachingDataSource {
                 }
             }
         }
+    }
+
+    /// Additive merge: dedupe `new_events` against what's already cached and
+    /// rewrite the combined list sorted newest-first. Unlike `save_address_events`
+    /// (which replaces everything), this preserves older cached events when a
+    /// caller only supplies a fresh top-of-tip window. Returns the merged list.
+    fn merge_address_events_impl(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
+        let cached = self.get_cached_address_events(address);
+        let mut merged: Vec<SnEvent> = new_events.to_vec();
+        for event in cached {
+            let dup = merged.iter().any(|e| {
+                e.transaction_hash == event.transaction_hash
+                    && e.block_number == event.block_number
+                    && e.event_index == event.event_index
+            });
+            if !dup {
+                merged.push(event);
+            }
+        }
+        merged.sort_by(|a, b| {
+            b.block_number
+                .cmp(&a.block_number)
+                .then_with(|| b.event_index.cmp(&a.event_index))
+        });
+        self.save_address_events(address, &merged);
+        merged
     }
 
     fn get_cached_receipt(&self, hash: Felt) -> Option<SnReceipt> {
@@ -509,6 +553,27 @@ impl CachingDataSource {
             let _ = db.execute(
                 "INSERT OR REPLACE INTO address_search_progress (address, min_searched_block, max_searched_block) VALUES (?1, ?2, ?3)",
                 params![addr_hex, final_min as i64, final_max as i64],
+            );
+        }
+    }
+
+    fn get_cached_activity_total(&self, address: &Felt) -> Option<u64> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT total_known FROM address_activity_total WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|v| v as u64)
+    }
+
+    fn cache_activity_total(&self, address: &Felt, total: u64) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO address_activity_total (address, total_known) VALUES (?1, ?2)",
+                params![addr_hex, total as i64],
             );
         }
     }
@@ -731,7 +796,7 @@ impl DataSource for CachingDataSource {
         }
 
         // Load cached events
-        let cached = self.load_address_events(&address);
+        let cached = self.get_cached_address_events(&address);
 
         // Incremental: fetch events newer than our newest cached event
         let fetch_from = if !cached.is_empty() && from_block.is_none() {
@@ -1074,6 +1139,22 @@ impl DataSource for CachingDataSource {
         self.cache_search_progress(address, min_block, max_block);
     }
 
+    fn load_activity_total(&self, address: &Felt) -> Option<u64> {
+        self.get_cached_activity_total(address)
+    }
+
+    fn save_activity_total(&self, address: &Felt, total: u64) {
+        self.cache_activity_total(address, total);
+    }
+
+    fn load_address_events(&self, address: &Felt) -> Vec<SnEvent> {
+        self.get_cached_address_events(address)
+    }
+
+    fn merge_address_events(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
+        self.merge_address_events_impl(address, new_events)
+    }
+
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>> {
         // Fetch from upstream (recent blocks change)
         let blocks = self.upstream.get_recent_blocks(count).await?;
@@ -1213,5 +1294,124 @@ impl DataSource for CachingDataSource {
                 warn!(error = %e, "save_class_contracts: commit failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::DataSource;
+    use crate::data::types::*;
+    use starknet::core::types::ContractClass;
+
+    /// Minimal upstream stub — the search_progress / activity_total tests only
+    /// touch sync cache-local SQL, so the async upstream methods never fire.
+    struct NullUpstream;
+
+    #[async_trait]
+    impl DataSource for NullUpstream {
+        async fn get_latest_block_number(&self) -> Result<u64> {
+            unimplemented!()
+        }
+        async fn get_block(&self, _number: u64) -> Result<SnBlock> {
+            unimplemented!()
+        }
+        async fn get_block_by_hash(&self, _hash: Felt) -> Result<u64> {
+            unimplemented!()
+        }
+        async fn get_block_with_txs(&self, _number: u64) -> Result<(SnBlock, Vec<SnTransaction>)> {
+            unimplemented!()
+        }
+        async fn get_transaction(&self, _hash: Felt) -> Result<SnTransaction> {
+            unimplemented!()
+        }
+        async fn get_receipt(&self, _hash: Felt) -> Result<SnReceipt> {
+            unimplemented!()
+        }
+        async fn get_nonce(&self, _address: Felt) -> Result<Felt> {
+            unimplemented!()
+        }
+        async fn get_class_hash(&self, _address: Felt) -> Result<Felt> {
+            unimplemented!()
+        }
+        async fn get_class(&self, _class_hash: Felt) -> Result<ContractClass> {
+            unimplemented!()
+        }
+        async fn get_recent_blocks(&self, _count: usize) -> Result<Vec<SnBlock>> {
+            unimplemented!()
+        }
+        async fn get_events_for_address(
+            &self,
+            _address: Felt,
+            _from_block: Option<u64>,
+            _to_block: Option<u64>,
+            _limit: usize,
+        ) -> Result<Vec<SnEvent>> {
+            unimplemented!()
+        }
+        async fn call_contract(
+            &self,
+            _contract_address: Felt,
+            _selector: Felt,
+            _calldata: Vec<Felt>,
+        ) -> Result<Vec<Felt>> {
+            unimplemented!()
+        }
+    }
+
+    fn new_cache() -> (CachingDataSource, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.db");
+        let ds = CachingDataSource::new(Arc::new(NullUpstream), &path).expect("open cache");
+        (ds, dir)
+    }
+
+    #[test]
+    fn activity_total_roundtrip() {
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0x1234").unwrap();
+
+        assert_eq!(ds.load_activity_total(&addr), None);
+
+        ds.save_activity_total(&addr, 11400);
+        assert_eq!(ds.load_activity_total(&addr), Some(11400));
+
+        // Update is idempotent and overwrites.
+        ds.save_activity_total(&addr, 11450);
+        assert_eq!(ds.load_activity_total(&addr), Some(11450));
+    }
+
+    #[test]
+    fn save_search_progress_preserves_total_known() {
+        // Regression test: before this change, INSERT OR REPLACE in
+        // cache_search_progress would null out total_known when a later event
+        // scan extended the range. Now it must survive.
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0xabcd").unwrap();
+
+        ds.save_activity_total(&addr, 11400);
+        // Seed an initial scanned range.
+        ds.save_search_progress(&addr, 3_000_000, 8_900_000);
+        assert_eq!(ds.load_activity_total(&addr), Some(11400));
+
+        // Extending the range (e.g. fetching newer events) must keep total_known.
+        ds.save_search_progress(&addr, 3_000_000, 8_941_000);
+        assert_eq!(ds.load_activity_total(&addr), Some(11400));
+        assert_eq!(ds.load_search_progress(&addr), Some((3_000_000, 8_941_000)));
+    }
+
+    #[test]
+    fn search_progress_merges_ranges() {
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0xbeef").unwrap();
+
+        ds.save_search_progress(&addr, 100, 200);
+        ds.save_search_progress(&addr, 50, 150);
+        // Min shrinks, max doesn't regress.
+        assert_eq!(ds.load_search_progress(&addr), Some((50, 200)));
+
+        ds.save_search_progress(&addr, 300, 400);
+        // Max extends, min doesn't grow past the remembered floor.
+        assert_eq!(ds.load_search_progress(&addr), Some((50, 400)));
     }
 }

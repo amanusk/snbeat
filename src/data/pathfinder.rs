@@ -126,6 +126,23 @@ struct PfContractEventsResponse {
     continuation_token: Option<u64>,
 }
 
+/// Full-range event-count probe result returned by pf-query's
+/// `/contract-event-count` endpoint. Used to populate activity labels like
+/// "(N / total)" without depending on Dune.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContractEventCount {
+    pub count: u64,
+    pub min_block: Option<u64>,
+    pub max_block: Option<u64>,
+    /// False when pf-query stopped at its internal candidate cap; treat
+    /// `count` as a lower bound in that case.
+    pub complete: bool,
+    #[allow(dead_code)]
+    pub scanned_from: u64,
+    #[allow(dead_code)]
+    pub scanned_to: u64,
+}
+
 /// Serialize a positional key filter as pf-query expects:
 /// groups separated by `;`, OR-keys within a group by `,`.
 /// Empty groups => wildcard at that position.
@@ -396,6 +413,51 @@ impl PathfinderClient {
             .map(PfContractEvent::into_sn_event)
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok((events, resp.continuation_token))
+    }
+
+    /// Probe the total event count for a contract over a block range.
+    ///
+    /// Server-side this reuses the bloom+brute scan from `/contract-events`
+    /// but counts matches rather than collecting them, so it can afford to
+    /// walk the whole chain in a single request. Returns a `ContractEventCount`
+    /// whose `complete` flag is `false` if the server bailed out at its
+    /// internal candidate cap (in which case `count` is a lower bound).
+    pub async fn get_contract_event_count(
+        &self,
+        address: Felt,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        keys: &[Vec<Felt>],
+    ) -> anyhow::Result<ContractEventCount> {
+        let addr_hex = format!("{:#x}", address);
+        let mut url = format!("{}/contract-event-count/{}", self.base_url, addr_hex);
+        let mut first = true;
+        let mut add = |param: String| {
+            url.push(if first { '?' } else { '&' });
+            url.push_str(&param);
+            first = false;
+        };
+        if let Some(from) = from_block {
+            add(format!("from_block={from}"));
+        }
+        if let Some(to) = to_block {
+            add(format!("to_block={to}"));
+        }
+        if let Some(k) = encode_keys_filter(keys) {
+            let encoded = k.replace(';', "%3B");
+            add(format!("keys={encoded}"));
+        }
+
+        debug!(url = %url, "Probing contract event count from pf-query");
+        let resp: ContractEventCount = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp)
     }
 
     /// Convenience: fetch account-emitted `transaction_executed` events for an address.

@@ -158,6 +158,31 @@ pub trait DataSource: Send + Sync {
     /// Save search progress for an address.
     fn save_search_progress(&self, _address: &Felt, _min_block: u64, _max_block: u64) {}
 
+    /// Load the last-known upstream event-count total (e.g. Dune probe) for
+    /// an address. `None` means "never probed" — not "zero activity".
+    fn load_activity_total(&self, _address: &Felt) -> Option<u64> {
+        None
+    }
+    /// Persist the upstream event-count total. Survives restarts so that UI
+    /// labels like "(204 / 11400)" don't regress to "(204)" on revisit.
+    fn save_activity_total(&self, _address: &Felt, _total: u64) {}
+
+    /// Load all cached events for an address (newest-first when persisted
+    /// through the merge path). Empty vec if nothing cached.
+    fn load_address_events(&self, _address: &Felt) -> Vec<SnEvent> {
+        Vec::new()
+    }
+
+    /// Additive merge of `new_events` into the per-address event cache. Dedupes
+    /// on (tx_hash, block, event_index), sorts newest-first, persists, and
+    /// returns the merged list.
+    ///
+    /// Use this instead of `save_address_events` when appending a top-of-tip
+    /// or bottom-extension window — it preserves older cached events.
+    fn merge_address_events(&self, _address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
+        new_events.to_vec()
+    }
+
     // --- Class declaration cache ---
     /// Load cached declare info for a class hash. Declarations are immutable
     /// (a class's declaration block/tx never changes), so there is no TTL.

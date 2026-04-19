@@ -193,6 +193,26 @@ struct ContractEventsResponse {
     continuation_token: Option<u64>,
 }
 
+/// Response for /contract-event-count — total-events probe used by clients
+/// to populate UI labels like "(N / total)". Uses the same bloom-walk as
+/// /contract-events but skips tx-hash/timestamp decoding.
+#[derive(Serialize)]
+struct ContractEventCountResponse {
+    /// Total matching events across the scanned range.
+    count: u64,
+    /// Oldest block with at least one matching event (None when count == 0).
+    min_block: Option<u64>,
+    /// Newest block with at least one matching event (None when count == 0).
+    max_block: Option<u64>,
+    /// True when the full requested range was scanned; false if we stopped
+    /// after the per-request candidate cap to bound latency.
+    complete: bool,
+    /// Inclusive lower bound actually scanned.
+    scanned_from: u64,
+    /// Inclusive upper bound actually scanned.
+    scanned_to: u64,
+}
+
 // =========================================================================
 // Query params
 // =========================================================================
@@ -244,6 +264,16 @@ struct ContractEventsParams {
     /// Pagination: inclusive upper bound for the next page (newest-first).
     /// Takes precedence over `to_block`.
     continuation_token: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ContractEventCountParams {
+    /// Inclusive lower block bound. Default 0 (scan whole chain).
+    from_block: Option<u64>,
+    /// Inclusive upper block bound. Default = latest block.
+    to_block: Option<u64>,
+    /// Key filter — same syntax as /contract-events.
+    keys: Option<String>,
 }
 
 // =========================================================================
@@ -991,6 +1021,37 @@ fn process_candidate_block(
     }
 }
 
+/// Count matching events in a single block without materializing
+/// `ContractEvent` records. Used by the /contract-event-count probe, which
+/// walks the whole range and can't afford per-block tx-hash/timestamp
+/// decoding.
+fn count_candidate_block(
+    block_number: u64,
+    addr_bytes: &[u8],
+    keys_filter: &[Vec<[u8; 32]>],
+    events_stmt: &mut rusqlite::Statement<'_>,
+) -> u64 {
+    let events_blob: Option<Vec<u8>> = events_stmt
+        .query_row(rusqlite::params![block_number], |row| row.get(0))
+        .ok();
+    let Some(events_blob) = events_blob else {
+        return 0;
+    };
+    let tx_events = match decode::decode_events(&events_blob) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut n: u64 = 0;
+    for evs in tx_events.iter() {
+        for e in evs.iter() {
+            if e.from_address.0 == addr_bytes && event_keys_match(&e.keys, keys_filter) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// GET /contract-events/{address} — events emitted by a contract, accelerated by bloom filters.
 ///
 /// Pagination: newest-first. When more events may exist below the oldest returned
@@ -1195,6 +1256,169 @@ async fn handler_contract_events(
     }))
 }
 
+/// GET /contract-event-count/{address} — total count of events emitted by a
+/// contract over the requested range. Skips per-block tx-hash / timestamp
+/// decoding so it can afford to scan the whole chain in a single request.
+///
+/// Used by snbeat as an activity probe to populate labels like "(N / total)"
+/// without depending on Dune.
+async fn handler_contract_event_count(
+    Path(address): Path<String>,
+    Query(params): Query<ContractEventCountParams>,
+    State(state): State<AppState>,
+) -> ApiResult<ContractEventCountResponse> {
+    // Higher cap than /contract-events because the per-block cost is lower
+    // (no tx-hash / timestamp fetch) and the caller wants a full-range count.
+    // On dense contracts we still bail out rather than spin forever; the
+    // response's `complete=false` tells the caller the number is a lower bound.
+    const MAX_CANDIDATES: usize = 200_000;
+
+    let addr_bytes = parse_address(&address)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid address: {e}")))?;
+
+    let addr_array: [u8; 32] = addr_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Address must be 32 bytes".into()))?;
+
+    let keys_filter: Vec<Vec<[u8; 32]>> = match params.keys.as_deref() {
+        Some(raw) => parse_keys_filter(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?,
+        None => Vec::new(),
+    };
+
+    let conn = open_db(&state.db_path).map_err(db_err)?;
+
+    let latest_block: u64 = conn
+        .query_row(
+            "SELECT number FROM block_headers ORDER BY number DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+
+    let from_block = params.from_block.unwrap_or(0);
+    let effective_to = params.to_block.unwrap_or(latest_block).min(latest_block);
+
+    if from_block > effective_to {
+        return Ok(Json(ContractEventCountResponse {
+            count: 0,
+            min_block: None,
+            max_block: None,
+            complete: true,
+            scanned_from: from_block,
+            scanned_to: effective_to,
+        }));
+    }
+
+    let max_bloom_covered: Option<u64> = conn
+        .query_row(
+            "SELECT MAX(to_block) FROM event_filters WHERE from_block <= ?1",
+            rusqlite::params![effective_to],
+            |row| row.get::<_, Option<u64>>(0),
+        )
+        .unwrap_or(None);
+
+    let brute_scan_start = max_bloom_covered
+        .map(|m| m.saturating_add(1).max(from_block))
+        .unwrap_or(from_block);
+
+    let mut events_stmt = conn
+        .prepare("SELECT events FROM transactions WHERE block_number = ?1")
+        .map_err(db_err)?;
+
+    let mut total: u64 = 0;
+    let mut min_block: Option<u64> = None;
+    let mut max_block: Option<u64> = None;
+    let mut candidates_processed: usize = 0;
+    let mut complete = true;
+
+    // Helper that updates the running totals for one candidate block.
+    let mut record = |b: u64, n: u64, min_block: &mut Option<u64>, max_block: &mut Option<u64>| {
+        if n == 0 {
+            return;
+        }
+        *min_block = Some(min_block.map_or(b, |m| m.min(b)));
+        *max_block = Some(max_block.map_or(b, |m| m.max(b)));
+    };
+
+    // Step 2a: Brute-scan blocks above the persisted bloom filter.
+    if brute_scan_start <= effective_to {
+        let mut b = effective_to;
+        loop {
+            if b < brute_scan_start {
+                break;
+            }
+            candidates_processed += 1;
+            let n = count_candidate_block(b, &addr_bytes, &keys_filter, &mut events_stmt);
+            total = total.saturating_add(n);
+            record(b, n, &mut min_block, &mut max_block);
+
+            if candidates_processed >= MAX_CANDIDATES {
+                complete = false;
+                break;
+            }
+            if b == 0 {
+                break;
+            }
+            b -= 1;
+        }
+    }
+
+    // Step 2b: Walk bloom chunks for blocks already covered by event_filters.
+    if complete {
+        let mut bloom_stmt = conn
+            .prepare(
+                "SELECT from_block, to_block, bitmap \
+                 FROM event_filters \
+                 WHERE to_block >= ?1 AND from_block <= ?2 \
+                 ORDER BY from_block DESC",
+            )
+            .map_err(db_err)?;
+
+        let mut bloom_rows = bloom_stmt
+            .query(rusqlite::params![from_block, effective_to])
+            .map_err(db_err)?;
+
+        'chunks: while let Some(row) = bloom_rows.next().map_err(db_err)? {
+            let bf_from: u64 = row.get(0).map_err(db_err)?;
+            let bf_to: u64 = row.get(1).map_err(db_err)?;
+            let compressed: Vec<u8> = row.get(2).map_err(db_err)?;
+
+            let agg = bloom::AggregateBloom::from_compressed(bf_from, bf_to, &compressed);
+            let mut blocks = agg.blocks_for_address(&addr_array);
+            blocks.retain(|&b| b >= from_block && b <= effective_to);
+            blocks.sort_unstable_by(|a, b| b.cmp(a));
+            blocks.dedup();
+
+            for block_number in blocks {
+                candidates_processed += 1;
+                let n = count_candidate_block(
+                    block_number,
+                    &addr_bytes,
+                    &keys_filter,
+                    &mut events_stmt,
+                );
+                total = total.saturating_add(n);
+                record(block_number, n, &mut min_block, &mut max_block);
+
+                if candidates_processed >= MAX_CANDIDATES {
+                    complete = false;
+                    break 'chunks;
+                }
+            }
+        }
+    }
+
+    Ok(Json(ContractEventCountResponse {
+        count: total,
+        min_block,
+        max_block,
+        complete,
+        scanned_from: from_block,
+        scanned_to: effective_to,
+    }))
+}
+
 // =========================================================================
 // Main
 // =========================================================================
@@ -1255,6 +1479,10 @@ async fn main() -> Result<()> {
         .route("/block-timestamps", get(handler_block_timestamps))
         .route("/sender-txs/{address}", get(handler_sender_txs))
         .route("/contract-events/{address}", get(handler_contract_events))
+        .route(
+            "/contract-event-count/{address}",
+            get(handler_contract_event_count),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
