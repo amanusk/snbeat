@@ -46,15 +46,29 @@ pub(super) async fn decode_and_send_transaction(
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
+    // Parse multicall up front so we can prewarm the ABI cache for every
+    // unique address referenced by this tx (event sources + call targets)
+    // in a single parallel round-trip. Every subsequent per-event /
+    // per-call `get_abi_for_address` call then hits warm cache.
+    let mut decoded_calls = match &transaction {
+        SnTransaction::Invoke(invoke) => parse_multicall(&invoke.calldata),
+        _ => Vec::new(),
+    };
+    let mut prewarm_targets: std::collections::HashSet<starknet::core::types::Felt> =
+        std::collections::HashSet::with_capacity(receipt.events.len() + decoded_calls.len());
+    for event in &receipt.events {
+        prewarm_targets.insert(event.from_address);
+    }
+    for call in &decoded_calls {
+        prewarm_targets.insert(call.contract_address);
+    }
+    super::helpers::prewarm_abis(prewarm_targets, abi_reg).await;
+
     let mut decoded_events = Vec::with_capacity(receipt.events.len());
     for event in &receipt.events {
         let abi = abi_reg.get_abi_for_address(&event.from_address).await;
         decoded_events.push(decode_event(event, abi.as_deref()));
     }
-    let mut decoded_calls = match &transaction {
-        SnTransaction::Invoke(invoke) => parse_multicall(&invoke.calldata),
-        _ => Vec::new(),
-    };
     resolve_call_abis(&mut decoded_calls, abi_reg).await;
     let outside_executions = detect_and_resolve_outside_executions(&decoded_calls, abi_reg).await;
 

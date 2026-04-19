@@ -373,3 +373,347 @@ async fn bench_click_latency_under_enrichment_load() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P0 baselines for pf-query parallel-decode work (issue #16).
+// These benchmarks time the server endpoints end-to-end so we can record
+// before/after numbers when the server-side spawn_blocking + rayon change
+// lands. Run against the live pf-query host:
+//
+//   APP_RPC_URL=... APP_PATHFINDER_SERVICE_URL=... \
+//     cargo test --release --test enrich_bench_test -- --ignored --nocapture \
+//     bench_pf_sender_txs_heavy bench_pf_txs_by_hash_bulk
+// ---------------------------------------------------------------------------
+
+/// Proxy-metric: last 8 bytes of the Felt interpreted as u64. Nonces always
+/// fit in u64 for real accounts, so this ranks them correctly.
+fn felt_low_u64(f: Felt) -> u64 {
+    let bytes = f.to_bytes_be();
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&bytes[24..32]);
+    u64::from_be_bytes(low)
+}
+
+/// Find an active invoke sender in recent blocks. "Active" = highest nonce
+/// observed across N scanned blocks, which correlates with the size of the
+/// account's nonce-update history and therefore with the server-side decode
+/// workload that this benchmark exercises.
+async fn sample_heavy_sender(ds: &Arc<dyn DataSource>, scan_blocks: u64) -> Option<Felt> {
+    let latest = ds.get_latest_block_number().await.ok()?;
+    let mut best: Option<(u64, Felt)> = None;
+    for off in 5..(5 + scan_blocks) {
+        let blk = latest.checked_sub(off)?;
+        let Ok((_, txs)) = ds.get_block_with_txs(blk).await else {
+            continue;
+        };
+        for t in &txs {
+            if !matches!(t, SnTransaction::Invoke(_)) {
+                continue;
+            }
+            let Some(nonce) = t.nonce() else { continue };
+            let n = felt_low_u64(nonce);
+            if best.map(|(b, _)| n > b).unwrap_or(true) {
+                best = Some((n, t.sender()));
+            }
+        }
+    }
+    best.map(|(_, addr)| addr)
+}
+
+fn summarize(label: &str, mut samples: Vec<u128>, extra: &str) {
+    samples.sort();
+    let min = *samples.first().unwrap_or(&0);
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    let max = *samples.last().unwrap_or(&0);
+    let mean: u128 = samples.iter().sum::<u128>() / samples.len() as u128;
+    println!(
+        "  {label:<28} runs={:>2} min={min:>5} p50={p50:>5} p95={p95:>5} max={max:>5} mean={mean:>5} ms  {extra}",
+        samples.len()
+    );
+}
+
+/// Time GET /sender-txs?limit=2000 on an active account. On the serial-decode
+/// server, wall time scales with the number of distinct blocks in the
+/// account's nonce history; after rayon+spawn_blocking, expect ~Ncores
+/// speedup on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires APP_RPC_URL and APP_PATHFINDER_SERVICE_URL"]
+async fn bench_pf_sender_txs_heavy() {
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+    let pf = Arc::new(PathfinderClient::new(pf_url()));
+
+    let addr = sample_heavy_sender(&ds, 30)
+        .await
+        .expect("no invoke sender found in recent blocks");
+    println!("\n[bench_pf_sender_txs_heavy] sampled sender {:#x}", addr);
+
+    for &limit in &[500u32, 2000] {
+        // Warm-up run (discarded).
+        let _ = pf.get_sender_txs(addr, limit).await;
+
+        let mut samples = Vec::with_capacity(5);
+        let mut rows_last = 0usize;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let rows = pf
+                .get_sender_txs(addr, limit)
+                .await
+                .expect("pf get_sender_txs");
+            samples.push(t0.elapsed().as_millis());
+            rows_last = rows.len();
+        }
+        summarize(
+            &format!("sender-txs limit={limit}"),
+            samples,
+            &format!("rows={rows_last}"),
+        );
+    }
+}
+
+/// Time cold-cache ABI resolution for a tx's event sources, comparing:
+///   - OLD: serial `for event in events { get_abi_for_address(e.from_address).await }`
+///   - NEW: `prewarm_abis(unique_sources)` (join_all in parallel), then serial
+///     cache-hit awaits in the decode loop.
+/// Picks a tx with many distinct event sources from recent blocks — the
+/// worst-case for the serial pattern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires APP_RPC_URL"]
+async fn bench_event_abi_prewarm() {
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+
+    // Scan recent blocks for invoke txs with many unique event sources.
+    let latest = ds.get_latest_block_number().await.expect("latest block");
+    let mut candidates: Vec<(Felt, Vec<Felt>)> = Vec::new(); // (tx_hash, unique_event_sources)
+    'outer: for off in 5..60 {
+        let blk = match latest.checked_sub(off) {
+            Some(b) => b,
+            None => break,
+        };
+        let Ok((_, txs)) = ds.get_block_with_txs(blk).await else {
+            continue;
+        };
+        for t in txs.iter().filter(|t| matches!(t, SnTransaction::Invoke(_))) {
+            let h = t.hash();
+            let Ok(receipt) = ds.get_receipt(h).await else {
+                continue;
+            };
+            let unique: std::collections::HashSet<Felt> =
+                receipt.events.iter().map(|e| e.from_address).collect();
+            if unique.len() >= 5 {
+                candidates.push((h, unique.into_iter().collect()));
+                if candidates.len() >= 8 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        println!("[bench_event_abi_prewarm] no suitable txs found");
+        return;
+    }
+    println!(
+        "\n[bench_event_abi_prewarm] found {} txs, unique-sources per tx: {:?}",
+        candidates.len(),
+        candidates.iter().map(|(_, s)| s.len()).collect::<Vec<_>>()
+    );
+
+    // OLD path: serial get_abi_for_address per event source, cold cache.
+    let mut serial_samples = Vec::with_capacity(candidates.len());
+    for (_, sources) in &candidates {
+        let abi = new_abi_registry(Arc::clone(&ds));
+        let t0 = Instant::now();
+        for addr in sources {
+            let _ = abi.get_abi_for_address(addr).await;
+        }
+        serial_samples.push(t0.elapsed().as_millis());
+    }
+    summarize(
+        "serial per-event (cold)",
+        serial_samples,
+        &format!("txs={}", candidates.len()),
+    );
+
+    // NEW path: prewarm_abis in parallel, then serial cache-hit awaits.
+    let mut prewarm_samples = Vec::with_capacity(candidates.len());
+    for (_, sources) in &candidates {
+        let abi = new_abi_registry(Arc::clone(&ds));
+        let t0 = Instant::now();
+        snbeat::network::helpers::prewarm_abis(sources.iter().copied(), &abi).await;
+        // simulate the post-prewarm serial decode loop (cache hits).
+        for addr in sources {
+            let _ = abi.get_abi_for_address(addr).await;
+        }
+        prewarm_samples.push(t0.elapsed().as_millis());
+    }
+    summarize(
+        "prewarm + serial (cold)",
+        prewarm_samples,
+        &format!("txs={}", candidates.len()),
+    );
+}
+
+/// Time POST /txs-by-hash with N hashes sampled from recent blocks. Decode
+/// cost scales with the number of distinct blocks in the request (the server
+/// decodes each block blob once). After the parallel-decode change, expect
+/// linear speedup in the number of distinct blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires APP_RPC_URL and APP_PATHFINDER_SERVICE_URL"]
+async fn bench_pf_txs_by_hash_bulk() {
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+    let pf = Arc::new(PathfinderClient::new(pf_url()));
+
+    for &n in &[100usize, 500, 2000] {
+        let hashes = sample_invoke_hashes(&ds, n).await;
+        if hashes.len() < n / 2 {
+            println!(
+                "[bench_pf_txs_by_hash_bulk] skipping N={n} (only sampled {})",
+                hashes.len()
+            );
+            continue;
+        }
+
+        // Warm-up run (discarded).
+        let _ = pf.get_txs_by_hash(&hashes).await;
+
+        let mut samples = Vec::with_capacity(5);
+        let mut rows_last = 0usize;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let rows = pf.get_txs_by_hash(&hashes).await.expect("pf txs-by-hash");
+            samples.push(t0.elapsed().as_millis());
+            rows_last = rows.len();
+        }
+        summarize(
+            &format!("txs-by-hash N={n}"),
+            samples,
+            &format!("rows={rows_last}"),
+        );
+    }
+}
+
+/// Compare `provider.batch_requests([tx, receipt, ...])` in a single HTTP
+/// round-trip vs the current `join_all` of individual per-hash calls.
+/// Accept criterion (per plan P4): ≥ 1.3× faster at N=20, no p95 regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires APP_RPC_URL"]
+async fn bench_rpc_batch_vs_join_all() {
+    use starknet::core::types::Felt;
+    use starknet::core::types::requests::{
+        GetTransactionByHashRequest, GetTransactionReceiptRequest,
+    };
+    use starknet::providers::{
+        JsonRpcClient, Provider, ProviderRequestData, jsonrpc::HttpTransport,
+    };
+    use url::Url;
+
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+    let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(
+        Url::parse(&rpc_url()).unwrap(),
+    )));
+
+    for &n in &[20usize, 50, 100] {
+        let hashes = sample_invoke_hashes(&ds, n).await;
+        if hashes.len() < n {
+            println!(
+                "[bench_rpc_batch_vs_join_all] skipping N={n} (only sampled {})",
+                hashes.len()
+            );
+            continue;
+        }
+        let hashes: Vec<Felt> = hashes.into_iter().take(n).collect();
+
+        // --- Warm-up (discarded) ---
+        let _ = {
+            let futs: Vec<_> = hashes
+                .iter()
+                .map(|h| {
+                    let p = Arc::clone(&provider);
+                    let h = *h;
+                    async move {
+                        let tx = p.get_transaction_by_hash(h, None).await;
+                        let rx = p.get_transaction_receipt(h).await;
+                        (tx, rx)
+                    }
+                })
+                .collect();
+            futures::future::join_all(futs).await
+        };
+        let _ = {
+            let mut reqs: Vec<ProviderRequestData> = Vec::with_capacity(n * 2);
+            for h in &hashes {
+                reqs.push(ProviderRequestData::GetTransactionByHash(
+                    GetTransactionByHashRequest {
+                        transaction_hash: *h,
+                        response_flags: None,
+                    },
+                ));
+                reqs.push(ProviderRequestData::GetTransactionReceipt(
+                    GetTransactionReceiptRequest {
+                        transaction_hash: *h,
+                    },
+                ));
+            }
+            provider.batch_requests(&reqs).await
+        };
+
+        // --- join_all path ---
+        let mut join_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let futs: Vec<_> = hashes
+                .iter()
+                .map(|h| {
+                    let p = Arc::clone(&provider);
+                    let h = *h;
+                    async move {
+                        let tx = p.get_transaction_by_hash(h, None).await;
+                        let rx = p.get_transaction_receipt(h).await;
+                        (tx, rx)
+                    }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            let ok = results
+                .iter()
+                .filter(|(t, r)| t.is_ok() && r.is_ok())
+                .count();
+            join_samples.push(t0.elapsed().as_millis());
+            assert_eq!(ok, n, "join_all: some requests failed");
+        }
+        summarize(
+            &format!("join_all N={n}"),
+            join_samples.clone(),
+            &format!("req_count={}", n * 2),
+        );
+
+        // --- batch_requests path ---
+        let mut batch_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let mut reqs: Vec<ProviderRequestData> = Vec::with_capacity(n * 2);
+            for h in &hashes {
+                reqs.push(ProviderRequestData::GetTransactionByHash(
+                    GetTransactionByHashRequest {
+                        transaction_hash: *h,
+                        response_flags: None,
+                    },
+                ));
+                reqs.push(ProviderRequestData::GetTransactionReceipt(
+                    GetTransactionReceiptRequest {
+                        transaction_hash: *h,
+                    },
+                ));
+            }
+            let t0 = Instant::now();
+            let resp = provider.batch_requests(&reqs).await;
+            batch_samples.push(t0.elapsed().as_millis());
+            let responses = resp.expect("batch_requests should succeed");
+            assert_eq!(responses.len(), n * 2, "batch returned wrong count");
+        }
+        summarize(
+            &format!("batch    N={n}"),
+            batch_samples,
+            &format!("req_count={}", n * 2),
+        );
+    }
+}
