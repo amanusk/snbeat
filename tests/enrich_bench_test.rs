@@ -591,3 +591,125 @@ async fn bench_pf_txs_by_hash_bulk() {
         );
     }
 }
+
+/// Compare `provider.batch_requests([tx, receipt, ...])` in a single HTTP
+/// round-trip vs the current `join_all` of individual per-hash calls.
+/// Accept criterion (per plan P4): ≥ 1.3× faster at N=20, no p95 regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires APP_RPC_URL"]
+async fn bench_rpc_batch_vs_join_all() {
+    use starknet::core::types::requests::{
+        GetTransactionByHashRequest, GetTransactionReceiptRequest,
+    };
+    use starknet::core::types::Felt;
+    use starknet::providers::{
+        JsonRpcClient, Provider, ProviderRequestData, jsonrpc::HttpTransport,
+    };
+    use url::Url;
+
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+    let provider =
+        Arc::new(JsonRpcClient::new(HttpTransport::new(Url::parse(&rpc_url()).unwrap())));
+
+    for &n in &[20usize, 50, 100] {
+        let hashes = sample_invoke_hashes(&ds, n).await;
+        if hashes.len() < n {
+            println!(
+                "[bench_rpc_batch_vs_join_all] skipping N={n} (only sampled {})",
+                hashes.len()
+            );
+            continue;
+        }
+        let hashes: Vec<Felt> = hashes.into_iter().take(n).collect();
+
+        // --- Warm-up (discarded) ---
+        let _ = {
+            let futs: Vec<_> = hashes
+                .iter()
+                .map(|h| {
+                    let p = Arc::clone(&provider);
+                    let h = *h;
+                    async move {
+                        let tx = p.get_transaction_by_hash(h, None).await;
+                        let rx = p.get_transaction_receipt(h).await;
+                        (tx, rx)
+                    }
+                })
+                .collect();
+            futures::future::join_all(futs).await
+        };
+        let _ = {
+            let mut reqs: Vec<ProviderRequestData> = Vec::with_capacity(n * 2);
+            for h in &hashes {
+                reqs.push(ProviderRequestData::GetTransactionByHash(
+                    GetTransactionByHashRequest {
+                        transaction_hash: *h,
+                        response_flags: None,
+                    },
+                ));
+                reqs.push(ProviderRequestData::GetTransactionReceipt(
+                    GetTransactionReceiptRequest {
+                        transaction_hash: *h,
+                    },
+                ));
+            }
+            provider.batch_requests(&reqs).await
+        };
+
+        // --- join_all path ---
+        let mut join_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let futs: Vec<_> = hashes
+                .iter()
+                .map(|h| {
+                    let p = Arc::clone(&provider);
+                    let h = *h;
+                    async move {
+                        let tx = p.get_transaction_by_hash(h, None).await;
+                        let rx = p.get_transaction_receipt(h).await;
+                        (tx, rx)
+                    }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            let ok = results.iter().filter(|(t, r)| t.is_ok() && r.is_ok()).count();
+            join_samples.push(t0.elapsed().as_millis());
+            assert_eq!(ok, n, "join_all: some requests failed");
+        }
+        summarize(
+            &format!("join_all N={n}"),
+            join_samples.clone(),
+            &format!("req_count={}", n * 2),
+        );
+
+        // --- batch_requests path ---
+        let mut batch_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let mut reqs: Vec<ProviderRequestData> = Vec::with_capacity(n * 2);
+            for h in &hashes {
+                reqs.push(ProviderRequestData::GetTransactionByHash(
+                    GetTransactionByHashRequest {
+                        transaction_hash: *h,
+                        response_flags: None,
+                    },
+                ));
+                reqs.push(ProviderRequestData::GetTransactionReceipt(
+                    GetTransactionReceiptRequest {
+                        transaction_hash: *h,
+                    },
+                ));
+            }
+            let t0 = Instant::now();
+            let resp = provider.batch_requests(&reqs).await;
+            batch_samples.push(t0.elapsed().as_millis());
+            let responses = resp.expect("batch_requests should succeed");
+            assert_eq!(responses.len(), n * 2, "batch returned wrong count");
+        }
+        summarize(
+            &format!("batch    N={n}"),
+            batch_samples,
+            &format!("req_count={}", n * 2),
+        );
+    }
+}
