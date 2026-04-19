@@ -471,6 +471,88 @@ async fn bench_pf_sender_txs_heavy() {
     }
 }
 
+/// Time cold-cache ABI resolution for a tx's event sources, comparing:
+///   - OLD: serial `for event in events { get_abi_for_address(e.from_address).await }`
+///   - NEW: `prewarm_abis(unique_sources)` (join_all in parallel), then serial
+///     cache-hit awaits in the decode loop.
+/// Picks a tx with many distinct event sources from recent blocks — the
+/// worst-case for the serial pattern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires APP_RPC_URL"]
+async fn bench_event_abi_prewarm() {
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
+
+    // Scan recent blocks for invoke txs with many unique event sources.
+    let latest = ds.get_latest_block_number().await.expect("latest block");
+    let mut candidates: Vec<(Felt, Vec<Felt>)> = Vec::new(); // (tx_hash, unique_event_sources)
+    'outer: for off in 5..60 {
+        let blk = match latest.checked_sub(off) {
+            Some(b) => b,
+            None => break,
+        };
+        let Ok((_, txs)) = ds.get_block_with_txs(blk).await else {
+            continue;
+        };
+        for t in txs.iter().filter(|t| matches!(t, SnTransaction::Invoke(_))) {
+            let h = t.hash();
+            let Ok(receipt) = ds.get_receipt(h).await else {
+                continue;
+            };
+            let unique: std::collections::HashSet<Felt> =
+                receipt.events.iter().map(|e| e.from_address).collect();
+            if unique.len() >= 5 {
+                candidates.push((h, unique.into_iter().collect()));
+                if candidates.len() >= 8 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        println!("[bench_event_abi_prewarm] no suitable txs found");
+        return;
+    }
+    println!(
+        "\n[bench_event_abi_prewarm] found {} txs, unique-sources per tx: {:?}",
+        candidates.len(),
+        candidates.iter().map(|(_, s)| s.len()).collect::<Vec<_>>()
+    );
+
+    // OLD path: serial get_abi_for_address per event source, cold cache.
+    let mut serial_samples = Vec::with_capacity(candidates.len());
+    for (_, sources) in &candidates {
+        let abi = new_abi_registry(Arc::clone(&ds));
+        let t0 = Instant::now();
+        for addr in sources {
+            let _ = abi.get_abi_for_address(addr).await;
+        }
+        serial_samples.push(t0.elapsed().as_millis());
+    }
+    summarize(
+        "serial per-event (cold)",
+        serial_samples,
+        &format!("txs={}", candidates.len()),
+    );
+
+    // NEW path: prewarm_abis in parallel, then serial cache-hit awaits.
+    let mut prewarm_samples = Vec::with_capacity(candidates.len());
+    for (_, sources) in &candidates {
+        let abi = new_abi_registry(Arc::clone(&ds));
+        let t0 = Instant::now();
+        snbeat::network::helpers::prewarm_abis(sources.iter().copied(), &abi).await;
+        // simulate the post-prewarm serial decode loop (cache hits).
+        for addr in sources {
+            let _ = abi.get_abi_for_address(addr).await;
+        }
+        prewarm_samples.push(t0.elapsed().as_millis());
+    }
+    summarize(
+        "prewarm + serial (cold)",
+        prewarm_samples,
+        &format!("txs={}", candidates.len()),
+    );
+}
+
 /// Time POST /txs-by-hash with N hashes sampled from recent blocks. Decode
 /// cost scales with the number of distinct blocks in the request (the server
 /// decodes each block blob once). After the parallel-decode change, expect
