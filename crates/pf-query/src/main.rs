@@ -528,112 +528,131 @@ async fn handler_txs_by_hash(
         wanted.push((bytes, h.clone()));
     }
 
-    let conn = open_db(&state.db_path).map_err(db_err)?;
+    let db_path = Arc::clone(&state.db_path);
 
-    // Step 1: map each hash → (block_number, idx). One SELECT per hash (fast,
-    // indexed lookup). The transaction_hashes table is keyed on hash so these
-    // are O(log N) B-tree lookups — no wildcard scan.
-    let mut lookup_stmt = conn
-        .prepare("SELECT block_number, idx FROM transaction_hashes WHERE hash = ?1")
-        .map_err(db_err)?;
+    // Entire body runs on a blocking thread — rusqlite `Connection` is !Send,
+    // so we keep it off the async state machine and use rayon::par_iter for
+    // the CPU-bound blob decode.
+    let results = tokio::task::spawn_blocking(move || {
+        let conn = open_db(&db_path).map_err(db_err)?;
 
-    // (block_number, tx_idx_in_block, original_hash_hex)
-    let mut locations: Vec<(u64, u64, String)> = Vec::with_capacity(wanted.len());
-    for (hash_bytes, hash_hex) in &wanted {
-        match lookup_stmt.query_row(rusqlite::params![hash_bytes.as_slice()], |row| {
-            Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
-        }) {
-            Ok((block_number, idx)) => locations.push((block_number, idx, hash_hex.clone())),
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(e) => return Err(db_err(e)),
+        // Step 1: map each hash → (block_number, idx). One SELECT per hash
+        // (fast indexed lookup on `transaction_hashes`, no wildcard scan).
+        let mut lookup_stmt = conn
+            .prepare("SELECT block_number, idx FROM transaction_hashes WHERE hash = ?1")
+            .map_err(db_err)?;
+
+        // (block_number, tx_idx_in_block, original_hash_hex)
+        let mut locations: Vec<(u64, u64, String)> = Vec::with_capacity(wanted.len());
+        for (hash_bytes, hash_hex) in &wanted {
+            match lookup_stmt.query_row(rusqlite::params![hash_bytes.as_slice()], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+            }) {
+                Ok((block_number, idx)) => locations.push((block_number, idx, hash_hex.clone())),
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                Err(e) => return Err(db_err(e)),
+            }
         }
-    }
 
-    if locations.is_empty() {
-        return Ok(Json(vec![]));
-    }
+        if locations.is_empty() {
+            return Ok::<Vec<TxByHashEntry>, (StatusCode, String)>(Vec::new());
+        }
 
-    // Step 2: fetch block timestamps and decode each distinct block blob once.
-    // We decode lazily so blocks with no requested txs are skipped (they won't
-    // appear in `locations`).
-    let mut tx_blob_stmt = conn
-        .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
-        .map_err(db_err)?;
-    let mut timestamp_stmt = conn
-        .prepare("SELECT timestamp FROM block_headers WHERE number = ?1")
-        .map_err(db_err)?;
+        // Step 2: gather unique block blobs + timestamps (cheap indexed reads).
+        let mut tx_blob_stmt = conn
+            .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
+            .map_err(db_err)?;
+        let mut timestamp_stmt = conn
+            .prepare("SELECT timestamp FROM block_headers WHERE number = ?1")
+            .map_err(db_err)?;
 
-    let mut decoded_cache: std::collections::HashMap<u64, Vec<dto::TransactionWithReceiptV4>> =
-        std::collections::HashMap::new();
-    let mut timestamp_cache: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let unique_blocks: std::collections::BTreeSet<u64> =
+            locations.iter().map(|(b, _, _)| *b).collect();
 
-    let mut results: Vec<TxByHashEntry> = Vec::with_capacity(locations.len());
-    for (block_number, tx_idx, hash_hex) in &locations {
-        // Decode the block blob on first touch.
-        if !decoded_cache.contains_key(block_number) {
-            let blob: Vec<u8> =
-                match tx_blob_stmt.query_row(rusqlite::params![block_number], |row| row.get(0)) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-            let decoded = match decode::decode_transactions(&blob) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(block = block_number, error = %e, "Failed to decode tx blob");
-                    continue;
+        let mut blobs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(unique_blocks.len());
+        let mut timestamp_cache: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
+        for block_number in &unique_blocks {
+            if let Ok(blob) = tx_blob_stmt
+                .query_row(rusqlite::params![block_number], |row| row.get::<_, Vec<u8>>(0))
+            {
+                blobs.push((*block_number, blob));
+            }
+            if let Ok(ts) =
+                timestamp_stmt.query_row(rusqlite::params![block_number], |row| row.get(0))
+            {
+                timestamp_cache.insert(*block_number, ts);
+            }
+        }
+
+        // Step 3: parallel zstd + bincode decode via rayon.
+        let decoded_by_block: std::collections::HashMap<u64, Vec<dto::TransactionWithReceiptV4>> = {
+            use rayon::prelude::*;
+            blobs
+                .into_par_iter()
+                .filter_map(|(block_number, blob)| match decode::decode_transactions(&blob) {
+                    Ok(d) => Some((block_number, d)),
+                    Err(e) => {
+                        tracing::warn!(block = block_number, error = %e, "Failed to decode tx blob");
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Step 4: stitch results in the original request order.
+        let mut results: Vec<TxByHashEntry> = Vec::with_capacity(locations.len());
+        for (block_number, tx_idx, hash_hex) in &locations {
+            let Some(txs) = decoded_by_block.get(block_number) else {
+                continue;
+            };
+            let Some(timestamp) = timestamp_cache.get(block_number).copied() else {
+                continue;
+            };
+            let tr = match txs.get(*tx_idx as usize) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let (status, revert_reason) = match &tr.receipt.execution_status {
+                dto::ExecutionStatus::Succeeded => ("OK".to_string(), None),
+                dto::ExecutionStatus::Reverted { reason } => {
+                    ("REV".to_string(), Some(reason.clone()))
                 }
             };
-            decoded_cache.insert(*block_number, decoded);
-        }
-        if !timestamp_cache.contains_key(block_number) {
-            let ts: u64 =
-                match timestamp_stmt.query_row(rusqlite::params![block_number], |row| row.get(0)) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-            timestamp_cache.insert(*block_number, ts);
-        }
 
-        let txs = &decoded_cache[block_number];
-        let timestamp = timestamp_cache[block_number];
-
-        let tr = match txs.get(*tx_idx as usize) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let (status, revert_reason) = match &tr.receipt.execution_status {
-            dto::ExecutionStatus::Succeeded => ("OK".to_string(), None),
-            dto::ExecutionStatus::Reverted { reason } => ("REV".to_string(), Some(reason.clone())),
-        };
-
-        let calldata: Vec<String> = tr
-            .transaction
-            .calldata()
-            .iter()
-            .map(|f| f.to_hex())
-            .collect();
-
-        results.push(TxByHashEntry {
-            hash: hash_hex.clone(),
-            block_number: *block_number,
-            block_timestamp: timestamp,
-            tx_index: *tx_idx,
-            sender: tr
+            let calldata: Vec<String> = tr
                 .transaction
-                .variant
-                .sender_address()
-                .map(|a| a.to_hex())
-                .unwrap_or_default(),
-            nonce: tr.transaction.nonce(),
-            tx_type: tr.transaction.tx_type().to_string(),
-            calldata,
-            actual_fee: tr.receipt.actual_fee.to_hex(),
-            tip: tr.transaction.tip(),
-            status,
-            revert_reason,
-        });
-    }
+                .calldata()
+                .iter()
+                .map(|f| f.to_hex())
+                .collect();
+
+            results.push(TxByHashEntry {
+                hash: hash_hex.clone(),
+                block_number: *block_number,
+                block_timestamp: timestamp,
+                tx_index: *tx_idx,
+                sender: tr
+                    .transaction
+                    .variant
+                    .sender_address()
+                    .map(|a| a.to_hex())
+                    .unwrap_or_default(),
+                nonce: tr.transaction.nonce(),
+                tx_type: tr.transaction.tx_type().to_string(),
+                calldata,
+                actual_fee: tr.receipt.actual_fee.to_hex(),
+                tip: tr.transaction.tip(),
+                status,
+                revert_reason,
+            });
+        }
+
+        Ok(results)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join error: {e}")))??;
 
     Ok(Json(results))
 }
@@ -688,6 +707,12 @@ async fn handler_block_timestamps(
 ///
 /// Combines nonce_updates (to find blocks) with transaction blob decoding
 /// (to get hash, fee, status, type) in a single request.
+///
+/// The zstd+bincode decode of each block blob is the CPU-bound hot path. We
+/// gather blobs first (cheap, indexed SQLite reads), then decode them in
+/// parallel via `rayon` inside `spawn_blocking` so we don't block the tokio
+/// worker and we exploit the server's cores. Output ordering matches the
+/// nonce_updates DESC order of the serial implementation it replaces.
 async fn handler_sender_txs(
     Path(address): Path<String>,
     Query(params): Query<SenderTxParams>,
@@ -696,116 +721,138 @@ async fn handler_sender_txs(
     let limit = params.limit.unwrap_or(500).min(2000);
     let addr_bytes = parse_address(&address)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid address: {e}")))?;
+    let db_path = Arc::clone(&state.db_path);
 
-    let conn = open_db(&state.db_path).map_err(db_err)?;
+    // Entire body runs on a blocking thread so the rusqlite `Connection`
+    // (which is !Send) never crosses an async await point. Inside, we use
+    // rayon::par_iter to decode block blobs across the server's cores.
+    let results = tokio::task::spawn_blocking(move || {
+        let conn = open_db(&db_path).map_err(db_err)?;
 
-    // Step 1: Get block numbers from nonce_updates + timestamps
-    let mut stmt = conn
-        .prepare(
-            "SELECT nu.block_number, nu.nonce, bh.timestamp \
-             FROM nonce_updates nu \
-             JOIN contract_addresses ca ON nu.contract_address_id = ca.id \
-             JOIN block_headers bh ON nu.block_number = bh.number \
-             WHERE ca.contract_address = ?1 \
-             ORDER BY nu.block_number DESC LIMIT ?2",
-        )
-        .map_err(db_err)?;
+        // Step 1: Get block numbers from nonce_updates + timestamps
+        let mut stmt = conn
+            .prepare(
+                "SELECT nu.block_number, nu.nonce, bh.timestamp \
+                 FROM nonce_updates nu \
+                 JOIN contract_addresses ca ON nu.contract_address_id = ca.id \
+                 JOIN block_headers bh ON nu.block_number = bh.number \
+                 WHERE ca.contract_address = ?1 \
+                 ORDER BY nu.block_number DESC LIMIT ?2",
+            )
+            .map_err(db_err)?;
 
-    let nonce_entries: Vec<(u64, u64, u64)> = stmt
-        .query_map(rusqlite::params![addr_bytes.as_slice(), limit], |row| {
-            Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?))
-        })
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
+        let nonce_entries: Vec<(u64, u64, u64)> = stmt
+            .query_map(rusqlite::params![addr_bytes.as_slice(), limit], |row| {
+                Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
 
-    if nonce_entries.is_empty() {
-        return Ok(Json(vec![]));
-    }
-
-    // Step 2: Decode transaction blobs for each block and match by sender.
-    // Use a set to avoid decoding the same block twice when the sender has
-    // multiple nonce updates in one block (which would cause duplicate results).
-    let mut results = Vec::with_capacity(nonce_entries.len());
-    let mut seen_blocks = std::collections::HashSet::new();
-
-    // Prepare the statement once for re-use
-    let mut tx_stmt = conn
-        .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
-        .map_err(db_err)?;
-
-    for (block_number, expected_nonce, timestamp) in &nonce_entries {
-        if !seen_blocks.insert(block_number) {
-            continue; // already decoded this block
+        if nonce_entries.is_empty() {
+            return Ok::<Vec<SenderTxEntry>, (StatusCode, String)>(Vec::new());
         }
-        let blob: Vec<u8> =
-            match tx_stmt.query_row(rusqlite::params![block_number], |row| row.get(0)) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
 
-        let txs = match decode::decode_transactions(&blob) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        // Step 2: Dedup blocks and fetch each blob once. Preserve
+        // first-occurrence order so the final output matches nonce_updates
+        // DESC ordering.
+        let mut tx_stmt = conn
+            .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
+            .map_err(db_err)?;
 
-        // Find the transaction from this sender in this block
-        for tr in txs {
-            let sender = match tr.transaction.sender_address() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if sender.0 != addr_bytes.as_slice() {
+        let mut block_order: Vec<(u64, u64, u64)> = Vec::with_capacity(nonce_entries.len());
+        let mut blobs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(nonce_entries.len());
+        let mut seen_blocks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (block_number, expected_nonce, timestamp) in &nonce_entries {
+            if !seen_blocks.insert(*block_number) {
                 continue;
             }
+            block_order.push((*block_number, *expected_nonce, *timestamp));
+            if let Ok(blob) = tx_stmt.query_row(rusqlite::params![block_number], |row| {
+                row.get::<_, Vec<u8>>(0)
+            }) {
+                blobs.push((*block_number, blob));
+            }
+        }
 
-            let nonce = tr.transaction.nonce();
+        // Step 3: Parallel zstd + bincode decode of block blobs via rayon.
+        let decoded_by_block: std::collections::HashMap<u64, Vec<dto::TransactionWithReceiptV4>> = {
+            use rayon::prelude::*;
+            blobs
+                .into_par_iter()
+                .filter_map(
+                    |(block_number, blob)| match decode::decode_transactions(&blob) {
+                        Ok(txs) => Some((block_number, txs)),
+                        Err(e) => {
+                            tracing::warn!(block = block_number, error = %e, "decode tx blob");
+                            None
+                        }
+                    },
+                )
+                .collect()
+        };
 
-            // Match by nonce if possible (nonce_updates records the nonce AFTER the tx)
-            // The tx that caused nonce N has nonce = N-1 in its body (for Invoke),
-            // but nonce_updates stores the NEW nonce. So the tx nonce = expected_nonce - 1.
-            // However, for deploy_account, nonce is 0 and nonce_update records 1.
-            // We include all txs from this sender in this block.
-            let (status, revert_reason) = match &tr.receipt.execution_status {
-                dto::ExecutionStatus::Succeeded => ("OK".to_string(), None),
-                dto::ExecutionStatus::Reverted { reason } => {
-                    ("REV".to_string(), Some(reason.clone()))
+        // Step 4: Stitch results in block_order. For each unique block, emit
+        // every matching sender tx; if none matched, emit a stub from
+        // nonce_updates (nonce = expected_nonce - 1).
+        let mut results: Vec<SenderTxEntry> = Vec::with_capacity(block_order.len());
+        for (block_number, expected_nonce, timestamp) in &block_order {
+            let mut matched_any = false;
+            if let Some(txs) = decoded_by_block.get(block_number) {
+                for tr in txs {
+                    let sender = match tr.transaction.sender_address() {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if sender.0 != addr_bytes.as_slice() {
+                        continue;
+                    }
+                    let (status, revert_reason) = match &tr.receipt.execution_status {
+                        dto::ExecutionStatus::Succeeded => ("OK".to_string(), None),
+                        dto::ExecutionStatus::Reverted { reason } => {
+                            ("REV".to_string(), Some(reason.clone()))
+                        }
+                    };
+                    results.push(SenderTxEntry {
+                        hash: tr.transaction.hash.to_hex(),
+                        sender_address: sender.to_hex(),
+                        nonce: tr.transaction.nonce(),
+                        block_number: *block_number,
+                        timestamp: *timestamp,
+                        tx_type: tr.transaction.tx_type().to_string(),
+                        actual_fee: tr.receipt.actual_fee.to_hex(),
+                        tip: tr.transaction.tip(),
+                        status,
+                        revert_reason,
+                    });
+                    matched_any = true;
                 }
-            };
-
-            results.push(SenderTxEntry {
-                hash: tr.transaction.hash.to_hex(),
-                sender_address: sender.to_hex(),
-                nonce,
-                block_number: *block_number,
-                timestamp: *timestamp,
-                tx_type: tr.transaction.tx_type().to_string(),
-                actual_fee: tr.receipt.actual_fee.to_hex(),
-                tip: tr.transaction.tip(),
-                status,
-                revert_reason,
-            });
+            }
+            if !matched_any {
+                results.push(SenderTxEntry {
+                    hash: String::new(),
+                    sender_address: String::new(),
+                    nonce: Some(expected_nonce.saturating_sub(1)),
+                    block_number: *block_number,
+                    timestamp: *timestamp,
+                    tx_type: "UNKNOWN".to_string(),
+                    actual_fee: "0x0".to_string(),
+                    tip: 0,
+                    status: "OK".to_string(),
+                    revert_reason: None,
+                });
+            }
         }
 
-        // If we couldn't find any tx from this sender via blob decode,
-        // still include a stub entry from nonce_updates data
-        let block_has_match = results.iter().any(|r| r.block_number == *block_number);
-        if !block_has_match {
-            results.push(SenderTxEntry {
-                hash: String::new(),
-                sender_address: String::new(),
-                nonce: Some(expected_nonce.saturating_sub(1)),
-                block_number: *block_number,
-                timestamp: *timestamp,
-                tx_type: "UNKNOWN".to_string(),
-                actual_fee: "0x0".to_string(),
-                tip: 0,
-                status: "OK".to_string(),
-                revert_reason: None,
-            });
-        }
-    }
+        Ok(results)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Join error: {e}"),
+        )
+    })??;
 
     Ok(Json(results))
 }
