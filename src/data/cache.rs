@@ -131,6 +131,34 @@ impl CachingDataSource {
                 PRIMARY KEY (address, event_index)
             );
             CREATE INDEX IF NOT EXISTS idx_contract_events ON contract_events(address);
+            CREATE TABLE IF NOT EXISTS address_meta_txs (
+                address TEXT NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (address, tx_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addr_meta_txs
+                ON address_meta_txs(address, block_number DESC);
+            CREATE TABLE IF NOT EXISTS class_declarations (
+                class_hash TEXT PRIMARY KEY,
+                tx_hash TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS class_contracts (
+                class_hash TEXT NOT NULL,
+                contract_address TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                PRIMARY KEY (class_hash, contract_address)
+            );
+            CREATE INDEX IF NOT EXISTS idx_class_contracts_class
+                ON class_contracts(class_hash, block_number DESC);
+            CREATE TABLE IF NOT EXISTS class_contracts_meta (
+                class_hash TEXT PRIMARY KEY,
+                fetched_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -820,6 +848,43 @@ impl DataSource for CachingDataSource {
         }
     }
 
+    fn load_cached_meta_txs(&self, address: &Felt) -> Vec<MetaTxIntenderSummary> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = match db.prepare(
+            "SELECT data FROM address_meta_txs WHERE address = ?1 ORDER BY block_number DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![addr_hex], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect()
+    }
+
+    fn save_meta_txs(&self, address: &Felt, txs: &[MetaTxIntenderSummary]) {
+        if let Ok(db) = self.db.lock() {
+            let addr_hex = format!("{:#x}", address);
+            for tx in txs {
+                if let Ok(json) = serde_json::to_string(tx) {
+                    let hash_hex = format!("{:#x}", tx.hash);
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO address_meta_txs \
+                         (address, tx_hash, block_number, data) VALUES (?1, ?2, ?3, ?4)",
+                        params![addr_hex, hash_hex, tx.block_number as i64, json],
+                    );
+                }
+            }
+        }
+    }
+
     fn load_cached_activity_range(&self, address: &Felt) -> Option<(u64, u64)> {
         self.load_cached_activity_range_with_count(address)
             .map(|(min, max, _count)| (min, max))
@@ -1017,5 +1082,136 @@ impl DataSource for CachingDataSource {
             self.cache_block(block);
         }
         Ok(blocks)
+    }
+
+    fn load_cached_class_declaration(&self, class_hash: &Felt) -> Option<ClassDeclareInfo> {
+        let db = self.db.lock().ok()?;
+        let hash_hex = format!("{:#x}", class_hash);
+        let mut stmt = db
+            .prepare(
+                "SELECT tx_hash, sender, block_number, timestamp \
+                 FROM class_declarations WHERE class_hash = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![hash_hex], |row| {
+            let tx_hash_s: String = row.get(0)?;
+            let sender_s: String = row.get(1)?;
+            let block_number: i64 = row.get(2)?;
+            let timestamp: i64 = row.get(3)?;
+            Ok((tx_hash_s, sender_s, block_number as u64, timestamp as u64))
+        })
+        .ok()
+        .and_then(|(tx_hash_s, sender_s, block_number, timestamp)| {
+            let tx_hash = Felt::from_hex(&tx_hash_s).ok()?;
+            let sender = Felt::from_hex(&sender_s).ok()?;
+            Some(ClassDeclareInfo {
+                tx_hash,
+                sender,
+                block_number,
+                timestamp,
+            })
+        })
+    }
+
+    fn save_class_declaration(&self, class_hash: &Felt, info: &ClassDeclareInfo) {
+        if let Ok(db) = self.db.lock() {
+            let hash_hex = format!("{:#x}", class_hash);
+            let tx_hex = format!("{:#x}", info.tx_hash);
+            let sender_hex = format!("{:#x}", info.sender);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO class_declarations \
+                 (class_hash, tx_hash, sender, block_number, timestamp) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    hash_hex,
+                    tx_hex,
+                    sender_hex,
+                    info.block_number as i64,
+                    info.timestamp as i64,
+                ],
+            );
+        }
+    }
+
+    fn load_cached_class_contracts(&self, class_hash: &Felt) -> Option<Vec<ClassContractEntry>> {
+        let db = self.db.lock().ok()?;
+        let hash_hex = format!("{:#x}", class_hash);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        // Contracts-by-class is fresh for 1 hour; stale entries return None so
+        // the caller re-fetches. Without this TTL the list would miss new
+        // deploys performed against the class after the first cache write.
+        let cutoff = now - 3600;
+        let fetched_at: i64 = db
+            .prepare("SELECT fetched_at FROM class_contracts_meta WHERE class_hash = ?1")
+            .ok()?
+            .query_row(params![&hash_hex], |row| row.get(0))
+            .ok()?;
+        if fetched_at <= cutoff {
+            return None;
+        }
+        let mut stmt = db
+            .prepare(
+                "SELECT contract_address, block_number FROM class_contracts \
+                 WHERE class_hash = ?1 ORDER BY block_number DESC",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(params![hash_hex], |row| {
+                let addr_s: String = row.get(0)?;
+                let block_number: i64 = row.get(1)?;
+                Ok((addr_s, block_number as u64))
+            })
+            .ok()?;
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            if let Ok(address) = Felt::from_hex(&row.0) {
+                out.push(ClassContractEntry {
+                    address,
+                    block_number: row.1,
+                });
+            }
+        }
+        Some(out)
+    }
+
+    fn save_class_contracts(&self, class_hash: &Felt, contracts: &[ClassContractEntry]) {
+        if let Ok(mut db) = self.db.lock() {
+            let hash_hex = format!("{:#x}", class_hash);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let tx = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_class_contracts: begin transaction failed");
+                    return;
+                }
+            };
+            // Replace: drop prior rows, insert the new list atomically.
+            let _ = tx.execute(
+                "DELETE FROM class_contracts WHERE class_hash = ?1",
+                params![hash_hex],
+            );
+            for entry in contracts {
+                let contract_hex = format!("{:#x}", entry.address);
+                let _ = tx.execute(
+                    "INSERT OR REPLACE INTO class_contracts \
+                     (class_hash, contract_address, block_number) VALUES (?1, ?2, ?3)",
+                    params![hash_hex, contract_hex, entry.block_number as i64],
+                );
+            }
+            let _ = tx.execute(
+                "INSERT OR REPLACE INTO class_contracts_meta (class_hash, fetched_at) \
+                 VALUES (?1, ?2)",
+                params![hash_hex, now],
+            );
+            if let Err(e) = tx.commit() {
+                warn!(error = %e, "save_class_contracts: commit failed");
+            }
+        }
     }
 }

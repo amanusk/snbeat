@@ -32,22 +32,27 @@ pub fn format_endpoint_names(tx: &SnTransaction, abi_reg: &AbiRegistry) -> Strin
     format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
 }
 
+/// Resolve a selector to its ABI name, or a short hex fallback if unknown.
+/// Shared across per-call formatters so the fallback shape stays consistent.
+pub fn format_selector_name_or_hex(selector: &Felt, abi_reg: &AbiRegistry) -> String {
+    abi_reg.get_selector_name(selector).unwrap_or_else(|| {
+        let hex = format!("{:#x}", selector);
+        if hex.len() > 10 {
+            format!("{}…", &hex[..10])
+        } else {
+            hex
+        }
+    })
+}
+
 /// Format a list of selectors into a human-readable endpoint name string.
+/// Truncates to 3 + "+N" once more than three selectors are present.
 pub fn format_selector_names(
     selectors: impl Iterator<Item = Felt>,
     abi_reg: &AbiRegistry,
 ) -> String {
     let names: Vec<String> = selectors
-        .map(|sel| {
-            abi_reg.get_selector_name(&sel).unwrap_or_else(|| {
-                let hex = format!("{:#x}", sel);
-                if hex.len() > 10 {
-                    format!("{}…", &hex[..10])
-                } else {
-                    hex
-                }
-            })
-        })
+        .map(|sel| format_selector_name_or_hex(&sel, abi_reg))
         .collect();
     if names.is_empty() {
         return String::new();
@@ -57,6 +62,22 @@ pub fn format_selector_names(
     } else {
         format!("{}, … +{}", names[..3].join(", "), names.len() - 3)
     }
+}
+
+/// Pre-warm the ABI registry for a set of addresses in parallel.
+///
+/// Each `get_abi_for_address` call populates the LRU + SQLite cache so that
+/// subsequent synchronous `get_selector_name` lookups in the same task hit
+/// warm data. No-op for addresses that fail to fetch (errors are already
+/// surfaced inside `AbiRegistry`).
+pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &AbiRegistry) {
+    let futs: Vec<_> = addresses
+        .into_iter()
+        .map(|a| async move {
+            let _ = abi_reg.get_abi_for_address(&a).await;
+        })
+        .collect();
+    futures::future::join_all(futs).await;
 }
 
 /// Extract execution status string from a receipt.

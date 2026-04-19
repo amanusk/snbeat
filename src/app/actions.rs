@@ -4,8 +4,9 @@ use crate::app::state::SourceStatus;
 use crate::app::views::address_info::UnfilledGap;
 use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
-    AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary, SnAddressInfo,
-    SnBlock, SnReceipt, SnTransaction, TokenBalance, VoyagerLabelInfo,
+    AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
+    MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnReceipt, SnTransaction, TokenBalance,
+    VoyagerLabelInfo,
 };
 use crate::decode::events::DecodedEvent;
 use crate::decode::functions::RawCall;
@@ -80,6 +81,28 @@ pub enum Action {
         address: Felt,
         before_block: u64,
         is_contract: bool,
+    },
+    /// Fetch meta-transactions (SNIP-9 outside executions) where `address` is
+    /// the intender (issue #11). Paginates via pf-query's event continuation
+    /// token — opaque u64 from the previous response, or `None` for first page.
+    ///
+    /// `from_block` bounds the initial bloom scan range; without it, pf-query
+    /// walks from genesis and times out on accounts with long history. The
+    /// dispatcher sets this to the deploy block when known.
+    FetchAddressMetaTxs {
+        address: Felt,
+        from_block: u64,
+        continuation_token: Option<u64>,
+        limit: u32,
+    },
+    /// Classify a single tx as a potential meta-tx where `address` is the
+    /// intender. Dispatched from the WS event handler on every
+    /// `TRANSACTION_EXECUTED` event for the currently-viewed account so the
+    /// MetaTxs tab updates in real time. Requires pf-query (tx_type +
+    /// calldata decoding); no-op when unavailable.
+    ClassifyPotentialMetaTx {
+        address: Felt,
+        tx_hash: Felt,
     },
     /// Fetch class hash info (ABI, declaration, deployed contracts).
     FetchClassInfo {
@@ -161,6 +184,28 @@ pub enum Action {
         oldest_block: u64,
         /// Whether there is likely more data beyond this batch.
         has_more: bool,
+    },
+    /// Meta-transaction summaries loaded for an address (issue #11).
+    AddressMetaTxsLoaded {
+        address: Felt,
+        summaries: Vec<MetaTxIntenderSummary>,
+        /// Opaque continuation token from pf-query, if more pages remain.
+        /// Pass back via `FetchAddressMetaTxs::continuation_token` to resume.
+        next_token: Option<u64>,
+    },
+    /// Cached meta-tx rows delivered synchronously at tab-entry time. Merges
+    /// into the visible list but does NOT touch the loading flag / cursor — a
+    /// live pf-query fetch may still be in-flight behind this.
+    AddressMetaTxsCacheLoaded {
+        address: Felt,
+        summaries: Vec<MetaTxIntenderSummary>,
+    },
+    /// Streaming single-tx meta-tx classification result from the WS path.
+    /// Merges into the visible list without touching pagination state (live
+    /// pf-query fetches may still be in-flight in parallel).
+    AddressMetaTxsStreamed {
+        address: Felt,
+        summaries: Vec<MetaTxIntenderSummary>,
     },
     /// Dune activity probe result delivered to UI for pagination window sizing.
     AddressProbeLoaded {

@@ -7,7 +7,9 @@ use starknet::core::types::Felt;
 use crate::app::AddressTab;
 use crate::app::actions::Source;
 use crate::app::state::TxNavItem;
-use crate::data::types::{AddressTxSummary, ContractCallSummary, SnAddressInfo};
+use crate::data::types::{
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnAddressInfo,
+};
 use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
 use crate::ui::widgets::stateful_list::StatefulList;
@@ -88,7 +90,36 @@ pub struct AddressInfoState {
     /// Set after the initial load settles; filled on-demand when the user
     /// scrolls near the bottom of the list.
     pub unfilled_gap: Option<UnfilledGap>,
+    /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
+    pub meta_txs: StatefulList<MetaTxIntenderSummary>,
+    /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
+    pub fetching_meta_txs: bool,
+    /// pf-query event cursor (oldest block - 1) for MetaTxs pagination.
+    pub meta_tx_cursor_block: Option<u64>,
+    /// Whether pf-query signaled more meta-tx data is available.
+    pub meta_tx_has_more: bool,
+    /// Whether the initial MetaTxs fetch has been dispatched for the current address.
+    pub meta_txs_dispatched: bool,
+    /// Lower bound for the MetaTxs bloom scan, preserved across pagination.
+    /// Set to deploy block when known; bounds the scan range so pf-query
+    /// doesn't time out walking chunks older than the account.
+    pub meta_tx_from_block: u64,
+    /// Number of automatic (non-user-triggered) pages already fetched while
+    /// trying to fill the first screen of MetaTxs. Capped by
+    /// `META_TX_AUTO_PAGE_CAP` so an address with many events but zero
+    /// classified meta-txs doesn't walk the whole history in the background.
+    pub meta_tx_auto_pages: u32,
 }
+
+/// Maximum background auto-continue pages when filling the MetaTxs first
+/// screen. Each page scans ~50 events, so 10 pages ≈ 500 events. Once hit,
+/// further pagination requires the user to scroll (strictly on-demand).
+pub const META_TX_AUTO_PAGE_CAP: u32 = 10;
+
+/// Target MetaTx row count for the first screen. Auto-continue keeps paging
+/// until either this target is reached, `next_token` exhausts, or the
+/// `META_TX_AUTO_PAGE_CAP` safety cap trips.
+pub const META_TX_FIRST_PAINT_TARGET: usize = 20;
 
 impl Default for AddressInfoState {
     fn default() -> Self {
@@ -117,6 +148,13 @@ impl Default for AddressInfoState {
             ws_subscribed: false,
             sanity_check_dispatched: false,
             unfilled_gap: None,
+            meta_txs: StatefulList::new(),
+            fetching_meta_txs: false,
+            meta_tx_cursor_block: None,
+            meta_tx_has_more: false,
+            meta_txs_dispatched: false,
+            meta_tx_from_block: 0,
+            meta_tx_auto_pages: 0,
         }
     }
 }
@@ -146,6 +184,13 @@ impl AddressInfoState {
         self.ws_subscribed = false;
         self.sanity_check_dispatched = false;
         self.unfilled_gap = None;
+        self.meta_txs = StatefulList::new();
+        self.fetching_meta_txs = false;
+        self.meta_tx_cursor_block = None;
+        self.meta_tx_has_more = false;
+        self.meta_txs_dispatched = false;
+        self.meta_tx_from_block = 0;
+        self.meta_tx_auto_pages = 0;
     }
 
     /// Whether any source thinks there is more data to fetch.

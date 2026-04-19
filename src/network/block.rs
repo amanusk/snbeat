@@ -12,11 +12,9 @@ use crate::app::actions::Action;
 use crate::data::DataSource;
 use crate::decode::AbiRegistry;
 use crate::decode::functions::parse_multicall;
-use crate::decode::outside_execution::{
-    OutsideExecutionVersion, is_avnu_forwarder, is_outside_execution, looks_like_outside_execution,
-    parse_forwarder_call, parse_outside_execution,
-};
+use crate::decode::outside_execution::detect_outside_execution;
 
+use super::helpers;
 use super::rpc_source_update;
 use super::voyager;
 
@@ -191,73 +189,30 @@ async fn resolve_endpoint_names(
     let mut meta_tx_info: Vec<Option<MetaTxSummary>> = vec![None; tx_calls.len()];
 
     for (i, (calls, raw_calls)) in tx_calls.iter().zip(tx_raw_calls.iter()).enumerate() {
-        // Endpoint names
+        // Endpoint names (shared helper: "foo, bar, baz, … +N").
         if calls.is_empty() {
             endpoint_names.push(None);
         } else {
-            let resolved: Vec<String> = calls
-                .iter()
-                .map(|(_addr, selector)| {
-                    abi_registry.get_selector_name(selector).unwrap_or_else(|| {
-                        let hex = format!("{:#x}", selector);
-                        if hex.len() > 10 {
-                            format!("{}…", &hex[..10])
-                        } else {
-                            hex
-                        }
-                    })
-                })
-                .collect();
-
-            if resolved.len() <= 3 {
-                endpoint_names.push(Some(resolved.join(", ")));
-            } else {
-                let shown: Vec<_> = resolved[..3].to_vec();
-                endpoint_names.push(Some(format!(
-                    "{}, … +{}",
-                    shown.join(", "),
-                    resolved.len() - 3
-                )));
-            }
+            let names = helpers::format_selector_names(
+                calls.iter().map(|(_addr, selector)| *selector),
+                abi_registry,
+            );
+            endpoint_names.push(Some(names));
         }
 
-        // Outside execution detection (lightweight — no inner call ABI resolution)
+        // Outside execution detection (lightweight — no inner call ABI resolution).
+        // Shared with address-view classify; see `detect_outside_execution`.
         for call in raw_calls {
             let resolved_name = call
                 .function_name
                 .clone()
                 .or_else(|| abi_registry.get_selector_name(&call.selector));
-            let fname = resolved_name.as_deref().unwrap_or("");
-
-            // Method 1: by function name
-            if let Some(version) = is_outside_execution(fname) {
-                if let Some(oe) = parse_outside_execution(call, version) {
-                    meta_tx_info[i] = Some(MetaTxSummary {
-                        intender: oe.intender,
-                        version: oe.version,
-                    });
-                    break;
-                }
-            }
-            // Method 2: by calldata heuristic (ANY_CALLER + valid struct)
-            if fname.is_empty() && looks_like_outside_execution(call) {
-                if let Some(oe) = parse_outside_execution(call, OutsideExecutionVersion::V2) {
-                    meta_tx_info[i] = Some(MetaTxSummary {
-                        intender: oe.intender,
-                        version: oe.version,
-                    });
-                    break;
-                }
-            }
-            // Method 3: by known AVNU forwarder address
-            if is_avnu_forwarder(&call.contract_address) {
-                if let Some(oe) = parse_forwarder_call(call) {
-                    meta_tx_info[i] = Some(MetaTxSummary {
-                        intender: oe.intender,
-                        version: oe.version,
-                    });
-                    break;
-                }
+            if let Some((oe, _method)) = detect_outside_execution(call, resolved_name.as_deref()) {
+                meta_tx_info[i] = Some(MetaTxSummary {
+                    intender: oe.intender,
+                    version: oe.version,
+                });
+                break;
             }
         }
     }

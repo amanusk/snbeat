@@ -25,6 +25,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-util = "0.7"
 futures = "0.3"
 
 # HTTP — reqwest 0.13 must match starknet-rust's version and enable TLS

@@ -609,6 +609,31 @@ fn handle_event(result: &Value, address: Felt, response_tx: &mpsc::UnboundedSend
         address,
         calls: vec![call],
     });
+
+    // If the viewed address is an Argent/Braavos account, every invoke —
+    // including execute_from_outside* — emits TRANSACTION_EXECUTED. Classify
+    // the tx to see whether it's a meta-tx with this address as the intender,
+    // and if so stream it into the MetaTxs tab. Cheap check up front: only
+    // dispatch when the first key matches the selector.
+    if event
+        .emitted_event
+        .keys
+        .first()
+        .map(|k| *k == tx_executed_selector())
+        .unwrap_or(false)
+    {
+        let _ = response_tx.send(Action::ClassifyPotentialMetaTx { address, tx_hash });
+    }
+}
+
+/// Cached `TRANSACTION_EXECUTED` selector as `Felt` (parsed once per process).
+fn tx_executed_selector() -> Felt {
+    use std::sync::OnceLock;
+    static SELECTOR: OnceLock<Felt> = OnceLock::new();
+    *SELECTOR.get_or_init(|| {
+        Felt::from_hex(crate::data::pathfinder::TRANSACTION_EXECUTED_SELECTOR)
+            .expect("TRANSACTION_EXECUTED_SELECTOR is a valid felt")
+    })
 }
 
 fn handle_new_transaction(
@@ -966,5 +991,123 @@ mod tests {
         let removed = state.remove_address(addr);
         assert_eq!(removed.len(), 2);
         assert!(state.subscriptions.is_empty());
+    }
+
+    /// Bug-guard (address-view live updates): when a `TRANSACTION_EXECUTED`
+    /// event arrives via WS for the viewed account, `handle_event` must
+    /// fan it out to **both** the Calls tab and the meta-tx classifier.
+    /// The latter is how execute_from_outside meta-txs populate the MetaTxs
+    /// tab in real time — if this emission goes missing, MetaTxs appears
+    /// stale even while Calls keeps ticking.
+    #[test]
+    fn handle_event_tx_executed_fans_out_to_calls_and_classifier() {
+        use crate::app::actions::Action;
+        use tokio::sync::mpsc;
+
+        let address = Felt::from_hex_unchecked(
+            "0x03a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4",
+        );
+        let tx_hash_hex = "0x0136e683b9f88958252cc44987fabb06483ead59d65b86a8521886637a5bd08d";
+        let selector = crate::data::pathfinder::TRANSACTION_EXECUTED_SELECTOR;
+
+        let event_json = format!(
+            r#"{{
+                "from_address": "{addr}",
+                "keys": ["{sel}"],
+                "data": [],
+                "block_hash": "0xabc",
+                "block_number": 8914198,
+                "transaction_hash": "{tx}",
+                "transaction_index": 0,
+                "event_index": 0,
+                "finality_status": "ACCEPTED_ON_L2"
+            }}"#,
+            addr = format!("{:#x}", address),
+            sel = selector,
+            tx = tx_hash_hex,
+        );
+        let result: Value = serde_json::from_str(&event_json).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        super::handle_event(&result, address, &tx);
+
+        // Drain everything the handler produced.
+        let mut actions: Vec<Action> = Vec::new();
+        while let Ok(a) = rx.try_recv() {
+            actions.push(a);
+        }
+
+        let saw_calls = actions
+            .iter()
+            .any(|a| matches!(a, Action::AddressCallsStreamed { .. }));
+        let saw_classify = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::ClassifyPotentialMetaTx { address: ca, .. } if *ca == address
+            )
+        });
+
+        assert!(
+            saw_calls,
+            "TRANSACTION_EXECUTED must route to the Calls tab. Got: {:?}",
+            actions
+        );
+        assert!(
+            saw_classify,
+            "TRANSACTION_EXECUTED for a viewed account must dispatch \
+             ClassifyPotentialMetaTx so execute_from_outside calls \
+             populate the MetaTxs tab live. Got: {:?}",
+            actions
+        );
+    }
+
+    /// Bug-guard: a non-`TRANSACTION_EXECUTED` event (e.g. a plain contract
+    /// event like an ERC20 Transfer) must still route to Calls but must NOT
+    /// trigger meta-tx classification — `classify_meta_tx_candidate` would
+    /// always reject it, so the dispatch is wasted work.
+    #[test]
+    fn handle_event_non_tx_executed_skips_classifier() {
+        use crate::app::actions::Action;
+        use tokio::sync::mpsc;
+
+        let address = Felt::from_hex_unchecked(
+            "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+        );
+        // Some arbitrary non-TRANSACTION_EXECUTED selector (Transfer).
+        let other_selector = "0x0099cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9";
+
+        let event_json = format!(
+            r#"{{
+                "from_address": "{addr}",
+                "keys": ["{sel}"],
+                "data": [],
+                "block_hash": "0xabc",
+                "block_number": 100,
+                "transaction_hash": "0xdef",
+                "transaction_index": 0,
+                "event_index": 0,
+                "finality_status": "ACCEPTED_ON_L2"
+            }}"#,
+            addr = format!("{:#x}", address),
+            sel = other_selector,
+        );
+        let result: Value = serde_json::from_str(&event_json).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        super::handle_event(&result, address, &tx);
+
+        let mut actions: Vec<Action> = Vec::new();
+        while let Ok(a) = rx.try_recv() {
+            actions.push(a);
+        }
+
+        let saw_classify = actions
+            .iter()
+            .any(|a| matches!(a, Action::ClassifyPotentialMetaTx { .. }));
+        assert!(
+            !saw_classify,
+            "Non-TRANSACTION_EXECUTED event must not trigger meta-tx classify. Got: {:?}",
+            actions
+        );
     }
 }

@@ -162,6 +162,98 @@ pub(super) async fn fetch_events_routed(
     }
 }
 
+/// One page of shared address-activity data, produced once per pf-available
+/// fetch and consumed by all three address-view tabs (Events / Calls-Txs /
+/// MetaTxs). Hoisting the common fetch here avoids running
+/// `get_events_for_address` + `get_txs_by_hash` twice — MetaTxs are a classified
+/// subset of the same tx rows the calls/txs tab needs.
+#[derive(Debug)]
+pub(super) struct AddressActivityPage {
+    /// Raw events for the address (TRANSACTION_EXECUTED for accounts,
+    /// from_address filter for contracts).
+    pub events: Vec<crate::data::types::SnEvent>,
+    /// Bulk-fetched tx rows for every unique tx_hash in `events`, in the order
+    /// they were first seen (newest-first when pf returns events in reverse
+    /// chronological order).
+    pub tx_rows: Vec<crate::data::pathfinder::TxByHashData>,
+    /// Unique tx_hashes (non-zero) from `events`, deduped preserving first-seen
+    /// order — matches `tx_rows` 1:1. Exposed so consumers don't re-walk events.
+    pub unique_hashes: Vec<starknet::core::types::Felt>,
+    /// tx_hash → block_number, derived from events. Useful for tabs that only
+    /// index by hash but need block context.
+    pub tx_block_map: std::collections::HashMap<starknet::core::types::Felt, u64>,
+    /// Pagination cursor for the next page of events. `None` means no more
+    /// history behind this page.
+    pub next_token: Option<u64>,
+}
+
+/// Fetch one page of address activity via pf-query and return the shared
+/// intermediate data for all three address-view tabs.
+///
+/// Two-step pipeline:
+/// 1. `get_events_for_address` (accounts) or `get_contract_events` (contracts)
+///    — bloom-indexed event scan bounded by `from_block`.
+/// 2. `get_txs_by_hash` on the unique tx hashes — bulk tx-row fetch in one
+///    round trip (much faster than per-tx RPC).
+///
+/// Derivations (events decoded for the Events tab, TxSummary for the Txs tab,
+/// MetaTxIntenderSummary for the MetaTxs tab) are cheap CPU-bound passes over
+/// the returned page and live in their own helpers.
+///
+/// pf-query-only by design — the RPC fallback keeps the legacy per-tx flow.
+pub(super) async fn fetch_address_activity(
+    address: starknet::core::types::Felt,
+    kind: EventQueryKind,
+    from_block: u64,
+    continuation_token: Option<u64>,
+    limit: u32,
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+) -> crate::error::Result<AddressActivityPage> {
+    use starknet::core::types::Felt;
+
+    // 1. Events.
+    let (events, next_token) = match kind {
+        EventQueryKind::Account => pf
+            .get_events_for_address(address, from_block, None, limit, continuation_token)
+            .await
+            .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))?,
+        EventQueryKind::Contract => pf
+            .get_contract_events(address, from_block, None, &[], limit, continuation_token)
+            .await
+            .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))?,
+    };
+
+    // 2. Dedupe tx hashes, preserve first-seen order (pf returns newest-first).
+    let mut unique_hashes: Vec<Felt> = Vec::with_capacity(events.len());
+    let mut seen: std::collections::HashSet<Felt> = std::collections::HashSet::new();
+    let mut tx_block_map: std::collections::HashMap<Felt, u64> = std::collections::HashMap::new();
+    for e in &events {
+        if e.transaction_hash != Felt::ZERO && seen.insert(e.transaction_hash) {
+            unique_hashes.push(e.transaction_hash);
+        }
+        tx_block_map
+            .entry(e.transaction_hash)
+            .or_insert(e.block_number);
+    }
+
+    // 3. Bulk tx-row fetch.
+    let tx_rows = if unique_hashes.is_empty() {
+        Vec::new()
+    } else {
+        pf.get_txs_by_hash(&unique_hashes)
+            .await
+            .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))?
+    };
+
+    Ok(AddressActivityPage {
+        events,
+        tx_rows,
+        unique_hashes,
+        tx_block_map,
+        next_token,
+    })
+}
+
 /// Well-known tokens whose balances we probe for every address.
 ///
 /// `(contract_address, display_name, decimals)`. Extend cautiously: each
@@ -390,6 +482,32 @@ async fn fetch_tx_summaries_from_hashes(
     summaries
 }
 
+/// Build `AddressTxSummary` rows from pre-fetched pf-query tx data. Drop-in
+/// replacement for `fetch_tx_summaries_from_hashes` on the pf-available path:
+/// no per-tx RPC round-trips, timestamps already populated by pf.
+///
+/// Pre-warms the ABI registry for every multicall target across all rows so
+/// selector → name resolution hits the cache during the per-row build.
+pub(super) async fn build_tx_summaries_from_pf_rows(
+    tx_rows: &[crate::data::pathfinder::TxByHashData],
+    abi_reg: &Arc<AbiRegistry>,
+) -> Vec<crate::data::types::AddressTxSummary> {
+    // Pre-warm ABIs for all unique multicall targets in one pass.
+    let mut targets: std::collections::HashSet<starknet::core::types::Felt> =
+        std::collections::HashSet::new();
+    for row in tx_rows {
+        for t in helpers::pf_tx_target_addresses(row) {
+            targets.insert(t);
+        }
+    }
+    helpers::prewarm_abis(targets, abi_reg).await;
+
+    tx_rows
+        .iter()
+        .filter_map(|row| helpers::build_tx_summary_from_pf_data(row, abi_reg))
+        .collect()
+}
+
 /// Build ContractCallSummary entries from event tx hashes by fetching tx+receipt
 /// and extracting calls to the target contract. Also backfills timestamps.
 pub(super) async fn build_contract_calls_from_hashes(
@@ -400,7 +518,7 @@ pub(super) async fn build_contract_calls_from_hashes(
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<crate::data::types::ContractCallSummary> {
     // Pre-fetch ABI for the target contract so selector→name lookups succeed.
-    let _ = abi_reg.get_abi_for_address(&address).await;
+    helpers::prewarm_abis([address], abi_reg).await;
 
     let mut calls_list = Vec::new();
     for chunk in hashes_with_blocks.chunks(20) {
@@ -436,24 +554,12 @@ pub(super) async fn build_contract_calls_from_hashes(
                     .unwrap_or("?")
                     .to_string();
                 let function_name = match &fetched_tx {
-                    crate::data::types::SnTransaction::Invoke(i) => {
-                        let calls = parse_multicall(&i.calldata);
-                        calls
-                            .iter()
-                            .filter(|c| c.contract_address == address)
-                            .map(|c| {
-                                abi_reg.get_selector_name(&c.selector).unwrap_or_else(|| {
-                                    let hex = format!("{:#x}", c.selector);
-                                    if hex.len() > 10 {
-                                        format!("{}…", &hex[..10])
-                                    } else {
-                                        hex
-                                    }
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    }
+                    crate::data::types::SnTransaction::Invoke(i) => parse_multicall(&i.calldata)
+                        .iter()
+                        .filter(|c| c.contract_address == address)
+                        .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     _ => String::new(),
                 };
                 calls_list.push(crate::data::types::ContractCallSummary {
@@ -470,6 +576,64 @@ pub(super) async fn build_contract_calls_from_hashes(
     }
 
     helpers::backfill_call_timestamps(&mut calls_list, ds, pf).await;
+    crate::data::types::deduplicate_contract_calls(calls_list)
+}
+
+/// Build `ContractCallSummary` rows from pre-fetched pf-query tx data.
+///
+/// Drop-in replacement for `build_contract_calls_from_hashes` on the
+/// pf-available path: no per-tx RPC, timestamps already populated by pf.
+/// Status strings are passed through as pf returns them (consistent with
+/// `classify_meta_tx_candidate` and `build_tx_summary_from_pf_data`).
+pub(super) async fn build_contract_calls_from_pf_rows(
+    address: starknet::core::types::Felt,
+    tx_rows: &[crate::data::pathfinder::TxByHashData],
+    abi_reg: &Arc<AbiRegistry>,
+) -> Vec<crate::data::types::ContractCallSummary> {
+    use starknet::core::types::Felt;
+
+    // Pre-warm ABI for the target contract so selector→name lookups succeed.
+    helpers::prewarm_abis([address], abi_reg).await;
+
+    let mut calls_list: Vec<crate::data::types::ContractCallSummary> =
+        Vec::with_capacity(tx_rows.len());
+    for row in tx_rows {
+        let Ok(tx_hash) = Felt::from_hex(&row.hash) else {
+            continue;
+        };
+        let Ok(sender) = Felt::from_hex(&row.sender) else {
+            continue;
+        };
+        let fee_fri =
+            u128::from_str_radix(row.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
+
+        let function_name = if helpers::normalize_pf_tx_type(&row.tx_type) == "INVOKE" {
+            let calldata: Vec<Felt> = row
+                .calldata
+                .iter()
+                .filter_map(|h| Felt::from_hex(h).ok())
+                .collect();
+            parse_multicall(&calldata)
+                .iter()
+                .filter(|c| c.contract_address == address)
+                .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
+
+        calls_list.push(crate::data::types::ContractCallSummary {
+            tx_hash,
+            sender,
+            function_name,
+            block_number: row.block_number,
+            timestamp: row.block_timestamp,
+            total_fee_fri: fee_fri,
+            status: row.status.clone(),
+        });
+    }
+
     crate::data::types::deduplicate_contract_calls(calls_list)
 }
 
@@ -634,11 +798,11 @@ pub(super) async fn fetch_and_send_address_info(
                 (span / 100).max(100)
             });
         let mut probe = dune::AddressActivityProbe::default();
-        probe.sender_min_block = min_b;
-        probe.sender_max_block = max_b;
         probe.callee_min_block = min_b;
         probe.callee_max_block = max_b;
-        probe.sender_tx_count = event_count;
+        // Cached count is derived from Dune's events-from-address query, which
+        // populates callee activity only. Sender tx totals come from the
+        // on-chain nonce in the address info path; leave sender_* at 0.
         probe.callee_call_count = event_count;
         let _ = probe_watch_tx.send(Some(probe));
     } else if let Some(dune_client) = dune {
@@ -654,12 +818,12 @@ pub(super) async fn fetch_and_send_address_info(
                     if probe.has_activity() {
                         let _ = tx_probe.send(Action::LoadingStatus(format!(
                             "Dune probe: {} events, blocks {}..{}",
-                            probe.sender_tx_count,
+                            probe.callee_call_count,
                             probe.min_block(),
                             probe.max_block(),
                         )));
                         // Cache the discovered range + event count for next time.
-                        let total_events = probe.sender_tx_count.max(probe.callee_call_count);
+                        let total_events = probe.callee_call_count;
                         ds_probe.save_activity_range_with_count(
                             &address,
                             probe.min_block(),
@@ -1116,29 +1280,66 @@ pub(super) async fn fetch_and_send_address_info(
             } else {
                 EventQueryKind::Account
             };
-            let events_result = fetch_events_routed(
-                kind,
-                pf_c.as_ref(),
-                &ds_c,
-                address,
-                Some(from_block),
-                None,
-                phase1_limit,
-            )
-            .await;
-            let events = match events_result {
-                Ok(evts) => evts,
-                Err(e) => {
-                    warn!(error = %e, address = %format!("{:#x}", address), "RPC event fetch failed");
-                    let _ = tx_c.send(Action::LoadingStatus(format!(
-                        "RPC: event fetch failed: {}",
-                        e
-                    )));
-                    let _ = tx_c.send(Action::SourceUpdate {
-                        source: Source::Rpc,
-                        status: crate::app::state::SourceStatus::FetchError(e.to_string()),
-                    });
-                    Vec::new()
+
+            // Fast path: when pf is available, fetch events AND unique tx rows
+            // in one shared pipeline. The MetaTxs tab can derive from the same
+            // page (emitted alongside below), avoiding a second event scan +
+            // /txs-by-hash round trip.
+            let pf_page: Option<AddressActivityPage> = if let Some(pf) = pf_c.as_ref() {
+                match fetch_address_activity(
+                    address,
+                    kind,
+                    from_block,
+                    None,
+                    phase1_limit as u32,
+                    pf,
+                )
+                .await
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            address = %format!("{:#x}", address),
+                            "Shared activity fetch failed, falling back to RPC path"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Events: take from the shared page when available, else fall
+            // back to the legacy RPC/PF routed fetch (keeps behaviour when
+            // pf-query is unavailable).
+            let events = if let Some(page) = &pf_page {
+                page.events.clone()
+            } else {
+                let events_result = fetch_events_routed(
+                    kind,
+                    pf_c.as_ref(),
+                    &ds_c,
+                    address,
+                    Some(from_block),
+                    None,
+                    phase1_limit,
+                )
+                .await;
+                match events_result {
+                    Ok(evts) => evts,
+                    Err(e) => {
+                        warn!(error = %e, address = %format!("{:#x}", address), "RPC event fetch failed");
+                        let _ = tx_c.send(Action::LoadingStatus(format!(
+                            "RPC: event fetch failed: {}",
+                            e
+                        )));
+                        let _ = tx_c.send(Action::SourceUpdate {
+                            source: Source::Rpc,
+                            status: crate::app::state::SourceStatus::FetchError(e.to_string()),
+                        });
+                        Vec::new()
+                    }
                 }
             };
 
@@ -1146,7 +1347,8 @@ pub(super) async fn fetch_and_send_address_info(
             debug!(
                 address = %format!("{:#x}", address),
                 events = events_count,
-                "RPC phase 1 events fetched"
+                via_pf = pf_page.is_some(),
+                "Phase 1 events fetched"
             );
 
             if events_count > 0 {
@@ -1162,24 +1364,30 @@ pub(super) async fn fetch_and_send_address_info(
                 ));
             }
 
-            // Extract unique tx hashes
-            let mut seen = std::collections::HashSet::new();
-            let unique_hashes: Vec<starknet::core::types::Felt> = events
-                .iter()
-                .filter_map(|e| {
-                    let h = e.transaction_hash;
-                    if h != starknet::core::types::Felt::ZERO && seen.insert(h) {
-                        Some(h)
-                    } else {
-                        None
+            // Extract unique tx hashes + block map. On the pf path these were
+            // already computed inside `fetch_address_activity`; reuse them to
+            // avoid a second pass over `events`. The RPC fallback recomputes
+            // from events using the same first-seen-wins semantics.
+            let (unique_hashes, tx_block_map): (
+                Vec<starknet::core::types::Felt>,
+                std::collections::HashMap<starknet::core::types::Felt, u64>,
+            ) = if let Some(page) = &pf_page {
+                (page.unique_hashes.clone(), page.tx_block_map.clone())
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                let mut hashes: Vec<starknet::core::types::Felt> = Vec::with_capacity(events.len());
+                let mut map: std::collections::HashMap<starknet::core::types::Felt, u64> =
+                    std::collections::HashMap::new();
+                for e in &events {
+                    if e.transaction_hash != starknet::core::types::Felt::ZERO
+                        && seen.insert(e.transaction_hash)
+                    {
+                        hashes.push(e.transaction_hash);
                     }
-                })
-                .collect();
-
-            let tx_block_map: std::collections::HashMap<_, _> = events
-                .iter()
-                .map(|e| (e.transaction_hash, e.block_number))
-                .collect();
+                    map.entry(e.transaction_hash).or_insert(e.block_number);
+                }
+                (hashes, map)
+            };
 
             // Decode events for the events tab
             let mut decoded_events = Vec::new();
@@ -1197,21 +1405,32 @@ pub(super) async fn fetch_and_send_address_info(
                 }
             }
 
-            // Stream phase 1 results immediately (contracts: calls, accounts: events)
-            if is_contract && !unique_hashes.is_empty() {
-                let call_hashes: Vec<_> = unique_hashes
-                    .iter()
-                    .map(|h| (*h, *tx_block_map.get(h).unwrap_or(&0)))
-                    .collect();
-
-                let mut contract_calls_list = build_contract_calls_from_hashes(
-                    address,
-                    &call_hashes,
-                    &ds_c,
-                    pf_c.as_ref(),
-                    &abi_c,
-                )
-                .await;
+            // Stream phase 1 results immediately. Contract-call derivation runs
+            // for any address that has deployed code (class_hash.is_some()) —
+            // pure contracts AND hybrid accounts (nonce > 0 + class_hash) both
+            // can appear as callees in multicalls (e.g. `execute_from_outside`
+            // on a hybrid Cartridge-style account). The call-builder filters
+            // by target, so pure accounts without class_hash produce an empty
+            // list and skip this branch naturally.
+            let can_receive_calls = class_hash.is_some();
+            if can_receive_calls && !unique_hashes.is_empty() {
+                // Prefer pf-row derivation when available (no per-tx RPC).
+                let mut contract_calls_list = if let Some(page) = &pf_page {
+                    build_contract_calls_from_pf_rows(address, &page.tx_rows, &abi_c).await
+                } else {
+                    let call_hashes: Vec<_> = unique_hashes
+                        .iter()
+                        .map(|h| (*h, *tx_block_map.get(h).unwrap_or(&0)))
+                        .collect();
+                    build_contract_calls_from_hashes(
+                        address,
+                        &call_hashes,
+                        &ds_c,
+                        pf_c.as_ref(),
+                        &abi_c,
+                    )
+                    .await
+                };
                 contract_calls_list.sort_by(|a, b| b.block_number.cmp(&a.block_number));
 
                 {
@@ -1224,7 +1443,7 @@ pub(super) async fn fetch_and_send_address_info(
                         address,
                         nonce,
                         class_hash,
-                        recent_events: events,
+                        recent_events: events.clone(),
                         token_balances: Vec::new(),
                     },
                     decoded_events,
@@ -1251,41 +1470,82 @@ pub(super) async fn fetch_and_send_address_info(
                 let cached_txs = ds_c.load_cached_address_txs(&address);
                 let cached_hashes: std::collections::HashSet<_> =
                     cached_txs.iter().map(|t| t.hash).collect();
-                let hashes_to_fetch: Vec<_> = unique_hashes
-                    .iter()
-                    .filter(|h| !cached_hashes.contains(h))
-                    .copied()
-                    .collect();
 
-                if !hashes_to_fetch.is_empty() {
-                    let summaries = fetch_tx_summaries_from_hashes(
-                        &hashes_to_fetch,
-                        &tx_block_map,
-                        &ds_c,
-                        pf_c.as_ref(),
-                        &abi_c,
-                        &tx_c,
-                        "RPC: fetching txs",
-                    )
-                    .await;
-
-                    if !summaries.is_empty() {
-                        let mut all_txs = cached_txs;
-                        for s in &summaries {
-                            if !all_txs.iter().any(|t| t.hash == s.hash) {
-                                all_txs.push(s.clone());
-                            }
-                        }
-                        all_txs.sort_by(|a, b| b.nonce.cmp(&a.nonce));
-                        ds_c.save_address_txs(&address, &all_txs);
-
-                        let _ = tx_c.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Rpc,
-                            tx_summaries: summaries,
-                            complete: false,
-                        });
+                let summaries = if let Some(page) = &pf_page {
+                    // Derive from shared pf rows, filtering out anything we've
+                    // already persisted (matches RPC-path "hashes_to_fetch" semantics).
+                    let new_rows: Vec<_> = page
+                        .tx_rows
+                        .iter()
+                        .filter(|r| {
+                            starknet::core::types::Felt::from_hex(&r.hash)
+                                .map(|h| !cached_hashes.contains(&h))
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if new_rows.is_empty() {
+                        Vec::new()
+                    } else {
+                        build_tx_summaries_from_pf_rows(&new_rows, &abi_c).await
                     }
+                } else {
+                    let hashes_to_fetch: Vec<_> = unique_hashes
+                        .iter()
+                        .filter(|h| !cached_hashes.contains(h))
+                        .copied()
+                        .collect();
+                    if hashes_to_fetch.is_empty() {
+                        Vec::new()
+                    } else {
+                        fetch_tx_summaries_from_hashes(
+                            &hashes_to_fetch,
+                            &tx_block_map,
+                            &ds_c,
+                            pf_c.as_ref(),
+                            &abi_c,
+                            &tx_c,
+                            "RPC: fetching txs",
+                        )
+                        .await
+                    }
+                };
+
+                if !summaries.is_empty() {
+                    let mut all_txs = cached_txs;
+                    for s in &summaries {
+                        if !all_txs.iter().any(|t| t.hash == s.hash) {
+                            all_txs.push(s.clone());
+                        }
+                    }
+                    all_txs.sort_by(|a, b| b.nonce.cmp(&a.nonce));
+                    ds_c.save_address_txs(&address, &all_txs);
+
+                    let _ = tx_c.send(Action::AddressTxsStreamed {
+                        address,
+                        source: Source::Rpc,
+                        tx_summaries: summaries,
+                        complete: false,
+                    });
+                }
+            }
+
+            // Classify MetaTxs from the same shared page and persist to cache
+            // — next time the user opens the MetaTxs tab it renders instantly
+            // via `AddressMetaTxsCacheLoaded` (see `src/network/mod.rs`). We
+            // deliberately don't emit `AddressMetaTxsLoaded` here: the tab's
+            // own fetch starts from `deploy_block` with a different pagination
+            // cursor, and mixing the two cursor origins would confuse the
+            // state machine's auto-continue logic.
+            //
+            // Guarded so the RPC fallback path (no pf) keeps today's lazy
+            // "MetaTxs tab classifies on demand" behaviour.
+            if let Some(page) = &pf_page
+                && !page.tx_rows.is_empty()
+            {
+                let meta_summaries = derive_meta_txs_from_page(address, page, &abi_c).await;
+                if !meta_summaries.is_empty() {
+                    ds_c.save_meta_txs(&address, &meta_summaries);
                 }
             }
 
@@ -1305,11 +1565,12 @@ pub(super) async fn fetch_and_send_address_info(
                 .and_then(|p| p.clone());
 
                 if let Some(p) = probe {
-                    let has_activity = if is_contract {
-                        p.callee_call_count > 0
-                    } else {
-                        p.sender_tx_count > 0
-                    };
+                    // The Dune probe's events-from-address query now
+                    // populates callee_call_count for both accounts and
+                    // contracts (it's the event emitter count). sender_tx_count
+                    // is authoritative only via the on-chain nonce, so we use
+                    // callee_call_count as a proxy for any upstream activity.
+                    let has_activity = p.callee_call_count > 0;
 
                     if has_activity {
                         let window = p.recommended_window();
@@ -2598,6 +2859,618 @@ pub(super) async fn find_deploy_tx(
     }
 
     debug!(%addr, deploy_block, "Deploy tx not found in block (neither native nor UDC)");
+}
+
+/// Classify every tx row in a shared activity page as a meta-tx where
+/// `address` is the intender, returning the recency-sorted summaries.
+///
+/// Pure derivation over an `AddressActivityPage` — no network I/O beyond ABI
+/// pre-warm. Hoisted out of `fetch_address_meta_txs` so the dispatcher can
+/// run one shared pipeline and derive Events / Calls-Txs / MetaTxs results
+/// from the same page.
+pub(super) async fn derive_meta_txs_from_page(
+    address: starknet::core::types::Felt,
+    page: &AddressActivityPage,
+    abi_reg: &Arc<AbiRegistry>,
+) -> Vec<crate::data::types::MetaTxIntenderSummary> {
+    use starknet::core::types::Felt;
+
+    use crate::data::types::MetaTxIntenderSummary;
+
+    // Pre-warm account ABI once (Argent/Braavos component selectors).
+    helpers::prewarm_abis([address], abi_reg).await;
+
+    // Index events by tx_hash so we can derive a deterministic tx_index
+    // tie-breaker from the minimum event_index per tx (events-per-tx ordering
+    // is preserved, so event_index strictly increases with tx_index).
+    let mut tx_index_by_hash: std::collections::HashMap<Felt, u64> =
+        std::collections::HashMap::new();
+    for e in &page.events {
+        tx_index_by_hash
+            .entry(e.transaction_hash)
+            .and_modify(|v| {
+                if e.event_index < *v {
+                    *v = e.event_index;
+                }
+            })
+            .or_insert(e.event_index);
+    }
+
+    let mut summaries: Vec<MetaTxIntenderSummary> = Vec::with_capacity(page.tx_rows.len());
+    for row in &page.tx_rows {
+        if let Some(mut s) = classify_meta_tx_candidate(address, row, abi_reg).await {
+            if let Some(idx) = tx_index_by_hash.get(&s.hash).copied() {
+                s.tx_index = idx;
+            }
+            summaries.push(s);
+        }
+    }
+
+    sort_meta_txs_recency(&mut summaries);
+    summaries
+}
+
+/// Fetch meta-transactions where `address` is the intender (issue #11).
+///
+/// Thin wrapper over the shared `fetch_address_activity` pipeline plus the
+/// MetaTx-specific `derive_meta_txs_from_page` derivation. Used when the
+/// dispatcher hasn't already produced a shared page for another tab.
+///
+/// Sends `Action::AddressMetaTxsLoaded` when done. On pf-query failures, sends
+/// an empty result so the UI clears its "loading" state rather than hanging.
+pub(super) async fn fetch_address_meta_txs(
+    address: starknet::core::types::Felt,
+    from_block: u64,
+    continuation_token: Option<u64>,
+    limit: u32,
+    ds: &Arc<dyn crate::data::DataSource>,
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    let send_empty = || {
+        let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+            address,
+            summaries: Vec::new(),
+            next_token: None,
+        });
+    };
+
+    let page = match fetch_address_activity(
+        address,
+        EventQueryKind::Account,
+        from_block,
+        continuation_token,
+        limit,
+        pf,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: activity fetch failed");
+            send_empty();
+            return;
+        }
+    };
+
+    if page.events.is_empty() {
+        debug!(addr = %format!("{:#x}", address), "MetaTxs: no events returned");
+        send_empty();
+        return;
+    }
+
+    let summaries = derive_meta_txs_from_page(address, &page, abi_reg).await;
+
+    info!(
+        addr = %format!("{:#x}", address),
+        events = page.events.len(),
+        candidates = page.tx_rows.len(),
+        meta_txs = summaries.len(),
+        has_more = page.next_token.is_some(),
+        "MetaTxs: classified"
+    );
+
+    // Persist so the next tab entry can render instantly from cache.
+    if !summaries.is_empty() {
+        ds.save_meta_txs(&address, &summaries);
+    }
+
+    let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+        address,
+        summaries,
+        next_token: page.next_token,
+    });
+}
+
+/// Classify a single pf-query tx row as a meta-tx where `address` is the
+/// intender, or return `None` if it isn't one. Shared between the bulk pipeline
+/// (`fetch_address_meta_txs`) and the WS streaming path
+/// (`Action::ClassifyPotentialMetaTx`).
+///
+/// Pre-warms inner-call target ABIs so the returned `inner_endpoints` resolves
+/// to real names. `row.tx_index` is used as-is; callers can override if they
+/// have a more authoritative source.
+pub(super) async fn classify_meta_tx_candidate(
+    address: starknet::core::types::Felt,
+    row: &crate::data::pathfinder::TxByHashData,
+    abi_reg: &Arc<AbiRegistry>,
+) -> Option<crate::data::types::MetaTxIntenderSummary> {
+    use starknet::core::types::Felt;
+
+    use crate::data::types::MetaTxIntenderSummary;
+    use crate::decode::outside_execution::{DetectionMethod, detect_outside_execution};
+
+    let hash = Felt::from_hex(&row.hash).ok()?;
+    let sender = Felt::from_hex(&row.sender).ok()?;
+    if sender == address {
+        return None; // not a meta-tx: the account self-relayed
+    }
+    if helpers::normalize_pf_tx_type(&row.tx_type) != "INVOKE" {
+        return None;
+    }
+
+    let calldata: Vec<Felt> = row
+        .calldata
+        .iter()
+        .filter_map(|h| Felt::from_hex(h).ok())
+        .collect();
+    let calls = parse_multicall(&calldata);
+
+    // Pre-warm the intender's ABI so the per-call selector→name lookup below
+    // actually finds `execute_from_outside_v*`. Without this the WS path hits
+    // a cold cache (user just navigated), falls through to the structural
+    // heuristic, and misses Cartridge/Controller V3 layouts whose trailing
+    // fields don't match the strict sig-only tail check.
+    helpers::prewarm_abis([address], abi_reg).await;
+
+    // Try each top-level call to find an outside execution of `address`.
+    // Delegates the 3-method cascade to the shared `detect_outside_execution`
+    // helper (same code path as block.rs meta-tx detection); we filter by
+    // intender here so the result is specific to this address.
+    let mut found: Option<(
+        crate::decode::outside_execution::OutsideExecutionInfo,
+        &'static str,
+    )> = None;
+    for c in &calls {
+        let name = abi_reg.get_selector_name(&c.selector);
+        let Some((oe, method)) = detect_outside_execution(c, name.as_deref()) else {
+            continue;
+        };
+        if oe.intender != address {
+            continue;
+        }
+        let label = match method {
+            DetectionMethod::AvnuForwarder => "avnu",
+            DetectionMethod::Name => match oe.version {
+                crate::decode::outside_execution::OutsideExecutionVersion::V1 => "v1",
+                crate::decode::outside_execution::OutsideExecutionVersion::V2 => "v2",
+                crate::decode::outside_execution::OutsideExecutionVersion::V3 => "v3",
+            },
+            DetectionMethod::Heuristic => "v?",
+        };
+        found = Some((oe, label));
+        break;
+    }
+
+    let (oe, version_label) = found?;
+
+    // Pre-warm ABIs for inner-call targets so selector→name resolution works.
+    let targets: Vec<Felt> = oe
+        .inner_calls
+        .iter()
+        .map(|ic| ic.contract_address)
+        .collect();
+    helpers::prewarm_abis(targets.iter().copied(), abi_reg).await;
+    let inner_endpoints =
+        helpers::format_selector_names(oe.inner_calls.iter().map(|ic| ic.selector), abi_reg);
+
+    let fee_fri = u128::from_str_radix(row.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
+
+    Some(MetaTxIntenderSummary {
+        hash,
+        block_number: row.block_number,
+        tx_index: row.tx_index,
+        timestamp: row.block_timestamp,
+        paymaster: sender,
+        version: version_label.to_string(),
+        oe_nonce: oe.nonce,
+        total_fee_fri: fee_fri,
+        status: row.status.clone(),
+        inner_targets: targets,
+        inner_endpoints,
+        caller: oe.caller,
+    })
+}
+
+/// Recency ordering for meta-tx summaries: block desc, then tx_index desc.
+/// Exposed (pub(super)) purely for unit testing the sort.
+pub(super) fn sort_meta_txs_recency(summaries: &mut [crate::data::types::MetaTxIntenderSummary]) {
+    summaries.sort_by(|a, b| {
+        b.block_number
+            .cmp(&a.block_number)
+            .then(b.tx_index.cmp(&a.tx_index))
+    });
+}
+
+#[cfg(test)]
+mod meta_tx_tests {
+    use super::*;
+    use crate::data::types::MetaTxIntenderSummary;
+    use starknet::core::types::Felt;
+
+    fn s(block: u64, idx: u64) -> MetaTxIntenderSummary {
+        MetaTxIntenderSummary {
+            hash: Felt::from(block * 1000 + idx),
+            block_number: block,
+            tx_index: idx,
+            timestamp: 0,
+            paymaster: Felt::ZERO,
+            version: "v3".into(),
+            oe_nonce: Felt::ZERO,
+            total_fee_fri: 0,
+            status: "OK".into(),
+            inner_targets: vec![],
+            inner_endpoints: String::new(),
+            caller: Felt::ZERO,
+        }
+    }
+
+    #[test]
+    fn sort_orders_by_block_then_tx_index_desc() {
+        let mut v = vec![s(100, 5), s(200, 1), s(100, 7)];
+        sort_meta_txs_recency(&mut v);
+        let coords: Vec<_> = v.iter().map(|m| (m.block_number, m.tx_index)).collect();
+        assert_eq!(coords, vec![(200, 1), (100, 7), (100, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod shared_pipeline_tests {
+    //! Unit tests for the shared `AddressActivityPage` derivations. Run with
+    //! plain `cargo test`; they do NOT need `APP_RPC_URL`. An `AbiRegistry` is
+    //! constructed against a non-listening localhost URL so `get_class_hash`
+    //! calls fail fast (connection refused) and ABI lookups return `None` —
+    //! exercising the fallback paths without any real network.
+    //!
+    //! Scope: each test exercises a specific invariant introduced by the
+    //! refactor. They do not re-verify pre-existing helpers like
+    //! `classify_meta_tx_candidate` in isolation; those have their own tests.
+    use super::*;
+    use crate::data::pathfinder::TxByHashData;
+    use crate::data::rpc::RpcDataSource;
+    use crate::data::types::SnEvent;
+    use crate::decode::AbiRegistry;
+    use crate::decode::class_cache::ClassCache;
+    use starknet::core::types::Felt;
+
+    /// Build a test `AbiRegistry` backed by a bogus localhost URL. Every
+    /// `get_class_hash` call fails with connection-refused in ~1ms, so ABI
+    /// lookups return `None` and callers fall back to hex selectors — no
+    /// real network touched.
+    fn mk_abi_reg() -> Arc<AbiRegistry> {
+        let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new("http://127.0.0.1:1/"));
+        let db = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS parsed_abis (class_hash TEXT PRIMARY KEY, data TEXT NOT NULL);"
+        ).unwrap();
+        let class_cache = ClassCache::new(db, 16);
+        Arc::new(AbiRegistry::new(ds, class_cache))
+    }
+
+    fn tx_row(
+        hash: Felt,
+        sender: Felt,
+        block_number: u64,
+        tx_index: u64,
+        calldata: Vec<Felt>,
+    ) -> TxByHashData {
+        TxByHashData {
+            hash: format!("{:#x}", hash),
+            block_number,
+            block_timestamp: 0,
+            tx_index,
+            sender: format!("{:#x}", sender),
+            nonce: Some(0),
+            tx_type: "INVOKE".to_string(),
+            calldata: calldata.iter().map(|c| format!("{:#x}", c)).collect(),
+            actual_fee: "0x0".to_string(),
+            tip: 0,
+            status: "OK".to_string(),
+            revert_reason: None,
+        }
+    }
+
+    fn ev(tx_hash: Felt, block_number: u64, event_index: u64) -> SnEvent {
+        SnEvent {
+            from_address: Felt::ZERO,
+            keys: vec![],
+            data: vec![],
+            transaction_hash: tx_hash,
+            block_number,
+            event_index,
+        }
+    }
+
+    /// `derive_meta_txs_from_page` must filter out self-relayed invokes
+    /// (sender == address is not a meta-tx). Confirms the classifier is
+    /// actually called per row and its short-circuit is respected.
+    #[tokio::test]
+    async fn derive_meta_txs_skips_self_relayed() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let tx_hash = Felt::from(1u64);
+
+        let page = AddressActivityPage {
+            events: vec![ev(tx_hash, 100, 0)],
+            tx_rows: vec![tx_row(tx_hash, addr, 100, 3, vec![])],
+            unique_hashes: vec![tx_hash],
+            tx_block_map: std::collections::HashMap::from([(tx_hash, 100u64)]),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+        let metas = derive_meta_txs_from_page(addr, &page, &abi).await;
+        assert!(
+            metas.is_empty(),
+            "self-relayed tx must not be classified as meta-tx"
+        );
+    }
+
+    /// `derive_meta_txs_from_page` returns an empty list for a page full of
+    /// plain invokes (multicall targets some unrelated address, not an
+    /// outside-execution shape). Guards against false positives.
+    #[tokio::test]
+    async fn derive_meta_txs_filters_non_meta_tx_rows() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let other_target = Felt::from(0xC0FFEEu64);
+        let paymaster = Felt::from(0xDEADu64);
+        let tx_hash = Felt::from(0xBEEFu64);
+
+        // Multicall with one call to a different contract (not `addr`, not an
+        // AVNU forwarder, no outside-execution selector). Must not classify.
+        let calldata = vec![
+            Felt::from(1u64),
+            other_target,
+            Felt::from(0x99u64),
+            Felt::ZERO,
+        ];
+        let page = AddressActivityPage {
+            events: vec![ev(tx_hash, 100, 0)],
+            tx_rows: vec![tx_row(tx_hash, paymaster, 100, 0, calldata)],
+            unique_hashes: vec![tx_hash],
+            tx_block_map: std::collections::HashMap::from([(tx_hash, 100u64)]),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+        let metas = derive_meta_txs_from_page(addr, &page, &abi).await;
+        assert!(
+            metas.is_empty(),
+            "non-meta-tx invoke must not classify, got: {:?}",
+            metas
+        );
+    }
+
+    /// `build_contract_calls_from_pf_rows` must filter multicall entries by
+    /// the `address` argument. Given a 3-call multicall where only the
+    /// middle call targets `address`, the produced summary's
+    /// `function_name` must reflect exactly one inner call (no comma).
+    #[tokio::test]
+    async fn build_contract_calls_filters_by_target_in_multicall() {
+        let target =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let other_a = Felt::from(0xAAu64);
+        let other_b = Felt::from(0xBBu64);
+        let sel_a = Felt::from(0x11u64);
+        let sel_t = Felt::from(0x22u64); // unknown selector → hex fallback
+        let sel_b = Felt::from(0x33u64);
+
+        let calldata = vec![
+            Felt::from(3u64),
+            other_a,
+            sel_a,
+            Felt::ZERO,
+            target,
+            sel_t,
+            Felt::ZERO,
+            other_b,
+            sel_b,
+            Felt::ZERO,
+        ];
+        let sender = Felt::from(0xCAFEu64);
+        let tx_hash = Felt::from(0xD00Du64);
+
+        let tx_rows = vec![tx_row(tx_hash, sender, 42, 7, calldata)];
+        let abi = mk_abi_reg();
+
+        let calls = build_contract_calls_from_pf_rows(target, &tx_rows, &abi).await;
+        assert_eq!(calls.len(), 1, "one row -> one ContractCallSummary");
+        let c = &calls[0];
+        assert_eq!(c.tx_hash, tx_hash);
+        assert_eq!(c.sender, sender);
+        assert_eq!(c.block_number, 42);
+        assert_eq!(c.status, "OK");
+        assert!(
+            !c.function_name.is_empty(),
+            "function_name must reflect the one targeting call"
+        );
+        assert!(
+            !c.function_name.contains(','),
+            "only one inner call targets `address`, function_name should not list multiple: {:?}",
+            c.function_name
+        );
+    }
+
+    /// Hybrid account (contract with account-like class, e.g. Cartridge
+    /// Controller): `0x3a49…74c4`. Well-known publicly-deployed class.
+    /// Selected because it has **both** sender-side txs (non-zero nonce)
+    /// **and** is the callee of many execute_from_outside calls — making
+    /// it the canonical case where Events / Calls / MetaTxs must share
+    /// upstream work.
+    ///
+    /// No ownership/activity implication — chosen purely for its class
+    /// shape and typical traffic profile.
+    #[cfg(test)]
+    const HYBRID_TEST_ADDR: &str =
+        "0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4";
+
+    /// End-to-end invariant: one shared-pipeline fetch yields self-consistent
+    /// Events / Calls / MetaTxs derivations for a hybrid account. Specifically:
+    ///
+    ///   MetaTxs ⊆ Calls ⊆ tx_rows   (by tx_hash)
+    ///
+    /// This is the property that makes sharing the upstream fetch valid:
+    /// every MetaTx is an execute_from_outside call (∈ Calls), and every
+    /// Call in this pipeline is an invoke of the account (∈ tx_rows). If
+    /// Events/Calls/MetaTxs ever diverge from the single source of truth,
+    /// we're either filtering wrong or (worse) fetching independently.
+    ///
+    /// Requires a live pf-query and the address to have non-trivial
+    /// history. Ignored by default.
+    #[tokio::test]
+    #[ignore = "requires APP_RPC_URL + APP_PATHFINDER_SERVICE_URL + Dune"]
+    async fn hybrid_account_shared_pipeline_derives_consistent_tabs() {
+        dotenvy::dotenv().ok();
+        let rpc_url = std::env::var("APP_RPC_URL").expect("APP_RPC_URL");
+        let pf_url =
+            std::env::var("APP_PATHFINDER_SERVICE_URL").expect("APP_PATHFINDER_SERVICE_URL");
+
+        let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url));
+        let pf = Arc::new(crate::data::pathfinder::PathfinderClient::new(pf_url));
+        let db = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS parsed_abis (class_hash TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        )
+        .unwrap();
+        let abi = Arc::new(AbiRegistry::new(Arc::clone(&ds), ClassCache::new(db, 256)));
+
+        let address = Felt::from_hex(HYBRID_TEST_ADDR).unwrap();
+
+        // Single pipeline call — this is the claim under test.
+        let page = fetch_address_activity(address, EventQueryKind::Account, 0, None, 100, &pf)
+            .await
+            .expect("fetch_address_activity");
+
+        println!(
+            "Pipeline page: {} events, {} tx_rows, next_token={:?}",
+            page.events.len(),
+            page.tx_rows.len(),
+            page.next_token
+        );
+        assert!(!page.events.is_empty(), "hybrid account must have events");
+        assert!(!page.tx_rows.is_empty(), "hybrid account must have tx_rows");
+
+        // Every event's tx_hash must be in tx_block_map (built from same events).
+        for e in &page.events {
+            assert!(
+                page.tx_block_map.contains_key(&e.transaction_hash),
+                "tx_block_map missing entry for event tx_hash {:#x}",
+                e.transaction_hash
+            );
+        }
+
+        // tx_rows contains exactly one row per unique event tx_hash (bulk fetch
+        // happened once). Allow for pf dropping a hash occasionally (not fatal)
+        // but require >= 90% coverage to catch silent drops.
+        let unique_event_hashes: std::collections::HashSet<Felt> =
+            page.events.iter().map(|e| e.transaction_hash).collect();
+        let row_hashes: std::collections::HashSet<Felt> = page
+            .tx_rows
+            .iter()
+            .filter_map(|r| Felt::from_hex(&r.hash).ok())
+            .collect();
+        let covered = unique_event_hashes.intersection(&row_hashes).count();
+        assert!(
+            covered * 10 >= unique_event_hashes.len() * 9,
+            "tx_rows must cover ≥90% of unique event tx_hashes \
+             (got {}/{})",
+            covered,
+            unique_event_hashes.len()
+        );
+
+        // Now derive all three tabs from the same page. This is the shared-work
+        // payoff — a single `page` drives three outputs.
+        let meta_txs = derive_meta_txs_from_page(address, &page, &abi).await;
+        let calls = build_contract_calls_from_pf_rows(address, &page.tx_rows, &abi).await;
+        let tx_summaries = build_tx_summaries_from_pf_rows(&page.tx_rows, &abi).await;
+
+        println!(
+            "Derivations: {} meta-txs, {} calls, {} tx_summaries",
+            meta_txs.len(),
+            calls.len(),
+            tx_summaries.len()
+        );
+
+        // INVARIANT 1: MetaTx hashes are a subset of tx_rows.
+        let tx_row_hashes: std::collections::HashSet<Felt> = row_hashes.clone();
+        for m in &meta_txs {
+            assert!(
+                tx_row_hashes.contains(&m.hash),
+                "meta-tx {:#x} not in tx_rows — classified from thin air",
+                m.hash
+            );
+        }
+
+        // INVARIANT 2: Call hashes are a subset of tx_rows.
+        let call_hashes: std::collections::HashSet<Felt> =
+            calls.iter().map(|c| c.tx_hash).collect();
+        for h in &call_hashes {
+            assert!(
+                tx_row_hashes.contains(h),
+                "call hash {:#x} not derived from tx_rows",
+                h
+            );
+        }
+
+        // INVARIANT 3 (the critical one): MetaTxs ⊆ Calls. Every meta-tx is
+        // an execute_from_outside call — it MUST also appear in the Calls
+        // derivation for a hybrid account. If this fails, the Calls tab is
+        // silently dropping meta-txs (Bug 3 regression guard).
+        let meta_hash_set: std::collections::HashSet<Felt> =
+            meta_txs.iter().map(|m| m.hash).collect();
+        let missing_from_calls: Vec<Felt> =
+            meta_hash_set.difference(&call_hashes).copied().collect();
+        assert!(
+            missing_from_calls.is_empty(),
+            "{} meta-tx(es) missing from Calls derivation (Bug 3): {:?}",
+            missing_from_calls.len(),
+            missing_from_calls.iter().take(3).collect::<Vec<_>>()
+        );
+
+        // Sanity: for a hybrid account we expect meta-txs to exist, otherwise
+        // the test is uninformative.
+        if meta_txs.is_empty() {
+            println!(
+                "WARN: no meta-txs found in this page — pick a fresher page \
+                 or a different test address if this becomes common."
+            );
+        }
+    }
+
+    /// `build_tx_summaries_from_pf_rows` is a per-row builder — it must
+    /// preserve row order and count even when ABI resolution fails
+    /// (no network, empty registry). Guards against the builder dropping
+    /// rows silently on ABI miss.
+    #[tokio::test]
+    async fn build_tx_summaries_preserves_rows_without_abi() {
+        let sender = Felt::from(0xAB01u64);
+        // calldata: `[0]` = empty multicall, no inner calls.
+        let rows = vec![
+            tx_row(Felt::from(1u64), sender, 100, 0, vec![Felt::ZERO]),
+            tx_row(Felt::from(2u64), sender, 101, 1, vec![Felt::ZERO]),
+        ];
+        let abi = mk_abi_reg();
+        let out = build_tx_summaries_from_pf_rows(&rows, &abi).await;
+        assert_eq!(out.len(), 2, "each parseable row produces one summary");
+        assert_eq!(out[0].hash, Felt::from(1u64));
+        assert_eq!(out[0].block_number, 100);
+        assert_eq!(out[1].hash, Felt::from(2u64));
+        assert_eq!(out[1].block_number, 101);
+        assert_eq!(out[0].sender, Some(sender));
+    }
 }
 
 #[cfg(test)]

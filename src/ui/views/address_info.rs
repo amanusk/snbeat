@@ -42,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.address.tab {
         AddressTab::Transactions => draw_transactions_tab(f, app, chunks[3]),
+        AddressTab::MetaTxs => draw_meta_txs_tab(f, app, chunks[3]),
         AddressTab::Calls => draw_calls_tab(f, app, chunks[3]),
         AddressTab::Balances => draw_balances_tab(f, app, chunks[3]),
         AddressTab::Events => draw_events_tab(f, app, chunks[3]),
@@ -225,6 +226,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let tx_count = app.address.txs.items.len();
+    let meta_count = app.address.meta_txs.items.len();
     let call_count = app.address.calls.items.len();
     let bal_count = app
         .address
@@ -235,19 +237,59 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let ev_count = app.address.events.items.len();
 
     let class_count = app.address.class_history.len();
+
+    // Probe gives the authoritative total when it's landed. Surface it as
+    // "loaded / total" so the user sees "3 / 27" instead of just "3" and
+    // knows there's more behind pagination.
+    //
+    // For senders (Txs tab), the authoritative total is the on-chain nonce —
+    // Dune's event count counts emitted events, not sender txs, so it
+    // over-counts wildly on hybrid accounts. For callees (Calls tab), the
+    // probe's event-derived count is the right signal.
+    let probe = app.address.activity_probe.as_ref();
+    let tx_total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
+    let call_total = probe.map(|p| p.callee_call_count);
+    let tx_label = match tx_total {
+        Some(total) if (tx_count as u64) < total => {
+            format!(" Txs ({tx_count} / {total}) ")
+        }
+        _ => format!(" Txs ({tx_count}) "),
+    };
+    let call_label = match call_total {
+        Some(total) if (call_count as u64) < total => {
+            format!(" Calls ({call_count} / {total}) ")
+        }
+        _ => format!(" Calls ({call_count}) "),
+    };
+
+    // MetaTxs: no upstream count exists (requires classification). Show a
+    // progress indicator instead:
+    //   - before dispatch: " MetaTxs " (body shows spinner)
+    //   - while paging:    " MetaTxs (N+) "  — "+" signals more possible
+    //   - exhausted:       " MetaTxs (N) "   — definitive count
+    let meta_label = if !app.address.meta_txs_dispatched && meta_count == 0 {
+        " MetaTxs ".to_string()
+    } else if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
+        format!(" MetaTxs ({meta_count}+) ")
+    } else {
+        format!(" MetaTxs ({meta_count}) ")
+    };
+
     let titles = vec![
-        Span::raw(format!(" Txs ({tx_count}) ")),
-        Span::raw(format!(" Calls ({call_count}) ")),
+        Span::raw(tx_label),
+        Span::raw(meta_label),
+        Span::raw(call_label),
         Span::raw(format!(" Balances ({bal_count}) ")),
         Span::raw(format!(" Events ({ev_count}) ")),
         Span::raw(format!(" Class ({class_count}) ")),
     ];
     let selected = match app.address.tab {
         AddressTab::Transactions => 0,
-        AddressTab::Calls => 1,
-        AddressTab::Balances => 2,
-        AddressTab::Events => 3,
-        AddressTab::ClassHistory => 4,
+        AddressTab::MetaTxs => 1,
+        AddressTab::Calls => 2,
+        AddressTab::Balances => 3,
+        AddressTab::Events => 4,
+        AddressTab::ClassHistory => 5,
     };
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -538,6 +580,142 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, list_area, &mut app.address.calls.state);
+}
+
+fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let header_area = Rect { height: 1, ..area };
+    let list_area = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    // 3 leading spaces match the ">> " highlight_symbol on the list rows.
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("   Age   ", theme::SUGGESTION_STYLE),
+        Span::styled("Hash          ", theme::SUGGESTION_STYLE),
+        Span::styled("Block      ", theme::SUGGESTION_STYLE),
+        Span::styled("Paymaster            ", theme::SUGGESTION_STYLE),
+        Span::styled("Ver   ", theme::SUGGESTION_STYLE),
+        Span::styled("Protocol(s)          ", theme::SUGGESTION_STYLE),
+        Span::styled("Endpoint(s)              ", theme::SUGGESTION_STYLE),
+        Span::styled("Fee(STRK)      ", theme::SUGGESTION_STYLE),
+        Span::styled("St  ", theme::SUGGESTION_STYLE),
+    ]));
+    f.render_widget(header, header_area);
+
+    if app.address.meta_txs.items.is_empty() {
+        let msg = if app.address.fetching_meta_txs || !app.address.meta_txs_dispatched {
+            " Scanning for meta-transactions..."
+        } else {
+            " No meta-transactions found (requires pf-query; only Argent/Braavos accounts)"
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(theme::SUGGESTION_STYLE).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::BORDER_STYLE),
+            ),
+            list_area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .address
+        .meta_txs
+        .items
+        .iter()
+        .map(|m| {
+            let age = format_age(m.timestamp);
+            let paymaster_label = app.format_address(&m.paymaster);
+            let paymaster_display = if paymaster_label.chars().count() > 20 {
+                let truncated: String = paymaster_label.chars().take(19).collect();
+                format!("{truncated}…")
+            } else {
+                paymaster_label
+            };
+
+            // Protocol column: first inner target (labeled) + " +N" if more.
+            let protocol = match m.inner_targets.first() {
+                Some(t) => {
+                    let base = app.format_address(t);
+                    let trimmed: String = if base.chars().count() > 16 {
+                        let t: String = base.chars().take(15).collect();
+                        format!("{t}…")
+                    } else {
+                        base
+                    };
+                    let extra = m.inner_targets.len().saturating_sub(1);
+                    if extra > 0 {
+                        format!("{trimmed} +{extra}")
+                    } else {
+                        trimmed
+                    }
+                }
+                None => "-".to_string(),
+            };
+            let protocol_display = if protocol.chars().count() > 20 {
+                let truncated: String = protocol.chars().take(19).collect();
+                format!("{truncated}…")
+            } else {
+                protocol
+            };
+
+            let endpoint = if m.inner_endpoints.chars().count() > 24 {
+                let truncated: String = m.inner_endpoints.chars().take(23).collect();
+                format!("{truncated}…")
+            } else {
+                m.inner_endpoints.clone()
+            };
+
+            let fee_str = format_strk_u128(m.total_fee_fri)
+                .trim_end_matches(" STRK")
+                .to_string();
+
+            let status_style = match m.status.as_str() {
+                "OK" => theme::STATUS_OK,
+                "REV" => theme::STATUS_REVERTED,
+                _ => theme::SUGGESTION_STYLE,
+            };
+
+            let line = Line::from(vec![
+                Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
+                Span::styled(format!("{:<14}", short_hash(&m.hash)), theme::TX_HASH_STYLE),
+                Span::styled(
+                    format!("#{:<10}", m.block_number),
+                    theme::BLOCK_NUMBER_STYLE,
+                ),
+                Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
+                Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
+                Span::styled(format!("{:<21}", protocol_display), theme::LABEL_STYLE),
+                Span::styled(format!("{:<25}", endpoint), theme::LABEL_STYLE),
+                Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
+                Span::styled(format!("{:<4}", &m.status), status_style),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let title = if app.address.fetching_meta_txs {
+        format!(
+            " MetaTxs ({}) fetching... ",
+            app.address.meta_txs.items.len()
+        )
+    } else {
+        format!(" MetaTxs ({}) ", app.address.meta_txs.items.len())
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::BORDER_STYLE)
+                .title(Span::styled(title, theme::TITLE_STYLE)),
+        )
+        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, list_area, &mut app.address.meta_txs.state);
 }
 
 fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {

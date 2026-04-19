@@ -42,6 +42,8 @@ pub enum NavEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressTab {
     Transactions,
+    /// SNIP-9 outside executions where this address is the intender (issue #11).
+    MetaTxs,
     Calls, // Incoming calls to this contract (for non-account contracts)
     Balances,
     Events,
@@ -377,8 +379,39 @@ impl App {
                 self.maybe_enrich_visible_address_txs();
             }
             AddressTab::Calls => self.address.calls.scroll_by(delta),
+            AddressTab::MetaTxs => {
+                self.address.meta_txs.scroll_by(delta);
+                self.maybe_fetch_more_meta_txs();
+            }
             _ => {}
         }
+    }
+
+    /// Dispatch the next MetaTxs page when the selection nears the end of the
+    /// list and pf-query signaled more data. Idempotent: guarded by
+    /// `fetching_meta_txs`.
+    pub fn maybe_fetch_more_meta_txs(&mut self) {
+        if !matches!(self.address.tab, AddressTab::MetaTxs) {
+            return;
+        }
+        if self.address.fetching_meta_txs || !self.address.meta_tx_has_more {
+            return;
+        }
+        if !self.address.meta_txs.is_near_bottom(5) {
+            return;
+        }
+        let Some(addr) = self.address.context else {
+            return;
+        };
+        let token = self.address.meta_tx_cursor_block;
+        let from_block = self.address.meta_tx_from_block;
+        self.address.fetching_meta_txs = true;
+        let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
+            address: addr,
+            from_block,
+            continuation_token: token,
+            limit: 50,
+        });
     }
 
     pub fn select_next(&mut self) {
@@ -403,6 +436,10 @@ impl App {
                 AddressTab::Calls => {
                     self.address.calls.next();
                     self.maybe_fetch_more_address_txs();
+                }
+                AddressTab::MetaTxs => {
+                    self.address.meta_txs.next();
+                    self.maybe_fetch_more_meta_txs();
                 }
                 AddressTab::Events => self.address.events.next(),
                 AddressTab::ClassHistory => {
@@ -433,6 +470,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => self.address.calls.previous(),
+                AddressTab::MetaTxs => self.address.meta_txs.previous(),
                 AddressTab::Events => self.address.events.previous(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll =
@@ -459,6 +497,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => self.address.calls.select_first(),
+                AddressTab::MetaTxs => self.address.meta_txs.select_first(),
                 AddressTab::Events => self.address.events.select_first(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll = 0;
@@ -490,6 +529,10 @@ impl App {
                 AddressTab::Calls => {
                     self.address.calls.select_last();
                     self.maybe_fetch_more_address_txs();
+                }
+                AddressTab::MetaTxs => {
+                    self.address.meta_txs.select_last();
+                    self.maybe_fetch_more_meta_txs();
                 }
                 AddressTab::Events => self.address.events.select_last(),
                 AddressTab::ClassHistory => {
@@ -999,6 +1042,109 @@ impl App {
                 }
                 self.address.fetching_more_txs = false;
             }
+            Action::AddressMetaTxsLoaded {
+                address,
+                summaries,
+                next_token,
+            } => {
+                if self.address.context == Some(address) {
+                    // Merge by hash to avoid dupes across pages.
+                    let mut seen: std::collections::HashSet<_> =
+                        self.address.meta_txs.items.iter().map(|m| m.hash).collect();
+                    for s in summaries {
+                        if seen.insert(s.hash) {
+                            self.address.meta_txs.items.push(s);
+                        }
+                    }
+                    self.address.meta_txs.items.sort_by(|a, b| {
+                        b.block_number
+                            .cmp(&a.block_number)
+                            .then(b.tx_index.cmp(&a.tx_index))
+                    });
+                    if !self.address.meta_txs.items.is_empty()
+                        && self.address.meta_txs.state.selected().is_none()
+                    {
+                        self.address.meta_txs.select_first();
+                    }
+                    self.address.meta_tx_cursor_block = next_token;
+                    self.address.meta_tx_has_more = next_token.is_some();
+                }
+                self.address.fetching_meta_txs = false;
+                // Progressive fill: keep paging until the visible screen is
+                // full (~FIRST_PAINT_TARGET rows) OR we hit the safety cap
+                // (AUTO_PAGE_CAP). The cap prevents addresses with many events
+                // but zero classified meta-txs from walking their whole
+                // history in the background. Once either limit trips,
+                // pagination goes back to strictly on-demand via
+                // `maybe_fetch_more_meta_txs` on scroll.
+                use crate::app::views::address_info::{
+                    META_TX_AUTO_PAGE_CAP, META_TX_FIRST_PAINT_TARGET,
+                };
+                if self.address.context == Some(address)
+                    && self.address.meta_tx_has_more
+                    && self.address.meta_txs.items.len() < META_TX_FIRST_PAINT_TARGET
+                    && self.address.meta_tx_auto_pages < META_TX_AUTO_PAGE_CAP
+                {
+                    let next = self.address.meta_tx_cursor_block;
+                    let from_block = self.address.meta_tx_from_block;
+                    self.address.fetching_meta_txs = true;
+                    self.address.meta_tx_auto_pages += 1;
+                    let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
+                        address,
+                        from_block,
+                        continuation_token: next,
+                        limit: 50,
+                    });
+                }
+            }
+            Action::AddressMetaTxsCacheLoaded { address, summaries } => {
+                if self.address.context == Some(address) {
+                    let mut seen: std::collections::HashSet<_> =
+                        self.address.meta_txs.items.iter().map(|m| m.hash).collect();
+                    for s in summaries {
+                        if seen.insert(s.hash) {
+                            self.address.meta_txs.items.push(s);
+                        }
+                    }
+                    self.address.meta_txs.items.sort_by(|a, b| {
+                        b.block_number
+                            .cmp(&a.block_number)
+                            .then(b.tx_index.cmp(&a.tx_index))
+                    });
+                    if !self.address.meta_txs.items.is_empty()
+                        && self.address.meta_txs.state.selected().is_none()
+                    {
+                        self.address.meta_txs.select_first();
+                    }
+                    // Keep fetching_meta_txs / cursor as-is: a live fetch may
+                    // still be in-flight behind this cache delivery.
+                }
+            }
+            Action::AddressMetaTxsStreamed { address, summaries } => {
+                if self.address.context == Some(address) && !summaries.is_empty() {
+                    let mut seen: std::collections::HashSet<_> =
+                        self.address.meta_txs.items.iter().map(|m| m.hash).collect();
+                    for s in summaries {
+                        if seen.insert(s.hash) {
+                            self.address.meta_txs.items.push(s);
+                        }
+                    }
+                    self.address.meta_txs.items.sort_by(|a, b| {
+                        b.block_number
+                            .cmp(&a.block_number)
+                            .then(b.tx_index.cmp(&a.tx_index))
+                    });
+                    if self.address.meta_txs.state.selected().is_none() {
+                        self.address.meta_txs.select_first();
+                    }
+                    // Persistence of streamed rows happens in the network
+                    // dispatcher (it holds the DataSource Arc). We never touch
+                    // fetching_meta_txs / cursor / has_more / meta_txs_dispatched
+                    // here: streaming merges run in parallel with bulk
+                    // pagination and must not change the user's view or
+                    // short-circuit in-flight fetches.
+                }
+            }
             Action::AddressProbeLoaded { address, probe } => {
                 if self.address.context == Some(address) {
                     self.address.activity_probe = Some(probe);
@@ -1198,8 +1344,12 @@ impl App {
                     if self.address.calls.state.selected().is_none() {
                         self.address.calls.select_first();
                     }
-                    // Auto-switch to Calls tab if Txs tab is empty
-                    if self.address.txs.items.is_empty() {
+                    // Auto-switch to Calls only if the user is still on the
+                    // default Transactions tab. Never yank them away from a
+                    // tab they deliberately navigated to.
+                    if self.address.tab == AddressTab::Transactions
+                        && self.address.txs.items.is_empty()
+                    {
                         self.address.tab = AddressTab::Calls;
                     }
                 }
