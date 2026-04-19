@@ -828,7 +828,11 @@ async fn handler_sender_txs(
                     matched_any = true;
                 }
             }
-            if !matched_any {
+            // Only emit a stub when the block was decoded successfully but
+            // contained no matching sender tx — matches the pre-rayon
+            // behavior where blob fetch / decode failures caused the block
+            // to be skipped entirely (rather than surfaced as "UNKNOWN").
+            if !matched_any && decoded_by_block.contains_key(block_number) {
                 results.push(SenderTxEntry {
                     hash: String::new(),
                     sender_address: String::new(),
