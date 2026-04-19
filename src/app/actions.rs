@@ -5,7 +5,7 @@ use crate::app::views::address_info::UnfilledGap;
 use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
-    MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnReceipt, SnTransaction, TokenBalance,
+    MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnEvent, SnReceipt, SnTransaction, TokenBalance,
     VoyagerLabelInfo,
 };
 use crate::decode::events::DecodedEvent;
@@ -217,6 +217,16 @@ pub enum Action {
         address: Felt,
         sources: Vec<Source>,
     },
+    /// Passive update of the shared event-window hint (min/max scanned block,
+    /// deferred gap) driven by `ensure_address_events_window`. Consumed by
+    /// the Calls / Events / MetaTxs tab titles to surface gap state. Fires
+    /// from every event-window fetch path so all three tabs stay aligned.
+    AddressEventWindowUpdated {
+        address: Felt,
+        min_searched: u64,
+        max_searched: u64,
+        deferred_gap: Option<(u64, u64)>,
+    },
     /// Streaming partial tx results from a specific data source (merges, never replaces).
     AddressTxsStreamed {
         address: Felt,
@@ -225,11 +235,15 @@ pub enum Action {
         /// When true, this source has delivered all its data.
         complete: bool,
     },
-    /// Streaming incoming calls (events emitted by the contract) from WS.
-    /// Goes to the Calls tab — separate from AddressTxsStreamed which populates the Txs tab.
-    AddressCallsStreamed {
+    /// Single broadcast of a WS-received event. Emitted once per event; the
+    /// reducer fans it out to the Calls tab (builds a `ContractCallSummary`
+    /// stub + dispatches `EnrichAddressCalls`) and, for `TRANSACTION_EXECUTED`
+    /// events, dispatches `ClassifyPotentialMetaTx` so live meta-tx detection
+    /// still reaches the MetaTxs tab. The event itself has already been
+    /// persisted into the address event cache in the WS handler.
+    AddressWsEvent {
         address: Felt,
-        calls: Vec<ContractCallSummary>,
+        event: SnEvent,
     },
     /// Token balances loaded for an address (sent early for accounts).
     AddressBalancesLoaded {

@@ -21,6 +21,31 @@ use crate::ui::widgets::stateful_list::StatefulList;
 /// they stay aligned — drift between the two causes silent data loss.
 pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
 
+/// Passive UI hint derived from the event-window helper's last fetch.
+/// Shared across the Calls / Events / MetaTxs tabs because all three
+/// project from the same `address_events` + `address_search_progress`
+/// cache. Surfaces whatever the helper already computed — no fill logic
+/// is wired to it yet (see task #7 scope: passive-only port).
+///
+/// - `deferred_gap = Some((lo, hi))` ⇒ helper deliberately skipped that
+///   block range because the TopDelta delta exceeded
+///   `EVENT_LARGE_GAP_THRESHOLD_BLOCKS`. Surfaced as a title suffix so
+///   users know the cached event set isn't contiguous.
+/// - `min_searched > 0` ⇒ older history exists below the cached floor
+///   (useful future signal for an interactive ExtendDown trigger).
+#[derive(Clone, Debug, Default)]
+pub struct EventWindowHint {
+    /// Lowest block ever scanned for this address. `0` ⇒ reached genesis
+    /// or never scanned.
+    pub min_searched: u64,
+    /// Highest block ever scanned. Anchors the "is there more tip to fetch"
+    /// question on the next TopDelta.
+    pub max_searched: u64,
+    /// Deliberately skipped block range from the last TopDelta fetch.
+    /// `Some((lo, hi))` where `lo..=hi` is unscanned.
+    pub deferred_gap: Option<(u64, u64)>,
+}
+
 /// A detected, unfilled nonce gap in the tx list that has been deferred
 /// for on-demand filling (issue #10). We do NOT auto-fill large gaps on
 /// address load; instead we wait until the user scrolls toward the gap
@@ -109,6 +134,10 @@ pub struct AddressInfoState {
     /// `META_TX_AUTO_PAGE_CAP` so an address with many events but zero
     /// classified meta-txs doesn't walk the whole history in the background.
     pub meta_tx_auto_pages: u32,
+    /// Shared event-window hint for the event-backed tabs (Calls / Events /
+    /// MetaTxs). Updated whenever `ensure_address_events_window` runs.
+    /// `None` before any fetch completes.
+    pub event_window: Option<EventWindowHint>,
 }
 
 /// Maximum background auto-continue pages when filling the MetaTxs first
@@ -155,6 +184,7 @@ impl Default for AddressInfoState {
             meta_txs_dispatched: false,
             meta_tx_from_block: 0,
             meta_tx_auto_pages: 0,
+            event_window: None,
         }
     }
 }
@@ -191,6 +221,7 @@ impl AddressInfoState {
         self.meta_txs_dispatched = false;
         self.meta_tx_from_block = 0;
         self.meta_tx_auto_pages = 0;
+        self.event_window = None;
     }
 
     /// Whether any source thinks there is more data to fetch.

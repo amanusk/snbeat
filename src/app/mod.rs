@@ -1211,6 +1211,21 @@ impl App {
                     self.address.sources_pending = sources.into_iter().collect();
                 }
             }
+            Action::AddressEventWindowUpdated {
+                address,
+                min_searched,
+                max_searched,
+                deferred_gap,
+            } => {
+                if self.address.context == Some(address) {
+                    self.address.event_window =
+                        Some(crate::app::views::address_info::EventWindowHint {
+                            min_searched,
+                            max_searched,
+                            deferred_gap,
+                        });
+                }
+            }
             Action::AddressTxsStreamed {
                 address,
                 source,
@@ -1312,31 +1327,39 @@ impl App {
                     )));
                 }
             }
-            Action::AddressCallsStreamed { address, calls } => {
+            Action::AddressWsEvent { address, event } => {
+                // Fan-out hub for WS-received events. The event has already
+                // been persisted to the per-address event cache in ws.rs; this
+                // reducer is purely about updating in-memory tab state and
+                // dispatching enrichment / classification follow-ups.
                 if self.address.context != Some(address) {
                     return;
                 }
-                if calls.is_empty() {
-                    return;
-                }
-                let existing: std::collections::HashSet<_> =
-                    self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                let new_calls: Vec<_> = calls
-                    .into_iter()
-                    .filter(|c| !existing.contains(&c.tx_hash))
-                    .collect();
-                if !new_calls.is_empty() {
-                    // Dispatch enrichment for the new stubs (fetch sender/function/fee/timestamp)
-                    let hashes_with_blocks: Vec<_> = new_calls
-                        .iter()
-                        .map(|c| (c.tx_hash, c.block_number))
-                        .collect();
+
+                // --- Calls tab: derive a stub summary and merge (dedupe by tx_hash).
+                let tx_hash = event.transaction_hash;
+                let block_number = event.block_number;
+                let already_present = self
+                    .address
+                    .calls
+                    .items
+                    .iter()
+                    .any(|c| c.tx_hash == tx_hash);
+                if !already_present {
+                    let stub = crate::data::types::ContractCallSummary {
+                        tx_hash,
+                        sender: Felt::ZERO, // filled in by EnrichAddressCalls
+                        function_name: String::new(),
+                        block_number,
+                        timestamp: 0,
+                        total_fee_fri: 0,
+                        status: "OK".to_string(), // events only fire for successful txs
+                    };
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
                         address,
-                        hashes_with_blocks,
+                        hashes_with_blocks: vec![(tx_hash, block_number)],
                     });
-
-                    self.address.calls.items.extend(new_calls);
+                    self.address.calls.items.push(stub);
                     self.address
                         .calls
                         .items
@@ -1352,6 +1375,20 @@ impl App {
                     {
                         self.address.tab = AddressTab::Calls;
                     }
+                }
+
+                // --- MetaTxs: for viewed accounts, any TRANSACTION_EXECUTED
+                // event might be an execute_from_outside. Dispatch the
+                // classifier to check and populate the MetaTxs tab live.
+                if event
+                    .keys
+                    .first()
+                    .map(|k| *k == crate::network::ws::tx_executed_selector())
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .action_tx
+                        .send(Action::ClassifyPotentialMetaTx { address, tx_hash });
                 }
             }
             Action::AddressCallsEnriched { address, calls } => {

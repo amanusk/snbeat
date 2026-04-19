@@ -15,6 +15,78 @@ use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
 
+/// Count fragment for the Txs tab — just the parens content (`"3"`, `"3 / 27"`).
+///
+/// `tx_count_fragment` / `call_count_fragment` / `meta_tx_count_fragment` are
+/// the single source of truth for what goes inside the `(...)` on each tab,
+/// shared by the compact `draw_tabs` row at the top of the view and the
+/// per-tab body title. Previously each site recomputed the fragment
+/// independently; keeping them aligned by hand was fragile (the MetaTxs body
+/// title in particular used to lag the compact row's `"+"` indicator).
+fn tx_count_fragment(app: &App) -> String {
+    let count = app.address.txs.items.len();
+    // Authoritative total is the on-chain nonce: one invoke per sender nonce.
+    // Dune's event count over-counts on hybrid accounts (it counts emitted
+    // events, not sender txs) — not suitable here.
+    let total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
+    match total {
+        Some(total) if (count as u64) < total => format!("{count} / {total}"),
+        _ => count.to_string(),
+    }
+}
+
+/// Count fragment for the Calls tab.
+fn call_count_fragment(app: &App) -> String {
+    let count = app.address.calls.items.len();
+    let total = app
+        .address
+        .activity_probe
+        .as_ref()
+        .map(|p| p.callee_call_count);
+    match total {
+        Some(total) if (count as u64) < total => format!("{count} / {total}"),
+        _ => count.to_string(),
+    }
+}
+
+/// Count fragment for the MetaTxs tab. Returns `None` when the tab hasn't
+/// been dispatched yet and has no rows — callers render an empty `" MetaTxs "`
+/// label in that case so users don't see a misleading `"(0)"` while the
+/// classifier is still spinning up.
+///
+/// `"N+"` signals "more results possible" while paging is in-flight or
+/// `meta_tx_has_more` is set; `"N"` alone means the classifier has exhausted
+/// the scanned window.
+fn meta_tx_count_fragment(app: &App) -> Option<String> {
+    let count = app.address.meta_txs.items.len();
+    if !app.address.meta_txs_dispatched && count == 0 {
+        return None;
+    }
+    if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
+        Some(format!("{count}+"))
+    } else {
+        Some(count.to_string())
+    }
+}
+
+/// Title suffix describing any passive gap the event-window helper reported
+/// on its last fetch. Shared between the Calls and MetaTxs tabs (Events tab
+/// is intentionally excluded here — see task #13 for a follow-up review).
+/// Returns an empty string when no gap is known, so callers can always
+/// concatenate without a None-check.
+fn event_window_gap_suffix(app: &App) -> String {
+    let Some(hint) = app.address.event_window.as_ref() else {
+        return String::new();
+    };
+    match hint.deferred_gap {
+        Some((lo, hi)) => {
+            let span = hi.saturating_sub(lo).saturating_add(1);
+            format!(" — gap {lo}..{hi} ({span} blocks deferred) ")
+        }
+        None => String::new(),
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let has_deploy = app.address.deployment.is_some();
     let has_deployer = app
@@ -225,9 +297,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let tx_count = app.address.txs.items.len();
-    let meta_count = app.address.meta_txs.items.len();
-    let call_count = app.address.calls.items.len();
     let bal_count = app
         .address
         .info
@@ -235,44 +304,15 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .map(|i| i.token_balances.len())
         .unwrap_or(0);
     let ev_count = app.address.events.items.len();
-
     let class_count = app.address.class_history.len();
 
-    // Probe gives the authoritative total when it's landed. Surface it as
-    // "loaded / total" so the user sees "3 / 27" instead of just "3" and
-    // knows there's more behind pagination.
-    //
-    // For senders (Txs tab), the authoritative total is the on-chain nonce —
-    // Dune's event count counts emitted events, not sender txs, so it
-    // over-counts wildly on hybrid accounts. For callees (Calls tab), the
-    // probe's event-derived count is the right signal.
-    let probe = app.address.activity_probe.as_ref();
-    let tx_total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
-    let call_total = probe.map(|p| p.callee_call_count);
-    let tx_label = match tx_total {
-        Some(total) if (tx_count as u64) < total => {
-            format!(" Txs ({tx_count} / {total}) ")
-        }
-        _ => format!(" Txs ({tx_count}) "),
-    };
-    let call_label = match call_total {
-        Some(total) if (call_count as u64) < total => {
-            format!(" Calls ({call_count} / {total}) ")
-        }
-        _ => format!(" Calls ({call_count}) "),
-    };
-
-    // MetaTxs: no upstream count exists (requires classification). Show a
-    // progress indicator instead:
-    //   - before dispatch: " MetaTxs " (body shows spinner)
-    //   - while paging:    " MetaTxs (N+) "  — "+" signals more possible
-    //   - exhausted:       " MetaTxs (N) "   — definitive count
-    let meta_label = if !app.address.meta_txs_dispatched && meta_count == 0 {
-        " MetaTxs ".to_string()
-    } else if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
-        format!(" MetaTxs ({meta_count}+) ")
-    } else {
-        format!(" MetaTxs ({meta_count}) ")
+    let tx_label = format!(" Txs ({}) ", tx_count_fragment(app));
+    let call_label = format!(" Calls ({}) ", call_count_fragment(app));
+    // None ⇒ classifier hasn't been dispatched yet — render a bare label so
+    // users don't see a misleading "(0)" while the tab is still warming up.
+    let meta_label = match meta_tx_count_fragment(app) {
+        Some(frag) => format!(" MetaTxs ({frag}) "),
+        None => " MetaTxs ".to_string(),
     };
 
     let titles = vec![
@@ -433,18 +473,11 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Some(g) => format!(" — gap of {} txs (press r to retry) ", g.missing_count),
         None => String::new(),
     };
+    let count = tx_count_fragment(app);
     let title = if app.is_loading {
-        format!(
-            " Transactions ({}) fetching...{} ",
-            app.address.txs.items.len(),
-            gap_suffix
-        )
+        format!(" Transactions ({count}) fetching...{gap_suffix} ")
     } else {
-        format!(
-            " Transactions ({}){} ",
-            app.address.txs.items.len(),
-            gap_suffix
-        )
+        format!(" Transactions ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
@@ -563,10 +596,12 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let gap_suffix = event_window_gap_suffix(app);
+    let count = call_count_fragment(app);
     let title = if app.is_loading {
-        format!(" Calls ({}) fetching... ", app.address.calls.items.len())
+        format!(" Calls ({count}) fetching...{gap_suffix} ")
     } else {
-        format!(" Calls ({}) ", app.address.calls.items.len())
+        format!(" Calls ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
@@ -696,13 +731,15 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let gap_suffix = event_window_gap_suffix(app);
+    // The body title shows the same count fragment as the compact tab row.
+    // `None` only occurs before dispatch, in which case callers short-circuit
+    // above on empty items — render a bare label defensively.
+    let count = meta_tx_count_fragment(app).unwrap_or_default();
     let title = if app.address.fetching_meta_txs {
-        format!(
-            " MetaTxs ({}) fetching... ",
-            app.address.meta_txs.items.len()
-        )
+        format!(" MetaTxs ({count}) fetching...{gap_suffix} ")
     } else {
-        format!(" MetaTxs ({}) ", app.address.meta_txs.items.len())
+        format!(" MetaTxs ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
