@@ -598,18 +598,19 @@ async fn bench_pf_txs_by_hash_bulk() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires APP_RPC_URL"]
 async fn bench_rpc_batch_vs_join_all() {
+    use starknet::core::types::Felt;
     use starknet::core::types::requests::{
         GetTransactionByHashRequest, GetTransactionReceiptRequest,
     };
-    use starknet::core::types::Felt;
     use starknet::providers::{
         JsonRpcClient, Provider, ProviderRequestData, jsonrpc::HttpTransport,
     };
     use url::Url;
 
     let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url()));
-    let provider =
-        Arc::new(JsonRpcClient::new(HttpTransport::new(Url::parse(&rpc_url()).unwrap())));
+    let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(
+        Url::parse(&rpc_url()).unwrap(),
+    )));
 
     for &n in &[20usize, 50, 100] {
         let hashes = sample_invoke_hashes(&ds, n).await;
@@ -673,7 +674,10 @@ async fn bench_rpc_batch_vs_join_all() {
                 })
                 .collect();
             let results = futures::future::join_all(futs).await;
-            let ok = results.iter().filter(|(t, r)| t.is_ok() && r.is_ok()).count();
+            let ok = results
+                .iter()
+                .filter(|(t, r)| t.is_ok() && r.is_ok())
+                .count();
             join_samples.push(t0.elapsed().as_millis());
             assert_eq!(ok, n, "join_all: some requests failed");
         }
