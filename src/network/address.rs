@@ -560,7 +560,14 @@ pub(super) async fn build_contract_calls_from_hashes(
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<crate::data::types::ContractCallSummary> {
-    // Pre-fetch ABI for the target contract so selector→name lookups succeed.
+    // Pre-warm ABIs for every top-level call target in the batch so the
+    // selector→name lookups below all hit a warm registry. We don't filter
+    // these multicalls by `address` — the Calls row's `function_name` column
+    // mirrors what the block and tx detail views show for the same tx, i.e.
+    // the entire top-level endpoint list (see `helpers::format_endpoint_names`).
+    // For contracts called only internally (e.g. Ekubo Core via an aggregator)
+    // this surfaces the aggregator's outer function name, which is consistent
+    // with the rest of the UI and avoids needing `starknet_traceTransaction`.
     helpers::prewarm_abis([address], abi_reg).await;
 
     let mut calls_list = Vec::new();
@@ -580,6 +587,20 @@ pub(super) async fn build_contract_calls_from_hashes(
             .collect();
         let results = futures::future::join_all(futs).await;
 
+        // Prewarm the ABIs for the top-level call targets we're about to
+        // format, otherwise `format_endpoint_names` would hit a cold registry
+        // for the aggregator/router contracts and fall back to hex.
+        let prewarm_targets: std::collections::HashSet<_> = results
+            .iter()
+            .filter_map(|(_, _, tx_r, _)| tx_r.as_ref().ok())
+            .flat_map(|tx| match tx {
+                crate::data::types::SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
+                _ => Vec::new(),
+            })
+            .map(|c| c.contract_address)
+            .collect();
+        helpers::prewarm_abis(prewarm_targets, abi_reg).await;
+
         for (hash, block_num, tx_r, rx_r) in results {
             if let Ok(fetched_tx) = tx_r {
                 let receipt = rx_r.ok();
@@ -596,15 +617,7 @@ pub(super) async fn build_contract_calls_from_hashes(
                     })
                     .unwrap_or("?")
                     .to_string();
-                let function_name = match &fetched_tx {
-                    crate::data::types::SnTransaction::Invoke(i) => parse_multicall(&i.calldata)
-                        .iter()
-                        .filter(|c| c.contract_address == address)
-                        .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    _ => String::new(),
-                };
+                let function_name = helpers::format_endpoint_names(&fetched_tx, abi_reg);
                 calls_list.push(crate::data::types::ContractCallSummary {
                     tx_hash: hash,
                     sender: fetched_tx.sender(),
@@ -635,8 +648,25 @@ pub(super) async fn build_contract_calls_from_pf_rows(
 ) -> Vec<crate::data::types::ContractCallSummary> {
     use starknet::core::types::Felt;
 
-    // Pre-warm ABI for the target contract so selector→name lookups succeed.
-    helpers::prewarm_abis([address], abi_reg).await;
+    // Pre-warm ABIs: the Calls row's `function_name` mirrors the block/tx
+    // detail views (see `helpers::format_endpoint_names`) and lists every
+    // top-level call in the multicall, so we prewarm each call target's ABI
+    // — not just `address` — to keep hex fallbacks out of the common case.
+    let prewarm_targets: std::collections::HashSet<Felt> = tx_rows
+        .iter()
+        .filter(|r| helpers::normalize_pf_tx_type(&r.tx_type) == "INVOKE")
+        .flat_map(|r| {
+            let calldata: Vec<Felt> = r
+                .calldata
+                .iter()
+                .filter_map(|h| Felt::from_hex(h).ok())
+                .collect();
+            parse_multicall(&calldata)
+        })
+        .map(|c| c.contract_address)
+        .chain(std::iter::once(address))
+        .collect();
+    helpers::prewarm_abis(prewarm_targets, abi_reg).await;
 
     let mut calls_list: Vec<crate::data::types::ContractCallSummary> =
         Vec::with_capacity(tx_rows.len());
@@ -656,12 +686,10 @@ pub(super) async fn build_contract_calls_from_pf_rows(
                 .iter()
                 .filter_map(|h| Felt::from_hex(h).ok())
                 .collect();
-            parse_multicall(&calldata)
-                .iter()
-                .filter(|c| c.contract_address == address)
-                .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
-                .collect::<Vec<_>>()
-                .join(", ")
+            helpers::format_selector_names(
+                parse_multicall(&calldata).iter().map(|c| c.selector),
+                abi_reg,
+            )
         } else {
             String::new()
         };
@@ -877,6 +905,15 @@ pub(super) async fn fetch_and_send_address_info(
         // populates callee activity only. Sender tx totals come from the
         // on-chain nonce in the address info path; leave sender_* at 0.
         probe.callee_call_count = event_count;
+        // Publish to both the UI reducer (so the Calls tab can show its
+        // `shown / known+` fragment on re-entry from cache) AND the watch
+        // channel (for downstream task window sizing). Previously only the
+        // watch channel got it, so the UI regressed to a bare `Calls(N)`
+        // count whenever re-entry hit the fresh-cache fast path.
+        let _ = tx.send(Action::AddressProbeLoaded {
+            address,
+            probe: probe.clone(),
+        });
         let _ = probe_watch_tx.send(Some(probe));
     } else {
         // No fresh cache. Two paths from here:
@@ -923,6 +960,22 @@ pub(super) async fn fetch_and_send_address_info(
             if let Some(dune_c) = dune_probe.as_ref() {
                 match stale_cached {
                     Some((cached_min, cached_max, cached_count)) => {
+                        // Publish the stale cached probe to the UI immediately
+                        // — the count we learned last time is a valid
+                        // lower bound right now, and we'd rather show
+                        // `shown / cached_count+` during the delta probe than
+                        // regress to a bare `Calls(N)` for the seconds it
+                        // takes Dune to respond (or forever, if Dune fails).
+                        let mut stale_probe = dune::AddressActivityProbe::default();
+                        stale_probe.callee_min_block = cached_min;
+                        stale_probe.callee_max_block = cached_max;
+                        stale_probe.callee_call_count = cached_count;
+                        let _ = tx_probe.send(Action::AddressProbeLoaded {
+                            address,
+                            probe: stale_probe.clone(),
+                        });
+                        let _ = probe_watch_tx_c.send(Some(stale_probe));
+
                         // TopDelta: only probe blocks > cached_max and merge.
                         let _ = tx_probe.send(Action::LoadingStatus(format!(
                             "Dune: extending activity probe (>{} block)...",
@@ -951,13 +1004,10 @@ pub(super) async fn fetch_and_send_address_info(
                                     "Dune probe failed: {}",
                                     e
                                 )));
-                                // Fall back: still publish the cached range so
-                                // downstream tasks can size their windows.
-                                let mut fallback = dune::AddressActivityProbe::default();
-                                fallback.callee_min_block = cached_min;
-                                fallback.callee_max_block = cached_max;
-                                fallback.callee_call_count = cached_count;
-                                let _ = probe_watch_tx_c.send(Some(fallback));
+                                // The stale probe was already published to
+                                // the UI + watch at the top of this branch,
+                                // so the Calls tab keeps its `/ cached+`
+                                // hint. Nothing more to do here.
                             }
                         }
                     }
@@ -2513,8 +2563,12 @@ pub(super) async fn fetch_more_address_txs(
         };
         let dune_to = before_block.saturating_sub(1);
         if is_contract {
+            // Pagination walks backward from `before_block`; we don't keep a
+            // reliable timestamp for arbitrary historical windows, so skip the
+            // `block_date` hint here. The narrower LIMIT (100) and user-capped
+            // `window_size` keep Dune's scan bounded in practice.
             match dune_client
-                .query_contract_calls_windowed(address, from_block, dune_to, 100)
+                .query_contract_calls_windowed(address, from_block, dune_to, 100, None)
                 .await
             {
                 Ok(calls) => (Vec::new(), calls),
@@ -3267,17 +3321,33 @@ pub(super) async fn fetch_address_contract_calls(
     // for blocks strictly newer than the highest block we've seen. Cold cache
     // still falls back to the unwindowed "500 most recent" fetch so first open
     // on a long-lived contract stays cheap.
-    let max_cached_block = ds
-        .load_cached_address_calls(&address)
+    //
+    // We also pull the timestamp of that newest-cached row and feed it to the
+    // windowed query as a `block_date` partition hint — `starknet.calls` is
+    // partitioned by date, so without it Dune scans every partition to resolve
+    // the `block_number BETWEEN` range and fails with QUERY_STATE_FAILED on
+    // dense contracts. A 1-day UTC cushion guards against the cached row
+    // sitting right before a day boundary.
+    let cached_calls = ds.load_cached_address_calls(&address);
+    let newest_cached = cached_calls
         .iter()
-        .map(|c| c.block_number)
-        .filter(|&b| b > 0)
-        .max();
+        .filter(|c| c.block_number > 0)
+        .max_by_key(|c| c.block_number);
 
-    let dune_calls_result = match max_cached_block {
-        Some(from) => {
+    let dune_calls_result = match newest_cached {
+        Some(c) => {
+            let min_date = (c.timestamp > 0)
+                .then(|| chrono::DateTime::from_timestamp(c.timestamp as i64, 0))
+                .flatten()
+                .map(|dt| dt.date_naive() - chrono::Duration::days(1));
             dune_client
-                .query_contract_calls_windowed(address, from + 1, u64::MAX, CONTRACT_CALL_LIMIT)
+                .query_contract_calls_windowed(
+                    address,
+                    c.block_number + 1,
+                    u64::MAX,
+                    CONTRACT_CALL_LIMIT,
+                    min_date,
+                )
                 .await
         }
         None => {
@@ -3307,8 +3377,16 @@ pub(super) async fn fetch_address_contract_calls(
         "Calls: Dune contract calls complete"
     );
 
+    // Merge the freshly fetched rows with whatever we already had cached before
+    // persisting. The windowed TopDelta path only returns rows newer than the
+    // previously seen tip, so writing just `calls` would clobber the bulk of
+    // the cache. Cold-cache path still works: `cached_calls` is empty there,
+    // and `deduplicate_contract_calls` returns the full 500-row set unchanged.
     if !calls.is_empty() {
-        ds.save_address_calls(&address, &calls);
+        let mut merged = cached_calls;
+        merged.extend(calls.iter().cloned());
+        let merged = crate::data::types::deduplicate_contract_calls(merged);
+        ds.save_address_calls(&address, &merged);
     }
 
     // Emit using the same merge path the Dune bulk fetch used. An empty
@@ -3598,12 +3676,16 @@ mod shared_pipeline_tests {
         );
     }
 
-    /// `build_contract_calls_from_pf_rows` must filter multicall entries by
-    /// the `address` argument. Given a 3-call multicall where only the
-    /// middle call targets `address`, the produced summary's
-    /// `function_name` must reflect exactly one inner call (no comma).
+    /// `build_contract_calls_from_pf_rows` lists every top-level multicall
+    /// entry in `function_name`, matching what the block/tx detail views
+    /// show via `helpers::format_endpoint_names`. Given a 3-call multicall
+    /// (where only the middle call actually targets `address`), the summary
+    /// must list all three selectors — the Calls row mirrors the outer tx's
+    /// endpoint set, not the subset that happens to touch `address` at the
+    /// top level. This is what makes function names appear for contracts
+    /// invoked only internally (e.g. Ekubo Core via an aggregator).
     #[tokio::test]
-    async fn build_contract_calls_filters_by_target_in_multicall() {
+    async fn build_contract_calls_lists_all_multicall_endpoints() {
         let target =
             Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
                 .unwrap();
@@ -3640,11 +3722,14 @@ mod shared_pipeline_tests {
         assert_eq!(c.status, "OK");
         assert!(
             !c.function_name.is_empty(),
-            "function_name must reflect the one targeting call"
+            "function_name must reflect the full top-level multicall"
         );
-        assert!(
-            !c.function_name.contains(','),
-            "only one inner call targets `address`, function_name should not list multiple: {:?}",
+        // Three top-level calls → at least two commas in the joined output
+        // (`format_selector_names` joins with ", ").
+        assert_eq!(
+            c.function_name.matches(',').count(),
+            2,
+            "all three top-level calls should be listed, got: {:?}",
             c.function_name
         );
     }

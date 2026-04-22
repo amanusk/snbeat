@@ -229,27 +229,47 @@ impl DuneClient {
     }
 
     /// Windowed variant of `query_contract_calls` — scoped to a block range for fast completion.
+    ///
+    /// `min_block_date` is an optional partition hint: `starknet.calls` is partitioned by
+    /// `block_date`, and without a date predicate Dune has to scan every partition to find
+    /// the requested `block_number` range, which times out as `QUERY_STATE_FAILED` on dense
+    /// contracts. Pass the `block_date` of `from_block` (minus a 1-day UTC buffer) whenever
+    /// the caller has a reasonable estimate — the SQL stays correct either way.
     pub async fn query_contract_calls_windowed(
         &self,
         contract: Felt,
         from_block: u64,
         to_block: u64,
         limit: u32,
+        min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<Vec<ContractCallSummary>, String> {
         let contract_hex = format!("{:#066x}", contract);
+        let date_clause = min_block_date
+            .map(|d| format!("AND block_date >= date '{}' ", d.format("%Y-%m-%d")))
+            .unwrap_or_default();
+        // DuneSQL (Trino) uses bigint for block_number; any literal above i64::MAX
+        // (9_223_372_036_854_775_807) is rejected at parse time as "Invalid numeric
+        // literal" — so a caller passing u64::MAX as "no upper bound" would have
+        // the whole query fail. Emit an open-ended predicate in that case.
+        let range_clause = if to_block == u64::MAX {
+            format!("AND block_number >= {}", from_block)
+        } else {
+            format!("AND block_number BETWEEN {} AND {}", from_block, to_block)
+        };
         let sql = format!(
             "SELECT transaction_hash, caller_address, entry_point_selector, \
              block_number, block_time, revert_reason \
              FROM starknet.calls \
              WHERE contract_address = {} \
-             AND block_number BETWEEN {} AND {} \
+             {}\
+             {} \
              AND call_type = 'CALL' \
              ORDER BY block_number DESC \
              LIMIT {}",
-            contract_hex, from_block, to_block, limit
+            contract_hex, date_clause, range_clause, limit
         );
 
-        debug!(contract = %contract_hex, from_block, to_block, "Querying Dune for contract calls (windowed)");
+        debug!(contract = %contract_hex, from_block, to_block, ?min_block_date, "Querying Dune for contract calls (windowed)");
         let rows = self.execute_sql(&sql).await?;
         info!(
             rows = rows.len(),

@@ -1085,141 +1085,85 @@ async fn handler_contract_events(
         None => Vec::new(),
     };
 
-    let conn = open_db(&state.db_path).map_err(db_err)?;
+    let db_path = Arc::clone(&state.db_path);
+    let from_block_param = params.from_block;
+    let to_block_param = params.to_block;
+    let continuation_token_param = params.continuation_token;
 
-    // Resolve block range.
-    let latest_block: u64 = conn
-        .query_row(
-            "SELECT number FROM block_headers ORDER BY number DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_err)?;
+    // Entire body runs on a blocking thread so the rusqlite `Connection`
+    // (which is !Send) never crosses an async await point, and the bloom
+    // decompress + event decode hot path doesn't starve tokio workers.
+    let response = tokio::task::spawn_blocking(move || {
+        let conn = open_db(&db_path).map_err(db_err)?;
 
-    let from_block = params.from_block.unwrap_or(0);
-    // continuation_token takes precedence over to_block.
-    let requested_to = params
-        .continuation_token
-        .or(params.to_block)
-        .unwrap_or(latest_block);
-    let effective_to = requested_to.min(latest_block);
-
-    if from_block > effective_to {
-        return Ok(Json(ContractEventsResponse {
-            events: Vec::new(),
-            continuation_token: None,
-        }));
-    }
-
-    // Step 1: Discover max bloom coverage so we know where to brute-scan.
-    // Blocks above `max_bloom_covered` are in `running_event_filter` (not yet
-    // persisted into an `event_filters` row) and must be scanned directly.
-    let max_bloom_covered: Option<u64> = conn
-        .query_row(
-            "SELECT MAX(to_block) FROM event_filters WHERE from_block <= ?1",
-            rusqlite::params![effective_to],
-            |row| row.get::<_, Option<u64>>(0),
-        )
-        .unwrap_or(None);
-
-    let brute_scan_start = max_bloom_covered
-        .map(|m| m.saturating_add(1).max(from_block))
-        .unwrap_or(from_block);
-
-    // Statements used during per-block processing.
-    let mut events_stmt = conn
-        .prepare("SELECT events FROM transactions WHERE block_number = ?1")
-        .map_err(db_err)?;
-    let mut txs_stmt = conn
-        .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
-        .map_err(db_err)?;
-    let mut ts_stmt = conn
-        .prepare("SELECT timestamp FROM block_headers WHERE number = ?1")
-        .map_err(db_err)?;
-
-    // Inline closure-like helper: given a block number, decode events and push
-    // any matching ones into `results`. Returns true if the block contained at
-    // least one match (for telemetry; not used directly).
-    //
-    // We expand it as a macro-style block below since it borrows `results`,
-    // the addr bytes, the filter, and multiple prepared statements — inlining
-    // avoids lifetime gymnastics.
-    let mut results: Vec<ContractEvent> = Vec::new();
-    let mut last_processed: Option<u64> = None;
-    let mut candidates_processed: usize = 0;
-    let mut hit_limit = false;
-    let mut hit_candidate_cap = false;
-
-    // Step 2a: Brute-scan blocks above the persisted bloom filter, newest-first.
-    if brute_scan_start <= effective_to {
-        let mut b = effective_to;
-        loop {
-            if b < brute_scan_start {
-                break;
-            }
-            last_processed = Some(b);
-            candidates_processed += 1;
-
-            process_candidate_block(
-                b,
-                &addr_bytes,
-                &keys_filter,
-                &mut events_stmt,
-                &mut txs_stmt,
-                &mut ts_stmt,
-                &mut results,
-            );
-
-            if results.len() >= limit {
-                hit_limit = true;
-                break;
-            }
-            if candidates_processed >= MAX_CANDIDATES {
-                hit_candidate_cap = true;
-                break;
-            }
-            if b == 0 {
-                break;
-            }
-            b -= 1;
-        }
-    }
-
-    // Step 2b: Walk bloom chunks newest-first, decompressing one at a time.
-    // As soon as `limit` is reached we stop — the continuation token resumes
-    // the scan from (last_processed - 1) on the next call.
-    if !hit_limit && !hit_candidate_cap {
-        let mut bloom_stmt = conn
-            .prepare(
-                "SELECT from_block, to_block, bitmap \
-                 FROM event_filters \
-                 WHERE to_block >= ?1 AND from_block <= ?2 \
-                 ORDER BY from_block DESC",
+        // Resolve block range.
+        let latest_block: u64 = conn
+            .query_row(
+                "SELECT number FROM block_headers ORDER BY number DESC LIMIT 1",
+                [],
+                |row| row.get(0),
             )
             .map_err(db_err)?;
 
-        let mut bloom_rows = bloom_stmt
-            .query(rusqlite::params![from_block, effective_to])
+        let from_block = from_block_param.unwrap_or(0);
+        // continuation_token takes precedence over to_block.
+        let requested_to = continuation_token_param
+            .or(to_block_param)
+            .unwrap_or(latest_block);
+        let effective_to = requested_to.min(latest_block);
+
+        if from_block > effective_to {
+            return Ok::<ContractEventsResponse, (StatusCode, String)>(ContractEventsResponse {
+                events: Vec::new(),
+                continuation_token: None,
+            });
+        }
+
+        // Step 1: Discover max bloom coverage so we know where to brute-scan.
+        // Blocks above `max_bloom_covered` are in `running_event_filter` (not
+        // yet persisted into an `event_filters` row) and must be scanned
+        // directly.
+        let max_bloom_covered: Option<u64> = conn
+            .query_row(
+                "SELECT MAX(to_block) FROM event_filters WHERE from_block <= ?1",
+                rusqlite::params![effective_to],
+                |row| row.get::<_, Option<u64>>(0),
+            )
+            .unwrap_or(None);
+
+        let brute_scan_start = max_bloom_covered
+            .map(|m| m.saturating_add(1).max(from_block))
+            .unwrap_or(from_block);
+
+        // Statements used during per-block processing.
+        let mut events_stmt = conn
+            .prepare("SELECT events FROM transactions WHERE block_number = ?1")
+            .map_err(db_err)?;
+        let mut txs_stmt = conn
+            .prepare("SELECT transactions FROM transactions WHERE block_number = ?1")
+            .map_err(db_err)?;
+        let mut ts_stmt = conn
+            .prepare("SELECT timestamp FROM block_headers WHERE number = ?1")
             .map_err(db_err)?;
 
-        'chunks: while let Some(row) = bloom_rows.next().map_err(db_err)? {
-            let bf_from: u64 = row.get(0).map_err(db_err)?;
-            let bf_to: u64 = row.get(1).map_err(db_err)?;
-            let compressed: Vec<u8> = row.get(2).map_err(db_err)?;
+        let mut results: Vec<ContractEvent> = Vec::new();
+        let mut last_processed: Option<u64> = None;
+        let mut candidates_processed: usize = 0;
+        let mut hit_limit = false;
+        let mut hit_candidate_cap = false;
 
-            let agg = bloom::AggregateBloom::from_compressed(bf_from, bf_to, &compressed);
-            let mut blocks = agg.blocks_for_address(&addr_array);
-            blocks.retain(|&b| b >= from_block && b <= effective_to);
-            // Process within-chunk candidates newest-first.
-            blocks.sort_unstable_by(|a, b| b.cmp(a));
-            blocks.dedup();
-
-            for block_number in blocks {
-                last_processed = Some(block_number);
+        // Step 2a: Brute-scan blocks above the persisted bloom filter, newest-first.
+        if brute_scan_start <= effective_to {
+            let mut b = effective_to;
+            loop {
+                if b < brute_scan_start {
+                    break;
+                }
+                last_processed = Some(b);
                 candidates_processed += 1;
 
                 process_candidate_block(
-                    block_number,
+                    b,
                     &addr_bytes,
                     &keys_filter,
                     &mut events_stmt,
@@ -1230,30 +1174,93 @@ async fn handler_contract_events(
 
                 if results.len() >= limit {
                     hit_limit = true;
-                    break 'chunks;
+                    break;
                 }
                 if candidates_processed >= MAX_CANDIDATES {
                     hit_candidate_cap = true;
-                    break 'chunks;
+                    break;
+                }
+                if b == 0 {
+                    break;
+                }
+                b -= 1;
+            }
+        }
+
+        // Step 2b: Walk bloom chunks newest-first, decompressing one at a time.
+        // As soon as `limit` is reached we stop — the continuation token
+        // resumes the scan from (last_processed - 1) on the next call.
+        if !hit_limit && !hit_candidate_cap {
+            let mut bloom_stmt = conn
+                .prepare(
+                    "SELECT from_block, to_block, bitmap \
+                     FROM event_filters \
+                     WHERE to_block >= ?1 AND from_block <= ?2 \
+                     ORDER BY from_block DESC",
+                )
+                .map_err(db_err)?;
+
+            let mut bloom_rows = bloom_stmt
+                .query(rusqlite::params![from_block, effective_to])
+                .map_err(db_err)?;
+
+            'chunks: while let Some(row) = bloom_rows.next().map_err(db_err)? {
+                let bf_from: u64 = row.get(0).map_err(db_err)?;
+                let bf_to: u64 = row.get(1).map_err(db_err)?;
+                let compressed: Vec<u8> = row.get(2).map_err(db_err)?;
+
+                let agg = bloom::AggregateBloom::from_compressed(bf_from, bf_to, &compressed);
+                let mut blocks = agg.blocks_for_address(&addr_array);
+                blocks.retain(|&b| b >= from_block && b <= effective_to);
+                // Process within-chunk candidates newest-first.
+                blocks.sort_unstable_by(|a, b| b.cmp(a));
+                blocks.dedup();
+
+                for block_number in blocks {
+                    last_processed = Some(block_number);
+                    candidates_processed += 1;
+
+                    process_candidate_block(
+                        block_number,
+                        &addr_bytes,
+                        &keys_filter,
+                        &mut events_stmt,
+                        &mut txs_stmt,
+                        &mut ts_stmt,
+                        &mut results,
+                    );
+
+                    if results.len() >= limit {
+                        hit_limit = true;
+                        break 'chunks;
+                    }
+                    if candidates_processed >= MAX_CANDIDATES {
+                        hit_candidate_cap = true;
+                        break 'chunks;
+                    }
                 }
             }
         }
-    }
 
-    // Compute continuation token.
-    let continuation_token = if hit_limit || hit_candidate_cap {
-        // More to scan: next page should start at (last_processed - 1).
-        last_processed
-            .and_then(|b| b.checked_sub(1))
-            .filter(|&b| b >= from_block)
-    } else {
-        None
-    };
+        // Compute continuation token.
+        let continuation_token = if hit_limit || hit_candidate_cap {
+            // More to scan: next page should start at (last_processed - 1).
+            last_processed
+                .and_then(|b| b.checked_sub(1))
+                .filter(|&b| b >= from_block)
+        } else {
+            None
+        };
 
-    Ok(Json(ContractEventsResponse {
-        events: results,
-        continuation_token,
-    }))
+        Ok(ContractEventsResponse {
+            events: results,
+            continuation_token,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))??;
+
+    Ok(Json(response))
 }
 
 /// GET /contract-event-count/{address} — total count of events emitted by a
@@ -1286,137 +1293,151 @@ async fn handler_contract_event_count(
         None => Vec::new(),
     };
 
-    let conn = open_db(&state.db_path).map_err(db_err)?;
+    let db_path = Arc::clone(&state.db_path);
+    let from_block_param = params.from_block;
+    let to_block_param = params.to_block;
 
-    let latest_block: u64 = conn
-        .query_row(
-            "SELECT number FROM block_headers ORDER BY number DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_err)?;
+    // Entire body runs on a blocking thread so the rusqlite `Connection`
+    // (which is !Send) never crosses an async await point, and the
+    // bloom-decompress + event-decode hot path doesn't starve tokio workers.
+    let response = tokio::task::spawn_blocking(move || {
+        let conn = open_db(&db_path).map_err(db_err)?;
 
-    let from_block = params.from_block.unwrap_or(0);
-    let effective_to = params.to_block.unwrap_or(latest_block).min(latest_block);
-
-    if from_block > effective_to {
-        return Ok(Json(ContractEventCountResponse {
-            count: 0,
-            min_block: None,
-            max_block: None,
-            complete: true,
-            scanned_from: from_block,
-            scanned_to: effective_to,
-        }));
-    }
-
-    let max_bloom_covered: Option<u64> = conn
-        .query_row(
-            "SELECT MAX(to_block) FROM event_filters WHERE from_block <= ?1",
-            rusqlite::params![effective_to],
-            |row| row.get::<_, Option<u64>>(0),
-        )
-        .unwrap_or(None);
-
-    let brute_scan_start = max_bloom_covered
-        .map(|m| m.saturating_add(1).max(from_block))
-        .unwrap_or(from_block);
-
-    let mut events_stmt = conn
-        .prepare("SELECT events FROM transactions WHERE block_number = ?1")
-        .map_err(db_err)?;
-
-    let mut total: u64 = 0;
-    let mut min_block: Option<u64> = None;
-    let mut max_block: Option<u64> = None;
-    let mut candidates_processed: usize = 0;
-    let mut complete = true;
-
-    // Helper that updates the running totals for one candidate block.
-    let mut record = |b: u64, n: u64, min_block: &mut Option<u64>, max_block: &mut Option<u64>| {
-        if n == 0 {
-            return;
-        }
-        *min_block = Some(min_block.map_or(b, |m| m.min(b)));
-        *max_block = Some(max_block.map_or(b, |m| m.max(b)));
-    };
-
-    // Step 2a: Brute-scan blocks above the persisted bloom filter.
-    if brute_scan_start <= effective_to {
-        let mut b = effective_to;
-        loop {
-            if b < brute_scan_start {
-                break;
-            }
-            candidates_processed += 1;
-            let n = count_candidate_block(b, &addr_bytes, &keys_filter, &mut events_stmt);
-            total = total.saturating_add(n);
-            record(b, n, &mut min_block, &mut max_block);
-
-            if candidates_processed >= MAX_CANDIDATES {
-                complete = false;
-                break;
-            }
-            if b == 0 {
-                break;
-            }
-            b -= 1;
-        }
-    }
-
-    // Step 2b: Walk bloom chunks for blocks already covered by event_filters.
-    if complete {
-        let mut bloom_stmt = conn
-            .prepare(
-                "SELECT from_block, to_block, bitmap \
-                 FROM event_filters \
-                 WHERE to_block >= ?1 AND from_block <= ?2 \
-                 ORDER BY from_block DESC",
+        let latest_block: u64 = conn
+            .query_row(
+                "SELECT number FROM block_headers ORDER BY number DESC LIMIT 1",
+                [],
+                |row| row.get(0),
             )
             .map_err(db_err)?;
 
-        let mut bloom_rows = bloom_stmt
-            .query(rusqlite::params![from_block, effective_to])
+        let from_block = from_block_param.unwrap_or(0);
+        let effective_to = to_block_param.unwrap_or(latest_block).min(latest_block);
+
+        if from_block > effective_to {
+            return Ok::<ContractEventCountResponse, (StatusCode, String)>(ContractEventCountResponse {
+                count: 0,
+                min_block: None,
+                max_block: None,
+                complete: true,
+                scanned_from: from_block,
+                scanned_to: effective_to,
+            });
+        }
+
+        let max_bloom_covered: Option<u64> = conn
+            .query_row(
+                "SELECT MAX(to_block) FROM event_filters WHERE from_block <= ?1",
+                rusqlite::params![effective_to],
+                |row| row.get::<_, Option<u64>>(0),
+            )
+            .unwrap_or(None);
+
+        let brute_scan_start = max_bloom_covered
+            .map(|m| m.saturating_add(1).max(from_block))
+            .unwrap_or(from_block);
+
+        let mut events_stmt = conn
+            .prepare("SELECT events FROM transactions WHERE block_number = ?1")
             .map_err(db_err)?;
 
-        'chunks: while let Some(row) = bloom_rows.next().map_err(db_err)? {
-            let bf_from: u64 = row.get(0).map_err(db_err)?;
-            let bf_to: u64 = row.get(1).map_err(db_err)?;
-            let compressed: Vec<u8> = row.get(2).map_err(db_err)?;
+        let mut total: u64 = 0;
+        let mut min_block: Option<u64> = None;
+        let mut max_block: Option<u64> = None;
+        let mut candidates_processed: usize = 0;
+        let mut complete = true;
 
-            let agg = bloom::AggregateBloom::from_compressed(bf_from, bf_to, &compressed);
-            let mut blocks = agg.blocks_for_address(&addr_array);
-            blocks.retain(|&b| b >= from_block && b <= effective_to);
-            blocks.sort_unstable_by(|a, b| b.cmp(a));
-            blocks.dedup();
+        // Helper that updates the running totals for one candidate block.
+        let mut record =
+            |b: u64, n: u64, min_block: &mut Option<u64>, max_block: &mut Option<u64>| {
+                if n == 0 {
+                    return;
+                }
+                *min_block = Some(min_block.map_or(b, |m| m.min(b)));
+                *max_block = Some(max_block.map_or(b, |m| m.max(b)));
+            };
 
-            for block_number in blocks {
+        // Step 2a: Brute-scan blocks above the persisted bloom filter.
+        if brute_scan_start <= effective_to {
+            let mut b = effective_to;
+            loop {
+                if b < brute_scan_start {
+                    break;
+                }
                 candidates_processed += 1;
-                let n = count_candidate_block(
-                    block_number,
-                    &addr_bytes,
-                    &keys_filter,
-                    &mut events_stmt,
-                );
+                let n = count_candidate_block(b, &addr_bytes, &keys_filter, &mut events_stmt);
                 total = total.saturating_add(n);
-                record(block_number, n, &mut min_block, &mut max_block);
+                record(b, n, &mut min_block, &mut max_block);
 
                 if candidates_processed >= MAX_CANDIDATES {
                     complete = false;
-                    break 'chunks;
+                    break;
+                }
+                if b == 0 {
+                    break;
+                }
+                b -= 1;
+            }
+        }
+
+        // Step 2b: Walk bloom chunks for blocks already covered by event_filters.
+        if complete {
+            let mut bloom_stmt = conn
+                .prepare(
+                    "SELECT from_block, to_block, bitmap \
+                     FROM event_filters \
+                     WHERE to_block >= ?1 AND from_block <= ?2 \
+                     ORDER BY from_block DESC",
+                )
+                .map_err(db_err)?;
+
+            let mut bloom_rows = bloom_stmt
+                .query(rusqlite::params![from_block, effective_to])
+                .map_err(db_err)?;
+
+            'chunks: while let Some(row) = bloom_rows.next().map_err(db_err)? {
+                let bf_from: u64 = row.get(0).map_err(db_err)?;
+                let bf_to: u64 = row.get(1).map_err(db_err)?;
+                let compressed: Vec<u8> = row.get(2).map_err(db_err)?;
+
+                let agg = bloom::AggregateBloom::from_compressed(bf_from, bf_to, &compressed);
+                let mut blocks = agg.blocks_for_address(&addr_array);
+                blocks.retain(|&b| b >= from_block && b <= effective_to);
+                blocks.sort_unstable_by(|a, b| b.cmp(a));
+                blocks.dedup();
+
+                for block_number in blocks {
+                    candidates_processed += 1;
+                    let n = count_candidate_block(
+                        block_number,
+                        &addr_bytes,
+                        &keys_filter,
+                        &mut events_stmt,
+                    );
+                    total = total.saturating_add(n);
+                    record(block_number, n, &mut min_block, &mut max_block);
+
+                    if candidates_processed >= MAX_CANDIDATES {
+                        complete = false;
+                        break 'chunks;
+                    }
                 }
             }
         }
-    }
 
-    Ok(Json(ContractEventCountResponse {
-        count: total,
-        min_block,
-        max_block,
-        complete,
-        scanned_from: from_block,
-        scanned_to: effective_to,
-    }))
+        Ok(ContractEventCountResponse {
+            count: total,
+            min_block,
+            max_block,
+            complete,
+            scanned_from: from_block,
+            scanned_to: effective_to,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))??;
+
+    Ok(Json(response))
 }
 
 // =========================================================================
