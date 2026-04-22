@@ -72,19 +72,13 @@ pub(super) async fn decode_and_send_transaction(
     resolve_call_abis(&mut decoded_calls, abi_reg).await;
     let outside_executions = detect_and_resolve_outside_executions(&decoded_calls, abi_reg).await;
 
-    // Only pay for the block fetch when the tx touches a tracked token —
-    // we'd just discard the timestamp otherwise.
-    let needs_timestamp = decoded_events
-        .iter()
-        .any(|e| crate::network::prices::is_tracked(&e.contract_address));
-    let block_timestamp = if needs_timestamp {
-        ds.get_block(receipt.block_number)
-            .await
-            .ok()
-            .map(|b| b.timestamp)
-    } else {
-        None
-    };
+    // Fetch block timestamp (used for age display and price lookups on tracked tokens).
+    // Block fetches are cached, so repeat calls for the same block are cheap.
+    let block_timestamp = ds
+        .get_block(receipt.block_number)
+        .await
+        .ok()
+        .map(|b| b.timestamp);
 
     let _ = action_tx.send(Action::TransactionLoaded {
         transaction,

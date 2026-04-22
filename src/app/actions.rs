@@ -86,13 +86,16 @@ pub enum Action {
     /// the intender (issue #11). Paginates via pf-query's event continuation
     /// token — opaque u64 from the previous response, or `None` for first page.
     ///
-    /// `from_block` bounds the initial bloom scan range; without it, pf-query
-    /// walks from genesis and times out on accounts with long history. The
-    /// dispatcher sets this to the deploy block when known.
+    /// `from_block` is the absolute scan floor (typically deploy block); the
+    /// backend stops paginating once `min_searched <= from_block` so we don't
+    /// time out walking chunks older than the account. `window_size` is the
+    /// per-page ExtendDown block range, adapted across calls (double on empty,
+    /// halve on full) — see `event_window::suggest_next_window`.
     FetchAddressMetaTxs {
         address: Felt,
         from_block: u64,
         continuation_token: Option<u64>,
+        window_size: u64,
         limit: u32,
     },
     /// Classify a single tx as a potential meta-tx where `address` is the
@@ -192,6 +195,12 @@ pub enum Action {
         /// Opaque continuation token from pf-query, if more pages remain.
         /// Pass back via `FetchAddressMetaTxs::continuation_token` to resume.
         next_token: Option<u64>,
+        /// Adaptive next ExtendDown window size (blocks) suggested by the
+        /// backend based on this page's hit density. `None` when no further
+        /// paging is expected (we hit the floor) or on non-ExtendDown calls.
+        /// The UI persists this as `meta_tx_last_window` and feeds it into
+        /// the next `FetchAddressMetaTxs` dispatch.
+        next_window_size: Option<u64>,
     },
     /// Cached meta-tx rows delivered synchronously at tab-entry time. Merges
     /// into the visible list but does NOT touch the loading flag / cursor — a

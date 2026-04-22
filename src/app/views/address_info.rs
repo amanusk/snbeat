@@ -134,6 +134,11 @@ pub struct AddressInfoState {
     /// `META_TX_AUTO_PAGE_CAP` so an address with many events but zero
     /// classified meta-txs doesn't walk the whole history in the background.
     pub meta_tx_auto_pages: u32,
+    /// Last ExtendDown window size (blocks) used for this address's MetaTxs
+    /// fetch. Adapted across pages: doubles on empty windows (sparse
+    /// addresses), halves on full pages (dense addresses, bloom cap hit).
+    /// Seeded with `EXTEND_DOWN_INITIAL_WINDOW` on tab entry.
+    pub meta_tx_last_window: u64,
     /// Shared event-window hint for the event-backed tabs (Calls / Events /
     /// MetaTxs). Updated whenever `ensure_address_events_window` runs.
     /// `None` before any fetch completes.
@@ -141,14 +146,17 @@ pub struct AddressInfoState {
 }
 
 /// Maximum background auto-continue pages when filling the MetaTxs first
-/// screen. Each page scans ~50 events, so 10 pages ≈ 500 events. Once hit,
-/// further pagination requires the user to scroll (strictly on-demand).
-pub const META_TX_AUTO_PAGE_CAP: u32 = 10;
+/// screen. With adaptive windows, a single page can cover up to
+/// `EXTEND_DOWN_MAX_WINDOW` blocks on sparse addresses, so 40 pages is ample
+/// backstop without being an unbounded walk. Once hit, further pagination
+/// requires the user to scroll (strictly on-demand).
+pub const META_TX_AUTO_PAGE_CAP: u32 = 40;
 
 /// Target MetaTx row count for the first screen. Auto-continue keeps paging
 /// until either this target is reached, `next_token` exhausts, or the
-/// `META_TX_AUTO_PAGE_CAP` safety cap trips.
-pub const META_TX_FIRST_PAINT_TARGET: usize = 20;
+/// `META_TX_AUTO_PAGE_CAP` safety cap trips. Sized to comfortably fill the
+/// visible list on most terminals.
+pub const META_TX_FIRST_PAINT_TARGET: usize = 50;
 
 impl Default for AddressInfoState {
     fn default() -> Self {
@@ -184,6 +192,7 @@ impl Default for AddressInfoState {
             meta_txs_dispatched: false,
             meta_tx_from_block: 0,
             meta_tx_auto_pages: 0,
+            meta_tx_last_window: crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW,
             event_window: None,
         }
     }
@@ -221,6 +230,7 @@ impl AddressInfoState {
         self.meta_txs_dispatched = false;
         self.meta_tx_from_block = 0;
         self.meta_tx_auto_pages = 0;
+        self.meta_tx_last_window = crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW;
         self.event_window = None;
     }
 

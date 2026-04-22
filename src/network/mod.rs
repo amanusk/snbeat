@@ -283,6 +283,7 @@ pub async fn run_network_task(
                         address,
                         from_block,
                         continuation_token,
+                        window_size,
                         limit,
                     } => {
                         // On first page, emit cached rows immediately so the UI
@@ -302,6 +303,7 @@ pub async fn run_network_task(
                                 address,
                                 from_block,
                                 continuation_token,
+                                window_size,
                                 limit,
                                 &ds,
                                 pf,
@@ -316,6 +318,7 @@ pub async fn run_network_task(
                                 address,
                                 summaries: Vec::new(),
                                 next_token: None,
+                                next_window_size: None,
                             });
                         }
                     }

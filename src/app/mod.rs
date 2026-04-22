@@ -29,6 +29,11 @@ use starknet::core::types::Felt;
 use state::{ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
 use views::{AddressInfoState, BlockDetailState, ClassInfoState, TxDetailState};
 
+/// Maximum number of blocks retained in the main blocks list.
+/// Applied consistently to both prepends (new blocks) and appends (older
+/// blocks paginated in) to keep the list stable while the user navigates.
+const MAX_BLOCKS: usize = 500;
+
 /// A saved navigation location for the forward/back jump list (Ctrl+o / Ctrl+i).
 #[derive(Debug, Clone)]
 pub enum NavEntry {
@@ -85,6 +90,11 @@ pub struct App {
     // Pagination flags (prevent duplicate fetches)
     pub fetching_older_blocks: bool,
 
+    /// Set when `G` on the blocks view triggers an older-blocks fetch, so
+    /// that once the fetch lands we re-snap the selection to the new last
+    /// item (without this, `G` stops 30 blocks short of the true bottom).
+    pub pending_bottom_jump: bool,
+
     /// Labels fetched from Voyager API at runtime (address → label info).
     /// Used as a fallback when neither user labels nor known addresses have an entry.
     pub voyager_labels: HashMap<starknet::core::types::Felt, VoyagerLabelInfo>,
@@ -132,6 +142,7 @@ impl App {
             data_sources: DataSources::default(),
 
             fetching_older_blocks: false,
+            pending_bottom_jump: false,
 
             voyager_labels: HashMap::new(),
 
@@ -387,6 +398,17 @@ impl App {
         }
     }
 
+    /// Scroll the main blocks list by a delta, triggering older-block
+    /// pagination when the new selection nears the tail. Used by Ctrl+D /
+    /// Ctrl+U on the Blocks view.
+    pub fn blocks_scroll_by(&mut self, delta: i64) {
+        if self.blocks.items.is_empty() {
+            return;
+        }
+        self.blocks.scroll_by(delta);
+        self.maybe_fetch_older_blocks();
+    }
+
     /// Dispatch the next MetaTxs page when the selection nears the end of the
     /// list and pf-query signaled more data. Idempotent: guarded by
     /// `fetching_meta_txs`.
@@ -405,11 +427,13 @@ impl App {
         };
         let token = self.address.meta_tx_cursor_block;
         let from_block = self.address.meta_tx_from_block;
+        let window_size = self.address.meta_tx_last_window;
         self.address.fetching_meta_txs = true;
         let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
             address: addr,
             from_block,
             continuation_token: token,
+            window_size,
             limit: 50,
         });
     }
@@ -511,7 +535,14 @@ impl App {
         match self.current_view() {
             View::Blocks => {
                 self.blocks.select_last();
+                let was_fetching = self.fetching_older_blocks;
                 self.maybe_fetch_older_blocks();
+                // If G just kicked off an older-blocks fetch, remember that
+                // the user wanted the true bottom so we can re-snap once
+                // the paginated batch lands.
+                if !was_fetching && self.fetching_older_blocks {
+                    self.pending_bottom_jump = true;
+                }
             }
             View::BlockDetail => self.block_detail.txs.select_last(),
             View::TxDetail => {
@@ -731,31 +762,71 @@ impl App {
                 }
                 self.is_loading = false;
                 self.fetching_older_blocks = false;
+                self.pending_bottom_jump = false;
             }
             Action::OlderBlocksLoaded(blocks) => {
-                // Append older blocks to the end of the list (they are already sorted newest-first)
+                // Preserve selection by block NUMBER across the append +
+                // truncate — index-based tracking silently drifts the user
+                // onto a different block when the list grows or shrinks.
+                let selected_number = self.blocks.selected_item().map(|b| b.number);
                 self.blocks.items.extend(blocks);
-                // Keep list bounded to avoid unbounded memory growth
-                if self.blocks.items.len() > 500 {
-                    self.blocks.items.truncate(500);
+                if self.blocks.items.len() > MAX_BLOCKS {
+                    self.blocks.items.truncate(MAX_BLOCKS);
                 }
                 self.fetching_older_blocks = false;
+                if self.pending_bottom_jump {
+                    // `G` asked for the true bottom; snap to the new last
+                    // item now that pagination has landed.
+                    self.blocks.select_last();
+                    self.pending_bottom_jump = false;
+                } else if let Some(num) = selected_number
+                    && let Some(idx) = self.blocks.items.iter().position(|b| b.number == num)
+                {
+                    self.blocks.state.select(Some(idx));
+                }
             }
             Action::NewBlock(block) => {
                 self.latest_block_number = block.number;
-                // If the user has scrolled away from the top, keep focus on the
-                // same block by bumping the selection index.  When the selection
-                // is at 0 (the newest block) we leave it there so the list
-                // always tracks the latest block.
-                if let Some(sel) = self.blocks.state.selected() {
-                    if sel > 0 {
-                        self.blocks.state.select(Some(sel + 1));
-                    }
+                // Remember where the user was *before* mutating the list so
+                // we can either follow the tip (sel==0) or pin to the same
+                // block number (sel>0), robust against tail truncation.
+                let prior_sel = self.blocks.state.selected();
+                let selected_number = self.blocks.selected_item().map(|b| b.number);
+
+                // Deduplicate: if the head already has this block number
+                // (e.g. WS replay on reconnect), overwrite rather than
+                // insert a duplicate row.
+                if self.blocks.items.first().map(|b| b.number) == Some(block.number) {
+                    self.blocks.items[0] = block;
+                } else {
+                    self.blocks.items.insert(0, block);
                 }
-                self.blocks.items.insert(0, block);
-                // Keep list bounded
-                if self.blocks.items.len() > 200 {
-                    self.blocks.items.truncate(200);
+                if self.blocks.items.len() > MAX_BLOCKS {
+                    self.blocks.items.truncate(MAX_BLOCKS);
+                }
+
+                match prior_sel {
+                    // Follow the tip when unselected or already at the top.
+                    None | Some(0) => {
+                        if !self.blocks.items.is_empty() {
+                            self.blocks.state.select(Some(0));
+                        }
+                    }
+                    // Otherwise pin to the same block number so the user's
+                    // highlighted row does not silently change under them.
+                    Some(_) => {
+                        if let Some(num) = selected_number {
+                            if let Some(idx) =
+                                self.blocks.items.iter().position(|b| b.number == num)
+                            {
+                                self.blocks.state.select(Some(idx));
+                            } else {
+                                // Block fell off the tail during truncation;
+                                // clamp to the new last item.
+                                self.blocks.select_last();
+                            }
+                        }
+                    }
                 }
             }
             Action::BlockDetailLoaded {
@@ -1046,6 +1117,7 @@ impl App {
                 address,
                 summaries,
                 next_token,
+                next_window_size,
             } => {
                 if self.address.context == Some(address) {
                     // Merge by hash to avoid dupes across pages.
@@ -1068,6 +1140,12 @@ impl App {
                     }
                     self.address.meta_tx_cursor_block = next_token;
                     self.address.meta_tx_has_more = next_token.is_some();
+                    // Persist adapted window size so the next ExtendDown
+                    // dispatch (auto-page or user-scroll) picks up where this
+                    // page left off.
+                    if let Some(w) = next_window_size {
+                        self.address.meta_tx_last_window = w;
+                    }
                 }
                 self.address.fetching_meta_txs = false;
                 // Progressive fill: keep paging until the visible screen is
@@ -1087,12 +1165,14 @@ impl App {
                 {
                     let next = self.address.meta_tx_cursor_block;
                     let from_block = self.address.meta_tx_from_block;
+                    let window_size = self.address.meta_tx_last_window;
                     self.address.fetching_meta_txs = true;
                     self.address.meta_tx_auto_pages += 1;
                     let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
                         address,
                         from_block,
                         continuation_token: next,
+                        window_size,
                         limit: 50,
                     });
                 }

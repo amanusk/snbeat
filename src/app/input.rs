@@ -499,10 +499,12 @@ fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
     app.address.fetching_meta_txs = true;
     app.address.meta_txs_dispatched = true;
     app.address.meta_tx_from_block = from_block;
+    let window_size = app.address.meta_tx_last_window;
     Some(Action::FetchAddressMetaTxs {
         address: addr,
         from_block,
         continuation_token: None,
+        window_size,
         limit: 50,
     })
 }
@@ -510,6 +512,16 @@ fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
 /// Cycle to the next/previous block or transaction depending on active view.
 fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
     match app.current_view() {
+        View::Blocks => {
+            // Half-page-ish scroll through the blocks list.
+            // direction: +1 = Ctrl+U / PageUp (toward newest = lower index),
+            //           -1 = Ctrl+D / PageDown (toward older = higher index).
+            // Blocks are newest-first, so "up" = lower index.
+            const CHUNK: i64 = 10;
+            let delta = -direction * CHUNK;
+            app.blocks_scroll_by(delta);
+            None
+        }
         View::BlockDetail => {
             let current = app.block_detail.block.as_ref()?.number;
             let target = (current as i64 + direction).max(0) as u64;

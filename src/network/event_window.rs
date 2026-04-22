@@ -53,6 +53,22 @@ pub const TIP_ONLY_WINDOW_BLOCKS: u64 = 5_000;
 /// How many events a single `TopDelta` fetch is allowed to pull.
 pub const EVENT_PAGE_LIMIT: u32 = 200;
 
+/// Initial `ExtendDown` window size (blocks). Small enough to return results
+/// quickly on dense addresses; grown adaptively when the backend returns
+/// empty pages (sparse addresses).
+pub const EXTEND_DOWN_INITIAL_WINDOW: u64 = 5_000;
+
+/// Minimum `ExtendDown` window size (blocks). We halve toward this floor
+/// when a scan hits the [`EVENT_PAGE_LIMIT`] cap (signal that the window
+/// was too big and events may have been truncated).
+pub const EXTEND_DOWN_MIN_WINDOW: u64 = 5_000;
+
+/// Maximum `ExtendDown` window size (blocks). We double toward this cap
+/// when a scan returns zero events on a sparse address. Kept well below
+/// what a keyed pf-query bloom scan can complete within the 30 s client
+/// deadline — start conservative, raise if measurements allow.
+pub const EXTEND_DOWN_MAX_WINDOW: u64 = 500_000;
+
 /// Fetch policy for [`ensure_address_events_window`].
 #[derive(Debug, Clone, Copy)]
 pub enum EventWindowPolicy {
@@ -65,9 +81,11 @@ pub enum EventWindowPolicy {
     ///   record a deferred gap; caller decides when/if to fill.
     TopDelta,
     /// Fetch events strictly older than the current `min_searched_block`.
-    /// Triggered when the user scrolls past the bottom of the cached window.
-    #[allow(dead_code)] // wired with the gap UI task
-    ExtendDown,
+    /// The `window_size` is the number of blocks below the cached floor to
+    /// scan in this call; the caller decides how to adapt it across
+    /// successive pages (e.g. doubling on empty hits up to
+    /// [`EXTEND_DOWN_MAX_WINDOW`]).
+    ExtendDown { window_size: u64 },
     /// Fetch a specific block range — used to fill a previously deferred gap.
     #[allow(dead_code)] // wired with the gap UI task
     FillGap { from_block: u64, to_block: u64 },
@@ -97,6 +115,15 @@ pub(crate) struct EventWindowOutcome {
     /// to fetch" signal — if `min_searched > 0`, an `ExtendDown` call can
     /// pull more.
     pub min_searched: u64,
+    /// Suggested window size (blocks) for the *next* `ExtendDown` call,
+    /// derived from this call's hit density:
+    /// - 0 events fetched → double (sparse address, amortize round-trips).
+    /// - `>= EVENT_PAGE_LIMIT` events → halve (dense address; we may have
+    ///   truncated at the page cap, narrow the next window).
+    /// - otherwise → keep the current size.
+    /// Clamped to `[EXTEND_DOWN_MIN_WINDOW, EXTEND_DOWN_MAX_WINDOW]`.
+    /// `None` for non-`ExtendDown` policies and short-circuit paths.
+    pub suggested_next_window: Option<u64>,
     /// The unfiltered pf-query page from the fetch, with `tx_rows` included.
     /// Callers that need the raw events + per-tx metadata (e.g. MetaTxs
     /// classification) can derive from this without re-querying.
@@ -119,6 +146,7 @@ pub(crate) async fn ensure_address_events_window(
     pf: Option<&Arc<PathfinderClient>>,
     ds: &Arc<dyn DataSource>,
     latest_block: u64,
+    floor_block: u64,
 ) -> Result<EventWindowOutcome> {
     // Current cursor (None ⇒ cold cache).
     let progress = ds.load_search_progress(&address);
@@ -126,17 +154,21 @@ pub(crate) async fn ensure_address_events_window(
     // Pick a fetch window.
     let (from_block, deferred_gap) = match policy {
         EventWindowPolicy::TopDelta => resolve_top_delta(progress, latest_block),
-        EventWindowPolicy::ExtendDown => {
+        EventWindowPolicy::ExtendDown { window_size } => {
             // Scan below the cached floor. `fetch_address_activity` fetches
             // newest-first, so "older" here means a lower from_block paired
             // with to_block = current min - 1.
             match progress {
-                Some((min, _)) if min > 0 => {
-                    let from = min.saturating_sub(TIP_ONLY_WINDOW_BLOCKS);
+                Some((min, _)) if min > floor_block => {
+                    // Clamp at floor so we never scan past e.g. the deploy
+                    // block. `to_block` below is still `min - 1`, so the
+                    // window we actually hit is `[from, min-1]` — no double
+                    // coverage of already-scanned range above `min`.
+                    let from = min.saturating_sub(window_size).max(floor_block);
                     (from, None)
                 }
                 Some(_) => {
-                    // Already at genesis — nothing older to fetch.
+                    // Already at floor (or below) — nothing older to fetch.
                     let (min, max) = progress.unwrap_or((0, 0));
                     return Ok(EventWindowOutcome {
                         merged: ds.load_address_events(&address),
@@ -145,6 +177,7 @@ pub(crate) async fn ensure_address_events_window(
                         deferred_gap: None,
                         max_searched: max,
                         min_searched: min,
+                        suggested_next_window: None,
                         page: empty_page(),
                     });
                 }
@@ -159,7 +192,7 @@ pub(crate) async fn ensure_address_events_window(
 
     let to_block = match policy {
         EventWindowPolicy::FillGap { to_block, .. } => Some(to_block),
-        EventWindowPolicy::ExtendDown => progress.and_then(|(min, _)| min.checked_sub(1)),
+        EventWindowPolicy::ExtendDown { .. } => progress.and_then(|(min, _)| min.checked_sub(1)),
         EventWindowPolicy::TopDelta => None,
     };
 
@@ -216,7 +249,7 @@ pub(crate) async fn ensure_address_events_window(
     // gap was deferred, the old min/max remain and we merge in the tip range.
     let scanned_min = match policy {
         EventWindowPolicy::TopDelta => from_block,
-        EventWindowPolicy::ExtendDown => from_block,
+        EventWindowPolicy::ExtendDown { .. } => from_block,
         EventWindowPolicy::FillGap { from_block, .. } => from_block,
     };
     let scanned_max = to_block.unwrap_or(latest_block);
@@ -228,6 +261,17 @@ pub(crate) async fn ensure_address_events_window(
         .load_search_progress(&address)
         .unwrap_or((scanned_min, scanned_max));
 
+    // Adapt the next ExtendDown window based on hit density. Empty window →
+    // widen (sparse address, minimise round-trips); full page (bloom cap
+    // hit) → narrow (dense address; we may have truncated events). Only
+    // meaningful for ExtendDown.
+    let suggested_next_window = match policy {
+        EventWindowPolicy::ExtendDown { window_size } => {
+            Some(suggest_next_window(window_size, fetched))
+        }
+        _ => None,
+    };
+
     Ok(EventWindowOutcome {
         merged,
         fetched,
@@ -235,8 +279,28 @@ pub(crate) async fn ensure_address_events_window(
         deferred_gap,
         max_searched,
         min_searched,
+        suggested_next_window,
         page,
     })
+}
+
+/// Density-aware window-size adaptation for `ExtendDown`.
+///
+/// - `fetched == 0` → double, up to [`EXTEND_DOWN_MAX_WINDOW`]. On a sparse
+///   address this amortises round-trips so we don't walk 6M blocks at 5K/step.
+/// - `fetched >= EVENT_PAGE_LIMIT` → halve, down to [`EXTEND_DOWN_MIN_WINDOW`].
+///   The bloom cap capped this page; a smaller next window is less likely to
+///   truncate.
+/// - otherwise → keep the current size.
+fn suggest_next_window(current: u64, fetched: usize) -> u64 {
+    let next = if fetched == 0 {
+        current.saturating_mul(2)
+    } else if fetched >= EVENT_PAGE_LIMIT as usize {
+        current / 2
+    } else {
+        current
+    };
+    next.clamp(EXTEND_DOWN_MIN_WINDOW, EXTEND_DOWN_MAX_WINDOW)
 }
 
 /// Empty page for short-circuit paths (e.g. ExtendDown past genesis).
@@ -338,5 +402,44 @@ mod tests {
         let (from, gap) = resolve_top_delta(Some((0, 9_000_000)), 9_000_000);
         assert_eq!(from, 9_000_001); // effectively no-op when fed to pf
         assert_eq!(gap, None);
+    }
+
+    #[test]
+    fn suggest_next_window_doubles_on_empty_page() {
+        assert_eq!(suggest_next_window(5_000, 0), 10_000);
+        assert_eq!(suggest_next_window(50_000, 0), 100_000);
+    }
+
+    #[test]
+    fn suggest_next_window_caps_at_max() {
+        assert_eq!(
+            suggest_next_window(EXTEND_DOWN_MAX_WINDOW, 0),
+            EXTEND_DOWN_MAX_WINDOW
+        );
+        assert_eq!(
+            suggest_next_window(EXTEND_DOWN_MAX_WINDOW / 2 + 1, 0),
+            EXTEND_DOWN_MAX_WINDOW
+        );
+    }
+
+    #[test]
+    fn suggest_next_window_halves_on_full_page() {
+        assert_eq!(
+            suggest_next_window(100_000, EVENT_PAGE_LIMIT as usize),
+            50_000
+        );
+    }
+
+    #[test]
+    fn suggest_next_window_floors_at_min() {
+        assert_eq!(
+            suggest_next_window(EXTEND_DOWN_MIN_WINDOW, EVENT_PAGE_LIMIT as usize),
+            EXTEND_DOWN_MIN_WINDOW
+        );
+    }
+
+    #[test]
+    fn suggest_next_window_keeps_on_partial_page() {
+        assert_eq!(suggest_next_window(20_000, 37), 20_000);
     }
 }

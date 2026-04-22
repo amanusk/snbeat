@@ -36,6 +36,16 @@ fn tx_count_fragment(app: &App) -> String {
 }
 
 /// Count fragment for the Calls tab.
+///
+/// Priority of forms:
+/// - `"N / total"` — when an authoritative probe (Dune or cached range) gave
+///   us a count and we haven't filled it yet.
+/// - `"N+"` — when we know older history exists below the scanned floor
+///   (`event_window.min_searched > 0`) but no authoritative total is
+///   available. This is the scroll-driven signal for addresses where the
+///   only source of counts is the local `address_events` cache.
+/// - `"N"` — the window has been scanned to the bottom, or no "+ more"
+///   signal is available yet.
 fn call_count_fragment(app: &App) -> String {
     let count = app.address.calls.items.len();
     let total = app
@@ -43,8 +53,14 @@ fn call_count_fragment(app: &App) -> String {
         .activity_probe
         .as_ref()
         .map(|p| p.callee_call_count);
-    match total {
-        Some(total) if (count as u64) < total => format!("{count} / {total}"),
+    let has_more = app
+        .address
+        .event_window
+        .as_ref()
+        .is_some_and(|w| w.min_searched > 0);
+    match (total, has_more) {
+        (Some(total), _) if (count as u64) < total => format!("{count} / {total}"),
+        (_, true) => format!("{count}+"),
         _ => count.to_string(),
     }
 }
@@ -736,8 +752,17 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // `None` only occurs before dispatch, in which case callers short-circuit
     // above on empty items — render a bare label defensively.
     let count = meta_tx_count_fragment(app).unwrap_or_default();
+    // While an adaptive walk is in flight, surface how far back we've
+    // scanned — helpful signal for sparse addresses where the first few
+    // windows return nothing and the list appears to hang.
+    let scan_suffix = match app.address.event_window.as_ref() {
+        Some(hint) if hint.min_searched > 0 && app.address.fetching_meta_txs => {
+            format!(" scanned to block {}", hint.min_searched)
+        }
+        _ => String::new(),
+    };
     let title = if app.address.fetching_meta_txs {
-        format!(" MetaTxs ({count}) fetching...{gap_suffix} ")
+        format!(" MetaTxs ({count}) fetching...{scan_suffix}{gap_suffix} ")
     } else {
         format!(" MetaTxs ({count}){gap_suffix} ")
     };

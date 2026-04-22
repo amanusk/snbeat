@@ -792,8 +792,14 @@ pub(super) async fn fetch_and_send_address_info(
         )));
     }
 
-    // Spawn Dune activity probe — used by TASK B and TASK C to target the right block range.
-    // Uses starknet.events (3-4x cheaper than the old UNION ALL approach).
+    // Spawn activity probe — used by TASK B and TASK C to target the right block range.
+    // Source of truth is Dune's starknet.events (3-4x cheaper than the old UNION ALL approach).
+    // We intentionally no longer probe pf-query here: `/contract-event-count` over the full
+    // `deploy..tip` range is an unkeyed bloom-scan whose cost grows with chain age, and on
+    // long-lived contracts it exceeds the 30s client deadline — it also blocks the concurrent
+    // event-window fetch on the same pf-query server. Counts for the Calls tab are grown
+    // from the scroll-backed `address_events` cache; see `call_count_fragment` in
+    // ui/views/address_info.rs.
     // watch channel so both TASK B (Dune) and TASK C (RPC) can observe the probe result.
     let (probe_watch_tx, probe_watch_rx) =
         tokio::sync::watch::channel::<Option<dune::AddressActivityProbe>>(None);
@@ -820,12 +826,10 @@ pub(super) async fn fetch_and_send_address_info(
         probe.callee_call_count = event_count;
         let _ = probe_watch_tx.send(Some(probe));
     } else {
-        // No fresh cache — try pf-query first (when available), fall back to
-        // Dune if pf-query is absent or errors. pf-query's count endpoint
-        // walks the full range via bloom filters, so it matches Dune's
-        // activity-probe semantics without the external dependency.
-        let pf_probe: Option<Arc<crate::data::pathfinder::PathfinderClient>> =
-            pf.as_ref().map(Arc::clone);
+        // No fresh cache — run the Dune activity probe if Dune is configured.
+        // Otherwise the watch channel stays `None` and downstream tasks fall
+        // back to their own default windows. See the outer comment for why
+        // pf-query is no longer a probe source.
         let dune_probe: Option<Arc<dune::DuneClient>> = dune.as_ref().map(Arc::clone);
         let ds_probe = Arc::clone(ds);
         let tx_probe = tx.clone();
@@ -859,70 +863,6 @@ pub(super) async fn fetch_and_send_address_info(
                 let _ = probe_watch_tx_c.send(Some(probe));
             };
 
-            // 1. Try pf-query first — but only with a `from_block` bound.
-            // Unbounded probes walk from genesis via bloom filters, which on
-            // busy accounts exceeds the 30s client timeout and causes Dune
-            // fallback for every single probe (observed 2026-04-19: 8/8 PF
-            // probes timed out). Resolve a hint from cached deploy info, or
-            // by querying class history (cheap PF nonce-table lookup).
-            let deploy_hint: Option<u64> =
-                if let Some((_, b, _)) = ds_probe.load_cached_deploy_info(&address) {
-                    Some(b)
-                } else if let Some(pf_c) = pf_probe.as_ref() {
-                    match pf_c.get_class_history(address).await {
-                        Ok(entries) => entries.last().map(|e| e.block_number),
-                        Err(e) => {
-                            debug!(
-                                error = %e,
-                                "PF class-history lookup for probe from_block hint failed"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-            if let (Some(pf_c), Some(from_block)) = (pf_probe.as_ref(), deploy_hint) {
-                let _ = tx_probe.send(Action::LoadingStatus(format!(
-                    "PF: probing activity range (events, from block {from_block})..."
-                )));
-                match pf_c
-                    .get_contract_event_count(address, Some(from_block), None, &[])
-                    .await
-                {
-                    Ok(count) => {
-                        let probe = dune::AddressActivityProbe {
-                            callee_call_count: count.count,
-                            callee_min_block: count.min_block.unwrap_or(0),
-                            callee_max_block: count.max_block.unwrap_or(0),
-                            ..Default::default()
-                        };
-                        if !count.complete {
-                            warn!(
-                                "pf-query event-count hit candidate cap; count={} is a lower bound",
-                                count.count
-                            );
-                        }
-                        publish(probe, "PF probe");
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "pf-query activity probe failed, falling back to Dune");
-                        let _ = tx_probe.send(Action::LoadingStatus(format!(
-                            "PF probe failed ({}); trying Dune...",
-                            e
-                        )));
-                    }
-                }
-            } else if pf_probe.is_some() {
-                debug!(
-                    addr = %format!("{:#x}", address),
-                    "Skipping PF probe: no deploy-block hint available (would scan from genesis)"
-                );
-            }
-
-            // 2. Fall back to Dune.
             if let Some(dune_c) = dune_probe.as_ref() {
                 let _ = tx_probe.send(Action::LoadingStatus(
                     "Dune: probing activity range (events)...".into(),
@@ -1023,6 +963,7 @@ pub(super) async fn fetch_and_send_address_info(
         let tx_b = tx.clone();
         let abi_b = Arc::clone(abi_reg);
         let dune_b = dune.as_ref().map(Arc::clone);
+        let pf_b = pf.as_ref().map(Arc::clone);
         tokio::spawn(async move {
             let _ = tx_b.send(Action::LoadingStatus(
                 "Calls: fetching from Dune...".into(),
@@ -1031,6 +972,7 @@ pub(super) async fn fetch_and_send_address_info(
                 address,
                 &ds_b,
                 dune_b.as_ref(),
+                pf_b.as_ref(),
                 &abi_b,
                 &tx_b,
                 nonce,
@@ -1283,6 +1225,7 @@ pub(super) async fn fetch_and_send_address_info(
                 pf_c.as_ref(),
                 &ds_dyn,
                 latest_block,
+                0, // TopDelta doesn't scan old history; floor is unused.
             )
             .await
             {
@@ -2897,32 +2840,45 @@ pub(super) async fn derive_meta_txs_from_page(
 /// tabs. The `continuation_token` input is repurposed as a "fetch older" flag:
 ///
 /// - `None`           → [`EventWindowPolicy::TopDelta`] (tip-of-chain, cold or delta)
-/// - `Some(_)`        → [`EventWindowPolicy::ExtendDown`] (scan below cached floor)
+/// - `Some(_)`        → [`EventWindowPolicy::ExtendDown { window_size }`]
+///   (scan below cached floor, adaptive window size)
+///
+/// `from_block` is the absolute scan floor (typically deploy block) — the
+/// helper won't scan below it. When `min_searched <= from_block` we return
+/// `next_token = None` to signal "reached floor, stop paginating".
+///
+/// `window_size` is the block range size for the next ExtendDown page; the
+/// caller tracks it across calls (`meta_tx_last_window`) and the helper
+/// returns a suggested next size adapted to the observed hit density.
 ///
 /// The returned `next_token` carries `min_searched` when more older events
-/// remain, or `None` when we've reached genesis. The UI treats it as
+/// remain, or `None` when we've reached the floor. The UI treats it as
 /// opaque — whatever lands in the response gets echoed back on the next call.
 ///
-/// `from_block` / `limit` are currently ignored; kept in the Action schema
-/// until all three event-derived tabs are on the helper and we can cleanly
-/// collapse the Action surface.
+/// `limit` is currently ignored; kept in the Action schema until all three
+/// event-derived tabs are on the helper and we can cleanly collapse the
+/// Action surface.
 pub(super) async fn fetch_address_meta_txs(
     address: starknet::core::types::Felt,
-    _from_block: u64,
+    from_block: u64,
     continuation_token: Option<u64>,
+    window_size: u64,
     _limit: u32,
     ds: &Arc<dyn crate::data::DataSource>,
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
-    use crate::network::event_window::{EventWindowPolicy, ensure_address_events_window};
+    use crate::network::event_window::{
+        EXTEND_DOWN_INITIAL_WINDOW, EventWindowPolicy, ensure_address_events_window,
+    };
 
     let send_empty = || {
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
             summaries: Vec::new(),
             next_token: None,
+            next_window_size: None,
         });
     };
 
@@ -2936,9 +2892,18 @@ pub(super) async fn fetch_address_meta_txs(
         }
     };
 
+    // Guard against a 0 coming in from state defaults: use the initial window.
+    let effective_window = if window_size == 0 {
+        EXTEND_DOWN_INITIAL_WINDOW
+    } else {
+        window_size
+    };
+
     let policy = match continuation_token {
         None => EventWindowPolicy::TopDelta,
-        Some(_) => EventWindowPolicy::ExtendDown,
+        Some(_) => EventWindowPolicy::ExtendDown {
+            window_size: effective_window,
+        },
     };
 
     let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
@@ -2949,6 +2914,7 @@ pub(super) async fn fetch_address_meta_txs(
         Some(pf),
         &ds_dyn,
         latest_block,
+        from_block,
     )
     .await
     {
@@ -2967,20 +2933,30 @@ pub(super) async fn fetch_address_meta_txs(
         deferred_gap: outcome.deferred_gap,
     });
 
-    // `ExtendDown` past genesis returns an empty page — still emit an empty
+    // Stop paginating once we've scanned down to (or past) the deploy-block
+    // floor. The UI uses `next_token = None` as the "done" signal.
+    let has_more_below = outcome.min_searched > from_block;
+
+    // `ExtendDown` past floor returns an empty page — still emit an empty
     // response so the UI clears its loading flag and flips has_more=false.
     if outcome.page.events.is_empty() {
         debug!(
             addr = %format!("{:#x}", address),
             min_searched = outcome.min_searched,
             max_searched = outcome.max_searched,
+            floor = from_block,
             "MetaTxs: no new events in this window"
         );
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
             summaries: Vec::new(),
-            next_token: if outcome.min_searched > 0 {
+            next_token: if has_more_below {
                 Some(outcome.min_searched)
+            } else {
+                None
+            },
+            next_window_size: if has_more_below {
+                outcome.suggested_next_window
             } else {
                 None
             },
@@ -2997,6 +2973,8 @@ pub(super) async fn fetch_address_meta_txs(
         meta_txs = summaries.len(),
         min_searched = outcome.min_searched,
         max_searched = outcome.max_searched,
+        floor = from_block,
+        suggested_next_window = ?outcome.suggested_next_window,
         deferred_gap = ?outcome.deferred_gap,
         "MetaTxs: classified"
     );
@@ -3007,8 +2985,13 @@ pub(super) async fn fetch_address_meta_txs(
 
     // Signal "has more older" via Some(min_searched). The UI doesn't interpret
     // the value — it just checks is_some and echoes it back on the next call.
-    let next_token = if outcome.min_searched > 0 {
+    let next_token = if has_more_below {
         Some(outcome.min_searched)
+    } else {
+        None
+    };
+    let next_window_size = if has_more_below {
+        outcome.suggested_next_window
     } else {
         None
     };
@@ -3017,6 +3000,7 @@ pub(super) async fn fetch_address_meta_txs(
         address,
         summaries,
         next_token,
+        next_window_size,
     });
 }
 
@@ -3037,6 +3021,7 @@ pub(super) async fn fetch_address_contract_calls(
     address: starknet::core::types::Felt,
     ds: &Arc<dyn crate::data::DataSource>,
     dune: Option<&Arc<dune::DuneClient>>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
     nonce: starknet::core::types::Felt,
@@ -3052,7 +3037,7 @@ pub(super) async fn fetch_address_contract_calls(
         return;
     };
 
-    let mut calls = match dune_client
+    let dune_calls = match dune_client
         .query_contract_calls(address, CONTRACT_CALL_LIMIT)
         .await
     {
@@ -3063,19 +3048,11 @@ pub(super) async fn fetch_address_contract_calls(
         }
     };
 
-    // Dune returns the entry_point_selector as hex in `function_name`; resolve
-    // it through the ABI registry so the UI shows readable names.
-    helpers::prewarm_abis([address], abi_reg).await;
-    for c in &mut calls {
-        if let Ok(sel) = starknet::core::types::Felt::from_hex(&c.function_name) {
-            c.function_name = helpers::format_selector_name_or_hex(&sel, abi_reg);
-        }
-    }
-
-    // A single tx can call the same contract multiple times (multicall, nested
-    // calls). Dune returns one row per call, so merge them into one entry per
-    // tx with function names joined in Dune's trace order.
-    let calls = crate::data::types::deduplicate_contract_calls(calls);
+    // Resolve selectors, dedupe, and backfill real sender + fee + timestamp.
+    // Dune's `starknet.calls.caller_address` is the immediate caller (often a
+    // router like Ekubo), not the outer tx sender; `enrich_dune_calls` replaces
+    // it with `fetched_tx.sender()` and fills in fee/timestamp from the receipt.
+    let calls = enrich_dune_calls(address, dune_calls, abi_reg, ds, pf, action_tx).await;
 
     info!(
         addr = %format!("{:#x}", address),
