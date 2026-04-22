@@ -88,27 +88,36 @@ fn call_count_fragment(app: &App) -> String {
     count_fragment(count, bound)
 }
 
-/// Count fragment for the MetaTxs tab. Returns `None` when the tab hasn't
-/// been dispatched yet and has no rows — callers render an empty `" MetaTxs "`
-/// label in that case so users don't see a misleading `"(0)"` while the
-/// classifier is still spinning up.
+/// Count fragment for the MetaTxs tab.
 ///
-/// While paging is in-flight (`meta_tx_has_more` or `fetching_meta_txs`),
-/// we emit [`CountBound::LowerBound`]. Once both flags drop we promote to
-/// [`CountBound::Exact`] at the current count — that matches the pre-revamp
-/// behavior. A tighter "exact when scan reached deploy_block" transition
-/// is a planned follow-up once filter_kind is tracked on the window hint.
-fn meta_tx_count_fragment(app: &App) -> Option<String> {
+/// Per the revamp spec we can only claim [`CountBound::Exact`] once the
+/// backwards scan has reached (or crossed) the deploy block — only then
+/// have we demonstrably seen every `execute_from_outside` targeting this
+/// address. Until that holds we stay [`CountBound::LowerBound`], even if
+/// `meta_tx_has_more` has flipped to false because the current fetch
+/// returned no new rows: a dry page doesn't imply history exhausted.
+///
+/// The function now always returns a fragment — callers render the label
+/// even on cold state so the tab doesn't silently hide behind a probe.
+/// "0+" on first paint is strictly more informative than no count at all.
+fn meta_tx_count_fragment(app: &App) -> String {
     let count = app.address.meta_txs.items.len() as u64;
-    if !app.address.meta_txs_dispatched && count == 0 {
-        return None;
-    }
-    let bound = if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
-        CountBound::LowerBound { hint: None }
-    } else {
-        CountBound::Exact(count)
+    // Reached deploy-floor iff we know both values AND the scan has a
+    // non-zero min_searched <= deploy_block. `min_searched == 0` is the
+    // "never scanned" sentinel — never promote on that.
+    let reached_floor = match (
+        app.address.event_window.as_ref().map(|w| w.min_searched),
+        app.address.deployment.as_ref().map(|d| d.block_number),
+    ) {
+        (Some(m), Some(d)) if m > 0 => m <= d,
+        _ => false,
     };
-    Some(count_fragment(count, bound))
+    let bound = if reached_floor {
+        CountBound::Exact(count)
+    } else {
+        CountBound::LowerBound { hint: None }
+    };
+    count_fragment(count, bound)
 }
 
 /// Title suffix describing any passive gap the event-window helper reported
@@ -350,12 +359,9 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
 
     let tx_label = format!(" Txs ({}) ", tx_count_fragment(app));
     let call_label = format!(" Calls ({}) ", call_count_fragment(app));
-    // None ⇒ classifier hasn't been dispatched yet — render a bare label so
-    // users don't see a misleading "(0)" while the tab is still warming up.
-    let meta_label = match meta_tx_count_fragment(app) {
-        Some(frag) => format!(" MetaTxs ({frag}) "),
-        None => " MetaTxs ".to_string(),
-    };
+    // The fragment is always rendered — "0+" on cold state beats a bare
+    // label that hides the tab's existence while the classifier spins up.
+    let meta_label = format!(" MetaTxs ({}) ", meta_tx_count_fragment(app));
 
     let titles = vec![
         Span::raw(tx_label),
@@ -774,10 +780,8 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let gap_suffix = event_window_gap_suffix(app);
-    // The body title shows the same count fragment as the compact tab row.
-    // `None` only occurs before dispatch, in which case callers short-circuit
-    // above on empty items — render a bare label defensively.
-    let count = meta_tx_count_fragment(app).unwrap_or_default();
+    // The body title shares the same fragment helper as the compact tab row.
+    let count = meta_tx_count_fragment(app);
     // While an adaptive walk is in flight, surface how far back we've
     // scanned — helpful signal for sparse addresses where the first few
     // windows return nothing and the list appears to hang.
