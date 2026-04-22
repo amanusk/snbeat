@@ -1279,6 +1279,11 @@ pub(super) async fn fetch_and_send_address_info(
             // so TASK C's custom `from_block` (derived from nonce_delta /
             // search_progress above) is now only used for the fast-skip
             // short-circuit and the loading-status banner — not for the fetch.
+            let _events_guard = QueryGuard::new(
+                &tx_c,
+                format!("events:{}", query_addr_prefix(&address)),
+                "Events scan".to_string(),
+            );
             let ds_dyn: Arc<dyn crate::data::DataSource> = ds_c.clone();
             let pf_page: Option<AddressActivityPage> = match crate::network::event_window::ensure_address_events_window(
                 address,
