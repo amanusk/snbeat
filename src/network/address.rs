@@ -1158,7 +1158,16 @@ pub(super) async fn fetch_and_send_address_info(
             let latest_block = ds_c.get_latest_block_number().await.unwrap_or(0);
 
             // --- Use cached search progress + nonce delta to narrow the window ---
-            let search_progress = ds_c.load_search_progress(&address);
+            // TASK C's scan uses the same `kind` as ensure_address_events_window
+            // (derived from is_contract below at line ~1200). Match the
+            // filter_kind here so the cursor lookup and update land on the
+            // same row.
+            let filter_kind = if is_contract {
+                crate::data::FilterKind::Unkeyed
+            } else {
+                crate::data::FilterKind::Keyed
+            };
+            let search_progress = ds_c.load_search_progress(&address, filter_kind);
 
             // If nonce hasn't changed and we've already searched up to near the tip,
             // skip the full search — only check the small delta.
@@ -1642,7 +1651,7 @@ pub(super) async fn fetch_and_send_address_info(
             // Save search progress only when events were found — otherwise the initial
             // window may have been too small and we need to retry with probe guidance.
             if any_events_found {
-                ds_c.save_search_progress(&address, from_block, latest_block);
+                ds_c.save_search_progress(&address, filter_kind, from_block, latest_block);
             }
 
             // RPC task complete

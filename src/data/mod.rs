@@ -14,6 +14,36 @@ use types::{
     MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt, SnTransaction,
 };
 
+/// What kind of event filter a scan applied. Used as a secondary key in
+/// `address_search_progress` so that a narrower (keyed) scan doesn't
+/// falsely mark the broader (unkeyed) region as "covered". Scans record
+/// coverage under the kind they used; callers query the kind they need.
+///
+/// - [`FilterKind::Unkeyed`] — all events emitted by the address
+///   (pf-query `from_address` filter, no key filter). Equivalent to the
+///   Events-tab source. Strictly a superset of `Keyed` data over the
+///   same block range, so an unkeyed-covered range satisfies keyed
+///   queries too (though we don't currently exploit that — see §3 of
+///   the address-view revamp plan).
+/// - [`FilterKind::Keyed`] — events with a specific key filter
+///   (currently only `TRANSACTION_EXECUTED`, used by the MetaTxs tab).
+///   Narrower than `Unkeyed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterKind {
+    Unkeyed,
+    Keyed,
+}
+
+impl FilterKind {
+    /// Stable string identifier persisted in the SQLite `filter_kind` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterKind::Unkeyed => "unkeyed",
+            FilterKind::Keyed => "keyed",
+        }
+    }
+}
+
 /// Abstraction over different Starknet data sources (RPC, Pathfinder DB).
 #[async_trait]
 pub trait DataSource: Send + Sync {
@@ -151,12 +181,26 @@ pub trait DataSource: Send + Sync {
     fn save_cached_nonce(&self, _address: &Felt, _nonce: &Felt, _block: u64) {}
 
     // --- Search progress cache ---
-    /// Load cached search progress (min_searched_block, max_searched_block).
-    fn load_search_progress(&self, _address: &Felt) -> Option<(u64, u64)> {
+    /// Load cached search progress `(min_searched_block, max_searched_block)`
+    /// for `(address, filter_kind)`. `None` ⇒ no scan of that kind recorded.
+    fn load_search_progress(
+        &self,
+        _address: &Felt,
+        _filter_kind: FilterKind,
+    ) -> Option<(u64, u64)> {
         None
     }
-    /// Save search progress for an address.
-    fn save_search_progress(&self, _address: &Felt, _min_block: u64, _max_block: u64) {}
+    /// Save (merge-expand) search progress for `(address, filter_kind)`.
+    /// The SQLite impl extends the existing min/max range rather than
+    /// replacing, so repeated windowed scans accumulate coverage.
+    fn save_search_progress(
+        &self,
+        _address: &Felt,
+        _filter_kind: FilterKind,
+        _min_block: u64,
+        _max_block: u64,
+    ) {
+    }
 
     /// Load the last-known upstream event-count total (e.g. Dune probe) for
     /// an address. `None` means "never probed" — not "zero activity".

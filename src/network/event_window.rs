@@ -26,13 +26,23 @@ use std::sync::Arc;
 use starknet::core::types::Felt;
 use tracing::{debug, warn};
 
-use crate::data::DataSource;
 use crate::data::pathfinder::PathfinderClient;
 use crate::data::types::SnEvent;
+use crate::data::{DataSource, FilterKind};
 use crate::error::Result;
 use crate::network::address::{
     AddressActivityPage, EventQueryKind, fetch_address_activity, fetch_events_routed,
 };
+
+/// Map an [`EventQueryKind`] to the scan-coverage kind recorded in
+/// `address_search_progress`. Accounts scan with a `TRANSACTION_EXECUTED`
+/// key filter (keyed), contracts scan without a key filter (unkeyed).
+fn filter_kind_for(kind: EventQueryKind) -> FilterKind {
+    match kind {
+        EventQueryKind::Account => FilterKind::Keyed,
+        EventQueryKind::Contract => FilterKind::Unkeyed,
+    }
+}
 
 /// Initial window size (events) when no prior scan exists. Matches the pre-
 /// existing Phase-1 scan limits used by `fetch_and_send_address_info`.
@@ -148,8 +158,10 @@ pub(crate) async fn ensure_address_events_window(
     latest_block: u64,
     floor_block: u64,
 ) -> Result<EventWindowOutcome> {
-    // Current cursor (None ⇒ cold cache).
-    let progress = ds.load_search_progress(&address);
+    // Current cursor (None ⇒ cold cache). Keyed/unkeyed coverage is tracked
+    // separately so a narrower keyed scan doesn't lie about broader coverage.
+    let filter_kind = filter_kind_for(kind);
+    let progress = ds.load_search_progress(&address, filter_kind);
 
     // Pick a fetch window.
     let (from_block, deferred_gap) = match policy {
@@ -254,11 +266,11 @@ pub(crate) async fn ensure_address_events_window(
     };
     let scanned_max = to_block.unwrap_or(latest_block);
     if scanned_max >= scanned_min {
-        ds.save_search_progress(&address, scanned_min, scanned_max);
+        ds.save_search_progress(&address, filter_kind, scanned_min, scanned_max);
     }
 
     let (min_searched, max_searched) = ds
-        .load_search_progress(&address)
+        .load_search_progress(&address, filter_kind)
         .unwrap_or((scanned_min, scanned_max));
 
     // Adapt the next ExtendDown window based on hit density. Empty window →
