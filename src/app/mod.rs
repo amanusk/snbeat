@@ -979,21 +979,29 @@ impl App {
                     );
                 }
 
-                // Update contract calls (merge, not replace)
+                // Update contract calls (merge across sources, not replace).
+                //
+                // Calls can arrive from two paths for the same tx_hash:
+                //   - Dune `starknet.calls` — authoritative and richer (resolved
+                //     function_name, accurate fee).
+                //   - pf-query shared window scan — supplementary, may arrive
+                //     first if Dune is slow/unavailable.
+                //
+                // Previously the reducer skipped any new row whose tx_hash was
+                // already present, which silently dropped Dune's richer data
+                // when pf-query arrived first. Route both sources through
+                // `deduplicate_contract_calls` which merges function_name
+                // (joined), fills missing fee/timestamp, and preserves the
+                // superset — so neither source can hide the other's data.
                 if !contract_calls.is_empty() {
-                    let existing_hashes: std::collections::HashSet<_> =
-                        self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                    let new_calls: Vec<_> = contract_calls
-                        .into_iter()
-                        .filter(|c| !existing_hashes.contains(&c.tx_hash))
-                        .collect();
-                    if !new_calls.is_empty() {
-                        self.address.calls.items.extend(new_calls);
-                        self.address
-                            .calls
-                            .items
-                            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
-                    }
+                    let mut merged = std::mem::take(&mut self.address.calls.items);
+                    merged.extend(contract_calls);
+                    self.address.calls.items =
+                        crate::data::types::deduplicate_contract_calls(merged);
+                    self.address
+                        .calls
+                        .items
+                        .sort_by(|a, b| b.block_number.cmp(&a.block_number));
                     if self.address.calls.state.selected().is_none()
                         && !self.address.calls.items.is_empty()
                     {
@@ -1091,15 +1099,18 @@ impl App {
                 if self.address.context == Some(address) {
                     let tx_summaries = self.filter_deployment_txs(address, tx_summaries);
                     self.address.merge_tx_summaries(tx_summaries);
-                    // Merge contract calls
+                    // Merge contract calls across sources (Dune + pf-query).
+                    // See the AddressInfoLoaded handler above for the full
+                    // rationale — `deduplicate_contract_calls` does the
+                    // field-level merge so a later-arriving Dune row can
+                    // still contribute its richer function_name/fee data
+                    // to an already-rendered pf-query row with the same
+                    // tx_hash (and vice-versa).
                     if !contract_calls.is_empty() {
-                        let existing_hashes: std::collections::HashSet<_> =
-                            self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                        let new_calls: Vec<_> = contract_calls
-                            .into_iter()
-                            .filter(|c| !existing_hashes.contains(&c.tx_hash))
-                            .collect();
-                        self.address.calls.items.extend(new_calls);
+                        let mut merged = std::mem::take(&mut self.address.calls.items);
+                        merged.extend(contract_calls);
+                        self.address.calls.items =
+                            crate::data::types::deduplicate_contract_calls(merged);
                         self.address
                             .calls
                             .items
