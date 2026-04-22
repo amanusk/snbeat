@@ -751,15 +751,25 @@ pub(super) async fn fetch_and_send_address_info(
     });
 
     // Send partial info immediately (cached txs seed the UI)
+    // Decode cached events so the Events tab renders instantly on revisit,
+    // mirroring the cache-first behaviour already in place for Txs/Calls.
+    // Live fetches downstream will emit AddressEventsStreamed with newer
+    // events; decoded_events here is the starting set the reducer can merge on.
+    let cached_events = ds.load_address_events(&address);
+    let mut cached_decoded = Vec::with_capacity(cached_events.len());
+    for event in &cached_events {
+        let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+        cached_decoded.push(decode_event(event, abi.as_deref()));
+    }
     let _ = tx.send(Action::AddressInfoLoaded {
         info: crate::data::types::SnAddressInfo {
             address,
             nonce,
             class_hash,
-            recent_events: Vec::new(),
+            recent_events: cached_events,
             token_balances: Vec::new(),
         },
-        decoded_events: Vec::new(),
+        decoded_events: cached_decoded,
         tx_summaries: ds.load_cached_address_txs(&address),
         contract_calls: ds.load_cached_address_calls(&address),
     });
