@@ -26,7 +26,7 @@ use crate::search::SearchEngine;
 use crate::ui::widgets::stateful_list::StatefulList;
 use actions::{Action, Source};
 use starknet::core::types::Felt;
-use state::{ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
+use state::{ActiveQueries, ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
 use views::{AddressInfoState, BlockDetailState, ClassInfoState, TxDetailState};
 
 /// Maximum number of blocks retained in the main blocks list.
@@ -86,6 +86,7 @@ pub struct App {
     pub connection_status: ConnectionStatus,
     pub error_message: Option<String>,
     pub data_sources: DataSources,
+    pub active_queries: ActiveQueries,
 
     // Pagination flags (prevent duplicate fetches)
     pub fetching_older_blocks: bool,
@@ -140,6 +141,7 @@ impl App {
             connection_status: ConnectionStatus::default(),
             error_message: None,
             data_sources: DataSources::default(),
+            active_queries: ActiveQueries::default(),
 
             fetching_older_blocks: false,
             pending_bottom_jump: false,
@@ -1597,6 +1599,10 @@ impl App {
                 self.is_loading = true;
                 self.loading_detail = Some(msg);
             }
+            Action::SetActiveQuery { key, label } => match label {
+                Some(l) => self.active_queries.set(&key, l),
+                None => self.active_queries.clear(&key),
+            },
             Action::SourceUpdate { source, status } => {
                 use crate::app::actions::Source;
                 let target = match source {

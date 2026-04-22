@@ -29,6 +29,49 @@ use super::dune_source_update;
 use super::helpers;
 use super::voyager;
 
+/// RAII helper that registers an entry in the per-query status bar on
+/// construction and clears it on drop. Every early-return path in the
+/// fetcher it guards gets the clear for free, so we can't leave a stale
+/// label in the UI.
+struct QueryGuard {
+    tx: mpsc::UnboundedSender<Action>,
+    key: String,
+}
+
+impl QueryGuard {
+    fn new(tx: &mpsc::UnboundedSender<Action>, key: impl Into<String>, label: String) -> Self {
+        let key = key.into();
+        let _ = tx.send(Action::SetActiveQuery {
+            key: key.clone(),
+            label: Some(label),
+        });
+        Self {
+            tx: tx.clone(),
+            key,
+        }
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Action::SetActiveQuery {
+            key: std::mem::take(&mut self.key),
+            label: None,
+        });
+    }
+}
+
+/// Short prefix of a Felt address used as the stable part of an
+/// [`ActiveQueries`] key. Six hex chars is enough to tell two concurrent
+/// addresses apart without bloating the status bar.
+fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
+    let hex = format!("{:064x}", address);
+    hex.trim_start_matches('0')
+        .chars()
+        .take(6)
+        .collect::<String>()
+}
+
 /// UDC ContractDeployed event selector.
 const UDC_CONTRACT_DEPLOYED: &str =
     "0x26b160f10156dea0639bec90696772c640b9706a47f5b8c52ea1abe5858b34d";
@@ -2969,6 +3012,14 @@ pub(super) async fn fetch_address_meta_txs(
         EXTEND_DOWN_INITIAL_WINDOW, EventWindowPolicy, ensure_address_events_window,
     };
 
+    // Register the query in the status bar for the duration of this scan.
+    // Dropped automatically on every early-return path below.
+    let _guard = QueryGuard::new(
+        action_tx,
+        format!("meta:{}", query_addr_prefix(&address)),
+        "MetaTxs scan".to_string(),
+    );
+
     let send_empty = || {
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
@@ -3132,6 +3183,14 @@ pub(super) async fn fetch_address_contract_calls(
         );
         return;
     };
+
+    // Register the Calls fetch in the status bar for the duration of the
+    // Dune round-trip + enrichment. Dropped on every return path below.
+    let _guard = QueryGuard::new(
+        action_tx,
+        format!("calls:{}", query_addr_prefix(&address)),
+        "Calls fetch".to_string(),
+    );
 
     // TopDelta: if we've already cached rows for this address, only ask Dune
     // for blocks strictly newer than the highest block we've seen. Cold cache

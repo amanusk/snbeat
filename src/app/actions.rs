@@ -295,6 +295,14 @@ pub enum Action {
     LatestBlockNumber(u64),
     /// Update the loading status message shown in the status bar.
     LoadingStatus(String),
+    /// Per-query status registry update: `Some(label)` starts/updates an entry
+    /// for `key`, `None` removes it. Keys are opaque strings owned by the
+    /// dispatcher (e.g. `"meta:41420f"` for the MetaTxs scan on an address).
+    /// Rendered alongside `loading_detail` in the status bar.
+    SetActiveQuery {
+        key: String,
+        label: Option<String>,
+    },
     /// Navigate to class info view immediately (before data loads).
     NavigateToClassInfo {
         class_hash: Felt,

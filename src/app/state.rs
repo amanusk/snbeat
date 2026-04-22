@@ -144,3 +144,94 @@ impl Default for DataSources {
         }
     }
 }
+
+/// Per-query status surface. Each in-flight background query registers a
+/// short, human-readable label keyed by (tab, address-prefix, ...). Labels
+/// are rendered in the status bar so the user can see what's fetching in
+/// each tab — a richer signal than the single-slot `loading_detail` string.
+///
+/// Keys are opaque strings (e.g. `"meta:41420f"`, `"calls:41420f"`), chosen
+/// by the dispatcher; the registry just stores the most recent label per key
+/// and drops the entry when the query finishes.
+#[derive(Debug, Default, Clone)]
+pub struct ActiveQueries {
+    entries: Vec<(String, String)>,
+}
+
+impl ActiveQueries {
+    pub fn set(&mut self, key: &str, label: String) {
+        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = label;
+        } else {
+            self.entries.push((key.to_string(), label));
+        }
+    }
+
+    pub fn clear(&mut self, key: &str) {
+        self.entries.retain(|(k, _)| k != key);
+    }
+
+    /// Drop every entry whose key starts with `prefix`. Useful on address
+    /// navigation: `clear_prefix("addr:41420f")` removes every per-tab
+    /// registration tied to that address without listing each tab.
+    pub fn clear_prefix(&mut self, prefix: &str) {
+        self.entries.retain(|(k, _)| !k.starts_with(prefix));
+    }
+
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(_, l)| l.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod active_queries_tests {
+    use super::ActiveQueries;
+
+    #[test]
+    fn set_inserts_and_updates_same_key_in_place() {
+        let mut q = ActiveQueries::default();
+        q.set("meta:41420f", "MetaTxs scan".into());
+        q.set("calls:41420f", "Calls fetch".into());
+        q.set("meta:41420f", "MetaTxs scan 6M→5M".into());
+
+        let labels: Vec<_> = q.labels().collect();
+        assert_eq!(labels, vec!["MetaTxs scan 6M→5M", "Calls fetch"]);
+    }
+
+    #[test]
+    fn clear_removes_only_matching_key() {
+        let mut q = ActiveQueries::default();
+        q.set("meta:41420f", "A".into());
+        q.set("calls:41420f", "B".into());
+        q.clear("meta:41420f");
+
+        let labels: Vec<_> = q.labels().collect();
+        assert_eq!(labels, vec!["B"]);
+    }
+
+    #[test]
+    fn clear_prefix_drops_every_entry_for_an_address() {
+        let mut q = ActiveQueries::default();
+        q.set("meta:41420f", "A".into());
+        q.set("calls:41420f", "B".into());
+        q.set("meta:deadbe", "C".into());
+        q.clear_prefix("meta:");
+
+        let labels: Vec<_> = q.labels().collect();
+        assert_eq!(labels, vec!["B"]);
+    }
+
+    #[test]
+    fn is_empty_tracks_lifecycle() {
+        let mut q = ActiveQueries::default();
+        assert!(q.is_empty());
+        q.set("k", "l".into());
+        assert!(!q.is_empty());
+        q.clear("k");
+        assert!(q.is_empty());
+    }
+}

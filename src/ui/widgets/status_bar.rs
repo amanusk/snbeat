@@ -87,6 +87,20 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(detail, theme::STATUS_LOADING));
     }
 
+    // Per-query registry: render up to 2 active query labels joined with
+    // " · " so parallel tab scans are both visible at once without
+    // overflowing the status bar.
+    if !app.active_queries.is_empty() {
+        let joined = app
+            .active_queries
+            .labels()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(joined, theme::STATUS_LOADING));
+    }
+
     let status =
         Paragraph::new(Line::from(spans)).style(Style::default().bg(ratatui::style::Color::Black));
     f.render_widget(status, area);
