@@ -2793,6 +2793,83 @@ pub(super) async fn find_deploy_tx(
     debug!(%addr, deploy_block, "Deploy tx not found in block (neither native nor UDC)");
 }
 
+/// Three tab-specific projections of an [`AddressActivityPage`] derived in
+/// a single classification pass.
+///
+/// Authority per projection:
+///
+/// - [`ClassifiedPage::txs`] — **authoritative.** All tx_rows where
+///   `sender == address`. Direct match, no decoding.
+/// - [`ClassifiedPage::meta_txs`] — **authoritative.** All tx_rows whose
+///   calldata contains an `execute_from_outside*` inner call with
+///   `intender == address`. Complete because `execute_from_outside` always
+///   emits `TRANSACTION_EXECUTED`, so pf-query's tx_rows covers every
+///   meta-tx within the scan range.
+/// - [`ClassifiedPage::calls`] — **supplementary only.** tx_rows whose
+///   multicall contains any inner call to `address`. Misses calls to
+///   contracts that don't emit events (pf-query indexes via events).
+///   Dune is the authoritative Calls source; these rows are valuable for
+///   showing something immediately while Dune loads, and for covering
+///   blocks past Dune's indexing lag.
+pub(super) struct ClassifiedPage {
+    pub txs: Vec<crate::data::types::AddressTxSummary>,
+    pub calls: Vec<crate::data::types::ContractCallSummary>,
+    pub meta_txs: Vec<crate::data::types::MetaTxIntenderSummary>,
+}
+
+/// Single-pass classifier over an [`AddressActivityPage`].
+///
+/// Composes the three existing per-tab helpers so every caller that wants
+/// the full fan-out (the shared window scan, WS event replay, etc.) goes
+/// through one entry point. Semantics match the per-helper versions
+/// exactly — migration target for tasks #3 (Calls merge) and #4 (WS
+/// routing) in the address-view revamp plan.
+pub(super) async fn classify_activity_page(
+    address: starknet::core::types::Felt,
+    page: &AddressActivityPage,
+    abi_reg: &Arc<AbiRegistry>,
+) -> ClassifiedPage {
+    use starknet::core::types::Felt;
+
+    // Prewarm the address's own ABI once. The individual helpers prewarm
+    // the same address too, so this is redundant with them but cheap and
+    // keeps the classifier's contract explicit ("ABIs are warm on entry").
+    helpers::prewarm_abis([address], abi_reg).await;
+
+    // Txs: rows the address authored itself. Filter to sender==address
+    // before batch-converting so prewarm targets inside the tx helper only
+    // see actually-relevant multicall destinations.
+    let sender_rows: Vec<_> = page
+        .tx_rows
+        .iter()
+        .filter(|r| {
+            Felt::from_hex(&r.sender)
+                .map(|s| s == address)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let txs = if sender_rows.is_empty() {
+        Vec::new()
+    } else {
+        build_tx_summaries_from_pf_rows(&sender_rows, abi_reg).await
+    };
+
+    // Calls: pf-query-supplementary rows (Dune authoritative). Reuses the
+    // existing builder verbatim — any row with an inner call to address.
+    let calls = build_contract_calls_from_pf_rows(address, &page.tx_rows, abi_reg).await;
+
+    // MetaTxs: full page-level derivation so the tx_index tie-breaker
+    // (built from event_index ordering) stays correct.
+    let meta_txs = derive_meta_txs_from_page(address, page, abi_reg).await;
+
+    ClassifiedPage {
+        txs,
+        calls,
+        meta_txs,
+    }
+}
+
 /// Classify every tx row in a shared activity page as a meta-tx where
 /// `address` is the intender, returning the recency-sorted summaries.
 ///
@@ -3577,6 +3654,79 @@ mod shared_pipeline_tests {
         assert_eq!(out[1].hash, Felt::from(2u64));
         assert_eq!(out[1].block_number, 101);
         assert_eq!(out[0].sender, Some(sender));
+    }
+
+    /// `classify_activity_page` fan-out for a direct sender-authored invoke:
+    /// sender == address and the multicall contains an inner call to address.
+    /// Expect Txs=1 (sender match) + Calls=1 (inner-call target match) +
+    /// MetaTxs=0 (no execute_from_outside shape, so not a meta-tx).
+    ///
+    /// Guards the unified classifier against regressing the per-tab fan-out
+    /// that the address-view revamp depends on.
+    #[tokio::test]
+    async fn classify_activity_page_fans_out_sender_and_call() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let tx_hash = Felt::from(0xABCDu64);
+
+        // Multicall with a single inner call targeting `addr`.
+        // Layout: [count=1, target=addr, selector=0x22, calldata_len=0].
+        let calldata = vec![Felt::from(1u64), addr, Felt::from(0x22u64), Felt::ZERO];
+        let page = AddressActivityPage {
+            events: vec![ev(tx_hash, 100, 0)],
+            tx_rows: vec![tx_row(tx_hash, addr, 100, 5, calldata)],
+            unique_hashes: vec![tx_hash],
+            tx_block_map: std::collections::HashMap::from([(tx_hash, 100u64)]),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+
+        let classified = classify_activity_page(addr, &page, &abi).await;
+
+        assert_eq!(
+            classified.txs.len(),
+            1,
+            "sender == address ⇒ one tx summary"
+        );
+        assert_eq!(classified.txs[0].hash, tx_hash);
+        assert_eq!(classified.txs[0].sender, Some(addr));
+
+        assert_eq!(
+            classified.calls.len(),
+            1,
+            "inner call to address ⇒ one call summary"
+        );
+        assert_eq!(classified.calls[0].tx_hash, tx_hash);
+        assert_eq!(classified.calls[0].sender, addr);
+
+        assert!(
+            classified.meta_txs.is_empty(),
+            "no outside_execution shape ⇒ no meta-tx classification, got: {:?}",
+            classified.meta_txs
+        );
+    }
+
+    /// `classify_activity_page` on an empty page returns empty projections
+    /// in all three slots. Guards against the classifier ever accidentally
+    /// fabricating rows when there are none to classify.
+    #[tokio::test]
+    async fn classify_activity_page_empty_page_yields_empty_projections() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let page = AddressActivityPage {
+            events: vec![],
+            tx_rows: vec![],
+            unique_hashes: vec![],
+            tx_block_map: std::collections::HashMap::new(),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+        let classified = classify_activity_page(addr, &page, &abi).await;
+        assert!(classified.txs.is_empty());
+        assert!(classified.calls.is_empty());
+        assert!(classified.meta_txs.is_empty());
     }
 }
 
