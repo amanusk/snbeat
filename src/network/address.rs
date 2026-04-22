@@ -3133,10 +3133,31 @@ pub(super) async fn fetch_address_contract_calls(
         return;
     };
 
-    let dune_calls = match dune_client
-        .query_contract_calls(address, CONTRACT_CALL_LIMIT)
-        .await
-    {
+    // TopDelta: if we've already cached rows for this address, only ask Dune
+    // for blocks strictly newer than the highest block we've seen. Cold cache
+    // still falls back to the unwindowed "500 most recent" fetch so first open
+    // on a long-lived contract stays cheap.
+    let max_cached_block = ds
+        .load_cached_address_calls(&address)
+        .iter()
+        .map(|c| c.block_number)
+        .filter(|&b| b > 0)
+        .max();
+
+    let dune_calls_result = match max_cached_block {
+        Some(from) => {
+            dune_client
+                .query_contract_calls_windowed(address, from + 1, u64::MAX, CONTRACT_CALL_LIMIT)
+                .await
+        }
+        None => {
+            dune_client
+                .query_contract_calls(address, CONTRACT_CALL_LIMIT)
+                .await
+        }
+    };
+
+    let dune_calls = match dune_calls_result {
         Ok(v) => v,
         Err(e) => {
             warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls fetch failed");
