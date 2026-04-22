@@ -102,6 +102,17 @@ pub trait DataSource: Send + Sync {
     fn load_cached_activity_range_with_count(&self, _address: &Felt) -> Option<(u64, u64, u64)> {
         None
     }
+    /// Load cached activity range ignoring freshness. Used by the probe
+    /// TopDelta path: a stale but present row still has a valid `min_block`
+    /// (the deploy/first-activity floor never regresses), so we can avoid
+    /// re-probing the entire history and only extend `max_block` + count
+    /// from the cached high-water mark.
+    fn load_cached_activity_range_any_age(
+        &self,
+        _address: &Felt,
+    ) -> Option<(u64, u64, u64)> {
+        None
+    }
     /// Save discovered activity range for an address.
     fn save_activity_range(&self, _address: &Felt, _min_block: u64, _max_block: u64) {
         // Default: no-op. CachingDataSource overrides.

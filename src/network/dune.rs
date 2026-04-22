@@ -373,6 +373,55 @@ impl DuneClient {
         Ok(probe)
     }
 
+    /// TopDelta variant of [`Self::probe_address_activity`].
+    ///
+    /// When a prior probe result is cached but stale, we only need to extend
+    /// its `max_block` + event count toward the chain tip — `min_block`
+    /// never regresses. This query scopes to `block_number > from_block`,
+    /// making the re-probe cheap regardless of chain age.
+    ///
+    /// Returns a partial probe: `callee_call_count` counts the delta events,
+    /// and `callee_max_block` is their upper bound. The caller is expected to
+    /// merge this into the cached row (cache.rs `save_activity_range_with_count`
+    /// handles the min-preserve / max-expand / count-max semantics).
+    pub async fn probe_address_activity_delta(
+        &self,
+        address: Felt,
+        from_block: u64,
+    ) -> Result<AddressActivityProbe, String> {
+        let addr_hex = format!("{:#066x}", address);
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt, \
+               MIN(block_number) AS min_block, MAX(block_number) AS max_block \
+             FROM starknet.events \
+             WHERE from_address = {addr} \
+             AND block_number > {from}",
+            addr = addr_hex,
+            from = from_block,
+        );
+
+        debug!(address = %addr_hex, from_block, "Dune events probe (delta): extending activity range");
+        let rows = self.execute_sql(&sql).await?;
+
+        let mut probe = AddressActivityProbe::default();
+        if let Some(row) = rows.first() {
+            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
+            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
+            probe.callee_call_count = cnt;
+            probe.callee_min_block = min_b;
+            probe.callee_max_block = max_b;
+        }
+
+        info!(
+            event_count = probe.callee_call_count,
+            from_block,
+            max_block = probe.callee_max_block,
+            "Dune events probe (delta) complete"
+        );
+        Ok(probe)
+    }
+
     /// Query the declare transaction for a class hash (fallback when PF is unavailable).
     pub async fn query_declare_tx(
         &self,

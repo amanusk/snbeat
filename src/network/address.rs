@@ -879,10 +879,14 @@ pub(super) async fn fetch_and_send_address_info(
         probe.callee_call_count = event_count;
         let _ = probe_watch_tx.send(Some(probe));
     } else {
-        // No fresh cache — run the Dune activity probe if Dune is configured.
-        // Otherwise the watch channel stays `None` and downstream tasks fall
-        // back to their own default windows. See the outer comment for why
-        // pf-query is no longer a probe source.
+        // No fresh cache. Two paths from here:
+        //   - Any cached row (stale or fresh) exists → TopDelta probe:
+        //     cheap `block_number > cached_max` query, merged into cache.
+        //   - No cached row at all → full probe (cold path).
+        // Either way, the watch channel stays `None` if Dune isn't configured
+        // and downstream tasks fall back to their own default windows. See the
+        // outer comment for why pf-query is no longer a probe source.
+        let stale_cached = ds.load_cached_activity_range_any_age(&address);
         let dune_probe: Option<Arc<dune::DuneClient>> = dune.as_ref().map(Arc::clone);
         let ds_probe = Arc::clone(ds);
         let tx_probe = tx.clone();
@@ -917,16 +921,61 @@ pub(super) async fn fetch_and_send_address_info(
             };
 
             if let Some(dune_c) = dune_probe.as_ref() {
-                let _ = tx_probe.send(Action::LoadingStatus(
-                    "Dune: probing activity range (events)...".into(),
-                ));
-                match dune_c.probe_address_activity(address).await {
-                    Ok(probe) => publish(probe, "Dune probe"),
-                    Err(e) => {
-                        warn!(error = %e, "Dune activity probe failed");
-                        let _ = tx_probe
-                            .send(Action::LoadingStatus(format!("Dune probe failed: {}", e)));
-                        // Leave watch at None — tasks will use default windows.
+                match stale_cached {
+                    Some((cached_min, cached_max, cached_count)) => {
+                        // TopDelta: only probe blocks > cached_max and merge.
+                        let _ = tx_probe.send(Action::LoadingStatus(format!(
+                            "Dune: extending activity probe (>{} block)...",
+                            cached_max
+                        )));
+                        match dune_c
+                            .probe_address_activity_delta(address, cached_max)
+                            .await
+                        {
+                            Ok(delta) => {
+                                // Merge delta into cached: min stays, max
+                                // expands, count sums. `save_activity_range_with_count`
+                                // also merges at the DB layer, but we need a
+                                // fully-populated probe to publish to the UI.
+                                let mut merged = dune::AddressActivityProbe::default();
+                                merged.callee_min_block = cached_min;
+                                merged.callee_max_block =
+                                    delta.callee_max_block.max(cached_max);
+                                merged.callee_call_count =
+                                    cached_count.saturating_add(delta.callee_call_count);
+                                publish(merged, "Dune probe (delta)");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Dune delta activity probe failed");
+                                let _ = tx_probe.send(Action::LoadingStatus(format!(
+                                    "Dune probe failed: {}",
+                                    e
+                                )));
+                                // Fall back: still publish the cached range so
+                                // downstream tasks can size their windows.
+                                let mut fallback = dune::AddressActivityProbe::default();
+                                fallback.callee_min_block = cached_min;
+                                fallback.callee_max_block = cached_max;
+                                fallback.callee_call_count = cached_count;
+                                let _ = probe_watch_tx_c.send(Some(fallback));
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = tx_probe.send(Action::LoadingStatus(
+                            "Dune: probing activity range (events)...".into(),
+                        ));
+                        match dune_c.probe_address_activity(address).await {
+                            Ok(probe) => publish(probe, "Dune probe"),
+                            Err(e) => {
+                                warn!(error = %e, "Dune activity probe failed");
+                                let _ = tx_probe.send(Action::LoadingStatus(format!(
+                                    "Dune probe failed: {}",
+                                    e
+                                )));
+                                // Leave watch at None — tasks will use default windows.
+                            }
+                        }
                     }
                 }
             }

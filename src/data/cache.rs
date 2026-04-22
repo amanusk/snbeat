@@ -1033,6 +1033,27 @@ impl DataSource for CachingDataSource {
         .ok()
     }
 
+    fn load_cached_activity_range_any_age(
+        &self,
+        address: &Felt,
+    ) -> Option<(u64, u64, u64)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare(
+                "SELECT min_block, max_block, event_count FROM address_activity \
+                 WHERE address = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let min: i64 = row.get(0)?;
+            let max: i64 = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            Ok((min as u64, max as u64, count as u64))
+        })
+        .ok()
+    }
+
     fn save_activity_range(&self, address: &Felt, min_block: u64, max_block: u64) {
         self.save_activity_range_with_count(address, min_block, max_block, 0);
     }
