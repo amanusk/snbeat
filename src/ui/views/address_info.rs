@@ -22,10 +22,12 @@ use crate::utils::{felt_to_u64, felt_to_u128};
 /// - [`CountBound::Exact`] — the tab's total is known exactly (e.g. the
 ///   on-chain nonce for Txs, a Dune probe total for Calls). Renders as
 ///   `"N / total"` while we're filling, or bare `"N"` once `shown == total`.
-/// - [`CountBound::LowerBound`] — "at least N; more may exist". Renders as
-///   `"N+"`, or `"N / hint+"` if a non-authoritative hint suggests a rough
-///   upper bound. This is the default when no authoritative probe has
-///   completed — every tab starts here on first paint.
+/// - [`CountBound::LowerBound`] — "at least N; more may exist". Always
+///   renders with an explicit denominator — `"N / hint+"` if a hint is
+///   available and exceeds `shown`, otherwise `"N / N+"` because we
+///   know at least `shown` items exist. This is the default when no
+///   authoritative probe has completed — every tab starts here on
+///   first paint.
 ///
 /// Keeping this enum the single input to [`count_fragment`] prevents
 /// display divergence between tabs: no tab accidentally renders bare `"N"`
@@ -43,12 +45,20 @@ enum CountBound {
 /// title. Previously every site recomputed a fragment independently, and
 /// display nits (like the MetaTxs body title lagging the compact row's
 /// `"+"`) crept in.
+///
+/// Format rules:
+/// - `Exact(N)`, `shown == N` → `"N"` (full knowledge, no `+`)
+/// - `Exact(N)`, `shown < N` → `"shown / N"` (filling toward a known total)
+/// - `LowerBound` with hint `H > shown` → `"shown / H+"` (inexact hint)
+/// - `LowerBound` otherwise → `"shown / shown+"` (no better hint; we
+///   still always render a denominator so "0/0+" on a cold tab beats
+///   a lonely "0+")
 fn count_fragment(shown: u64, bound: CountBound) -> String {
     match bound {
         CountBound::Exact(total) if shown < total => format!("{shown} / {total}"),
         CountBound::Exact(_) => shown.to_string(),
         CountBound::LowerBound { hint: Some(h) } if h > shown => format!("{shown} / {h}+"),
-        CountBound::LowerBound { .. } => format!("{shown}+"),
+        CountBound::LowerBound { .. } => format!("{shown} / {shown}+"),
     }
 }
 
@@ -84,6 +94,32 @@ fn call_count_fragment(app: &App) -> String {
     let bound = match dune_total {
         Some(total) => CountBound::Exact(total),
         None => CountBound::LowerBound { hint: None },
+    };
+    count_fragment(count, bound)
+}
+
+/// Count fragment for the Events tab.
+///
+/// Events are all `from_address == ADDR` logs, sourced via the unkeyed
+/// event-window scan. Per the plan we can only claim [`CountBound::Exact`]
+/// when the backwards scan has reached deploy block; until then we stay
+/// [`CountBound::LowerBound`]. Shares the same `event_window.min_searched`
+/// signal as MetaTxs — technically imprecise because a keyed scan on a
+/// hybrid address could satisfy the floor check here even if the unkeyed
+/// scan hasn't, but that's the only signal the UI has today.
+fn events_count_fragment(app: &App) -> String {
+    let count = app.address.events.items.len() as u64;
+    let reached_floor = match (
+        app.address.event_window.as_ref().map(|w| w.min_searched),
+        app.address.deployment.as_ref().map(|d| d.block_number),
+    ) {
+        (Some(m), Some(d)) if m > 0 => m <= d,
+        _ => false,
+    };
+    let bound = if reached_floor {
+        CountBound::Exact(count)
+    } else {
+        CountBound::LowerBound { hint: None }
     };
     count_fragment(count, bound)
 }
@@ -354,7 +390,6 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|i| i.token_balances.len())
         .unwrap_or(0);
-    let ev_count = app.address.events.items.len();
     let class_count = app.address.class_history.len();
 
     let tx_label = format!(" Txs ({}) ", tx_count_fragment(app));
@@ -368,7 +403,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(meta_label),
         Span::raw(call_label),
         Span::raw(format!(" Balances ({bal_count}) ")),
-        Span::raw(format!(" Events ({ev_count}) ")),
+        Span::raw(format!(" Events ({}) ", events_count_fragment(app))),
         Span::raw(format!(" Class ({class_count}) ")),
     ];
     let selected = match app.address.tab {
@@ -924,10 +959,11 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let count = events_count_fragment(app);
     let title = if app.is_loading {
-        format!(" Events ({}) fetching... ", app.address.events.items.len())
+        format!(" Events ({count}) fetching... ")
     } else {
-        format!(" Events ({}) ", app.address.events.items.len())
+        format!(" Events ({count}) ")
     };
 
     let list = List::new(items)
@@ -1066,10 +1102,23 @@ mod count_fragment_tests {
     }
 
     #[test]
-    fn lower_bound_without_hint_renders_plus_suffix() {
+    fn lower_bound_without_hint_renders_shown_over_shown_plus() {
+        // No hint ⇒ denominator defaults to `shown` itself. We know at
+        // least N items exist, so "N / N+" is both truthful and keeps
+        // the Shown/Known format across every tab state.
         assert_eq!(
             count_fragment(7, CountBound::LowerBound { hint: None }),
-            "7+"
+            "7 / 7+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_zero_renders_zero_over_zero_plus() {
+        // The cold-state display the user wants on every tab — never a
+        // bare "0" or an empty label while probes are still warming up.
+        assert_eq!(
+            count_fragment(0, CountBound::LowerBound { hint: None }),
+            "0 / 0+"
         );
     }
 
@@ -1082,16 +1131,17 @@ mod count_fragment_tests {
     }
 
     #[test]
-    fn lower_bound_with_hint_at_or_below_shown_drops_to_bare_plus() {
-        // Hint is stale or conservative; at the very least `shown` exist.
-        // Don't lie about "7 / 3+" — just emit "7+".
+    fn lower_bound_with_hint_at_or_below_shown_falls_back_to_shown_denominator() {
+        // Hint is stale or conservative; we still want the Shown/Known
+        // format, so fall back to "shown / shown+" rather than a
+        // misleading "7 / 3+".
         assert_eq!(
             count_fragment(7, CountBound::LowerBound { hint: Some(3) }),
-            "7+"
+            "7 / 7+"
         );
         assert_eq!(
             count_fragment(7, CountBound::LowerBound { hint: Some(7) }),
-            "7+"
+            "7 / 7+"
         );
     }
 }
