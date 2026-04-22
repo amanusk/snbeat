@@ -107,6 +107,17 @@ pub enum Action {
         address: Felt,
         tx_hash: Felt,
     },
+    /// Decode a WS-received event using the ABI of its `from_address`, then
+    /// emit [`Action::AddressEventStreamed`] so the Events tab merges the
+    /// decoded row in real time. Dispatched from the `AddressWsEvent`
+    /// reducer — the reducer can't call the async ABI registry itself, so it
+    /// delegates here. A best-effort decode returns the raw event wrapped in
+    /// a [`DecodedEvent`] when no ABI is available, so the tab still reflects
+    /// live activity.
+    DecodeAddressWsEvent {
+        address: Felt,
+        event: SnEvent,
+    },
     /// Fetch class hash info (ABI, declaration, deployed contracts).
     FetchClassInfo {
         class_hash: Felt,
@@ -216,6 +227,13 @@ pub enum Action {
         address: Felt,
         summaries: Vec<MetaTxIntenderSummary>,
     },
+    /// Streaming single decoded event from the WS path (response to
+    /// [`Action::DecodeAddressWsEvent`]). Merges into the Events tab list
+    /// newest-first, deduping by `(tx_hash, event_index)`.
+    AddressEventStreamed {
+        address: Felt,
+        decoded_event: DecodedEvent,
+    },
     /// Dune activity probe result delivered to UI for pagination window sizing.
     AddressProbeLoaded {
         address: Felt,
@@ -245,11 +263,15 @@ pub enum Action {
         complete: bool,
     },
     /// Single broadcast of a WS-received event. Emitted once per event; the
-    /// reducer fans it out to the Calls tab (builds a `ContractCallSummary`
-    /// stub + dispatches `EnrichAddressCalls`) and, for `TRANSACTION_EXECUTED`
-    /// events, dispatches `ClassifyPotentialMetaTx` so live meta-tx detection
-    /// still reaches the MetaTxs tab. The event itself has already been
-    /// persisted into the address event cache in the WS handler.
+    /// reducer fans it out to:
+    ///   - the Events tab via [`Action::DecodeAddressWsEvent`] (async decode);
+    ///   - the Calls tab (builds a `ContractCallSummary` stub + dispatches
+    ///     `EnrichAddressCalls`);
+    ///   - the MetaTxs tab for `TRANSACTION_EXECUTED` events via
+    ///     `ClassifyPotentialMetaTx`.
+    ///
+    /// The event itself has already been persisted into the address event
+    /// cache in the WS handler.
     AddressWsEvent {
         address: Felt,
         event: SnEvent,

@@ -357,6 +357,21 @@ pub async fn run_network_task(
                             }
                         }
                     }
+                    Action::DecodeAddressWsEvent { address, event } => {
+                        // Streaming path from WS: a raw event for the
+                        // currently-viewed `address` arrived. Resolve its
+                        // emitter ABI, decode, and forward so the Events tab
+                        // merges the decoded row in real time. ABI miss falls
+                        // back to an undecoded `DecodedEvent` (raw keys/data
+                        // preserved) — the user still sees live activity, it
+                        // just renders without names.
+                        let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+                        let decoded = crate::decode::events::decode_event(&event, abi.as_deref());
+                        let _ = tx.send(Action::AddressEventStreamed {
+                            address,
+                            decoded_event: decoded,
+                        });
+                    }
                     Action::FetchClassInfo { class_hash } => {
                         class::fetch_class_info(class_hash, &ds, &abi_reg, &dune, &pf, &tx).await;
                     }
@@ -431,6 +446,7 @@ fn action_is_cancellable(action: &Action) -> bool {
             | Action::EnrichAddressCalls { .. }
             | Action::FetchAddressMetaTxs { .. }
             | Action::ClassifyPotentialMetaTx { .. }
+            | Action::DecodeAddressWsEvent { .. }
             | Action::FetchMoreAddressTxs { .. }
     )
 }

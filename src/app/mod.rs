@@ -1427,6 +1427,14 @@ impl App {
                     return;
                 }
 
+                // --- Events tab: delegate decode to the network task (which
+                // owns the async ABI registry); the resulting
+                // `AddressEventStreamed` arm below merges the decoded row.
+                let _ = self.action_tx.send(Action::DecodeAddressWsEvent {
+                    address,
+                    event: event.clone(),
+                });
+
                 // --- Calls tab: derive a stub summary and merge (dedupe by tx_hash).
                 let tx_hash = event.transaction_hash;
                 let block_number = event.block_number;
@@ -1480,6 +1488,40 @@ impl App {
                     let _ = self
                         .action_tx
                         .send(Action::ClassifyPotentialMetaTx { address, tx_hash });
+                }
+            }
+            Action::AddressEventStreamed {
+                address,
+                decoded_event,
+            } => {
+                // Response arm for DecodeAddressWsEvent. Merge the decoded
+                // event into the Events tab list newest-first, dedup by
+                // `(tx_hash, event_index)` — the same key the cache uses. The
+                // event is already persisted (the WS handler called
+                // `merge_address_events` before broadcasting), so this is
+                // purely an in-memory refresh; a future cache reload will
+                // produce the same list via the cache path.
+                if self.address.context != Some(address) {
+                    return;
+                }
+                let key = (
+                    decoded_event.raw.transaction_hash,
+                    decoded_event.raw.event_index,
+                );
+                let already_present = self
+                    .address
+                    .events
+                    .items
+                    .iter()
+                    .any(|e| (e.raw.transaction_hash, e.raw.event_index) == key);
+                if already_present {
+                    return;
+                }
+                self.address.events.items.insert(0, decoded_event);
+                // `insert(0, …)` preserves newest-first ordering as long as
+                // WS events arrive in block order, which they do. No sort.
+                if self.address.events.state.selected().is_none() {
+                    self.address.events.select_first();
                 }
             }
             Action::AddressCallsEnriched { address, calls } => {
