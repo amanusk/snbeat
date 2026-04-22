@@ -129,11 +129,6 @@ pub struct AddressInfoState {
     /// Set to deploy block when known; bounds the scan range so pf-query
     /// doesn't time out walking chunks older than the account.
     pub meta_tx_from_block: u64,
-    /// Number of automatic (non-user-triggered) pages already fetched while
-    /// trying to fill the first screen of MetaTxs. Capped by
-    /// `META_TX_AUTO_PAGE_CAP` so an address with many events but zero
-    /// classified meta-txs doesn't walk the whole history in the background.
-    pub meta_tx_auto_pages: u32,
     /// Last ExtendDown window size (blocks) used for this address's MetaTxs
     /// fetch. Adapted across pages: doubles on empty windows (sparse
     /// addresses), halves on full pages (dense addresses, bloom cap hit).
@@ -145,18 +140,23 @@ pub struct AddressInfoState {
     pub event_window: Option<EventWindowHint>,
 }
 
-/// Maximum background auto-continue pages when filling the MetaTxs first
-/// screen. With adaptive windows, a single page can cover up to
-/// `EXTEND_DOWN_MAX_WINDOW` blocks on sparse addresses, so 40 pages is ample
-/// backstop without being an unbounded walk. Once hit, further pagination
-/// requires the user to scroll (strictly on-demand).
-pub const META_TX_AUTO_PAGE_CAP: u32 = 40;
-
-/// Target MetaTx row count for the first screen. Auto-continue keeps paging
-/// until either this target is reached, `next_token` exhausts, or the
-/// `META_TX_AUTO_PAGE_CAP` safety cap trips. Sized to comfortably fill the
-/// visible list on most terminals.
-pub const META_TX_FIRST_PAINT_TARGET: usize = 50;
+/// Auto-fill row target for the event-backed tabs (currently MetaTxs;
+/// extends to Calls / Events as those tabs migrate to the shared pipeline).
+///
+/// Stop conditions for the background auto-continue loop are exactly:
+///
+///   1. The visible list reaches `AUTO_FILL_TARGET` rows — stop.
+///   2. `has_more` drops (history exhausted: pf-query ran out of blocks
+///      to scan) — stop. The final count stands, no retry.
+///   3. The user navigates away — the session-token cancellation in the
+///      network task tears down any in-flight page fetch.
+///
+/// There is no page-count cap: a sparse address with zero classified
+/// meta-txs is allowed to walk back to its deploy block, because the
+/// alternative ("give up early") silently under-reports. Scrolling near
+/// the bottom re-arms auto-fill (see `maybe_fetch_more_meta_txs`), so
+/// history-exhaustion and user-initiated continuation share one path.
+pub const AUTO_FILL_TARGET: usize = 50;
 
 impl Default for AddressInfoState {
     fn default() -> Self {
@@ -191,7 +191,6 @@ impl Default for AddressInfoState {
             meta_tx_has_more: false,
             meta_txs_dispatched: false,
             meta_tx_from_block: 0,
-            meta_tx_auto_pages: 0,
             meta_tx_last_window: crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW,
             event_window: None,
         }
@@ -229,7 +228,6 @@ impl AddressInfoState {
         self.meta_tx_has_more = false;
         self.meta_txs_dispatched = false;
         self.meta_tx_from_block = 0;
-        self.meta_tx_auto_pages = 0;
         self.meta_tx_last_window = crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW;
         self.event_window = None;
     }
