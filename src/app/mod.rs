@@ -1193,9 +1193,9 @@ impl App {
                 if self.address.context == Some(address) {
                     let mut seen: std::collections::HashSet<_> =
                         self.address.meta_txs.items.iter().map(|m| m.hash).collect();
-                    for s in summaries {
+                    for s in &summaries {
                         if seen.insert(s.hash) {
-                            self.address.meta_txs.items.push(s);
+                            self.address.meta_txs.items.push(s.clone());
                         }
                     }
                     self.address.meta_txs.items.sort_by(|a, b| {
@@ -1210,6 +1210,30 @@ impl App {
                     }
                     // Keep fetching_meta_txs / cursor as-is: a live fetch may
                     // still be in-flight behind this cache delivery.
+
+                    // Plan §2 invariant: every cached MetaTx is also a Call on
+                    // this address. The live meta-tx scan already emits
+                    // `AddressCallsMerged` for freshly-seen pages, but on
+                    // re-entry the cached rows never pass through that path —
+                    // promote them here so the Calls list reflects the
+                    // MetaTxs ⊆ Calls invariant immediately from cache.
+                    let promoted: Vec<crate::data::types::ContractCallSummary> = summaries
+                        .into_iter()
+                        .map(|m| crate::data::types::ContractCallSummary {
+                            tx_hash: m.hash,
+                            sender: m.paymaster,
+                            function_name: String::new(),
+                            block_number: m.block_number,
+                            timestamp: m.timestamp,
+                            total_fee_fri: m.total_fee_fri,
+                            status: m.status,
+                        })
+                        .collect();
+                    if !promoted.is_empty() {
+                        let _ = self
+                            .action_tx
+                            .send(Action::AddressCallsMerged { address, calls: promoted });
+                    }
                 }
             }
             Action::AddressMetaTxsStreamed { address, summaries } => {
