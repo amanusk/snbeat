@@ -15,54 +15,77 @@ use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
 
-/// Count fragment for the Txs tab — just the parens content (`"3"`, `"3 / 27"`).
+/// How confident are we in the tab's count?
 ///
-/// `tx_count_fragment` / `call_count_fragment` / `meta_tx_count_fragment` are
-/// the single source of truth for what goes inside the `(...)` on each tab,
-/// shared by the compact `draw_tabs` row at the top of the view and the
-/// per-tab body title. Previously each site recomputed the fragment
-/// independently; keeping them aligned by hand was fragile (the MetaTxs body
-/// title in particular used to lag the compact row's `"+"` indicator).
-fn tx_count_fragment(app: &App) -> String {
-    let count = app.address.txs.items.len();
-    // Authoritative total is the on-chain nonce: one invoke per sender nonce.
-    // Dune's event count over-counts on hybrid accounts (it counts emitted
-    // events, not sender txs) — not suitable here.
-    let total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
-    match total {
-        Some(total) if (count as u64) < total => format!("{count} / {total}"),
-        _ => count.to_string(),
+/// The address-view revamp locks down two display states:
+///
+/// - [`CountBound::Exact`] — the tab's total is known exactly (e.g. the
+///   on-chain nonce for Txs, a Dune probe total for Calls). Renders as
+///   `"N / total"` while we're filling, or bare `"N"` once `shown == total`.
+/// - [`CountBound::LowerBound`] — "at least N; more may exist". Renders as
+///   `"N+"`, or `"N / hint+"` if a non-authoritative hint suggests a rough
+///   upper bound. This is the default when no authoritative probe has
+///   completed — every tab starts here on first paint.
+///
+/// Keeping this enum the single input to [`count_fragment`] prevents
+/// display divergence between tabs: no tab accidentally renders bare `"N"`
+/// when it only has a lower bound (the historical bug was Events/Calls
+/// hiding the `"+"` once a scan paused).
+enum CountBound {
+    Exact(u64),
+    LowerBound { hint: Option<u64> },
+}
+
+/// Render the parens content for a tab count given its [`CountBound`].
+///
+/// The single source of truth for what goes inside the `(...)` on each
+/// tab — shared by the compact `draw_tabs` row and each per-tab body
+/// title. Previously every site recomputed a fragment independently, and
+/// display nits (like the MetaTxs body title lagging the compact row's
+/// `"+"`) crept in.
+fn count_fragment(shown: u64, bound: CountBound) -> String {
+    match bound {
+        CountBound::Exact(total) if shown < total => format!("{shown} / {total}"),
+        CountBound::Exact(_) => shown.to_string(),
+        CountBound::LowerBound { hint: Some(h) } if h > shown => format!("{shown} / {h}+"),
+        CountBound::LowerBound { .. } => format!("{shown}+"),
     }
+}
+
+/// Count fragment for the Txs tab.
+///
+/// Authoritative total is the on-chain nonce (one invoke per sender nonce),
+/// so once nonce is known the bound is [`CountBound::Exact`]. Dune's event
+/// count over-counts on hybrid accounts (it counts emitted events, not
+/// sender txs) — not suitable here.
+fn tx_count_fragment(app: &App) -> String {
+    let count = app.address.txs.items.len() as u64;
+    let bound = match app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce)) {
+        Some(nonce) => CountBound::Exact(nonce),
+        None => CountBound::LowerBound { hint: None },
+    };
+    count_fragment(count, bound)
 }
 
 /// Count fragment for the Calls tab.
 ///
-/// Priority of forms:
-/// - `"N / total"` — when an authoritative probe (Dune or cached range) gave
-///   us a count and we haven't filled it yet.
-/// - `"N+"` — when we know older history exists below the scanned floor
-///   (`event_window.min_searched > 0`) but no authoritative total is
-///   available. This is the scroll-driven signal for addresses where the
-///   only source of counts is the local `address_events` cache.
-/// - `"N"` — the window has been scanned to the bottom, or no "+ more"
-///   signal is available yet.
+/// Only the Dune probe total counts as "exact" here — pf-query-only
+/// backfill can't promise completeness (misses calls to contracts that
+/// don't emit events). Until Dune returns, we're in `LowerBound`. The
+/// `event_window.min_searched > 0` signal becomes the lower-bound hint's
+/// "+" indicator, not a claim of exactness.
 fn call_count_fragment(app: &App) -> String {
-    let count = app.address.calls.items.len();
-    let total = app
+    let count = app.address.calls.items.len() as u64;
+    let dune_total = app
         .address
         .activity_probe
         .as_ref()
         .map(|p| p.callee_call_count);
-    let has_more = app
-        .address
-        .event_window
-        .as_ref()
-        .is_some_and(|w| w.min_searched > 0);
-    match (total, has_more) {
-        (Some(total), _) if (count as u64) < total => format!("{count} / {total}"),
-        (_, true) => format!("{count}+"),
-        _ => count.to_string(),
-    }
+    let bound = match dune_total {
+        Some(total) => CountBound::Exact(total),
+        None => CountBound::LowerBound { hint: None },
+    };
+    count_fragment(count, bound)
 }
 
 /// Count fragment for the MetaTxs tab. Returns `None` when the tab hasn't
@@ -70,19 +93,22 @@ fn call_count_fragment(app: &App) -> String {
 /// label in that case so users don't see a misleading `"(0)"` while the
 /// classifier is still spinning up.
 ///
-/// `"N+"` signals "more results possible" while paging is in-flight or
-/// `meta_tx_has_more` is set; `"N"` alone means the classifier has exhausted
-/// the scanned window.
+/// While paging is in-flight (`meta_tx_has_more` or `fetching_meta_txs`),
+/// we emit [`CountBound::LowerBound`]. Once both flags drop we promote to
+/// [`CountBound::Exact`] at the current count — that matches the pre-revamp
+/// behavior. A tighter "exact when scan reached deploy_block" transition
+/// is a planned follow-up once filter_kind is tracked on the window hint.
 fn meta_tx_count_fragment(app: &App) -> Option<String> {
-    let count = app.address.meta_txs.items.len();
+    let count = app.address.meta_txs.items.len() as u64;
     if !app.address.meta_txs_dispatched && count == 0 {
         return None;
     }
-    if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
-        Some(format!("{count}+"))
+    let bound = if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
+        CountBound::LowerBound { hint: None }
     } else {
-        Some(count.to_string())
-    }
+        CountBound::Exact(count)
+    };
+    Some(count_fragment(count, bound))
 }
 
 /// Title suffix describing any passive gap the event-window helper reported
@@ -1008,4 +1034,60 @@ fn draw_class_history_tab(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme::BORDER_STYLE),
     );
     f.render_widget(list, list_area);
+}
+
+#[cfg(test)]
+mod count_fragment_tests {
+    //! The count-fragment helper is the single source of truth for what the
+    //! four address-view tabs render inside `(...)`. These tests pin its
+    //! five distinct display outputs so regressions show up here before
+    //! they surface on screen.
+    use super::{CountBound, count_fragment};
+
+    #[test]
+    fn exact_shown_less_than_total_renders_fraction() {
+        assert_eq!(count_fragment(7, CountBound::Exact(20)), "7 / 20");
+    }
+
+    #[test]
+    fn exact_shown_equal_total_renders_bare_count() {
+        assert_eq!(count_fragment(20, CountBound::Exact(20)), "20");
+    }
+
+    #[test]
+    fn exact_shown_greater_than_total_falls_back_to_bare_count() {
+        // Stale probe: Dune total lags an active stream. Never render a
+        // negative-looking "20 / 7" — fall back to the authoritative shown.
+        assert_eq!(count_fragment(20, CountBound::Exact(7)), "20");
+    }
+
+    #[test]
+    fn lower_bound_without_hint_renders_plus_suffix() {
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: None }),
+            "7+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_with_hint_above_shown_renders_fraction_plus() {
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(100) }),
+            "7 / 100+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_with_hint_at_or_below_shown_drops_to_bare_plus() {
+        // Hint is stale or conservative; at the very least `shown` exist.
+        // Don't lie about "7 / 3+" — just emit "7+".
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(3) }),
+            "7+"
+        );
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(7) }),
+            "7+"
+        );
+    }
 }
