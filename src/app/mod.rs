@@ -1563,6 +1563,35 @@ impl App {
                     });
                 }
             }
+            Action::AddressCallsMerged { address, calls } => {
+                // Plan §2: pf-query tx_rows supplement Dune's capped Calls set.
+                // Dune's `starknet.calls` query is LIMIT 500 which collapses to
+                // far fewer unique tx_hashes after dedup for addresses with
+                // many multi-call txs (e.g. meta-tx-heavy accounts). The
+                // meta-tx scan already walks the right tx_rows — merge those
+                // rows so MetaTxs ⊆ Calls stays visible.
+                if self.address.context != Some(address) || calls.is_empty() {
+                    return;
+                }
+                let mut merged = std::mem::take(&mut self.address.calls.items);
+                merged.extend(calls);
+                self.address.calls.items =
+                    crate::data::types::deduplicate_contract_calls(merged);
+                self.address
+                    .calls
+                    .items
+                    .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                if self.address.calls.state.selected().is_none()
+                    && !self.address.calls.items.is_empty()
+                {
+                    self.address.calls.select_first();
+                }
+                // Persist the merged set so it survives restarts.
+                let _ = self.action_tx.send(Action::PersistAddressCalls {
+                    address,
+                    calls: self.address.calls.items.clone(),
+                });
+            }
             Action::AddressBalancesLoaded { address, balances } => {
                 if self.address.context == Some(address) {
                     // Balances can beat the nonce/class_hash fetch to the UI —

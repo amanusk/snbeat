@@ -3118,11 +3118,21 @@ pub(super) async fn fetch_address_meta_txs(
 
     let summaries = derive_meta_txs_from_page(address, &outcome.page, abi_reg).await;
 
+    // Plan §2: the meta-tx scan's tx_rows are also valuable Calls rows — every
+    // `execute_from_outside(intender=ADDR)` tx is an outer invoke whose
+    // multicall calls ADDR. Dune alone caps at 500 rows (collapses hard after
+    // tx_hash dedup for meta-tx-heavy accounts), so merging the shared page's
+    // call-shaped projection is what keeps the MetaTxs ⊆ Calls invariant
+    // visible on high-volume accounts.
+    let calls_from_page =
+        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg).await;
+
     info!(
         addr = %format!("{:#x}", address),
         events = outcome.page.events.len(),
         candidates = outcome.page.tx_rows.len(),
         meta_txs = summaries.len(),
+        supplementary_calls = calls_from_page.len(),
         min_searched = outcome.min_searched,
         max_searched = outcome.max_searched,
         floor = from_block,
@@ -3133,6 +3143,13 @@ pub(super) async fn fetch_address_meta_txs(
 
     if !summaries.is_empty() {
         ds.save_meta_txs(&address, &summaries);
+    }
+
+    if !calls_from_page.is_empty() {
+        let _ = action_tx.send(Action::AddressCallsMerged {
+            address,
+            calls: calls_from_page,
+        });
     }
 
     // Signal "has more older" via Some(min_searched). The UI doesn't interpret

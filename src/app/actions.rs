@@ -187,6 +187,17 @@ pub enum Action {
         address: Felt,
         calls: Vec<ContractCallSummary>,
     },
+    /// Supplementary Calls rows derived from a pf-query tx_rows scan (plan §2).
+    ///
+    /// The meta-tx keyed-event scan walks the same tx_rows the Calls tab needs
+    /// — every row is a tx that called this address via `execute_from_outside`.
+    /// Dune is still the completeness authority (LIMIT 500 after dedup), but
+    /// merging these rows closes the invariant gap where MetaTxs (keyed,
+    /// unbounded) could exceed Calls (Dune-only, capped).
+    AddressCallsMerged {
+        address: Felt,
+        calls: Vec<ContractCallSummary>,
+    },
     /// Older blocks loaded (appended to block list).
     OlderBlocksLoaded(Vec<SnBlock>),
     /// More address transactions loaded (appended to address tx list).
