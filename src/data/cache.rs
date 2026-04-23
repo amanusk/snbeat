@@ -130,6 +130,10 @@ impl CachingDataSource {
                 address TEXT PRIMARY KEY,
                 total_known INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS address_activity_total (
+                address TEXT PRIMARY KEY,
+                total_known INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS contract_events (
                 address TEXT NOT NULL,
                 event_index INTEGER NOT NULL,
