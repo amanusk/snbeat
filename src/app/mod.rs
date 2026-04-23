@@ -1476,7 +1476,7 @@ impl App {
                         timestamp: 0,
                         total_fee_fri: 0,
                         status: "OK".to_string(), // events only fire for successful txs
-                        nonce: None, // filled in by EnrichAddressCalls
+                        nonce: None,              // filled in by EnrichAddressCalls
                         tip: 0,
                     };
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
