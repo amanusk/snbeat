@@ -7,9 +7,16 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::Shared;
-use rusqlite::{Connection, params};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
 use starknet::core::types::{ContractClass, Felt};
 use tracing::{debug, trace, warn};
+
+/// Alias so call sites read cleanly. r2d2 reuses the same `rusqlite::Connection`
+/// type under the hood — `PooledConnection` derefs to `&Connection` (reads) and
+/// `DerefMut` to `&mut Connection` (needed for `.transaction()`).
+type DbPool = Pool<SqliteConnectionManager>;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -32,33 +39,36 @@ type SharedRxFut =
 /// trip, not N. Prevents the user-click-races-background-enrichment storm.
 pub struct CachingDataSource {
     upstream: Arc<dyn DataSource>,
-    db: Mutex<Connection>,
+    db: DbPool,
     pending_txs: Mutex<HashMap<Felt, SharedTxFut>>,
     pending_receipts: Mutex<HashMap<Felt, SharedRxFut>>,
 }
 
 impl CachingDataSource {
     pub fn new(upstream: Arc<dyn DataSource>, cache_path: &Path) -> Result<Self> {
-        let db = Connection::open(cache_path)
+        // r2d2 pool over SqliteConnectionManager. Each connection is configured
+        // the same way via `with_init`: WAL for concurrent readers + fast writer,
+        // synchronous=NORMAL to skip WAL-checkpoint fsyncs (cache rows are
+        // rebuildable from RPC, so a torn WAL on power-loss costs us re-fetches,
+        // not integrity), and temp_store=MEMORY so sort/hash spill stays in RAM.
+        let manager = SqliteConnectionManager::file(cache_path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL; \
+                 PRAGMA synchronous = NORMAL; \
+                 PRAGMA temp_store = MEMORY; \
+                 PRAGMA busy_timeout = 5000;",
+            )
+        });
+        // 8 connections: enough for the observed concurrency (one UI-thread
+        // reader + one WS writer + a handful of background enrichment tasks),
+        // without pinning a ton of file handles on idle users.
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)
+            .map_err(|e| SnbeatError::Config(format!("Failed to build cache db pool: {e}")))?;
+        let db = pool
+            .get()
             .map_err(|e| SnbeatError::Config(format!("Failed to open cache db: {e}")))?;
-
-        // WAL + synchronous=NORMAL:
-        //   - WAL lets readers proceed while a writer is mid-transaction (vs
-        //     the default rollback journal, which takes a reserved lock that
-        //     blocks concurrent readers on the same connection pool).
-        //   - NORMAL skips the extra fsync at WAL checkpoint boundaries.
-        //     Safe here because cache rows are fully rebuildable from RPC on
-        //     restart — a torn WAL at power-loss costs us a re-fetch, not
-        //     data integrity. `temp_store=MEMORY` keeps sort/hash spill buffers
-        //     off disk.
-        // These pragmas are persistent for WAL (stored in the DB header) but
-        // cheap to re-apply on every open, so we always set them.
-        db.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| SnbeatError::Config(format!("Failed to enable WAL: {e}")))?;
-        db.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| SnbeatError::Config(format!("Failed to set synchronous=NORMAL: {e}")))?;
-        db.pragma_update(None, "temp_store", "MEMORY")
-            .map_err(|e| SnbeatError::Config(format!("Failed to set temp_store=MEMORY: {e}")))?;
 
         // Create tables
         db.execute_batch(
@@ -254,16 +264,17 @@ impl CachingDataSource {
             debug!("Migration v6: split address_search_progress by filter_kind");
         }
 
+        drop(db);
         Ok(Self {
             upstream,
-            db: Mutex::new(db),
+            db: pool,
             pending_txs: Mutex::new(HashMap::new()),
             pending_receipts: Mutex::new(HashMap::new()),
         })
     }
 
     fn get_cached_block(&self, number: u64) -> Option<SnBlock> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let mut stmt = db
             .prepare("SELECT data FROM blocks WHERE number = ?1")
             .ok()?;
@@ -273,7 +284,7 @@ impl CachingDataSource {
 
     fn cache_block(&self, block: &SnBlock) {
         if let Ok(json) = serde_json::to_string(block) {
-            if let Ok(db) = self.db.lock() {
+            if let Ok(db) = self.db.get() {
                 let _ = db.execute(
                     "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
                     params![block.number, json],
@@ -292,7 +303,7 @@ impl CachingDataSource {
 
     fn get_cached_block_with_txs(&self, number: u64) -> Option<(SnBlock, Vec<SnTransaction>)> {
         let block = self.get_cached_block(number)?;
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let mut stmt = db
             .prepare(
                 "SELECT data FROM block_transactions WHERE block_number = ?1 ORDER BY tx_index",
@@ -316,7 +327,7 @@ impl CachingDataSource {
 
     fn cache_block_with_txs(&self, block: &SnBlock, txs: &[SnTransaction]) {
         self.cache_block(block);
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let tx_db = match db.transaction() {
                 Ok(t) => t,
                 Err(e) => {
@@ -345,7 +356,7 @@ impl CachingDataSource {
     }
 
     fn get_cached_transaction(&self, hash: Felt) -> Option<SnTransaction> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let hash_hex = format!("{:#x}", hash);
         let mut stmt = db
             .prepare("SELECT data FROM transactions WHERE hash = ?1")
@@ -356,7 +367,7 @@ impl CachingDataSource {
 
     fn cache_transaction(&self, tx: &SnTransaction) {
         if let Ok(json) = serde_json::to_string(tx) {
-            if let Ok(db) = self.db.lock() {
+            if let Ok(db) = self.db.get() {
                 let hash_hex = format!("{:#x}", tx.hash());
                 let _ = db.execute(
                     "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
@@ -367,7 +378,7 @@ impl CachingDataSource {
     }
 
     fn get_cached_address_events(&self, address: &Felt) -> Vec<SnEvent> {
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
@@ -388,7 +399,7 @@ impl CachingDataSource {
     }
 
     fn save_address_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx = match db.transaction() {
                 Ok(t) => t,
@@ -443,7 +454,7 @@ impl CachingDataSource {
     }
 
     fn get_cached_receipt(&self, hash: Felt) -> Option<SnReceipt> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let hash_hex = format!("{:#x}", hash);
         let mut stmt = db
             .prepare("SELECT data FROM receipts WHERE tx_hash = ?1")
@@ -454,7 +465,7 @@ impl CachingDataSource {
 
     fn cache_receipt(&self, receipt: &SnReceipt) {
         if let Ok(json) = serde_json::to_string(receipt) {
-            if let Ok(db) = self.db.lock() {
+            if let Ok(db) = self.db.get() {
                 let hash_hex = format!("{:#x}", receipt.transaction_hash);
                 let _ = db.execute(
                     "INSERT OR REPLACE INTO receipts (tx_hash, data) VALUES (?1, ?2)",
@@ -467,7 +478,7 @@ impl CachingDataSource {
     // --- class_hash cache ---
 
     fn get_cached_class_hash(&self, address: &Felt) -> Option<(Felt, u64)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare("SELECT class_hash, fetched_at_block FROM class_hashes WHERE address = ?1")
@@ -482,7 +493,7 @@ impl CachingDataSource {
     }
 
     fn cache_class_hash(&self, address: &Felt, class_hash: &Felt, block: u64) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let ch_hex = format!("{:#x}", class_hash);
             let _ = db.execute(
@@ -495,7 +506,7 @@ impl CachingDataSource {
     // --- block_by_hash cache ---
 
     fn get_cached_block_number_by_hash(&self, hash: &Felt) -> Option<u64> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let hash_hex = format!("{:#x}", hash);
         let mut stmt = db
             .prepare("SELECT number FROM block_hash_index WHERE hash = ?1")
@@ -508,7 +519,7 @@ impl CachingDataSource {
     }
 
     fn cache_block_hash(&self, hash: &Felt, number: u64) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let hash_hex = format!("{:#x}", hash);
             let _ = db.execute(
                 "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
@@ -520,7 +531,7 @@ impl CachingDataSource {
     // --- deploy info cache ---
 
     fn get_cached_deploy_info(&self, address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare(
@@ -548,7 +559,7 @@ impl CachingDataSource {
         block: u64,
         deployer: Option<&Felt>,
     ) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx_hex = format!("{:#x}", tx_hash);
             let deployer_hex = deployer.map(|d| format!("{:#x}", d));
@@ -562,7 +573,7 @@ impl CachingDataSource {
     // --- nonce cache ---
 
     fn get_cached_nonce_info(&self, address: &Felt) -> Option<(Felt, u64)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare("SELECT nonce, block_number FROM cached_nonces WHERE address = ?1")
@@ -577,7 +588,7 @@ impl CachingDataSource {
     }
 
     fn cache_nonce_info(&self, address: &Felt, nonce: &Felt, block: u64) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let nonce_hex = format!("{:#x}", nonce);
             let _ = db.execute(
@@ -594,7 +605,7 @@ impl CachingDataSource {
         address: &Felt,
         filter_kind: FilterKind,
     ) -> Option<(u64, u64)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare(
@@ -617,7 +628,7 @@ impl CachingDataSource {
         min_block: u64,
         max_block: u64,
     ) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             // Merge: expand existing range for this (address, filter_kind) row.
             let existing = db
@@ -654,7 +665,7 @@ impl CachingDataSource {
     }
 
     fn get_cached_activity_total(&self, address: &Felt) -> Option<u64> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare("SELECT total_known FROM address_activity_total WHERE address = ?1")
@@ -665,7 +676,7 @@ impl CachingDataSource {
     }
 
     fn cache_activity_total(&self, address: &Felt, total: u64) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let _ = db.execute(
                 "INSERT OR REPLACE INTO address_activity_total (address, total_known) VALUES (?1, ?2)",
@@ -677,7 +688,7 @@ impl CachingDataSource {
     // --- contract events cache ---
 
     fn load_contract_events(&self, address: &Felt) -> Vec<SnEvent> {
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
@@ -698,7 +709,7 @@ impl CachingDataSource {
     }
 
     fn save_contract_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx = match db.transaction() {
                 Ok(t) => t,
@@ -943,7 +954,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_address_txs(&self, address: &Felt) -> Vec<AddressTxSummary> {
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
@@ -963,7 +974,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_txs(&self, address: &Felt, txs: &[AddressTxSummary]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx_db = match db.transaction() {
                 Ok(t) => t,
@@ -991,7 +1002,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_address_calls(&self, address: &Felt) -> Vec<ContractCallSummary> {
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
@@ -1012,7 +1023,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_calls(&self, address: &Felt, calls: &[ContractCallSummary]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx = match db.transaction() {
                 Ok(t) => t,
@@ -1040,7 +1051,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_meta_txs(&self, address: &Felt) -> Vec<MetaTxIntenderSummary> {
-        let db = match self.db.lock() {
+        let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
@@ -1061,7 +1072,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_meta_txs(&self, address: &Felt, txs: &[MetaTxIntenderSummary]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let tx_db = match db.transaction() {
                 Ok(t) => t,
@@ -1092,7 +1103,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_activity_range_with_count(&self, address: &Felt) -> Option<(u64, u64, u64)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1116,7 +1127,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_activity_range_any_age(&self, address: &Felt) -> Option<(u64, u64, u64)> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
             .prepare(
@@ -1144,7 +1155,7 @@ impl DataSource for CachingDataSource {
         max_block: u64,
         event_count: u64,
     ) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let addr_hex = format!("{:#x}", address);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1326,7 +1337,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_class_declaration(&self, class_hash: &Felt) -> Option<ClassDeclareInfo> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let hash_hex = format!("{:#x}", class_hash);
         let mut stmt = db
             .prepare(
@@ -1355,7 +1366,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_class_declaration(&self, class_hash: &Felt, info: &ClassDeclareInfo) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(db) = self.db.get() {
             let hash_hex = format!("{:#x}", class_hash);
             let tx_hex = format!("{:#x}", info.tx_hash);
             let sender_hex = format!("{:#x}", info.sender);
@@ -1375,7 +1386,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_cached_class_contracts(&self, class_hash: &Felt) -> Option<Vec<ClassContractEntry>> {
-        let db = self.db.lock().ok()?;
+        let db = self.db.get().ok()?;
         let hash_hex = format!("{:#x}", class_hash);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1419,7 +1430,7 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_class_contracts(&self, class_hash: &Felt, contracts: &[ClassContractEntry]) {
-        if let Ok(mut db) = self.db.lock() {
+        if let Ok(mut db) = self.db.get() {
             let hash_hex = format!("{:#x}", class_hash);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
