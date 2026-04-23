@@ -42,6 +42,24 @@ impl CachingDataSource {
         let db = Connection::open(cache_path)
             .map_err(|e| SnbeatError::Config(format!("Failed to open cache db: {e}")))?;
 
+        // WAL + synchronous=NORMAL:
+        //   - WAL lets readers proceed while a writer is mid-transaction (vs
+        //     the default rollback journal, which takes a reserved lock that
+        //     blocks concurrent readers on the same connection pool).
+        //   - NORMAL skips the extra fsync at WAL checkpoint boundaries.
+        //     Safe here because cache rows are fully rebuildable from RPC on
+        //     restart — a torn WAL at power-loss costs us a re-fetch, not
+        //     data integrity. `temp_store=MEMORY` keeps sort/hash spill buffers
+        //     off disk.
+        // These pragmas are persistent for WAL (stored in the DB header) but
+        // cheap to re-apply on every open, so we always set them.
+        db.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| SnbeatError::Config(format!("Failed to enable WAL: {e}")))?;
+        db.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| SnbeatError::Config(format!("Failed to set synchronous=NORMAL: {e}")))?;
+        db.pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|e| SnbeatError::Config(format!("Failed to set temp_store=MEMORY: {e}")))?;
+
         // Create tables
         db.execute_batch(
             "
