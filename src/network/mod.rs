@@ -13,6 +13,7 @@ mod address;
 mod block;
 mod class;
 pub mod dune;
+pub mod event_window;
 pub mod helpers;
 pub mod prices;
 mod search;
