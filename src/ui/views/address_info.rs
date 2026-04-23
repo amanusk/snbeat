@@ -605,10 +605,12 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("    Sender              ", theme::SUGGESTION_STYLE),
+        Span::styled("    Sender                   ", theme::SUGGESTION_STYLE),
         Span::styled("Function             ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
+        Span::styled("Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
+        Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
@@ -639,8 +641,8 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|call| {
             let sender_label = app.format_address(&call.sender);
-            let sender_display = if sender_label.chars().count() > 20 {
-                let truncated: String = sender_label.chars().take(19).collect();
+            let sender_display = if sender_label.chars().count() > 25 {
+                let truncated: String = sender_label.chars().take(24).collect();
                 format!("{truncated}…")
             } else {
                 sender_label
@@ -654,6 +656,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             let fee_str = format_strk_u128(call.total_fee_fri)
                 .trim_end_matches(" STRK")
                 .to_string();
+            let nonce_str = match call.nonce {
+                Some(n) => n.to_string(),
+                None => "—".to_string(),
+            };
+            let tip_str = if call.tip > 0 {
+                format_fri(call.tip as u128)
+            } else {
+                "0".to_string()
+            };
             let status_style = match call.status.as_str() {
                 "OK" => theme::STATUS_OK,
                 "REV" => theme::STATUS_REVERTED,
@@ -661,13 +672,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let line = Line::from(vec![
-                Span::styled(format!(" {:<20}", sender_display), theme::LABEL_STYLE),
+                Span::styled(format!(" {:<25} ", sender_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<21}", func), theme::LABEL_STYLE),
                 Span::styled(
                     format!("{:<14}", short_hash(&call.tx_hash)),
                     theme::TX_HASH_STYLE,
                 ),
+                Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+                Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
                 Span::styled(
                     format!("#{:<9}", call.block_number),
                     theme::BLOCK_NUMBER_STYLE,

@@ -245,6 +245,14 @@ pub enum Action {
         address: Felt,
         decoded_event: DecodedEvent,
     },
+    /// Cached events decoded off the critical path. Emitted by a spawned task
+    /// after `AddressInfoLoaded` so the initial UI paint doesn't block on
+    /// per-event ABI fetches. Replaces the events list iff non-empty and the
+    /// address context still matches.
+    AddressEventsCacheLoaded {
+        address: Felt,
+        decoded_events: Vec<DecodedEvent>,
+    },
     /// Dune activity probe result delivered to UI for pagination window sizing.
     AddressProbeLoaded {
         address: Felt,

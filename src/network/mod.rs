@@ -72,7 +72,9 @@ pub async fn run_network_task(
 
         // Spawn each request as a separate task for concurrency
         tokio::spawn(async move {
+            let cancel_inner = cancel.clone();
             let task = async move {
+                let cancel = cancel_inner;
                 match action {
                     Action::FetchRecentBlocks { count } => {
                         let start = std::time::Instant::now();
@@ -132,7 +134,7 @@ pub async fn run_network_task(
                     Action::FetchAddressInfo { address } => {
                         let _ = tx.send(Action::NavigateToAddress { address });
                         address::fetch_and_send_address_info(
-                            address, &ds, &abi_reg, &dune, &pf, &voyager, &tx,
+                            address, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
                         )
                         .await;
                     }
@@ -205,8 +207,10 @@ pub async fn run_network_task(
                         }
                     }
                     Action::ResolveSearch { query } => {
-                        search::resolve_search(query, &ds, &abi_reg, &dune, &pf, &voyager, &tx)
-                            .await;
+                        search::resolve_search(
+                            query, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
+                        )
+                        .await;
                     }
                     Action::EnrichAddressTxs { address, hashes } => {
                         address::enrich_address_txs(

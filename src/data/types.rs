@@ -318,6 +318,13 @@ pub struct ContractCallSummary {
     pub timestamp: u64,
     pub total_fee_fri: u128,
     pub status: String,
+    /// Sender tx nonce. `None` from Dune-sourced rows (not in `starknet.calls`);
+    /// populated from RPC/pf-query rows and merged in by `deduplicate_contract_calls`.
+    #[serde(default)]
+    pub nonce: Option<u64>,
+    /// Sender tip (FRI). `0` from Dune-sourced rows and stubs; filled by RPC/pf path.
+    #[serde(default)]
+    pub tip: u64,
 }
 
 /// Label information fetched from Voyager for a contract/account address.
@@ -376,6 +383,12 @@ pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<Contra
             }
             if existing.timestamp == 0 && call.timestamp > 0 {
                 existing.timestamp = call.timestamp;
+            }
+            if existing.nonce.is_none() && call.nonce.is_some() {
+                existing.nonce = call.nonce;
+            }
+            if existing.tip == 0 && call.tip > 0 {
+                existing.tip = call.tip;
             }
         } else {
             seen.insert(call.tx_hash, result.len());

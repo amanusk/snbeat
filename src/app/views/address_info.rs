@@ -370,6 +370,24 @@ impl AddressInfoState {
         }
     }
 
+    /// Merge incoming contract calls into the existing list and sort by block
+    /// number descending. `deduplicate_contract_calls` does the field-level
+    /// merge so a later-arriving Dune row can still contribute richer
+    /// function_name/fee data to a pf-query row with the same tx_hash (and
+    /// vice-versa). Callers are responsible for follow-up work (selection,
+    /// cursor updates, persistence).
+    pub fn merge_calls(&mut self, incoming: Vec<ContractCallSummary>) {
+        if incoming.is_empty() {
+            return;
+        }
+        let mut merged = std::mem::take(&mut self.calls.items);
+        merged.extend(incoming);
+        self.calls.items = crate::data::types::deduplicate_contract_calls(merged);
+        self.calls
+            .items
+            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+    }
+
     /// Scan the current tx list for a "large" nonce gap that we want to defer
     /// filling until the user asks for it.
     ///

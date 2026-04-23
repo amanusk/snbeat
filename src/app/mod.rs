@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::data::types::{AddressTxSummary, SnBlock, VoyagerLabelInfo};
 use crate::network::prices::PriceClient;
@@ -269,7 +270,7 @@ impl App {
     pub fn go_to_root_or_quit(&mut self) {
         if self.view_stack.len() > 1 {
             // Unsubscribe from any active address WS subscription
-            if self.view_stack.iter().any(|v| *v == View::AddressInfo) {
+            if self.view_stack.contains(&View::AddressInfo) {
                 self.unsubscribe_current_address();
             }
             self.view_stack.truncate(1);
@@ -996,14 +997,7 @@ impl App {
                 // (joined), fills missing fee/timestamp, and preserves the
                 // superset — so neither source can hide the other's data.
                 if !contract_calls.is_empty() {
-                    let mut merged = std::mem::take(&mut self.address.calls.items);
-                    merged.extend(contract_calls);
-                    self.address.calls.items =
-                        crate::data::types::deduplicate_contract_calls(merged);
-                    self.address
-                        .calls
-                        .items
-                        .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                    self.address.merge_calls(contract_calls);
                     if self.address.calls.state.selected().is_none()
                         && !self.address.calls.items.is_empty()
                     {
@@ -1101,23 +1095,10 @@ impl App {
                 if self.address.context == Some(address) {
                     let tx_summaries = self.filter_deployment_txs(address, tx_summaries);
                     self.address.merge_tx_summaries(tx_summaries);
-                    // Merge contract calls across sources (Dune + pf-query).
-                    // See the AddressInfoLoaded handler above for the full
-                    // rationale — `deduplicate_contract_calls` does the
-                    // field-level merge so a later-arriving Dune row can
-                    // still contribute its richer function_name/fee data
-                    // to an already-rendered pf-query row with the same
-                    // tx_hash (and vice-versa).
-                    if !contract_calls.is_empty() {
-                        let mut merged = std::mem::take(&mut self.address.calls.items);
-                        merged.extend(contract_calls);
-                        self.address.calls.items =
-                            crate::data::types::deduplicate_contract_calls(merged);
-                        self.address
-                            .calls
-                            .items
-                            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
-                    }
+                    // Merge contract calls across sources (Dune + pf-query) —
+                    // see `merge_calls` for why this is a field-level merge
+                    // rather than a hash-based replace.
+                    self.address.merge_calls(contract_calls);
                     self.address.oldest_event_block = Some(oldest_block);
                     self.address.dune_cursor_block = Some(oldest_block);
                     self.address.rpc_cursor_block = Some(oldest_block);
@@ -1227,12 +1208,15 @@ impl App {
                             timestamp: m.timestamp,
                             total_fee_fri: m.total_fee_fri,
                             status: m.status,
+                            nonce: None,
+                            tip: 0,
                         })
                         .collect();
                     if !promoted.is_empty() {
-                        let _ = self
-                            .action_tx
-                            .send(Action::AddressCallsMerged { address, calls: promoted });
+                        let _ = self.action_tx.send(Action::AddressCallsMerged {
+                            address,
+                            calls: promoted,
+                        });
                     }
                 }
             }
@@ -1349,6 +1333,14 @@ impl App {
                 complete,
             } => {
                 if self.address.context != Some(address) {
+                    debug!(
+                        address = %format!("{:#x}", address),
+                        source = ?source,
+                        tx_summaries = tx_summaries.len(),
+                        complete,
+                        current_context = ?self.address.context.map(|c| format!("{:#x}", c)),
+                        "AddressTxsStreamed dropped: stale context"
+                    );
                     return;
                 }
                 let old_deploy_hash = self.address.deployment.as_ref().map(|d| d.hash);
@@ -1413,6 +1405,12 @@ impl App {
                 // Track source completion
                 if complete {
                     self.address.sources_pending.remove(&source);
+                    debug!(
+                        address = %format!("{:#x}", address),
+                        source = ?source,
+                        sources_pending = ?self.address.sources_pending,
+                        "AddressTxsStreamed source completed"
+                    );
                     if self.address.sources_pending.is_empty() {
                         self.is_loading = false;
                         self.loading_detail = None;
@@ -1478,6 +1476,8 @@ impl App {
                         timestamp: 0,
                         total_fee_fri: 0,
                         status: "OK".to_string(), // events only fire for successful txs
+                        nonce: None, // filled in by EnrichAddressCalls
+                        tip: 0,
                     };
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
                         address,
@@ -1549,6 +1549,27 @@ impl App {
                     self.address.events.select_first();
                 }
             }
+            Action::AddressEventsCacheLoaded {
+                address,
+                decoded_events,
+            } => {
+                // Deferred decode pass for the events cached at entry time.
+                // `fetch_and_send_address_info` now sends `AddressInfoLoaded`
+                // immediately with empty `decoded_events` so the TUI can drop
+                // the "Fetching address info…" spinner while this expensive
+                // per-event ABI decode runs in a background task.
+                if self.address.context != Some(address) {
+                    return; // stale — user navigated away
+                }
+                if decoded_events.is_empty() {
+                    return;
+                }
+                let had_selection = self.address.events.state.selected().is_some();
+                self.address.events.items = decoded_events;
+                if !had_selection {
+                    self.address.events.select_first();
+                }
+            }
             Action::AddressCallsEnriched { address, calls } => {
                 if self.address.context != Some(address) {
                     return;
@@ -1577,6 +1598,12 @@ impl App {
                         if existing.status == "?" && enriched.status != "?" {
                             existing.status = enriched.status;
                         }
+                        if existing.nonce.is_none() && enriched.nonce.is_some() {
+                            existing.nonce = enriched.nonce;
+                        }
+                        if existing.tip == 0 && enriched.tip > 0 {
+                            existing.tip = enriched.tip;
+                        }
                     }
                 }
                 // Persist enriched calls to cache so they survive restarts
@@ -1597,14 +1624,7 @@ impl App {
                 if self.address.context != Some(address) || calls.is_empty() {
                     return;
                 }
-                let mut merged = std::mem::take(&mut self.address.calls.items);
-                merged.extend(calls);
-                self.address.calls.items =
-                    crate::data::types::deduplicate_contract_calls(merged);
-                self.address
-                    .calls
-                    .items
-                    .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                self.address.merge_calls(calls);
                 if self.address.calls.state.selected().is_none()
                     && !self.address.calls.items.is_empty()
                 {

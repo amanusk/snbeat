@@ -11,6 +11,8 @@ fn make_call(tx_hash: u64, sender: u64, function_name: &str, block: u64) -> Cont
         timestamp: block * 10,
         total_fee_fri: 0,
         status: "OK".into(),
+        nonce: None,
+        tip: 0,
     }
 }
 

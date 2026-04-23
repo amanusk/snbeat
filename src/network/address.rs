@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 
+use std::future::Future;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Caps concurrent RPC `get_transaction` / `get_receipt` calls fired from the
@@ -14,6 +16,24 @@ use tracing::{debug, info, warn};
 /// pf-query is unavailable (or didn't return the requested hash). User clicks
 /// bypass this semaphore entirely.
 static ENRICH_RPC_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+
+/// Spawn a detached sub-task that aborts when `cancel` fires. Used for every
+/// background task fanned out from `fetch_and_send_address_info` so that
+/// foreground navigation to a new address stops stale RPC/Dune/PF enrichment
+/// work piling up on shared clients.
+fn spawn_cancellable<F>(cancel: CancellationToken, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = fut => {}
+            _ = cancel.cancelled() => {
+                debug!("Address sub-task cancelled on navigation");
+            }
+        }
+    })
+}
 
 use crate::app::actions::{Action, Source};
 use crate::data::DataSource;
@@ -565,11 +585,9 @@ pub(super) async fn build_contract_calls_from_hashes(
     // these multicalls by `address` — the Calls row's `function_name` column
     // mirrors what the block and tx detail views show for the same tx, i.e.
     // the entire top-level endpoint list (see `helpers::format_endpoint_names`).
-    // For contracts called only internally (e.g. Ekubo Core via an aggregator)
-    // this surfaces the aggregator's outer function name, which is consistent
-    // with the rest of the UI and avoids needing `starknet_traceTransaction`.
-    helpers::prewarm_abis([address], abi_reg).await;
-
+    // For contracts called only internally (e.g. via an aggregator) this
+    // surfaces the aggregator's outer function name, which is consistent with
+    // the rest of the UI and avoids needing `starknet_traceTransaction`.
     let mut calls_list = Vec::new();
     for chunk in hashes_with_blocks.chunks(20) {
         let futs: Vec<_> = chunk
@@ -587,9 +605,10 @@ pub(super) async fn build_contract_calls_from_hashes(
             .collect();
         let results = futures::future::join_all(futs).await;
 
-        // Prewarm the ABIs for the top-level call targets we're about to
-        // format, otherwise `format_endpoint_names` would hit a cold registry
-        // for the aggregator/router contracts and fall back to hex.
+        // Prewarm `{address} ∪ multicall targets` in one pass. `address`
+        // covers direct calls to the inspected contract; the multicall
+        // targets cover aggregator/router routes that would otherwise hit a
+        // cold registry in `format_endpoint_names` and fall back to hex.
         let prewarm_targets: std::collections::HashSet<_> = results
             .iter()
             .filter_map(|(_, _, tx_r, _)| tx_r.as_ref().ok())
@@ -598,6 +617,7 @@ pub(super) async fn build_contract_calls_from_hashes(
                 _ => Vec::new(),
             })
             .map(|c| c.contract_address)
+            .chain(std::iter::once(address))
             .collect();
         helpers::prewarm_abis(prewarm_targets, abi_reg).await;
 
@@ -618,6 +638,7 @@ pub(super) async fn build_contract_calls_from_hashes(
                     .unwrap_or("?")
                     .to_string();
                 let function_name = helpers::format_endpoint_names(&fetched_tx, abi_reg);
+                let (nonce, tip) = helpers::extract_nonce_tip(&fetched_tx);
                 calls_list.push(crate::data::types::ContractCallSummary {
                     tx_hash: hash,
                     sender: fetched_tx.sender(),
@@ -626,6 +647,8 @@ pub(super) async fn build_contract_calls_from_hashes(
                     timestamp: 0,
                     total_fee_fri: fee_fri,
                     status,
+                    nonce: Some(nonce),
+                    tip,
                 });
             }
         }
@@ -702,6 +725,8 @@ pub(super) async fn build_contract_calls_from_pf_rows(
             timestamp: row.block_timestamp,
             total_fee_fri: fee_fri,
             status: row.status.clone(),
+            nonce: row.nonce,
+            tip: row.tip,
         });
     }
 
@@ -720,6 +745,7 @@ pub(super) async fn fetch_and_send_address_info(
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_c: &Option<Arc<voyager::VoyagerClient>>,
     tx: &mpsc::UnboundedSender<Action>,
+    cancel: &CancellationToken,
 ) {
     let start = std::time::Instant::now();
     debug!(address = %format!("{:#x}", address), "Fetching address info");
@@ -729,7 +755,7 @@ pub(super) async fn fetch_and_send_address_info(
     {
         let ds_bal = Arc::clone(ds);
         let tx_bal = tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let balances = fetch_token_balances(address, &ds_bal).await;
             let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
         });
@@ -739,7 +765,7 @@ pub(super) async fn fetch_and_send_address_info(
     if let Some(vc) = voyager_c {
         let vc = Arc::clone(vc);
         let tx_v = tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             voyager::fetch_and_send_label(address, &vc, &tx_v).await;
         });
     }
@@ -778,7 +804,8 @@ pub(super) async fn fetch_and_send_address_info(
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         let addr = address;
-        tokio::spawn(async move {
+        let cancel_c = cancel.clone();
+        spawn_cancellable(cancel.clone(), async move {
             match pf_c.get_class_history(addr).await {
                 Ok(entries) => {
                     // Use earliest entry (deployment block) to find the deploy tx
@@ -786,10 +813,15 @@ pub(super) async fn fetch_and_send_address_info(
                         let deploy_block = deploy_entry.block_number;
                         let tx_c2 = tx_c.clone();
                         let ds_c2 = Arc::clone(&ds_c);
-                        tokio::spawn(async move {
+                        spawn_cancellable(cancel_c.clone(), async move {
                             find_deploy_tx(addr, deploy_block, &ds_c2, &tx_c2).await;
                         });
                     }
+                    debug!(
+                        address = %format!("{:#x}", addr),
+                        entries = entries.len(),
+                        "PF class history fetched"
+                    );
                     let _ = tx_c.send(Action::ClassHistoryLoaded {
                         address: addr,
                         entries,
@@ -821,29 +853,48 @@ pub(super) async fn fetch_and_send_address_info(
         sources: sources.clone(),
     });
 
-    // Send partial info immediately (cached txs seed the UI)
-    // Decode cached events so the Events tab renders instantly on revisit,
-    // mirroring the cache-first behaviour already in place for Txs/Calls.
-    // Live fetches downstream will emit AddressEventsStreamed with newer
-    // events; decoded_events here is the starting set the reducer can merge on.
+    // Send partial info immediately (cached txs seed the UI).
+    //
+    // The per-event ABI decode used to run inline here, gating the
+    // `AddressInfoLoaded` send on hundreds of `get_abi_for_address` calls
+    // (each potentially an RPC round-trip + SQLite cache mutex hop). Under
+    // any cache contention that loop could stretch to tens of seconds,
+    // keeping the "Fetching address info…" spinner up even though the
+    // tx/call caches were already in memory. Decode now runs in a
+    // background task; the Events tab renders when `AddressEventsCacheLoaded`
+    // arrives.
     let cached_events = ds.load_address_events(&address);
-    let mut cached_decoded = Vec::with_capacity(cached_events.len());
-    for event in &cached_events {
-        let abi = abi_reg.get_abi_for_address(&event.from_address).await;
-        cached_decoded.push(decode_event(event, abi.as_deref()));
-    }
     let _ = tx.send(Action::AddressInfoLoaded {
         info: crate::data::types::SnAddressInfo {
             address,
             nonce,
             class_hash,
-            recent_events: cached_events,
+            recent_events: cached_events.clone(),
             token_balances: Vec::new(),
         },
-        decoded_events: cached_decoded,
+        decoded_events: Vec::new(),
         tx_summaries: ds.load_cached_address_txs(&address),
         contract_calls: ds.load_cached_address_calls(&address),
     });
+
+    // Kick off the decode pass in the background. Cancellable so navigation
+    // away from this address doesn't leave the decoder chewing on a stale
+    // class-hash / ABI-fetch queue.
+    if !cached_events.is_empty() {
+        let abi_reg_c = Arc::clone(abi_reg);
+        let tx_c = tx.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            let mut decoded = Vec::with_capacity(cached_events.len());
+            for event in &cached_events {
+                let abi = abi_reg_c.get_abi_for_address(&event.from_address).await;
+                decoded.push(decode_event(event, abi.as_deref()));
+            }
+            let _ = tx_c.send(Action::AddressEventsCacheLoaded {
+                address,
+                decoded_events: decoded,
+            });
+        });
+    }
 
     // Seed the MetaTxs tab count from cache up-front, like `tx_summaries` /
     // `contract_calls` above. Previously the cache was only loaded when the
@@ -886,9 +937,8 @@ pub(super) async fn fetch_and_send_address_info(
         tokio::sync::watch::channel::<Option<dune::AddressActivityProbe>>(None);
     // Load cached range WITH event count for accurate density calculation
     let cached_range_with_count = ds.load_cached_activity_range_with_count(&address);
-    if cached_range.is_some() {
+    if let Some((min_b, max_b)) = cached_range {
         // Build probe from cache — no Dune query needed.
-        let (min_b, max_b) = cached_range.unwrap();
         let event_count = cached_range_with_count
             .map(|(_, _, c)| c)
             .filter(|&c| c > 1) // Ignore stale rows with placeholder count
@@ -898,13 +948,15 @@ pub(super) async fn fetch_and_send_address_info(
                 let span = max_b.saturating_sub(min_b).max(1);
                 (span / 100).max(100)
             });
-        let mut probe = dune::AddressActivityProbe::default();
-        probe.callee_min_block = min_b;
-        probe.callee_max_block = max_b;
         // Cached count is derived from Dune's events-from-address query, which
         // populates callee activity only. Sender tx totals come from the
         // on-chain nonce in the address info path; leave sender_* at 0.
-        probe.callee_call_count = event_count;
+        let probe = dune::AddressActivityProbe {
+            callee_min_block: min_b,
+            callee_max_block: max_b,
+            callee_call_count: event_count,
+            ..Default::default()
+        };
         // Publish to both the UI reducer (so the Calls tab can show its
         // `shown / known+` fragment on re-entry from cache) AND the watch
         // channel (for downstream task window sizing). Previously only the
@@ -928,7 +980,7 @@ pub(super) async fn fetch_and_send_address_info(
         let ds_probe = Arc::clone(ds);
         let tx_probe = tx.clone();
         let probe_watch_tx_c = probe_watch_tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             // Common post-success step: cache the discovered range, emit the
             // UI action, and publish on the watch channel so downstream tasks
             // can size their windows.
@@ -966,10 +1018,12 @@ pub(super) async fn fetch_and_send_address_info(
                         // `shown / cached_count+` during the delta probe than
                         // regress to a bare `Calls(N)` for the seconds it
                         // takes Dune to respond (or forever, if Dune fails).
-                        let mut stale_probe = dune::AddressActivityProbe::default();
-                        stale_probe.callee_min_block = cached_min;
-                        stale_probe.callee_max_block = cached_max;
-                        stale_probe.callee_call_count = cached_count;
+                        let stale_probe = dune::AddressActivityProbe {
+                            callee_min_block: cached_min,
+                            callee_max_block: cached_max,
+                            callee_call_count: cached_count,
+                            ..Default::default()
+                        };
                         let _ = tx_probe.send(Action::AddressProbeLoaded {
                             address,
                             probe: stale_probe.clone(),
@@ -990,12 +1044,13 @@ pub(super) async fn fetch_and_send_address_info(
                                 // expands, count sums. `save_activity_range_with_count`
                                 // also merges at the DB layer, but we need a
                                 // fully-populated probe to publish to the UI.
-                                let mut merged = dune::AddressActivityProbe::default();
-                                merged.callee_min_block = cached_min;
-                                merged.callee_max_block =
-                                    delta.callee_max_block.max(cached_max);
-                                merged.callee_call_count =
-                                    cached_count.saturating_add(delta.callee_call_count);
+                                let merged = dune::AddressActivityProbe {
+                                    callee_min_block: cached_min,
+                                    callee_max_block: delta.callee_max_block.max(cached_max),
+                                    callee_call_count: cached_count
+                                        .saturating_add(delta.callee_call_count),
+                                    ..Default::default()
+                                };
                                 publish(merged, "Dune probe (delta)");
                             }
                             Err(e) => {
@@ -1044,7 +1099,7 @@ pub(super) async fn fetch_and_send_address_info(
             let tx_a = tx.clone();
             let ds_a = Arc::clone(ds);
             let pf_ok = Arc::clone(&pf_succeeded);
-            tokio::spawn(async move {
+            spawn_cancellable(cancel.clone(), async move {
                 const PF_LIMIT: u32 = 200;
                 let _ = tx_a.send(Action::LoadingStatus("PF: fetching tx history...".into()));
                 match pf_c.get_sender_txs(address, PF_LIMIT).await {
@@ -1116,10 +1171,8 @@ pub(super) async fn fetch_and_send_address_info(
         let abi_b = Arc::clone(abi_reg);
         let dune_b = dune.as_ref().map(Arc::clone);
         let pf_b = pf.as_ref().map(Arc::clone);
-        tokio::spawn(async move {
-            let _ = tx_b.send(Action::LoadingStatus(
-                "Calls: fetching from Dune...".into(),
-            ));
+        spawn_cancellable(cancel.clone(), async move {
+            let _ = tx_b.send(Action::LoadingStatus("Calls: fetching from Dune...".into()));
             fetch_address_contract_calls(
                 address,
                 &ds_b,
@@ -1134,6 +1187,12 @@ pub(super) async fn fetch_and_send_address_info(
             // Stream completion marker so source tracking clears the loading
             // flag; tx_summaries is empty because Calls populate via
             // AddressInfoLoaded.contract_calls, not via AddressTxsStreamed.
+            debug!(
+                address = %format!("{:#x}", address),
+                source = ?Source::Dune,
+                tx_summaries = 0,
+                "AddressTxsStreamed dispatching complete marker"
+            );
             let _ = tx_b.send(Action::AddressTxsStreamed {
                 address,
                 source: Source::Dune,
@@ -1157,7 +1216,7 @@ pub(super) async fn fetch_and_send_address_info(
         const INITIAL_WINDOW: u64 = 5_000;
 
         // Account: windowed tx fetch
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let _ = tx_b.send(Action::LoadingStatus(
                 "Dune: fetching recent account txs...".into(),
             ));
@@ -1306,7 +1365,7 @@ pub(super) async fn fetch_and_send_address_info(
         let pf_c = pf.as_ref().map(Arc::clone);
         let mut probe_rx_c = probe_watch_rx.clone();
 
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let latest_block = ds_c.get_latest_block_number().await.unwrap_or(0);
 
             // --- Use cached search progress + nonce delta to narrow the window ---
@@ -1351,7 +1410,7 @@ pub(super) async fn fetch_and_send_address_info(
             let window_size = latest_block.saturating_sub(from_block);
             let _ = tx_c.send(Action::LoadingStatus(format!(
                 "RPC: scanning {}k blocks for events...",
-                (window_size + 999) / 1000
+                window_size.div_ceil(1000)
             )));
             // Phase 1 page limit is now managed inside the event_window helper
             // (`EVENT_PAGE_LIMIT` in event_window.rs). The old per-caller
@@ -1384,43 +1443,42 @@ pub(super) async fn fetch_and_send_address_info(
                 "Events scan".to_string(),
             );
             let ds_dyn: Arc<dyn crate::data::DataSource> = ds_c.clone();
-            let pf_page: Option<AddressActivityPage> = match crate::network::event_window::ensure_address_events_window(
-                address,
-                kind,
-                crate::network::event_window::EventWindowPolicy::TopDelta,
-                pf_c.as_ref(),
-                &ds_dyn,
-                latest_block,
-                0, // TopDelta doesn't scan old history; floor is unused.
-            )
-            .await
-            {
-                Ok(o) => {
-                    let _ = tx_c.send(Action::AddressEventWindowUpdated {
-                        address,
-                        min_searched: o.min_searched,
-                        max_searched: o.max_searched,
-                        deferred_gap: o.deferred_gap,
-                    });
-                    Some(o.page)
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        address = %format!("{:#x}", address),
-                        "event_window fetch failed in TASK C"
-                    );
-                    let _ = tx_c.send(Action::LoadingStatus(format!(
-                        "Event fetch failed: {}",
-                        e
-                    )));
-                    let _ = tx_c.send(Action::SourceUpdate {
-                        source: Source::Rpc,
-                        status: crate::app::state::SourceStatus::FetchError(e.to_string()),
-                    });
-                    None
-                }
-            };
+            let pf_page: Option<AddressActivityPage> =
+                match crate::network::event_window::ensure_address_events_window(
+                    address,
+                    kind,
+                    crate::network::event_window::EventWindowPolicy::TopDelta,
+                    pf_c.as_ref(),
+                    &ds_dyn,
+                    latest_block,
+                    0, // TopDelta doesn't scan old history; floor is unused.
+                )
+                .await
+                {
+                    Ok(o) => {
+                        let _ = tx_c.send(Action::AddressEventWindowUpdated {
+                            address,
+                            min_searched: o.min_searched,
+                            max_searched: o.max_searched,
+                            deferred_gap: o.deferred_gap,
+                        });
+                        Some(o.page)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            address = %format!("{:#x}", address),
+                            "event_window fetch failed in TASK C"
+                        );
+                        let _ =
+                            tx_c.send(Action::LoadingStatus(format!("Event fetch failed: {}", e)));
+                        let _ = tx_c.send(Action::SourceUpdate {
+                            source: Source::Rpc,
+                            status: crate::app::state::SourceStatus::FetchError(e.to_string()),
+                        });
+                        None
+                    }
+                };
 
             let events = pf_page
                 .as_ref()
@@ -1812,6 +1870,12 @@ pub(super) async fn fetch_and_send_address_info(
             }
 
             // RPC task complete
+            debug!(
+                address = %format!("{:#x}", address),
+                source = ?Source::Rpc,
+                tx_summaries = 0,
+                "AddressTxsStreamed dispatching complete marker"
+            );
             let _ = tx_c.send(Action::AddressTxsStreamed {
                 address,
                 source: Source::Rpc,
@@ -2456,13 +2520,15 @@ pub(super) async fn fetch_more_address_txs(
     let cached = ds.load_cached_activity_range(&address);
     let window_size = if let Some((min_b, max_b)) = cached {
         // Build a lightweight probe to compute recommended_window
-        let mut p = dune::AddressActivityProbe::default();
-        p.sender_min_block = min_b;
-        p.sender_max_block = max_b;
-        p.callee_min_block = min_b;
-        p.callee_max_block = max_b;
-        p.sender_tx_count = 1;
-        p.callee_call_count = 1;
+        let p = dune::AddressActivityProbe {
+            sender_min_block: min_b,
+            sender_max_block: max_b,
+            callee_min_block: min_b,
+            callee_max_block: max_b,
+            sender_tx_count: 1,
+            callee_call_count: 1,
+            ..Default::default()
+        };
         p.recommended_window()
     } else {
         50_000u64
@@ -2796,6 +2862,9 @@ pub(super) async fn enrich_dune_calls(
             if let Some(call) = chunk.iter_mut().find(|c| c.tx_hash == hash) {
                 if let Ok(ref fetched_tx) = tx_result {
                     call.sender = fetched_tx.sender();
+                    let (nonce, tip) = helpers::extract_nonce_tip(fetched_tx);
+                    call.nonce = Some(nonce);
+                    call.tip = tip;
                 }
                 if let Ok(receipt) = rx_result {
                     call.total_fee_fri = felt_to_u128(&receipt.actual_fee);

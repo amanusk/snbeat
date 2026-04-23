@@ -194,6 +194,8 @@ impl DuneClient {
                     timestamp: block_time,
                     total_fee_fri: 0, // Not in calls table
                     status,
+                    nonce: None, // Not in calls table — merged in from RPC/pf path
+                    tip: 0,
                 })
             })
             .collect())
@@ -313,6 +315,8 @@ impl DuneClient {
                     timestamp: block_time,
                     total_fee_fri: 0,
                     status,
+                    nonce: None,
+                    tip: 0,
                 })
             })
             .collect())
