@@ -1258,7 +1258,12 @@ async fn handler_contract_events(
         })
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join error: {e}"),
+        )
+    })??;
 
     Ok(Json(response))
 }
@@ -1315,14 +1320,16 @@ async fn handler_contract_event_count(
         let effective_to = to_block_param.unwrap_or(latest_block).min(latest_block);
 
         if from_block > effective_to {
-            return Ok::<ContractEventCountResponse, (StatusCode, String)>(ContractEventCountResponse {
-                count: 0,
-                min_block: None,
-                max_block: None,
-                complete: true,
-                scanned_from: from_block,
-                scanned_to: effective_to,
-            });
+            return Ok::<ContractEventCountResponse, (StatusCode, String)>(
+                ContractEventCountResponse {
+                    count: 0,
+                    min_block: None,
+                    max_block: None,
+                    complete: true,
+                    scanned_from: from_block,
+                    scanned_to: effective_to,
+                },
+            );
         }
 
         let max_bloom_covered: Option<u64> = conn
@@ -1435,7 +1442,12 @@ async fn handler_contract_event_count(
         })
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))??;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join error: {e}"),
+        )
+    })??;
 
     Ok(Json(response))
 }

@@ -107,10 +107,7 @@ pub trait DataSource: Send + Sync {
     /// (the deploy/first-activity floor never regresses), so we can avoid
     /// re-probing the entire history and only extend `max_block` + count
     /// from the cached high-water mark.
-    fn load_cached_activity_range_any_age(
-        &self,
-        _address: &Felt,
-    ) -> Option<(u64, u64, u64)> {
+    fn load_cached_activity_range_any_age(&self, _address: &Felt) -> Option<(u64, u64, u64)> {
         None
     }
     /// Save discovered activity range for an address.

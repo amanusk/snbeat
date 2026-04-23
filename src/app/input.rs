@@ -603,7 +603,7 @@ fn handle_nonce_cycle(app: &mut App, direction: i64) -> Option<Action> {
     app.clear_tx_detail();
     Some(Action::FetchTxByNonce {
         sender,
-        current_nonce: current_nonce,
+        current_nonce,
         direction,
     })
 }

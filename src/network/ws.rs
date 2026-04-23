@@ -1104,10 +1104,7 @@ mod tests {
         }
 
         let ws_event = actions.iter().find_map(|a| match a {
-            Action::AddressWsEvent {
-                address: ca,
-                event,
-            } if *ca == address => Some(event),
+            Action::AddressWsEvent { address: ca, event } if *ca == address => Some(event),
             _ => None,
         });
         let ev = ws_event.expect("TRANSACTION_EXECUTED must emit AddressWsEvent");
@@ -1117,10 +1114,7 @@ mod tests {
             "first key must be TRANSACTION_EXECUTED selector so the reducer \
              dispatches ClassifyPotentialMetaTx"
         );
-        assert_eq!(
-            ev.transaction_hash,
-            Felt::from_hex_unchecked(tx_hash_hex)
-        );
+        assert_eq!(ev.transaction_hash, Felt::from_hex_unchecked(tx_hash_hex));
         assert_eq!(ev.block_number, 8914198);
     }
 
@@ -1165,10 +1159,7 @@ mod tests {
         }
 
         let ws_event = actions.iter().find_map(|a| match a {
-            Action::AddressWsEvent {
-                address: ca,
-                event,
-            } if *ca == address => Some(event),
+            Action::AddressWsEvent { address: ca, event } if *ca == address => Some(event),
             _ => None,
         });
         let ev = ws_event.expect("non-TRANSACTION_EXECUTED event must still emit AddressWsEvent");

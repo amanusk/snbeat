@@ -1033,10 +1033,7 @@ impl DataSource for CachingDataSource {
         .ok()
     }
 
-    fn load_cached_activity_range_any_age(
-        &self,
-        address: &Felt,
-    ) -> Option<(u64, u64, u64)> {
+    fn load_cached_activity_range_any_age(&self, address: &Felt) -> Option<(u64, u64, u64)> {
         let db = self.db.lock().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
