@@ -298,20 +298,30 @@ impl CachingDataSource {
 
     fn cache_block_with_txs(&self, block: &SnBlock, txs: &[SnTransaction]) {
         self.cache_block(block);
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
+            let tx_db = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "cache_block_with_txs: begin transaction failed");
+                    return;
+                }
+            };
             for (i, tx) in txs.iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(tx) {
                     let hash_hex = format!("{:#x}", tx.hash());
-                    let _ = db.execute(
+                    let _ = tx_db.execute(
                         "INSERT OR REPLACE INTO block_transactions (block_number, tx_index, tx_hash, data) VALUES (?1, ?2, ?3, ?4)",
                         params![block.number, i as i64, hash_hex, json],
                     );
                     // Also cache in transactions table for hash lookup
-                    let _ = db.execute(
+                    let _ = tx_db.execute(
                         "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
                         params![hash_hex, block.number, json],
                     );
                 }
+            }
+            if let Err(e) = tx_db.commit() {
+                warn!(error = %e, "cache_block_with_txs: commit failed");
             }
         }
     }
@@ -360,20 +370,30 @@ impl CachingDataSource {
     }
 
     fn save_address_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
-            // Clear old events for this address and rewrite
-            let _ = db.execute(
+            let tx = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_address_events: begin transaction failed");
+                    return;
+                }
+            };
+            // Clear old events for this address and rewrite atomically.
+            let _ = tx.execute(
                 "DELETE FROM address_events WHERE address = ?1",
                 params![addr_hex],
             );
             for (i, event) in events.iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(event) {
-                    let _ = db.execute(
+                    let _ = tx.execute(
                         "INSERT OR REPLACE INTO address_events (address, event_index, data) VALUES (?1, ?2, ?3)",
                         params![addr_hex, i as i64, json],
                     );
                 }
+            }
+            if let Err(e) = tx.commit() {
+                warn!(error = %e, "save_address_events: commit failed");
             }
         }
     }
@@ -660,19 +680,29 @@ impl CachingDataSource {
     }
 
     fn save_contract_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
-            let _ = db.execute(
+            let tx = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_contract_events: begin transaction failed");
+                    return;
+                }
+            };
+            let _ = tx.execute(
                 "DELETE FROM contract_events WHERE address = ?1",
                 params![addr_hex],
             );
             for (i, event) in events.iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(event) {
-                    let _ = db.execute(
+                    let _ = tx.execute(
                         "INSERT OR REPLACE INTO contract_events (address, event_index, data) VALUES (?1, ?2, ?3)",
                         params![addr_hex, i as i64, json],
                     );
                 }
+            }
+            if let Err(e) = tx.commit() {
+                warn!(error = %e, "save_contract_events: commit failed");
             }
         }
     }
@@ -915,19 +945,29 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_txs(&self, address: &Felt, txs: &[AddressTxSummary]) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
-            let _ = db.execute(
+            let tx_db = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_address_txs: begin transaction failed");
+                    return;
+                }
+            };
+            let _ = tx_db.execute(
                 "DELETE FROM address_txs WHERE address = ?1",
                 params![addr_hex],
             );
             for (i, tx) in txs.iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(tx) {
-                    let _ = db.execute(
+                    let _ = tx_db.execute(
                         "INSERT OR REPLACE INTO address_txs (address, tx_index, data) VALUES (?1, ?2, ?3)",
                         params![addr_hex, i as i64, json],
                     );
                 }
+            }
+            if let Err(e) = tx_db.commit() {
+                warn!(error = %e, "save_address_txs: commit failed");
             }
         }
     }
@@ -954,19 +994,29 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_calls(&self, address: &Felt, calls: &[ContractCallSummary]) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
-            let _ = db.execute(
+            let tx = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_address_calls: begin transaction failed");
+                    return;
+                }
+            };
+            let _ = tx.execute(
                 "DELETE FROM address_calls WHERE address = ?1",
                 params![addr_hex],
             );
             for (i, call) in calls.iter().enumerate() {
                 if let Ok(json) = serde_json::to_string(call) {
-                    let _ = db.execute(
+                    let _ = tx.execute(
                         "INSERT OR REPLACE INTO address_calls (address, call_index, data) VALUES (?1, ?2, ?3)",
                         params![addr_hex, i as i64, json],
                     );
                 }
+            }
+            if let Err(e) = tx.commit() {
+                warn!(error = %e, "save_address_calls: commit failed");
             }
         }
     }
@@ -993,17 +1043,27 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_meta_txs(&self, address: &Felt, txs: &[MetaTxIntenderSummary]) {
-        if let Ok(db) = self.db.lock() {
+        if let Ok(mut db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
+            let tx_db = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "save_meta_txs: begin transaction failed");
+                    return;
+                }
+            };
             for tx in txs {
                 if let Ok(json) = serde_json::to_string(tx) {
                     let hash_hex = format!("{:#x}", tx.hash);
-                    let _ = db.execute(
+                    let _ = tx_db.execute(
                         "INSERT OR REPLACE INTO address_meta_txs \
                          (address, tx_hash, block_number, data) VALUES (?1, ?2, ?3, ?4)",
                         params![addr_hex, hash_hex, tx.block_number as i64, json],
                     );
                 }
+            }
+            if let Err(e) = tx_db.commit() {
+                warn!(error = %e, "save_meta_txs: commit failed");
             }
         }
     }
