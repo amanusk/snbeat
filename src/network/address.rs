@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 
+use std::future::Future;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Caps concurrent RPC `get_transaction` / `get_receipt` calls fired from the
@@ -14,6 +16,24 @@ use tracing::{debug, info, warn};
 /// pf-query is unavailable (or didn't return the requested hash). User clicks
 /// bypass this semaphore entirely.
 static ENRICH_RPC_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+
+/// Spawn a detached sub-task that aborts when `cancel` fires. Used for every
+/// background task fanned out from `fetch_and_send_address_info` so that
+/// foreground navigation to a new address stops stale RPC/Dune/PF enrichment
+/// work piling up on shared clients.
+fn spawn_cancellable<F>(cancel: CancellationToken, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = fut => {}
+            _ = cancel.cancelled() => {
+                debug!("Address sub-task cancelled on navigation");
+            }
+        }
+    })
+}
 
 use crate::app::actions::{Action, Source};
 use crate::data::DataSource;
@@ -28,6 +48,49 @@ use super::dune;
 use super::dune_source_update;
 use super::helpers;
 use super::voyager;
+
+/// RAII helper that registers an entry in the per-query status bar on
+/// construction and clears it on drop. Every early-return path in the
+/// fetcher it guards gets the clear for free, so we can't leave a stale
+/// label in the UI.
+struct QueryGuard {
+    tx: mpsc::UnboundedSender<Action>,
+    key: String,
+}
+
+impl QueryGuard {
+    fn new(tx: &mpsc::UnboundedSender<Action>, key: impl Into<String>, label: String) -> Self {
+        let key = key.into();
+        let _ = tx.send(Action::SetActiveQuery {
+            key: key.clone(),
+            label: Some(label),
+        });
+        Self {
+            tx: tx.clone(),
+            key,
+        }
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Action::SetActiveQuery {
+            key: std::mem::take(&mut self.key),
+            label: None,
+        });
+    }
+}
+
+/// Short prefix of a Felt address used as the stable part of an
+/// [`ActiveQueries`] key. Six hex chars is enough to tell two concurrent
+/// addresses apart without bloating the status bar.
+fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
+    let hex = format!("{:064x}", address);
+    hex.trim_start_matches('0')
+        .chars()
+        .take(6)
+        .collect::<String>()
+}
 
 /// UDC ContractDeployed event selector.
 const UDC_CONTRACT_DEPLOYED: &str =
@@ -517,9 +580,14 @@ pub(super) async fn build_contract_calls_from_hashes(
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<crate::data::types::ContractCallSummary> {
-    // Pre-fetch ABI for the target contract so selector→name lookups succeed.
-    helpers::prewarm_abis([address], abi_reg).await;
-
+    // Pre-warm ABIs for every top-level call target in the batch so the
+    // selector→name lookups below all hit a warm registry. We don't filter
+    // these multicalls by `address` — the Calls row's `function_name` column
+    // mirrors what the block and tx detail views show for the same tx, i.e.
+    // the entire top-level endpoint list (see `helpers::format_endpoint_names`).
+    // For contracts called only internally (e.g. via an aggregator) this
+    // surfaces the aggregator's outer function name, which is consistent with
+    // the rest of the UI and avoids needing `starknet_traceTransaction`.
     let mut calls_list = Vec::new();
     for chunk in hashes_with_blocks.chunks(20) {
         let futs: Vec<_> = chunk
@@ -537,6 +605,22 @@ pub(super) async fn build_contract_calls_from_hashes(
             .collect();
         let results = futures::future::join_all(futs).await;
 
+        // Prewarm `{address} ∪ multicall targets` in one pass. `address`
+        // covers direct calls to the inspected contract; the multicall
+        // targets cover aggregator/router routes that would otherwise hit a
+        // cold registry in `format_endpoint_names` and fall back to hex.
+        let prewarm_targets: std::collections::HashSet<_> = results
+            .iter()
+            .filter_map(|(_, _, tx_r, _)| tx_r.as_ref().ok())
+            .flat_map(|tx| match tx {
+                crate::data::types::SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
+                _ => Vec::new(),
+            })
+            .map(|c| c.contract_address)
+            .chain(std::iter::once(address))
+            .collect();
+        helpers::prewarm_abis(prewarm_targets, abi_reg).await;
+
         for (hash, block_num, tx_r, rx_r) in results {
             if let Ok(fetched_tx) = tx_r {
                 let receipt = rx_r.ok();
@@ -553,15 +637,8 @@ pub(super) async fn build_contract_calls_from_hashes(
                     })
                     .unwrap_or("?")
                     .to_string();
-                let function_name = match &fetched_tx {
-                    crate::data::types::SnTransaction::Invoke(i) => parse_multicall(&i.calldata)
-                        .iter()
-                        .filter(|c| c.contract_address == address)
-                        .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    _ => String::new(),
-                };
+                let function_name = helpers::format_endpoint_names(&fetched_tx, abi_reg);
+                let (nonce, tip) = helpers::extract_nonce_tip(&fetched_tx);
                 calls_list.push(crate::data::types::ContractCallSummary {
                     tx_hash: hash,
                     sender: fetched_tx.sender(),
@@ -570,6 +647,8 @@ pub(super) async fn build_contract_calls_from_hashes(
                     timestamp: 0,
                     total_fee_fri: fee_fri,
                     status,
+                    nonce: Some(nonce),
+                    tip,
                 });
             }
         }
@@ -592,8 +671,25 @@ pub(super) async fn build_contract_calls_from_pf_rows(
 ) -> Vec<crate::data::types::ContractCallSummary> {
     use starknet::core::types::Felt;
 
-    // Pre-warm ABI for the target contract so selector→name lookups succeed.
-    helpers::prewarm_abis([address], abi_reg).await;
+    // Pre-warm ABIs: the Calls row's `function_name` mirrors the block/tx
+    // detail views (see `helpers::format_endpoint_names`) and lists every
+    // top-level call in the multicall, so we prewarm each call target's ABI
+    // — not just `address` — to keep hex fallbacks out of the common case.
+    let prewarm_targets: std::collections::HashSet<Felt> = tx_rows
+        .iter()
+        .filter(|r| helpers::normalize_pf_tx_type(&r.tx_type) == "INVOKE")
+        .flat_map(|r| {
+            let calldata: Vec<Felt> = r
+                .calldata
+                .iter()
+                .filter_map(|h| Felt::from_hex(h).ok())
+                .collect();
+            parse_multicall(&calldata)
+        })
+        .map(|c| c.contract_address)
+        .chain(std::iter::once(address))
+        .collect();
+    helpers::prewarm_abis(prewarm_targets, abi_reg).await;
 
     let mut calls_list: Vec<crate::data::types::ContractCallSummary> =
         Vec::with_capacity(tx_rows.len());
@@ -613,12 +709,10 @@ pub(super) async fn build_contract_calls_from_pf_rows(
                 .iter()
                 .filter_map(|h| Felt::from_hex(h).ok())
                 .collect();
-            parse_multicall(&calldata)
-                .iter()
-                .filter(|c| c.contract_address == address)
-                .map(|c| helpers::format_selector_name_or_hex(&c.selector, abi_reg))
-                .collect::<Vec<_>>()
-                .join(", ")
+            helpers::format_selector_names(
+                parse_multicall(&calldata).iter().map(|c| c.selector),
+                abi_reg,
+            )
         } else {
             String::new()
         };
@@ -631,6 +725,8 @@ pub(super) async fn build_contract_calls_from_pf_rows(
             timestamp: row.block_timestamp,
             total_fee_fri: fee_fri,
             status: row.status.clone(),
+            nonce: row.nonce,
+            tip: row.tip,
         });
     }
 
@@ -649,6 +745,7 @@ pub(super) async fn fetch_and_send_address_info(
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_c: &Option<Arc<voyager::VoyagerClient>>,
     tx: &mpsc::UnboundedSender<Action>,
+    cancel: &CancellationToken,
 ) {
     let start = std::time::Instant::now();
     debug!(address = %format!("{:#x}", address), "Fetching address info");
@@ -658,7 +755,7 @@ pub(super) async fn fetch_and_send_address_info(
     {
         let ds_bal = Arc::clone(ds);
         let tx_bal = tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let balances = fetch_token_balances(address, &ds_bal).await;
             let _ = tx_bal.send(Action::AddressBalancesLoaded { address, balances });
         });
@@ -668,7 +765,7 @@ pub(super) async fn fetch_and_send_address_info(
     if let Some(vc) = voyager_c {
         let vc = Arc::clone(vc);
         let tx_v = tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             voyager::fetch_and_send_label(address, &vc, &tx_v).await;
         });
     }
@@ -707,7 +804,8 @@ pub(super) async fn fetch_and_send_address_info(
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         let addr = address;
-        tokio::spawn(async move {
+        let cancel_c = cancel.clone();
+        spawn_cancellable(cancel.clone(), async move {
             match pf_c.get_class_history(addr).await {
                 Ok(entries) => {
                     // Use earliest entry (deployment block) to find the deploy tx
@@ -715,10 +813,15 @@ pub(super) async fn fetch_and_send_address_info(
                         let deploy_block = deploy_entry.block_number;
                         let tx_c2 = tx_c.clone();
                         let ds_c2 = Arc::clone(&ds_c);
-                        tokio::spawn(async move {
+                        spawn_cancellable(cancel_c.clone(), async move {
                             find_deploy_tx(addr, deploy_block, &ds_c2, &tx_c2).await;
                         });
                     }
+                    debug!(
+                        address = %format!("{:#x}", addr),
+                        entries = entries.len(),
+                        "PF class history fetched"
+                    );
                     let _ = tx_c.send(Action::ClassHistoryLoaded {
                         address: addr,
                         entries,
@@ -750,19 +853,62 @@ pub(super) async fn fetch_and_send_address_info(
         sources: sources.clone(),
     });
 
-    // Send partial info immediately (cached txs seed the UI)
+    // Send partial info immediately (cached txs seed the UI).
+    //
+    // The per-event ABI decode used to run inline here, gating the
+    // `AddressInfoLoaded` send on hundreds of `get_abi_for_address` calls
+    // (each potentially an RPC round-trip + SQLite cache mutex hop). Under
+    // any cache contention that loop could stretch to tens of seconds,
+    // keeping the "Fetching address info…" spinner up even though the
+    // tx/call caches were already in memory. Decode now runs in a
+    // background task; the Events tab renders when `AddressEventsCacheLoaded`
+    // arrives.
+    let cached_events = ds.load_address_events(&address);
     let _ = tx.send(Action::AddressInfoLoaded {
         info: crate::data::types::SnAddressInfo {
             address,
             nonce,
             class_hash,
-            recent_events: Vec::new(),
+            recent_events: cached_events.clone(),
             token_balances: Vec::new(),
         },
         decoded_events: Vec::new(),
         tx_summaries: ds.load_cached_address_txs(&address),
         contract_calls: ds.load_cached_address_calls(&address),
     });
+
+    // Kick off the decode pass in the background. Cancellable so navigation
+    // away from this address doesn't leave the decoder chewing on a stale
+    // class-hash / ABI-fetch queue.
+    if !cached_events.is_empty() {
+        let abi_reg_c = Arc::clone(abi_reg);
+        let tx_c = tx.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            let mut decoded = Vec::with_capacity(cached_events.len());
+            for event in &cached_events {
+                let abi = abi_reg_c.get_abi_for_address(&event.from_address).await;
+                decoded.push(decode_event(event, abi.as_deref()));
+            }
+            let _ = tx_c.send(Action::AddressEventsCacheLoaded {
+                address,
+                decoded_events: decoded,
+            });
+        });
+    }
+
+    // Seed the MetaTxs tab count from cache up-front, like `tx_summaries` /
+    // `contract_calls` above. Previously the cache was only loaded when the
+    // user tabbed to MetaTxs (via `FetchAddressMetaTxs`), so the tab label
+    // read "(0)" on address entry even when cached classifications existed.
+    // The reducer doesn't flip `meta_txs_dispatched` for this action — a
+    // live pf-query fetch still fires when the user actually enters the tab.
+    let cached_meta_txs = ds.load_cached_meta_txs(&address);
+    if !cached_meta_txs.is_empty() {
+        let _ = tx.send(Action::AddressMetaTxsCacheLoaded {
+            address,
+            summaries: cached_meta_txs,
+        });
+    }
 
     // Check cached activity range — if fresh, skip Dune probe entirely.
     let cached_range = ds.load_cached_activity_range(&address);
@@ -778,16 +924,21 @@ pub(super) async fn fetch_and_send_address_info(
         )));
     }
 
-    // Spawn Dune activity probe — used by TASK B and TASK C to target the right block range.
-    // Uses starknet.events (3-4x cheaper than the old UNION ALL approach).
+    // Spawn activity probe — used by TASK B and TASK C to target the right block range.
+    // Source of truth is Dune's starknet.events (3-4x cheaper than the old UNION ALL approach).
+    // We intentionally no longer probe pf-query here: `/contract-event-count` over the full
+    // `deploy..tip` range is an unkeyed bloom-scan whose cost grows with chain age, and on
+    // long-lived contracts it exceeds the 30s client deadline — it also blocks the concurrent
+    // event-window fetch on the same pf-query server. Counts for the Calls tab are grown
+    // from the scroll-backed `address_events` cache; see `call_count_fragment` in
+    // ui/views/address_info.rs.
     // watch channel so both TASK B (Dune) and TASK C (RPC) can observe the probe result.
     let (probe_watch_tx, probe_watch_rx) =
         tokio::sync::watch::channel::<Option<dune::AddressActivityProbe>>(None);
     // Load cached range WITH event count for accurate density calculation
     let cached_range_with_count = ds.load_cached_activity_range_with_count(&address);
-    if cached_range.is_some() {
+    if let Some((min_b, max_b)) = cached_range {
         // Build probe from cache — no Dune query needed.
-        let (min_b, max_b) = cached_range.unwrap();
         let event_count = cached_range_with_count
             .map(|(_, _, c)| c)
             .filter(|&c| c > 1) // Ignore stale rows with placeholder count
@@ -797,26 +948,39 @@ pub(super) async fn fetch_and_send_address_info(
                 let span = max_b.saturating_sub(min_b).max(1);
                 (span / 100).max(100)
             });
-        let mut probe = dune::AddressActivityProbe::default();
-        probe.callee_min_block = min_b;
-        probe.callee_max_block = max_b;
         // Cached count is derived from Dune's events-from-address query, which
         // populates callee activity only. Sender tx totals come from the
         // on-chain nonce in the address info path; leave sender_* at 0.
-        probe.callee_call_count = event_count;
+        let probe = dune::AddressActivityProbe {
+            callee_min_block: min_b,
+            callee_max_block: max_b,
+            callee_call_count: event_count,
+            ..Default::default()
+        };
+        // Publish to both the UI reducer (so the Calls tab can show its
+        // `shown / known+` fragment on re-entry from cache) AND the watch
+        // channel (for downstream task window sizing). Previously only the
+        // watch channel got it, so the UI regressed to a bare `Calls(N)`
+        // count whenever re-entry hit the fresh-cache fast path.
+        let _ = tx.send(Action::AddressProbeLoaded {
+            address,
+            probe: probe.clone(),
+        });
         let _ = probe_watch_tx.send(Some(probe));
     } else {
-        // No fresh cache — try pf-query first (when available), fall back to
-        // Dune if pf-query is absent or errors. pf-query's count endpoint
-        // walks the full range via bloom filters, so it matches Dune's
-        // activity-probe semantics without the external dependency.
-        let pf_probe: Option<Arc<crate::data::pathfinder::PathfinderClient>> =
-            pf.as_ref().map(Arc::clone);
+        // No fresh cache. Two paths from here:
+        //   - Any cached row (stale or fresh) exists → TopDelta probe:
+        //     cheap `block_number > cached_max` query, merged into cache.
+        //   - No cached row at all → full probe (cold path).
+        // Either way, the watch channel stays `None` if Dune isn't configured
+        // and downstream tasks fall back to their own default windows. See the
+        // outer comment for why pf-query is no longer a probe source.
+        let stale_cached = ds.load_cached_activity_range_any_age(&address);
         let dune_probe: Option<Arc<dune::DuneClient>> = dune.as_ref().map(Arc::clone);
         let ds_probe = Arc::clone(ds);
         let tx_probe = tx.clone();
         let probe_watch_tx_c = probe_watch_tx.clone();
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             // Common post-success step: cache the discovered range, emit the
             // UI action, and publish on the watch channel so downstream tasks
             // can size their windows.
@@ -845,53 +1009,78 @@ pub(super) async fn fetch_and_send_address_info(
                 let _ = probe_watch_tx_c.send(Some(probe));
             };
 
-            // 1. Try pf-query first.
-            if let Some(pf_c) = pf_probe.as_ref() {
-                let _ = tx_probe.send(Action::LoadingStatus(
-                    "PF: probing activity range (events)...".into(),
-                ));
-                match pf_c
-                    .get_contract_event_count(address, None, None, &[])
-                    .await
-                {
-                    Ok(count) => {
-                        let probe = dune::AddressActivityProbe {
-                            callee_call_count: count.count,
-                            callee_min_block: count.min_block.unwrap_or(0),
-                            callee_max_block: count.max_block.unwrap_or(0),
+            if let Some(dune_c) = dune_probe.as_ref() {
+                match stale_cached {
+                    Some((cached_min, cached_max, cached_count)) => {
+                        // Publish the stale cached probe to the UI immediately
+                        // — the count we learned last time is a valid
+                        // lower bound right now, and we'd rather show
+                        // `shown / cached_count+` during the delta probe than
+                        // regress to a bare `Calls(N)` for the seconds it
+                        // takes Dune to respond (or forever, if Dune fails).
+                        let stale_probe = dune::AddressActivityProbe {
+                            callee_min_block: cached_min,
+                            callee_max_block: cached_max,
+                            callee_call_count: cached_count,
                             ..Default::default()
                         };
-                        if !count.complete {
-                            warn!(
-                                "pf-query event-count hit candidate cap; count={} is a lower bound",
-                                count.count
-                            );
-                        }
-                        publish(probe, "PF probe");
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "pf-query activity probe failed, falling back to Dune");
-                        let _ = tx_probe.send(Action::LoadingStatus(format!(
-                            "PF probe failed ({}); trying Dune...",
-                            e
-                        )));
-                    }
-                }
-            }
+                        let _ = tx_probe.send(Action::AddressProbeLoaded {
+                            address,
+                            probe: stale_probe.clone(),
+                        });
+                        let _ = probe_watch_tx_c.send(Some(stale_probe));
 
-            // 2. Fall back to Dune.
-            if let Some(dune_c) = dune_probe.as_ref() {
-                let _ = tx_probe.send(Action::LoadingStatus(
-                    "Dune: probing activity range (events)...".into(),
-                ));
-                match dune_c.probe_address_activity(address).await {
-                    Ok(probe) => publish(probe, "Dune probe"),
-                    Err(e) => {
-                        warn!(error = %e, "Dune activity probe failed");
-                        let _ = tx_probe
-                            .send(Action::LoadingStatus(format!("Dune probe failed: {}", e)));
-                        // Leave watch at None — tasks will use default windows.
+                        // TopDelta: only probe blocks > cached_max and merge.
+                        let _ = tx_probe.send(Action::LoadingStatus(format!(
+                            "Dune: extending activity probe (>{} block)...",
+                            cached_max
+                        )));
+                        match dune_c
+                            .probe_address_activity_delta(address, cached_max)
+                            .await
+                        {
+                            Ok(delta) => {
+                                // Merge delta into cached: min stays, max
+                                // expands, count sums. `save_activity_range_with_count`
+                                // also merges at the DB layer, but we need a
+                                // fully-populated probe to publish to the UI.
+                                let merged = dune::AddressActivityProbe {
+                                    callee_min_block: cached_min,
+                                    callee_max_block: delta.callee_max_block.max(cached_max),
+                                    callee_call_count: cached_count
+                                        .saturating_add(delta.callee_call_count),
+                                    ..Default::default()
+                                };
+                                publish(merged, "Dune probe (delta)");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Dune delta activity probe failed");
+                                let _ = tx_probe.send(Action::LoadingStatus(format!(
+                                    "Dune probe failed: {}",
+                                    e
+                                )));
+                                // The stale probe was already published to
+                                // the UI + watch at the top of this branch,
+                                // so the Calls tab keeps its `/ cached+`
+                                // hint. Nothing more to do here.
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = tx_probe.send(Action::LoadingStatus(
+                            "Dune: probing activity range (events)...".into(),
+                        ));
+                        match dune_c.probe_address_activity(address).await {
+                            Ok(probe) => publish(probe, "Dune probe"),
+                            Err(e) => {
+                                warn!(error = %e, "Dune activity probe failed");
+                                let _ = tx_probe.send(Action::LoadingStatus(format!(
+                                    "Dune probe failed: {}",
+                                    e
+                                )));
+                                // Leave watch at None — tasks will use default windows.
+                            }
+                        }
                     }
                 }
             }
@@ -910,7 +1099,7 @@ pub(super) async fn fetch_and_send_address_info(
             let tx_a = tx.clone();
             let ds_a = Arc::clone(ds);
             let pf_ok = Arc::clone(&pf_succeeded);
-            tokio::spawn(async move {
+            spawn_cancellable(cancel.clone(), async move {
                 const PF_LIMIT: u32 = 200;
                 let _ = tx_a.send(Action::LoadingStatus("PF: fetching tx history...".into()));
                 match pf_c.get_sender_txs(address, PF_LIMIT).await {
@@ -971,23 +1160,23 @@ pub(super) async fn fetch_and_send_address_info(
     }
 
     // =====================================================================
-    // TASK B1: Contract calls — pf-query primary, RPC fallback, always runs
-    // for contracts regardless of Dune availability. The prior Dune-backed
-    // bulk fetch was replaced by the unified event_window path so all three
-    // event-derived tabs share one cursor + additive cache.
+    // TASK B1: Contract calls — Dune-backed. Event-based fetches miss txs
+    // that called the contract without emitting events (reverted calls, pure
+    // setters, nested multicall targets), so this tab uses Dune's trace-indexed
+    // `starknet.calls` table. The Events tab (TASK C) stays on pf-query.
     // =====================================================================
     if is_contract {
         let ds_b = Arc::clone(ds);
         let tx_b = tx.clone();
         let abi_b = Arc::clone(abi_reg);
+        let dune_b = dune.as_ref().map(Arc::clone);
         let pf_b = pf.as_ref().map(Arc::clone);
-        tokio::spawn(async move {
-            let _ = tx_b.send(Action::LoadingStatus(
-                "Calls: fetching via event window...".into(),
-            ));
+        spawn_cancellable(cancel.clone(), async move {
+            let _ = tx_b.send(Action::LoadingStatus("Calls: fetching from Dune...".into()));
             fetch_address_contract_calls(
                 address,
                 &ds_b,
+                dune_b.as_ref(),
                 pf_b.as_ref(),
                 &abi_b,
                 &tx_b,
@@ -998,6 +1187,12 @@ pub(super) async fn fetch_and_send_address_info(
             // Stream completion marker so source tracking clears the loading
             // flag; tx_summaries is empty because Calls populate via
             // AddressInfoLoaded.contract_calls, not via AddressTxsStreamed.
+            debug!(
+                address = %format!("{:#x}", address),
+                source = ?Source::Dune,
+                tx_summaries = 0,
+                "AddressTxsStreamed dispatching complete marker"
+            );
             let _ = tx_b.send(Action::AddressTxsStreamed {
                 address,
                 source: Source::Dune,
@@ -1021,7 +1216,7 @@ pub(super) async fn fetch_and_send_address_info(
         const INITIAL_WINDOW: u64 = 5_000;
 
         // Account: windowed tx fetch
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let _ = tx_b.send(Action::LoadingStatus(
                 "Dune: fetching recent account txs...".into(),
             ));
@@ -1170,11 +1365,20 @@ pub(super) async fn fetch_and_send_address_info(
         let pf_c = pf.as_ref().map(Arc::clone);
         let mut probe_rx_c = probe_watch_rx.clone();
 
-        tokio::spawn(async move {
+        spawn_cancellable(cancel.clone(), async move {
             let latest_block = ds_c.get_latest_block_number().await.unwrap_or(0);
 
             // --- Use cached search progress + nonce delta to narrow the window ---
-            let search_progress = ds_c.load_search_progress(&address);
+            // TASK C's scan uses the same `kind` as ensure_address_events_window
+            // (derived from is_contract below at line ~1200). Match the
+            // filter_kind here so the cursor lookup and update land on the
+            // same row.
+            let filter_kind = if is_contract {
+                crate::data::FilterKind::Unkeyed
+            } else {
+                crate::data::FilterKind::Keyed
+            };
+            let search_progress = ds_c.load_search_progress(&address, filter_kind);
 
             // If nonce hasn't changed and we've already searched up to near the tip,
             // skip the full search — only check the small delta.
@@ -1206,9 +1410,12 @@ pub(super) async fn fetch_and_send_address_info(
             let window_size = latest_block.saturating_sub(from_block);
             let _ = tx_c.send(Action::LoadingStatus(format!(
                 "RPC: scanning {}k blocks for events...",
-                (window_size + 999) / 1000
+                window_size.div_ceil(1000)
             )));
-            let phase1_limit = if is_contract { 500 } else { 100 };
+            // Phase 1 page limit is now managed inside the event_window helper
+            // (`EVENT_PAGE_LIMIT` in event_window.rs). The old per-caller
+            // phase1_limit value is dead — left here as a comment so the
+            // history of Phase 1's contract-vs-account heuristics is findable.
 
             let kind = if is_contract {
                 EventQueryKind::Contract
@@ -1216,67 +1423,72 @@ pub(super) async fn fetch_and_send_address_info(
                 EventQueryKind::Account
             };
 
-            // Fast path: when pf is available, fetch events AND unique tx rows
-            // in one shared pipeline. The MetaTxs tab can derive from the same
-            // page (emitted alongside below), avoiding a second event scan +
-            // /txs-by-hash round trip.
-            let pf_page: Option<AddressActivityPage> = if let Some(pf) = pf_c.as_ref() {
-                match fetch_address_activity(
+            // Route through the shared event-window helper. Benefits over the
+            // previous direct `fetch_address_activity`/`fetch_events_routed`
+            // branching:
+            //   - `address_search_progress` cursor is advanced automatically,
+            //     so subsequent tab loads (Calls/MetaTxs via the same helper)
+            //     short-circuit instead of re-fetching the same window.
+            //   - Events are persisted via `merge_address_events` for free.
+            //   - Works whether pf-query is available (fast pf path with
+            //     tx_rows) or not (RPC fallback via `fetch_events_routed`).
+            //
+            // The helper picks its own `from_block` via `resolve_top_delta`,
+            // so TASK C's custom `from_block` (derived from nonce_delta /
+            // search_progress above) is now only used for the fast-skip
+            // short-circuit and the loading-status banner — not for the fetch.
+            let _events_guard = QueryGuard::new(
+                &tx_c,
+                format!("events:{}", query_addr_prefix(&address)),
+                "Events scan".to_string(),
+            );
+            let ds_dyn: Arc<dyn crate::data::DataSource> = ds_c.clone();
+            let pf_page: Option<AddressActivityPage> =
+                match crate::network::event_window::ensure_address_events_window(
                     address,
                     kind,
-                    from_block,
-                    None,
-                    phase1_limit as u32,
-                    pf,
+                    crate::network::event_window::EventWindowPolicy::TopDelta,
+                    pf_c.as_ref(),
+                    &ds_dyn,
+                    latest_block,
+                    0, // TopDelta doesn't scan old history; floor is unused.
                 )
                 .await
                 {
-                    Ok(p) => Some(p),
+                    Ok(o) => {
+                        let _ = tx_c.send(Action::AddressEventWindowUpdated {
+                            address,
+                            min_searched: o.min_searched,
+                            max_searched: o.max_searched,
+                            deferred_gap: o.deferred_gap,
+                        });
+                        Some(o.page)
+                    }
                     Err(e) => {
                         warn!(
                             error = %e,
                             address = %format!("{:#x}", address),
-                            "Shared activity fetch failed, falling back to RPC path"
+                            "event_window fetch failed in TASK C"
                         );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Events: take from the shared page when available, else fall
-            // back to the legacy RPC/PF routed fetch (keeps behaviour when
-            // pf-query is unavailable).
-            let events = if let Some(page) = &pf_page {
-                page.events.clone()
-            } else {
-                let events_result = fetch_events_routed(
-                    kind,
-                    pf_c.as_ref(),
-                    &ds_c,
-                    address,
-                    Some(from_block),
-                    None,
-                    phase1_limit,
-                )
-                .await;
-                match events_result {
-                    Ok(evts) => evts,
-                    Err(e) => {
-                        warn!(error = %e, address = %format!("{:#x}", address), "RPC event fetch failed");
-                        let _ = tx_c.send(Action::LoadingStatus(format!(
-                            "RPC: event fetch failed: {}",
-                            e
-                        )));
+                        let _ =
+                            tx_c.send(Action::LoadingStatus(format!("Event fetch failed: {}", e)));
                         let _ = tx_c.send(Action::SourceUpdate {
                             source: Source::Rpc,
                             status: crate::app::state::SourceStatus::FetchError(e.to_string()),
                         });
-                        Vec::new()
+                        None
                     }
-                }
-            };
+                };
+
+            let events = pf_page
+                .as_ref()
+                .map(|p| p.events.clone())
+                .unwrap_or_default();
+            // On the RPC fallback path `tx_rows` is empty. Treat that as "no
+            // pf page available" so the downstream derivations hash-scan RPC
+            // like before; the `pf_page.is_some()` branches check `tx_rows`
+            // implicitly by using the shared helpers.
+            let pf_page: Option<AddressActivityPage> = pf_page.filter(|p| !p.tx_rows.is_empty());
 
             let events_count = events.len();
             debug!(
@@ -1654,10 +1866,16 @@ pub(super) async fn fetch_and_send_address_info(
             // Save search progress only when events were found — otherwise the initial
             // window may have been too small and we need to retry with probe guidance.
             if any_events_found {
-                ds_c.save_search_progress(&address, from_block, latest_block);
+                ds_c.save_search_progress(&address, filter_kind, from_block, latest_block);
             }
 
             // RPC task complete
+            debug!(
+                address = %format!("{:#x}", address),
+                source = ?Source::Rpc,
+                tx_summaries = 0,
+                "AddressTxsStreamed dispatching complete marker"
+            );
             let _ = tx_c.send(Action::AddressTxsStreamed {
                 address,
                 source: Source::Rpc,
@@ -2302,13 +2520,15 @@ pub(super) async fn fetch_more_address_txs(
     let cached = ds.load_cached_activity_range(&address);
     let window_size = if let Some((min_b, max_b)) = cached {
         // Build a lightweight probe to compute recommended_window
-        let mut p = dune::AddressActivityProbe::default();
-        p.sender_min_block = min_b;
-        p.sender_max_block = max_b;
-        p.callee_min_block = min_b;
-        p.callee_max_block = max_b;
-        p.sender_tx_count = 1;
-        p.callee_call_count = 1;
+        let p = dune::AddressActivityProbe {
+            sender_min_block: min_b,
+            sender_max_block: max_b,
+            callee_min_block: min_b,
+            callee_max_block: max_b,
+            sender_tx_count: 1,
+            callee_call_count: 1,
+            ..Default::default()
+        };
         p.recommended_window()
     } else {
         50_000u64
@@ -2409,8 +2629,12 @@ pub(super) async fn fetch_more_address_txs(
         };
         let dune_to = before_block.saturating_sub(1);
         if is_contract {
+            // Pagination walks backward from `before_block`; we don't keep a
+            // reliable timestamp for arbitrary historical windows, so skip the
+            // `block_date` hint here. The narrower LIMIT (100) and user-capped
+            // `window_size` keep Dune's scan bounded in practice.
             match dune_client
-                .query_contract_calls_windowed(address, from_block, dune_to, 100)
+                .query_contract_calls_windowed(address, from_block, dune_to, 100, None)
                 .await
             {
                 Ok(calls) => (Vec::new(), calls),
@@ -2638,6 +2862,9 @@ pub(super) async fn enrich_dune_calls(
             if let Some(call) = chunk.iter_mut().find(|c| c.tx_hash == hash) {
                 if let Ok(ref fetched_tx) = tx_result {
                     call.sender = fetched_tx.sender();
+                    let (nonce, tip) = helpers::extract_nonce_tip(fetched_tx);
+                    call.nonce = Some(nonce);
+                    call.tip = tip;
                 }
                 if let Ok(receipt) = rx_result {
                     call.total_fee_fri = felt_to_u128(&receipt.actual_fee);
@@ -2796,6 +3023,83 @@ pub(super) async fn find_deploy_tx(
     debug!(%addr, deploy_block, "Deploy tx not found in block (neither native nor UDC)");
 }
 
+/// Three tab-specific projections of an [`AddressActivityPage`] derived in
+/// a single classification pass.
+///
+/// Authority per projection:
+///
+/// - [`ClassifiedPage::txs`] — **authoritative.** All tx_rows where
+///   `sender == address`. Direct match, no decoding.
+/// - [`ClassifiedPage::meta_txs`] — **authoritative.** All tx_rows whose
+///   calldata contains an `execute_from_outside*` inner call with
+///   `intender == address`. Complete because `execute_from_outside` always
+///   emits `TRANSACTION_EXECUTED`, so pf-query's tx_rows covers every
+///   meta-tx within the scan range.
+/// - [`ClassifiedPage::calls`] — **supplementary only.** tx_rows whose
+///   multicall contains any inner call to `address`. Misses calls to
+///   contracts that don't emit events (pf-query indexes via events).
+///   Dune is the authoritative Calls source; these rows are valuable for
+///   showing something immediately while Dune loads, and for covering
+///   blocks past Dune's indexing lag.
+pub(super) struct ClassifiedPage {
+    pub txs: Vec<crate::data::types::AddressTxSummary>,
+    pub calls: Vec<crate::data::types::ContractCallSummary>,
+    pub meta_txs: Vec<crate::data::types::MetaTxIntenderSummary>,
+}
+
+/// Single-pass classifier over an [`AddressActivityPage`].
+///
+/// Composes the three existing per-tab helpers so every caller that wants
+/// the full fan-out (the shared window scan, WS event replay, etc.) goes
+/// through one entry point. Semantics match the per-helper versions
+/// exactly — migration target for tasks #3 (Calls merge) and #4 (WS
+/// routing) in the address-view revamp plan.
+pub(super) async fn classify_activity_page(
+    address: starknet::core::types::Felt,
+    page: &AddressActivityPage,
+    abi_reg: &Arc<AbiRegistry>,
+) -> ClassifiedPage {
+    use starknet::core::types::Felt;
+
+    // Prewarm the address's own ABI once. The individual helpers prewarm
+    // the same address too, so this is redundant with them but cheap and
+    // keeps the classifier's contract explicit ("ABIs are warm on entry").
+    helpers::prewarm_abis([address], abi_reg).await;
+
+    // Txs: rows the address authored itself. Filter to sender==address
+    // before batch-converting so prewarm targets inside the tx helper only
+    // see actually-relevant multicall destinations.
+    let sender_rows: Vec<_> = page
+        .tx_rows
+        .iter()
+        .filter(|r| {
+            Felt::from_hex(&r.sender)
+                .map(|s| s == address)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let txs = if sender_rows.is_empty() {
+        Vec::new()
+    } else {
+        build_tx_summaries_from_pf_rows(&sender_rows, abi_reg).await
+    };
+
+    // Calls: pf-query-supplementary rows (Dune authoritative). Reuses the
+    // existing builder verbatim — any row with an inner call to address.
+    let calls = build_contract_calls_from_pf_rows(address, &page.tx_rows, abi_reg).await;
+
+    // MetaTxs: full page-level derivation so the tx_index tie-breaker
+    // (built from event_index ordering) stays correct.
+    let meta_txs = derive_meta_txs_from_page(address, page, abi_reg).await;
+
+    ClassifiedPage {
+        txs,
+        calls,
+        meta_txs,
+    }
+}
+
 /// Classify every tx row in a shared activity page as a meta-tx where
 /// `address` is the intender, returning the recency-sorted summaries.
 ///
@@ -2852,32 +3156,53 @@ pub(super) async fn derive_meta_txs_from_page(
 /// tabs. The `continuation_token` input is repurposed as a "fetch older" flag:
 ///
 /// - `None`           → [`EventWindowPolicy::TopDelta`] (tip-of-chain, cold or delta)
-/// - `Some(_)`        → [`EventWindowPolicy::ExtendDown`] (scan below cached floor)
+/// - `Some(_)`        → [`EventWindowPolicy::ExtendDown { window_size }`]
+///   (scan below cached floor, adaptive window size)
+///
+/// `from_block` is the absolute scan floor (typically deploy block) — the
+/// helper won't scan below it. When `min_searched <= from_block` we return
+/// `next_token = None` to signal "reached floor, stop paginating".
+///
+/// `window_size` is the block range size for the next ExtendDown page; the
+/// caller tracks it across calls (`meta_tx_last_window`) and the helper
+/// returns a suggested next size adapted to the observed hit density.
 ///
 /// The returned `next_token` carries `min_searched` when more older events
-/// remain, or `None` when we've reached genesis. The UI treats it as
+/// remain, or `None` when we've reached the floor. The UI treats it as
 /// opaque — whatever lands in the response gets echoed back on the next call.
 ///
-/// `from_block` / `limit` are currently ignored; kept in the Action schema
-/// until all three event-derived tabs are on the helper and we can cleanly
-/// collapse the Action surface.
+/// `limit` is currently ignored; kept in the Action schema until all three
+/// event-derived tabs are on the helper and we can cleanly collapse the
+/// Action surface.
 pub(super) async fn fetch_address_meta_txs(
     address: starknet::core::types::Felt,
-    _from_block: u64,
+    from_block: u64,
     continuation_token: Option<u64>,
+    window_size: u64,
     _limit: u32,
     ds: &Arc<dyn crate::data::DataSource>,
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
-    use crate::network::event_window::{EventWindowPolicy, ensure_address_events_window};
+    use crate::network::event_window::{
+        EXTEND_DOWN_INITIAL_WINDOW, EventWindowPolicy, ensure_address_events_window,
+    };
+
+    // Register the query in the status bar for the duration of this scan.
+    // Dropped automatically on every early-return path below.
+    let _guard = QueryGuard::new(
+        action_tx,
+        format!("meta:{}", query_addr_prefix(&address)),
+        "MetaTxs scan".to_string(),
+    );
 
     let send_empty = || {
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
             summaries: Vec::new(),
             next_token: None,
+            next_window_size: None,
         });
     };
 
@@ -2891,9 +3216,18 @@ pub(super) async fn fetch_address_meta_txs(
         }
     };
 
+    // Guard against a 0 coming in from state defaults: use the initial window.
+    let effective_window = if window_size == 0 {
+        EXTEND_DOWN_INITIAL_WINDOW
+    } else {
+        window_size
+    };
+
     let policy = match continuation_token {
         None => EventWindowPolicy::TopDelta,
-        Some(_) => EventWindowPolicy::ExtendDown,
+        Some(_) => EventWindowPolicy::ExtendDown {
+            window_size: effective_window,
+        },
     };
 
     let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
@@ -2904,6 +3238,7 @@ pub(super) async fn fetch_address_meta_txs(
         Some(pf),
         &ds_dyn,
         latest_block,
+        from_block,
     )
     .await
     {
@@ -2915,20 +3250,37 @@ pub(super) async fn fetch_address_meta_txs(
         }
     };
 
-    // `ExtendDown` past genesis returns an empty page — still emit an empty
+    let _ = action_tx.send(Action::AddressEventWindowUpdated {
+        address,
+        min_searched: outcome.min_searched,
+        max_searched: outcome.max_searched,
+        deferred_gap: outcome.deferred_gap,
+    });
+
+    // Stop paginating once we've scanned down to (or past) the deploy-block
+    // floor. The UI uses `next_token = None` as the "done" signal.
+    let has_more_below = outcome.min_searched > from_block;
+
+    // `ExtendDown` past floor returns an empty page — still emit an empty
     // response so the UI clears its loading flag and flips has_more=false.
     if outcome.page.events.is_empty() {
         debug!(
             addr = %format!("{:#x}", address),
             min_searched = outcome.min_searched,
             max_searched = outcome.max_searched,
+            floor = from_block,
             "MetaTxs: no new events in this window"
         );
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
             summaries: Vec::new(),
-            next_token: if outcome.min_searched > 0 {
+            next_token: if has_more_below {
                 Some(outcome.min_searched)
+            } else {
+                None
+            },
+            next_window_size: if has_more_below {
+                outcome.suggested_next_window
             } else {
                 None
             },
@@ -2938,13 +3290,25 @@ pub(super) async fn fetch_address_meta_txs(
 
     let summaries = derive_meta_txs_from_page(address, &outcome.page, abi_reg).await;
 
+    // Plan §2: the meta-tx scan's tx_rows are also valuable Calls rows — every
+    // `execute_from_outside(intender=ADDR)` tx is an outer invoke whose
+    // multicall calls ADDR. Dune alone caps at 500 rows (collapses hard after
+    // tx_hash dedup for meta-tx-heavy accounts), so merging the shared page's
+    // call-shaped projection is what keeps the MetaTxs ⊆ Calls invariant
+    // visible on high-volume accounts.
+    let calls_from_page =
+        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg).await;
+
     info!(
         addr = %format!("{:#x}", address),
         events = outcome.page.events.len(),
         candidates = outcome.page.tx_rows.len(),
         meta_txs = summaries.len(),
+        supplementary_calls = calls_from_page.len(),
         min_searched = outcome.min_searched,
         max_searched = outcome.max_searched,
+        floor = from_block,
+        suggested_next_window = ?outcome.suggested_next_window,
         deferred_gap = ?outcome.deferred_gap,
         "MetaTxs: classified"
     );
@@ -2953,10 +3317,22 @@ pub(super) async fn fetch_address_meta_txs(
         ds.save_meta_txs(&address, &summaries);
     }
 
+    if !calls_from_page.is_empty() {
+        let _ = action_tx.send(Action::AddressCallsMerged {
+            address,
+            calls: calls_from_page,
+        });
+    }
+
     // Signal "has more older" via Some(min_searched). The UI doesn't interpret
     // the value — it just checks is_some and echoes it back on the next call.
-    let next_token = if outcome.min_searched > 0 {
+    let next_token = if has_more_below {
         Some(outcome.min_searched)
+    } else {
+        None
+    };
+    let next_window_size = if has_more_below {
+        outcome.suggested_next_window
     } else {
         None
     };
@@ -2965,98 +3341,121 @@ pub(super) async fn fetch_address_meta_txs(
         address,
         summaries,
         next_token,
+        next_window_size,
     });
 }
 
-/// Fetch a window of contract events for `address` and emit the resulting
+/// Fetch calls-to-contract for `address` via Dune and emit the resulting
 /// [`ContractCallSummary`](crate::data::types::ContractCallSummary) rows as
 /// `AddressInfoLoaded { contract_calls, .. }`.
 ///
-/// Mirrors [`fetch_address_meta_txs`] but for the Calls tab. Works with or
-/// without pf-query:
-/// - **pf available** → `ensure_address_events_window` bulk-fetches tx rows
-///   alongside events, and we build summaries directly via
-///   [`build_contract_calls_from_pf_rows`] (no per-tx RPC).
-/// - **pf absent** → the window helper returns events with empty `tx_rows`;
-///   we fall back to [`build_contract_calls_from_hashes`] which fetches tx
-///   + receipt per hash through the [`DataSource`].
+/// Uses Dune's `starknet.calls` table (trace-indexed) rather than
+/// events-emitted-by-address, because the latter misses txs that called the
+/// contract without triggering an event (reverted calls, pure setters,
+/// nested multicall targets that don't emit). Event-based fetches are still
+/// used for accounts (where `TRANSACTION_EXECUTED` is always emitted) and
+/// for the contract's Events tab.
 ///
-/// Emission uses the same `AddressInfoLoaded` merge path that the legacy
-/// Dune bulk fetch used, so the UI reducer in the app state machine needs
-/// no changes.
+/// No-op when Dune is not configured — the tab falls back to whatever was
+/// loaded from cache on address entry.
 pub(super) async fn fetch_address_contract_calls(
     address: starknet::core::types::Felt,
     ds: &Arc<dyn crate::data::DataSource>,
+    dune: Option<&Arc<dune::DuneClient>>,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
     nonce: starknet::core::types::Felt,
     class_hash: Option<starknet::core::types::Felt>,
 ) {
-    use crate::network::event_window::{EventWindowPolicy, ensure_address_events_window};
+    const CONTRACT_CALL_LIMIT: u32 = 500;
 
-    let latest_block = match ds.get_latest_block_number().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: latest block fetch failed");
-            return;
-        }
-    };
-
-    let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
-    let outcome = match ensure_address_events_window(
-        address,
-        EventQueryKind::Contract,
-        EventWindowPolicy::TopDelta,
-        pf,
-        &ds_dyn,
-        latest_block,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: event window fetch failed");
-            return;
-        }
-    };
-
-    if outcome.page.events.is_empty() {
+    let Some(dune_client) = dune else {
         debug!(
             addr = %format!("{:#x}", address),
-            min_searched = outcome.min_searched,
-            max_searched = outcome.max_searched,
-            "Calls: no new events in this window"
+            "Calls: Dune not configured; skipping contract calls fetch"
         );
         return;
-    }
-
-    // pf path: tx_rows already populated. RPC fallback: derive from (hash, block).
-    let calls = if !outcome.page.tx_rows.is_empty() {
-        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg).await
-    } else {
-        let hashes_with_blocks: Vec<_> = outcome
-            .page
-            .unique_hashes
-            .iter()
-            .map(|h| (*h, *outcome.page.tx_block_map.get(h).unwrap_or(&0)))
-            .collect();
-        build_contract_calls_from_hashes(address, &hashes_with_blocks, ds, pf, abi_reg).await
     };
+
+    // Register the Calls fetch in the status bar for the duration of the
+    // Dune round-trip + enrichment. Dropped on every return path below.
+    let _guard = QueryGuard::new(
+        action_tx,
+        format!("calls:{}", query_addr_prefix(&address)),
+        "Calls fetch".to_string(),
+    );
+
+    // TopDelta: if we've already cached rows for this address, only ask Dune
+    // for blocks strictly newer than the highest block we've seen. Cold cache
+    // still falls back to the unwindowed "500 most recent" fetch so first open
+    // on a long-lived contract stays cheap.
+    //
+    // We also pull the timestamp of that newest-cached row and feed it to the
+    // windowed query as a `block_date` partition hint — `starknet.calls` is
+    // partitioned by date, so without it Dune scans every partition to resolve
+    // the `block_number BETWEEN` range and fails with QUERY_STATE_FAILED on
+    // dense contracts. A 1-day UTC cushion guards against the cached row
+    // sitting right before a day boundary.
+    let cached_calls = ds.load_cached_address_calls(&address);
+    let newest_cached = cached_calls
+        .iter()
+        .filter(|c| c.block_number > 0)
+        .max_by_key(|c| c.block_number);
+
+    let dune_calls_result = match newest_cached {
+        Some(c) => {
+            let min_date = (c.timestamp > 0)
+                .then(|| chrono::DateTime::from_timestamp(c.timestamp as i64, 0))
+                .flatten()
+                .map(|dt| dt.date_naive() - chrono::Duration::days(1));
+            dune_client
+                .query_contract_calls_windowed(
+                    address,
+                    c.block_number + 1,
+                    u64::MAX,
+                    CONTRACT_CALL_LIMIT,
+                    min_date,
+                )
+                .await
+        }
+        None => {
+            dune_client
+                .query_contract_calls(address, CONTRACT_CALL_LIMIT)
+                .await
+        }
+    };
+
+    let dune_calls = match dune_calls_result {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls fetch failed");
+            return;
+        }
+    };
+
+    // Resolve selectors, dedupe, and backfill real sender + fee + timestamp.
+    // Dune's `starknet.calls.caller_address` is the immediate caller (often a
+    // router like Ekubo), not the outer tx sender; `enrich_dune_calls` replaces
+    // it with `fetched_tx.sender()` and fills in fee/timestamp from the receipt.
+    let calls = enrich_dune_calls(address, dune_calls, abi_reg, ds, pf, action_tx).await;
 
     info!(
         addr = %format!("{:#x}", address),
-        events = outcome.page.events.len(),
         calls = calls.len(),
-        min_searched = outcome.min_searched,
-        max_searched = outcome.max_searched,
-        deferred_gap = ?outcome.deferred_gap,
-        via_pf = pf.is_some(),
-        "Calls: window fetch complete"
+        "Calls: Dune contract calls complete"
     );
 
+    // Merge the freshly fetched rows with whatever we already had cached before
+    // persisting. The windowed TopDelta path only returns rows newer than the
+    // previously seen tip, so writing just `calls` would clobber the bulk of
+    // the cache. Cold-cache path still works: `cached_calls` is empty there,
+    // and `deduplicate_contract_calls` returns the full 500-row set unchanged.
     if !calls.is_empty() {
-        ds.save_address_calls(&address, &calls);
+        let mut merged = cached_calls;
+        merged.extend(calls.iter().cloned());
+        let merged = crate::data::types::deduplicate_contract_calls(merged);
+        ds.save_address_calls(&address, &merged);
     }
 
     // Emit using the same merge path the Dune bulk fetch used. An empty
@@ -3346,12 +3745,16 @@ mod shared_pipeline_tests {
         );
     }
 
-    /// `build_contract_calls_from_pf_rows` must filter multicall entries by
-    /// the `address` argument. Given a 3-call multicall where only the
-    /// middle call targets `address`, the produced summary's
-    /// `function_name` must reflect exactly one inner call (no comma).
+    /// `build_contract_calls_from_pf_rows` lists every top-level multicall
+    /// entry in `function_name`, matching what the block/tx detail views
+    /// show via `helpers::format_endpoint_names`. Given a 3-call multicall
+    /// (where only the middle call actually targets `address`), the summary
+    /// must list all three selectors — the Calls row mirrors the outer tx's
+    /// endpoint set, not the subset that happens to touch `address` at the
+    /// top level. This is what makes function names appear for contracts
+    /// invoked only internally (e.g. Ekubo Core via an aggregator).
     #[tokio::test]
-    async fn build_contract_calls_filters_by_target_in_multicall() {
+    async fn build_contract_calls_lists_all_multicall_endpoints() {
         let target =
             Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
                 .unwrap();
@@ -3388,11 +3791,14 @@ mod shared_pipeline_tests {
         assert_eq!(c.status, "OK");
         assert!(
             !c.function_name.is_empty(),
-            "function_name must reflect the one targeting call"
+            "function_name must reflect the full top-level multicall"
         );
-        assert!(
-            !c.function_name.contains(','),
-            "only one inner call targets `address`, function_name should not list multiple: {:?}",
+        // Three top-level calls → at least two commas in the joined output
+        // (`format_selector_names` joins with ", ").
+        assert_eq!(
+            c.function_name.matches(',').count(),
+            2,
+            "all three top-level calls should be listed, got: {:?}",
             c.function_name
         );
     }
@@ -3563,6 +3969,79 @@ mod shared_pipeline_tests {
         assert_eq!(out[1].hash, Felt::from(2u64));
         assert_eq!(out[1].block_number, 101);
         assert_eq!(out[0].sender, Some(sender));
+    }
+
+    /// `classify_activity_page` fan-out for a direct sender-authored invoke:
+    /// sender == address and the multicall contains an inner call to address.
+    /// Expect Txs=1 (sender match) + Calls=1 (inner-call target match) +
+    /// MetaTxs=0 (no execute_from_outside shape, so not a meta-tx).
+    ///
+    /// Guards the unified classifier against regressing the per-tab fan-out
+    /// that the address-view revamp depends on.
+    #[tokio::test]
+    async fn classify_activity_page_fans_out_sender_and_call() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let tx_hash = Felt::from(0xABCDu64);
+
+        // Multicall with a single inner call targeting `addr`.
+        // Layout: [count=1, target=addr, selector=0x22, calldata_len=0].
+        let calldata = vec![Felt::from(1u64), addr, Felt::from(0x22u64), Felt::ZERO];
+        let page = AddressActivityPage {
+            events: vec![ev(tx_hash, 100, 0)],
+            tx_rows: vec![tx_row(tx_hash, addr, 100, 5, calldata)],
+            unique_hashes: vec![tx_hash],
+            tx_block_map: std::collections::HashMap::from([(tx_hash, 100u64)]),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+
+        let classified = classify_activity_page(addr, &page, &abi).await;
+
+        assert_eq!(
+            classified.txs.len(),
+            1,
+            "sender == address ⇒ one tx summary"
+        );
+        assert_eq!(classified.txs[0].hash, tx_hash);
+        assert_eq!(classified.txs[0].sender, Some(addr));
+
+        assert_eq!(
+            classified.calls.len(),
+            1,
+            "inner call to address ⇒ one call summary"
+        );
+        assert_eq!(classified.calls[0].tx_hash, tx_hash);
+        assert_eq!(classified.calls[0].sender, addr);
+
+        assert!(
+            classified.meta_txs.is_empty(),
+            "no outside_execution shape ⇒ no meta-tx classification, got: {:?}",
+            classified.meta_txs
+        );
+    }
+
+    /// `classify_activity_page` on an empty page returns empty projections
+    /// in all three slots. Guards against the classifier ever accidentally
+    /// fabricating rows when there are none to classify.
+    #[tokio::test]
+    async fn classify_activity_page_empty_page_yields_empty_projections() {
+        let addr =
+            Felt::from_hex("0x3a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4")
+                .unwrap();
+        let page = AddressActivityPage {
+            events: vec![],
+            tx_rows: vec![],
+            unique_hashes: vec![],
+            tx_block_map: std::collections::HashMap::new(),
+            next_token: None,
+        };
+        let abi = mk_abi_reg();
+        let classified = classify_activity_page(addr, &page, &abi).await;
+        assert!(classified.txs.is_empty());
+        assert!(classified.calls.is_empty());
+        assert!(classified.meta_txs.is_empty());
     }
 }
 

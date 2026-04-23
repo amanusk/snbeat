@@ -72,7 +72,9 @@ pub async fn run_network_task(
 
         // Spawn each request as a separate task for concurrency
         tokio::spawn(async move {
+            let cancel_inner = cancel.clone();
             let task = async move {
+                let cancel = cancel_inner;
                 match action {
                     Action::FetchRecentBlocks { count } => {
                         let start = std::time::Instant::now();
@@ -132,7 +134,7 @@ pub async fn run_network_task(
                     Action::FetchAddressInfo { address } => {
                         let _ = tx.send(Action::NavigateToAddress { address });
                         address::fetch_and_send_address_info(
-                            address, &ds, &abi_reg, &dune, &pf, &voyager, &tx,
+                            address, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
                         )
                         .await;
                     }
@@ -205,8 +207,10 @@ pub async fn run_network_task(
                         }
                     }
                     Action::ResolveSearch { query } => {
-                        search::resolve_search(query, &ds, &abi_reg, &dune, &pf, &voyager, &tx)
-                            .await;
+                        search::resolve_search(
+                            query, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
+                        )
+                        .await;
                     }
                     Action::EnrichAddressTxs { address, hashes } => {
                         address::enrich_address_txs(
@@ -283,6 +287,7 @@ pub async fn run_network_task(
                         address,
                         from_block,
                         continuation_token,
+                        window_size,
                         limit,
                     } => {
                         // On first page, emit cached rows immediately so the UI
@@ -302,6 +307,7 @@ pub async fn run_network_task(
                                 address,
                                 from_block,
                                 continuation_token,
+                                window_size,
                                 limit,
                                 &ds,
                                 pf,
@@ -316,6 +322,7 @@ pub async fn run_network_task(
                                 address,
                                 summaries: Vec::new(),
                                 next_token: None,
+                                next_window_size: None,
                             });
                         }
                     }
@@ -353,6 +360,21 @@ pub async fn run_network_task(
                                 debug!(tx = %format!("{:#x}", tx_hash), error = %e, "WS meta-tx classify: get_txs_by_hash failed");
                             }
                         }
+                    }
+                    Action::DecodeAddressWsEvent { address, event } => {
+                        // Streaming path from WS: a raw event for the
+                        // currently-viewed `address` arrived. Resolve its
+                        // emitter ABI, decode, and forward so the Events tab
+                        // merges the decoded row in real time. ABI miss falls
+                        // back to an undecoded `DecodedEvent` (raw keys/data
+                        // preserved) — the user still sees live activity, it
+                        // just renders without names.
+                        let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+                        let decoded = crate::decode::events::decode_event(&event, abi.as_deref());
+                        let _ = tx.send(Action::AddressEventStreamed {
+                            address,
+                            decoded_event: decoded,
+                        });
                     }
                     Action::FetchClassInfo { class_hash } => {
                         class::fetch_class_info(class_hash, &ds, &abi_reg, &dune, &pf, &tx).await;
@@ -428,6 +450,7 @@ fn action_is_cancellable(action: &Action) -> bool {
             | Action::EnrichAddressCalls { .. }
             | Action::FetchAddressMetaTxs { .. }
             | Action::ClassifyPotentialMetaTx { .. }
+            | Action::DecodeAddressWsEvent { .. }
             | Action::FetchMoreAddressTxs { .. }
     )
 }

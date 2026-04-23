@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::app::actions::Action;
 use crate::data::DataSource;
@@ -26,6 +27,7 @@ pub(super) async fn resolve_search(
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager: &Option<Arc<voyager::VoyagerClient>>,
     tx: &mpsc::UnboundedSender<Action>,
+    cancel: &CancellationToken,
 ) {
     // Try as block number first
     if let Ok(num) = query.parse::<u64>() {
@@ -45,7 +47,8 @@ pub(super) async fn resolve_search(
         if is_contract {
             // It's an address — go to address view
             let _ = tx.send(Action::NavigateToAddress { address: felt });
-            address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx).await;
+            address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx, cancel)
+                .await;
             return;
         }
 

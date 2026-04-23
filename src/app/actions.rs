@@ -5,7 +5,7 @@ use crate::app::views::address_info::UnfilledGap;
 use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
-    MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnReceipt, SnTransaction, TokenBalance,
+    MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnEvent, SnReceipt, SnTransaction, TokenBalance,
     VoyagerLabelInfo,
 };
 use crate::decode::events::DecodedEvent;
@@ -86,13 +86,16 @@ pub enum Action {
     /// the intender (issue #11). Paginates via pf-query's event continuation
     /// token — opaque u64 from the previous response, or `None` for first page.
     ///
-    /// `from_block` bounds the initial bloom scan range; without it, pf-query
-    /// walks from genesis and times out on accounts with long history. The
-    /// dispatcher sets this to the deploy block when known.
+    /// `from_block` is the absolute scan floor (typically deploy block); the
+    /// backend stops paginating once `min_searched <= from_block` so we don't
+    /// time out walking chunks older than the account. `window_size` is the
+    /// per-page ExtendDown block range, adapted across calls (double on empty,
+    /// halve on full) — see `event_window::suggest_next_window`.
     FetchAddressMetaTxs {
         address: Felt,
         from_block: u64,
         continuation_token: Option<u64>,
+        window_size: u64,
         limit: u32,
     },
     /// Classify a single tx as a potential meta-tx where `address` is the
@@ -103,6 +106,17 @@ pub enum Action {
     ClassifyPotentialMetaTx {
         address: Felt,
         tx_hash: Felt,
+    },
+    /// Decode a WS-received event using the ABI of its `from_address`, then
+    /// emit [`Action::AddressEventStreamed`] so the Events tab merges the
+    /// decoded row in real time. Dispatched from the `AddressWsEvent`
+    /// reducer — the reducer can't call the async ABI registry itself, so it
+    /// delegates here. A best-effort decode returns the raw event wrapped in
+    /// a [`DecodedEvent`] when no ABI is available, so the tab still reflects
+    /// live activity.
+    DecodeAddressWsEvent {
+        address: Felt,
+        event: SnEvent,
     },
     /// Fetch class hash info (ABI, declaration, deployed contracts).
     FetchClassInfo {
@@ -173,6 +187,17 @@ pub enum Action {
         address: Felt,
         calls: Vec<ContractCallSummary>,
     },
+    /// Supplementary Calls rows derived from a pf-query tx_rows scan (plan §2).
+    ///
+    /// The meta-tx keyed-event scan walks the same tx_rows the Calls tab needs
+    /// — every row is a tx that called this address via `execute_from_outside`.
+    /// Dune is still the completeness authority (LIMIT 500 after dedup), but
+    /// merging these rows closes the invariant gap where MetaTxs (keyed,
+    /// unbounded) could exceed Calls (Dune-only, capped).
+    AddressCallsMerged {
+        address: Felt,
+        calls: Vec<ContractCallSummary>,
+    },
     /// Older blocks loaded (appended to block list).
     OlderBlocksLoaded(Vec<SnBlock>),
     /// More address transactions loaded (appended to address tx list).
@@ -192,6 +217,12 @@ pub enum Action {
         /// Opaque continuation token from pf-query, if more pages remain.
         /// Pass back via `FetchAddressMetaTxs::continuation_token` to resume.
         next_token: Option<u64>,
+        /// Adaptive next ExtendDown window size (blocks) suggested by the
+        /// backend based on this page's hit density. `None` when no further
+        /// paging is expected (we hit the floor) or on non-ExtendDown calls.
+        /// The UI persists this as `meta_tx_last_window` and feeds it into
+        /// the next `FetchAddressMetaTxs` dispatch.
+        next_window_size: Option<u64>,
     },
     /// Cached meta-tx rows delivered synchronously at tab-entry time. Merges
     /// into the visible list but does NOT touch the loading flag / cursor — a
@@ -207,6 +238,21 @@ pub enum Action {
         address: Felt,
         summaries: Vec<MetaTxIntenderSummary>,
     },
+    /// Streaming single decoded event from the WS path (response to
+    /// [`Action::DecodeAddressWsEvent`]). Merges into the Events tab list
+    /// newest-first, deduping by `(tx_hash, event_index)`.
+    AddressEventStreamed {
+        address: Felt,
+        decoded_event: DecodedEvent,
+    },
+    /// Cached events decoded off the critical path. Emitted by a spawned task
+    /// after `AddressInfoLoaded` so the initial UI paint doesn't block on
+    /// per-event ABI fetches. Replaces the events list iff non-empty and the
+    /// address context still matches.
+    AddressEventsCacheLoaded {
+        address: Felt,
+        decoded_events: Vec<DecodedEvent>,
+    },
     /// Dune activity probe result delivered to UI for pagination window sizing.
     AddressProbeLoaded {
         address: Felt,
@@ -217,6 +263,16 @@ pub enum Action {
         address: Felt,
         sources: Vec<Source>,
     },
+    /// Passive update of the shared event-window hint (min/max scanned block,
+    /// deferred gap) driven by `ensure_address_events_window`. Consumed by
+    /// the Calls / Events / MetaTxs tab titles to surface gap state. Fires
+    /// from every event-window fetch path so all three tabs stay aligned.
+    AddressEventWindowUpdated {
+        address: Felt,
+        min_searched: u64,
+        max_searched: u64,
+        deferred_gap: Option<(u64, u64)>,
+    },
     /// Streaming partial tx results from a specific data source (merges, never replaces).
     AddressTxsStreamed {
         address: Felt,
@@ -225,11 +281,19 @@ pub enum Action {
         /// When true, this source has delivered all its data.
         complete: bool,
     },
-    /// Streaming incoming calls (events emitted by the contract) from WS.
-    /// Goes to the Calls tab — separate from AddressTxsStreamed which populates the Txs tab.
-    AddressCallsStreamed {
+    /// Single broadcast of a WS-received event. Emitted once per event; the
+    /// reducer fans it out to:
+    ///   - the Events tab via [`Action::DecodeAddressWsEvent`] (async decode);
+    ///   - the Calls tab (builds a `ContractCallSummary` stub + dispatches
+    ///     `EnrichAddressCalls`);
+    ///   - the MetaTxs tab for `TRANSACTION_EXECUTED` events via
+    ///     `ClassifyPotentialMetaTx`.
+    ///
+    /// The event itself has already been persisted into the address event
+    /// cache in the WS handler.
+    AddressWsEvent {
         address: Felt,
-        calls: Vec<ContractCallSummary>,
+        event: SnEvent,
     },
     /// Token balances loaded for an address (sent early for accounts).
     AddressBalancesLoaded {
@@ -250,6 +314,14 @@ pub enum Action {
     LatestBlockNumber(u64),
     /// Update the loading status message shown in the status bar.
     LoadingStatus(String),
+    /// Per-query status registry update: `Some(label)` starts/updates an entry
+    /// for `key`, `None` removes it. Keys are opaque strings owned by the
+    /// dispatcher (e.g. `"meta:41420f"` for the MetaTxs scan on an address).
+    /// Rendered alongside `loading_detail` in the status bar.
+    SetActiveQuery {
+        key: String,
+        label: Option<String>,
+    },
     /// Navigate to class info view immediately (before data loads).
     NavigateToClassInfo {
         class_hash: Felt,

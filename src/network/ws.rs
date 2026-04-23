@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 use crate::app::actions::{Action, Source};
 use crate::app::state::SourceStatus;
 use crate::data::DataSource;
-use crate::data::types::{AddressTxSummary, ContractCallSummary};
+use crate::data::types::{AddressTxSummary, SnEvent};
 use crate::utils::felt_to_u64;
 
 /// Maximum reconnect delay (capped exponential backoff).
@@ -530,7 +530,7 @@ async fn handle_message(
             handle_new_heads(&params.result, data_source, response_tx).await;
         }
         SubscriptionKind::Events { address } => {
-            handle_event(&params.result, address, response_tx);
+            handle_event(&params.result, address, data_source, response_tx);
         }
         SubscriptionKind::Transactions { address } => {
             handle_new_transaction(&params.result, address, response_tx);
@@ -574,7 +574,12 @@ async fn handle_new_heads(
     }
 }
 
-fn handle_event(result: &Value, address: Felt, response_tx: &mpsc::UnboundedSender<Action>) {
+fn handle_event(
+    result: &Value,
+    address: Felt,
+    data_source: &Arc<dyn DataSource>,
+    response_tx: &mpsc::UnboundedSender<Action>,
+) {
     let event: EmittedEventWithFinality = match serde_json::from_value(result.clone()) {
         Ok(e) => e,
         Err(e) => {
@@ -585,49 +590,46 @@ fn handle_event(result: &Value, address: Felt, response_tx: &mpsc::UnboundedSend
 
     let tx_hash = event.emitted_event.transaction_hash;
     let block_number = event.emitted_event.block_number.unwrap_or(0);
+    // event_index isn't carried in the subscription payload type; the WS
+    // notification includes it, but `EmittedEventWithFinality` doesn't expose
+    // it. Persisting it as 0 means the cache dedupe key degrades to
+    // (tx_hash, block) for WS-received events — fine in practice because the
+    // same (tx, block) never fires twice legitimately, and the reload path
+    // re-fetches the full event with its real index via pf-query.
+    let sn_event = SnEvent {
+        from_address: event.emitted_event.from_address,
+        keys: event.emitted_event.keys.clone(),
+        data: event.emitted_event.data.clone(),
+        transaction_hash: tx_hash,
+        block_number,
+        event_index: 0,
+    };
+
     debug!(
         address = %format!("{:#x}", address),
         tx = %format!("{:#x}", tx_hash),
         block = block_number,
-        "Received event via WS → Calls tab"
+        "Received event via WS → cache + single broadcast"
     );
 
-    // Events tell us the contract was invoked (called) — route to Calls tab.
-    // The tx sender and function name are not available from the event payload;
-    // they will be enriched later via the normal enrichment pipeline.
-    let call = ContractCallSummary {
-        tx_hash,
-        sender: Felt::ZERO, // Unknown from event alone; will be enriched
-        function_name: String::new(),
-        block_number,
-        timestamp: 0,
-        total_fee_fri: 0,
-        status: "OK".to_string(), // Events only fire for successful txs
-    };
+    // Route through the shared event cache so subsequent helper calls
+    // (`ensure_address_events_window`, tab loaders) see the new event
+    // without a round trip.
+    data_source.merge_address_events(&address, &[sn_event.clone()]);
 
-    let _ = response_tx.send(Action::AddressCallsStreamed {
+    // Single broadcast — the reducer fans out to Calls, MetaTxs classifier,
+    // and Events tab. Avoids multiple per-tab streaming actions diverging.
+    let _ = response_tx.send(Action::AddressWsEvent {
         address,
-        calls: vec![call],
+        event: sn_event,
     });
-
-    // If the viewed address is an Argent/Braavos account, every invoke —
-    // including execute_from_outside* — emits TRANSACTION_EXECUTED. Classify
-    // the tx to see whether it's a meta-tx with this address as the intender,
-    // and if so stream it into the MetaTxs tab. Cheap check up front: only
-    // dispatch when the first key matches the selector.
-    if event
-        .emitted_event
-        .keys
-        .first()
-        .map(|k| *k == tx_executed_selector())
-        .unwrap_or(false)
-    {
-        let _ = response_tx.send(Action::ClassifyPotentialMetaTx { address, tx_hash });
-    }
 }
 
 /// Cached `TRANSACTION_EXECUTED` selector as `Felt` (parsed once per process).
-fn tx_executed_selector() -> Felt {
+///
+/// pub(crate) so the `AddressWsEvent` reducer can compare the first key of a
+/// live event without re-parsing the hex string on every WS notification.
+pub(crate) fn tx_executed_selector() -> Felt {
     use std::sync::OnceLock;
     static SELECTOR: OnceLock<Felt> = OnceLock::new();
     *SELECTOR.get_or_init(|| {
@@ -817,7 +819,72 @@ fn block_from_raw(v: &Value) -> Option<crate::data::types::SnBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starknet::core::types::AddressFilter;
+    use crate::data::types::{SnBlock, SnReceipt, SnTransaction};
+    use async_trait::async_trait;
+    use starknet::core::types::{AddressFilter, ContractClass};
+
+    /// Minimal DataSource stub for `handle_event` tests. The handler only
+    /// calls `merge_address_events` (default trait impl returns the input
+    /// unchanged) — all other methods are unused here.
+    struct TestDataSource;
+
+    #[async_trait]
+    impl DataSource for TestDataSource {
+        async fn get_latest_block_number(&self) -> crate::error::Result<u64> {
+            unimplemented!()
+        }
+        async fn get_block(&self, _number: u64) -> crate::error::Result<SnBlock> {
+            unimplemented!()
+        }
+        async fn get_block_by_hash(&self, _hash: Felt) -> crate::error::Result<u64> {
+            unimplemented!()
+        }
+        async fn get_block_with_txs(
+            &self,
+            _number: u64,
+        ) -> crate::error::Result<(SnBlock, Vec<SnTransaction>)> {
+            unimplemented!()
+        }
+        async fn get_transaction(&self, _hash: Felt) -> crate::error::Result<SnTransaction> {
+            unimplemented!()
+        }
+        async fn get_receipt(&self, _hash: Felt) -> crate::error::Result<SnReceipt> {
+            unimplemented!()
+        }
+        async fn get_nonce(&self, _address: Felt) -> crate::error::Result<Felt> {
+            unimplemented!()
+        }
+        async fn get_class_hash(&self, _address: Felt) -> crate::error::Result<Felt> {
+            unimplemented!()
+        }
+        async fn get_class(&self, _class_hash: Felt) -> crate::error::Result<ContractClass> {
+            unimplemented!()
+        }
+        async fn get_recent_blocks(&self, _count: usize) -> crate::error::Result<Vec<SnBlock>> {
+            unimplemented!()
+        }
+        async fn get_events_for_address(
+            &self,
+            _address: Felt,
+            _from_block: Option<u64>,
+            _to_block: Option<u64>,
+            _limit: usize,
+        ) -> crate::error::Result<Vec<SnEvent>> {
+            unimplemented!()
+        }
+        async fn call_contract(
+            &self,
+            _contract_address: Felt,
+            _selector: Felt,
+            _calldata: Vec<Felt>,
+        ) -> crate::error::Result<Vec<Felt>> {
+            unimplemented!()
+        }
+    }
+
+    fn test_data_source() -> Arc<dyn DataSource> {
+        Arc::new(TestDataSource)
+    }
 
     #[test]
     fn build_subscribe_new_heads_msg() {
@@ -995,12 +1062,11 @@ mod tests {
 
     /// Bug-guard (address-view live updates): when a `TRANSACTION_EXECUTED`
     /// event arrives via WS for the viewed account, `handle_event` must
-    /// fan it out to **both** the Calls tab and the meta-tx classifier.
-    /// The latter is how execute_from_outside meta-txs populate the MetaTxs
-    /// tab in real time — if this emission goes missing, MetaTxs appears
-    /// stale even while Calls keeps ticking.
+    /// emit a single `AddressWsEvent` broadcast carrying the event. The
+    /// reducer fans this out to the Calls tab and the meta-tx classifier;
+    /// this test pins the emission at the handler boundary.
     #[test]
-    fn handle_event_tx_executed_fans_out_to_calls_and_classifier() {
+    fn handle_event_tx_executed_broadcasts_ws_event() {
         use crate::app::actions::Action;
         use tokio::sync::mpsc;
 
@@ -1029,44 +1095,34 @@ mod tests {
         let result: Value = serde_json::from_str(&event_json).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::handle_event(&result, address, &tx);
+        let ds = test_data_source();
+        super::handle_event(&result, address, &ds, &tx);
 
-        // Drain everything the handler produced.
         let mut actions: Vec<Action> = Vec::new();
         while let Ok(a) = rx.try_recv() {
             actions.push(a);
         }
 
-        let saw_calls = actions
-            .iter()
-            .any(|a| matches!(a, Action::AddressCallsStreamed { .. }));
-        let saw_classify = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::ClassifyPotentialMetaTx { address: ca, .. } if *ca == address
-            )
+        let ws_event = actions.iter().find_map(|a| match a {
+            Action::AddressWsEvent { address: ca, event } if *ca == address => Some(event),
+            _ => None,
         });
-
-        assert!(
-            saw_calls,
-            "TRANSACTION_EXECUTED must route to the Calls tab. Got: {:?}",
-            actions
+        let ev = ws_event.expect("TRANSACTION_EXECUTED must emit AddressWsEvent");
+        assert_eq!(
+            ev.keys.first().copied(),
+            Some(super::tx_executed_selector()),
+            "first key must be TRANSACTION_EXECUTED selector so the reducer \
+             dispatches ClassifyPotentialMetaTx"
         );
-        assert!(
-            saw_classify,
-            "TRANSACTION_EXECUTED for a viewed account must dispatch \
-             ClassifyPotentialMetaTx so execute_from_outside calls \
-             populate the MetaTxs tab live. Got: {:?}",
-            actions
-        );
+        assert_eq!(ev.transaction_hash, Felt::from_hex_unchecked(tx_hash_hex));
+        assert_eq!(ev.block_number, 8914198);
     }
 
-    /// Bug-guard: a non-`TRANSACTION_EXECUTED` event (e.g. a plain contract
-    /// event like an ERC20 Transfer) must still route to Calls but must NOT
-    /// trigger meta-tx classification — `classify_meta_tx_candidate` would
-    /// always reject it, so the dispatch is wasted work.
+    /// Bug-guard: a non-`TRANSACTION_EXECUTED` event still emits the broadcast,
+    /// but its first key must not equal the TRANSACTION_EXECUTED selector —
+    /// the reducer uses that check to skip meta-tx classification.
     #[test]
-    fn handle_event_non_tx_executed_skips_classifier() {
+    fn handle_event_non_tx_executed_broadcasts_with_other_key() {
         use crate::app::actions::Action;
         use tokio::sync::mpsc;
 
@@ -1094,20 +1150,23 @@ mod tests {
         let result: Value = serde_json::from_str(&event_json).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::handle_event(&result, address, &tx);
+        let ds = test_data_source();
+        super::handle_event(&result, address, &ds, &tx);
 
         let mut actions: Vec<Action> = Vec::new();
         while let Ok(a) = rx.try_recv() {
             actions.push(a);
         }
 
-        let saw_classify = actions
-            .iter()
-            .any(|a| matches!(a, Action::ClassifyPotentialMetaTx { .. }));
-        assert!(
-            !saw_classify,
-            "Non-TRANSACTION_EXECUTED event must not trigger meta-tx classify. Got: {:?}",
-            actions
+        let ws_event = actions.iter().find_map(|a| match a {
+            Action::AddressWsEvent { address: ca, event } if *ca == address => Some(event),
+            _ => None,
+        });
+        let ev = ws_event.expect("non-TRANSACTION_EXECUTED event must still emit AddressWsEvent");
+        assert_ne!(
+            ev.keys.first().copied(),
+            Some(super::tx_executed_selector()),
+            "first key must NOT match TRANSACTION_EXECUTED selector"
         );
     }
 }

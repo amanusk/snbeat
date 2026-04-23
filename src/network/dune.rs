@@ -194,6 +194,8 @@ impl DuneClient {
                     timestamp: block_time,
                     total_fee_fri: 0, // Not in calls table
                     status,
+                    nonce: None, // Not in calls table — merged in from RPC/pf path
+                    tip: 0,
                 })
             })
             .collect())
@@ -229,27 +231,47 @@ impl DuneClient {
     }
 
     /// Windowed variant of `query_contract_calls` — scoped to a block range for fast completion.
+    ///
+    /// `min_block_date` is an optional partition hint: `starknet.calls` is partitioned by
+    /// `block_date`, and without a date predicate Dune has to scan every partition to find
+    /// the requested `block_number` range, which times out as `QUERY_STATE_FAILED` on dense
+    /// contracts. Pass the `block_date` of `from_block` (minus a 1-day UTC buffer) whenever
+    /// the caller has a reasonable estimate — the SQL stays correct either way.
     pub async fn query_contract_calls_windowed(
         &self,
         contract: Felt,
         from_block: u64,
         to_block: u64,
         limit: u32,
+        min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<Vec<ContractCallSummary>, String> {
         let contract_hex = format!("{:#066x}", contract);
+        let date_clause = min_block_date
+            .map(|d| format!("AND block_date >= date '{}' ", d.format("%Y-%m-%d")))
+            .unwrap_or_default();
+        // DuneSQL (Trino) uses bigint for block_number; any literal above i64::MAX
+        // (9_223_372_036_854_775_807) is rejected at parse time as "Invalid numeric
+        // literal" — so a caller passing u64::MAX as "no upper bound" would have
+        // the whole query fail. Emit an open-ended predicate in that case.
+        let range_clause = if to_block == u64::MAX {
+            format!("AND block_number >= {}", from_block)
+        } else {
+            format!("AND block_number BETWEEN {} AND {}", from_block, to_block)
+        };
         let sql = format!(
             "SELECT transaction_hash, caller_address, entry_point_selector, \
              block_number, block_time, revert_reason \
              FROM starknet.calls \
              WHERE contract_address = {} \
-             AND block_number BETWEEN {} AND {} \
+             {}\
+             {} \
              AND call_type = 'CALL' \
              ORDER BY block_number DESC \
              LIMIT {}",
-            contract_hex, from_block, to_block, limit
+            contract_hex, date_clause, range_clause, limit
         );
 
-        debug!(contract = %contract_hex, from_block, to_block, "Querying Dune for contract calls (windowed)");
+        debug!(contract = %contract_hex, from_block, to_block, ?min_block_date, "Querying Dune for contract calls (windowed)");
         let rows = self.execute_sql(&sql).await?;
         info!(
             rows = rows.len(),
@@ -293,6 +315,8 @@ impl DuneClient {
                     timestamp: block_time,
                     total_fee_fri: 0,
                     status,
+                    nonce: None,
+                    tip: 0,
                 })
             })
             .collect())
@@ -369,6 +393,55 @@ impl DuneClient {
             event_count = probe.callee_call_count,
             blocks = format!("{}..{}", probe.min_block(), probe.max_block()),
             "Dune events probe complete"
+        );
+        Ok(probe)
+    }
+
+    /// TopDelta variant of [`Self::probe_address_activity`].
+    ///
+    /// When a prior probe result is cached but stale, we only need to extend
+    /// its `max_block` + event count toward the chain tip — `min_block`
+    /// never regresses. This query scopes to `block_number > from_block`,
+    /// making the re-probe cheap regardless of chain age.
+    ///
+    /// Returns a partial probe: `callee_call_count` counts the delta events,
+    /// and `callee_max_block` is their upper bound. The caller is expected to
+    /// merge this into the cached row (cache.rs `save_activity_range_with_count`
+    /// handles the min-preserve / max-expand / count-max semantics).
+    pub async fn probe_address_activity_delta(
+        &self,
+        address: Felt,
+        from_block: u64,
+    ) -> Result<AddressActivityProbe, String> {
+        let addr_hex = format!("{:#066x}", address);
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt, \
+               MIN(block_number) AS min_block, MAX(block_number) AS max_block \
+             FROM starknet.events \
+             WHERE from_address = {addr} \
+             AND block_number > {from}",
+            addr = addr_hex,
+            from = from_block,
+        );
+
+        debug!(address = %addr_hex, from_block, "Dune events probe (delta): extending activity range");
+        let rows = self.execute_sql(&sql).await?;
+
+        let mut probe = AddressActivityProbe::default();
+        if let Some(row) = rows.first() {
+            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
+            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
+            probe.callee_call_count = cnt;
+            probe.callee_min_block = min_b;
+            probe.callee_max_block = max_b;
+        }
+
+        info!(
+            event_count = probe.callee_call_count,
+            from_block,
+            max_block = probe.callee_max_block,
+            "Dune events probe (delta) complete"
         );
         Ok(probe)
     }

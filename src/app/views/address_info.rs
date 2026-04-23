@@ -21,6 +21,31 @@ use crate::ui::widgets::stateful_list::StatefulList;
 /// they stay aligned — drift between the two causes silent data loss.
 pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
 
+/// Passive UI hint derived from the event-window helper's last fetch.
+/// Shared across the Calls / Events / MetaTxs tabs because all three
+/// project from the same `address_events` + `address_search_progress`
+/// cache. Surfaces whatever the helper already computed — no fill logic
+/// is wired to it yet (see task #7 scope: passive-only port).
+///
+/// - `deferred_gap = Some((lo, hi))` ⇒ helper deliberately skipped that
+///   block range because the TopDelta delta exceeded
+///   `EVENT_LARGE_GAP_THRESHOLD_BLOCKS`. Surfaced as a title suffix so
+///   users know the cached event set isn't contiguous.
+/// - `min_searched > 0` ⇒ older history exists below the cached floor
+///   (useful future signal for an interactive ExtendDown trigger).
+#[derive(Clone, Debug, Default)]
+pub struct EventWindowHint {
+    /// Lowest block ever scanned for this address. `0` ⇒ reached genesis
+    /// or never scanned.
+    pub min_searched: u64,
+    /// Highest block ever scanned. Anchors the "is there more tip to fetch"
+    /// question on the next TopDelta.
+    pub max_searched: u64,
+    /// Deliberately skipped block range from the last TopDelta fetch.
+    /// `Some((lo, hi))` where `lo..=hi` is unscanned.
+    pub deferred_gap: Option<(u64, u64)>,
+}
+
 /// A detected, unfilled nonce gap in the tx list that has been deferred
 /// for on-demand filling (issue #10). We do NOT auto-fill large gaps on
 /// address load; instead we wait until the user scrolls toward the gap
@@ -104,22 +129,34 @@ pub struct AddressInfoState {
     /// Set to deploy block when known; bounds the scan range so pf-query
     /// doesn't time out walking chunks older than the account.
     pub meta_tx_from_block: u64,
-    /// Number of automatic (non-user-triggered) pages already fetched while
-    /// trying to fill the first screen of MetaTxs. Capped by
-    /// `META_TX_AUTO_PAGE_CAP` so an address with many events but zero
-    /// classified meta-txs doesn't walk the whole history in the background.
-    pub meta_tx_auto_pages: u32,
+    /// Last ExtendDown window size (blocks) used for this address's MetaTxs
+    /// fetch. Adapted across pages: doubles on empty windows (sparse
+    /// addresses), halves on full pages (dense addresses, bloom cap hit).
+    /// Seeded with `EXTEND_DOWN_INITIAL_WINDOW` on tab entry.
+    pub meta_tx_last_window: u64,
+    /// Shared event-window hint for the event-backed tabs (Calls / Events /
+    /// MetaTxs). Updated whenever `ensure_address_events_window` runs.
+    /// `None` before any fetch completes.
+    pub event_window: Option<EventWindowHint>,
 }
 
-/// Maximum background auto-continue pages when filling the MetaTxs first
-/// screen. Each page scans ~50 events, so 10 pages ≈ 500 events. Once hit,
-/// further pagination requires the user to scroll (strictly on-demand).
-pub const META_TX_AUTO_PAGE_CAP: u32 = 10;
-
-/// Target MetaTx row count for the first screen. Auto-continue keeps paging
-/// until either this target is reached, `next_token` exhausts, or the
-/// `META_TX_AUTO_PAGE_CAP` safety cap trips.
-pub const META_TX_FIRST_PAINT_TARGET: usize = 20;
+/// Auto-fill row target for the event-backed tabs (currently MetaTxs;
+/// extends to Calls / Events as those tabs migrate to the shared pipeline).
+///
+/// Stop conditions for the background auto-continue loop are exactly:
+///
+///   1. The visible list reaches `AUTO_FILL_TARGET` rows — stop.
+///   2. `has_more` drops (history exhausted: pf-query ran out of blocks
+///      to scan) — stop. The final count stands, no retry.
+///   3. The user navigates away — the session-token cancellation in the
+///      network task tears down any in-flight page fetch.
+///
+/// There is no page-count cap: a sparse address with zero classified
+/// meta-txs is allowed to walk back to its deploy block, because the
+/// alternative ("give up early") silently under-reports. Scrolling near
+/// the bottom re-arms auto-fill (see `maybe_fetch_more_meta_txs`), so
+/// history-exhaustion and user-initiated continuation share one path.
+pub const AUTO_FILL_TARGET: usize = 50;
 
 impl Default for AddressInfoState {
     fn default() -> Self {
@@ -154,7 +191,8 @@ impl Default for AddressInfoState {
             meta_tx_has_more: false,
             meta_txs_dispatched: false,
             meta_tx_from_block: 0,
-            meta_tx_auto_pages: 0,
+            meta_tx_last_window: crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW,
+            event_window: None,
         }
     }
 }
@@ -190,7 +228,8 @@ impl AddressInfoState {
         self.meta_tx_has_more = false;
         self.meta_txs_dispatched = false;
         self.meta_tx_from_block = 0;
-        self.meta_tx_auto_pages = 0;
+        self.meta_tx_last_window = crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW;
+        self.event_window = None;
     }
 
     /// Whether any source thinks there is more data to fetch.
@@ -329,6 +368,24 @@ impl AddressInfoState {
         {
             self.oldest_event_block = Some(oldest);
         }
+    }
+
+    /// Merge incoming contract calls into the existing list and sort by block
+    /// number descending. `deduplicate_contract_calls` does the field-level
+    /// merge so a later-arriving Dune row can still contribute richer
+    /// function_name/fee data to a pf-query row with the same tx_hash (and
+    /// vice-versa). Callers are responsible for follow-up work (selection,
+    /// cursor updates, persistence).
+    pub fn merge_calls(&mut self, incoming: Vec<ContractCallSummary>) {
+        if incoming.is_empty() {
+            return;
+        }
+        let mut merged = std::mem::take(&mut self.calls.items);
+        merged.extend(incoming);
+        self.calls.items = crate::data::types::deduplicate_contract_calls(merged);
+        self.calls
+            .items
+            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
     }
 
     /// Scan the current tx list for a "large" nonce gap that we want to defer

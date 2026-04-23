@@ -106,6 +106,24 @@ fn draw_scrollable_detail(
     } else {
         theme::BLOCK_NUMBER_STYLE
     };
+    // Block age (when the block timestamp has been fetched).
+    let age_suffix = app
+        .tx_detail
+        .block_timestamp
+        .map(|ts| {
+            let now = chrono::Utc::now().timestamp() as u64;
+            let diff = now.saturating_sub(ts);
+            if diff < 60 {
+                format!("  ({diff}s ago)")
+            } else if diff < 3600 {
+                format!("  ({}m ago)", diff / 60)
+            } else if diff < 86400 {
+                format!("  ({}h ago)", diff / 3600)
+            } else {
+                format!("  ({}d ago)", diff / 86400)
+            }
+        })
+        .unwrap_or_default();
     record(
         &TxNavItem::Block(blk_num),
         &lines,
@@ -119,6 +137,7 @@ fn draw_scrollable_detail(
         Span::styled(format!("  {}", block_hash_short), theme::BLOCK_HASH_STYLE),
         Span::styled(format!("  Idx: {}", tx.index()), theme::NORMAL_STYLE),
         Span::styled(format!("  {}", finality_str), theme::STATUS_OK),
+        Span::styled(age_suffix, theme::SUGGESTION_STYLE),
     ]));
 
     // Type
@@ -495,6 +514,11 @@ fn draw_scrollable_detail(
                 ),
                 theme::SUGGESTION_STYLE,
             ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   Tip:        ", theme::NORMAL_STYLE),
+            Span::raw(format_fri(tip as u128)),
+            Span::styled("  (Tip/gas)", theme::SUGGESTION_STYLE),
         ]));
 
         let res = &receipt.execution_resources;

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::data::types::{AddressTxSummary, SnBlock, VoyagerLabelInfo};
 use crate::network::prices::PriceClient;
@@ -26,8 +27,13 @@ use crate::search::SearchEngine;
 use crate::ui::widgets::stateful_list::StatefulList;
 use actions::{Action, Source};
 use starknet::core::types::Felt;
-use state::{ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
+use state::{ActiveQueries, ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
 use views::{AddressInfoState, BlockDetailState, ClassInfoState, TxDetailState};
+
+/// Maximum number of blocks retained in the main blocks list.
+/// Applied consistently to both prepends (new blocks) and appends (older
+/// blocks paginated in) to keep the list stable while the user navigates.
+const MAX_BLOCKS: usize = 500;
 
 /// A saved navigation location for the forward/back jump list (Ctrl+o / Ctrl+i).
 #[derive(Debug, Clone)]
@@ -81,9 +87,15 @@ pub struct App {
     pub connection_status: ConnectionStatus,
     pub error_message: Option<String>,
     pub data_sources: DataSources,
+    pub active_queries: ActiveQueries,
 
     // Pagination flags (prevent duplicate fetches)
     pub fetching_older_blocks: bool,
+
+    /// Set when `G` on the blocks view triggers an older-blocks fetch, so
+    /// that once the fetch lands we re-snap the selection to the new last
+    /// item (without this, `G` stops 30 blocks short of the true bottom).
+    pub pending_bottom_jump: bool,
 
     /// Labels fetched from Voyager API at runtime (address → label info).
     /// Used as a fallback when neither user labels nor known addresses have an entry.
@@ -130,8 +142,10 @@ impl App {
             connection_status: ConnectionStatus::default(),
             error_message: None,
             data_sources: DataSources::default(),
+            active_queries: ActiveQueries::default(),
 
             fetching_older_blocks: false,
+            pending_bottom_jump: false,
 
             voyager_labels: HashMap::new(),
 
@@ -256,7 +270,7 @@ impl App {
     pub fn go_to_root_or_quit(&mut self) {
         if self.view_stack.len() > 1 {
             // Unsubscribe from any active address WS subscription
-            if self.view_stack.iter().any(|v| *v == View::AddressInfo) {
+            if self.view_stack.contains(&View::AddressInfo) {
                 self.unsubscribe_current_address();
             }
             self.view_stack.truncate(1);
@@ -387,6 +401,17 @@ impl App {
         }
     }
 
+    /// Scroll the main blocks list by a delta, triggering older-block
+    /// pagination when the new selection nears the tail. Used by Ctrl+D /
+    /// Ctrl+U on the Blocks view.
+    pub fn blocks_scroll_by(&mut self, delta: i64) {
+        if self.blocks.items.is_empty() {
+            return;
+        }
+        self.blocks.scroll_by(delta);
+        self.maybe_fetch_older_blocks();
+    }
+
     /// Dispatch the next MetaTxs page when the selection nears the end of the
     /// list and pf-query signaled more data. Idempotent: guarded by
     /// `fetching_meta_txs`.
@@ -405,11 +430,13 @@ impl App {
         };
         let token = self.address.meta_tx_cursor_block;
         let from_block = self.address.meta_tx_from_block;
+        let window_size = self.address.meta_tx_last_window;
         self.address.fetching_meta_txs = true;
         let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
             address: addr,
             from_block,
             continuation_token: token,
+            window_size,
             limit: 50,
         });
     }
@@ -511,7 +538,14 @@ impl App {
         match self.current_view() {
             View::Blocks => {
                 self.blocks.select_last();
+                let was_fetching = self.fetching_older_blocks;
                 self.maybe_fetch_older_blocks();
+                // If G just kicked off an older-blocks fetch, remember that
+                // the user wanted the true bottom so we can re-snap once
+                // the paginated batch lands.
+                if !was_fetching && self.fetching_older_blocks {
+                    self.pending_bottom_jump = true;
+                }
             }
             View::BlockDetail => self.block_detail.txs.select_last(),
             View::TxDetail => {
@@ -731,31 +765,71 @@ impl App {
                 }
                 self.is_loading = false;
                 self.fetching_older_blocks = false;
+                self.pending_bottom_jump = false;
             }
             Action::OlderBlocksLoaded(blocks) => {
-                // Append older blocks to the end of the list (they are already sorted newest-first)
+                // Preserve selection by block NUMBER across the append +
+                // truncate — index-based tracking silently drifts the user
+                // onto a different block when the list grows or shrinks.
+                let selected_number = self.blocks.selected_item().map(|b| b.number);
                 self.blocks.items.extend(blocks);
-                // Keep list bounded to avoid unbounded memory growth
-                if self.blocks.items.len() > 500 {
-                    self.blocks.items.truncate(500);
+                if self.blocks.items.len() > MAX_BLOCKS {
+                    self.blocks.items.truncate(MAX_BLOCKS);
                 }
                 self.fetching_older_blocks = false;
+                if self.pending_bottom_jump {
+                    // `G` asked for the true bottom; snap to the new last
+                    // item now that pagination has landed.
+                    self.blocks.select_last();
+                    self.pending_bottom_jump = false;
+                } else if let Some(num) = selected_number
+                    && let Some(idx) = self.blocks.items.iter().position(|b| b.number == num)
+                {
+                    self.blocks.state.select(Some(idx));
+                }
             }
             Action::NewBlock(block) => {
                 self.latest_block_number = block.number;
-                // If the user has scrolled away from the top, keep focus on the
-                // same block by bumping the selection index.  When the selection
-                // is at 0 (the newest block) we leave it there so the list
-                // always tracks the latest block.
-                if let Some(sel) = self.blocks.state.selected() {
-                    if sel > 0 {
-                        self.blocks.state.select(Some(sel + 1));
-                    }
+                // Remember where the user was *before* mutating the list so
+                // we can either follow the tip (sel==0) or pin to the same
+                // block number (sel>0), robust against tail truncation.
+                let prior_sel = self.blocks.state.selected();
+                let selected_number = self.blocks.selected_item().map(|b| b.number);
+
+                // Deduplicate: if the head already has this block number
+                // (e.g. WS replay on reconnect), overwrite rather than
+                // insert a duplicate row.
+                if self.blocks.items.first().map(|b| b.number) == Some(block.number) {
+                    self.blocks.items[0] = block;
+                } else {
+                    self.blocks.items.insert(0, block);
                 }
-                self.blocks.items.insert(0, block);
-                // Keep list bounded
-                if self.blocks.items.len() > 200 {
-                    self.blocks.items.truncate(200);
+                if self.blocks.items.len() > MAX_BLOCKS {
+                    self.blocks.items.truncate(MAX_BLOCKS);
+                }
+
+                match prior_sel {
+                    // Follow the tip when unselected or already at the top.
+                    None | Some(0) => {
+                        if !self.blocks.items.is_empty() {
+                            self.blocks.state.select(Some(0));
+                        }
+                    }
+                    // Otherwise pin to the same block number so the user's
+                    // highlighted row does not silently change under them.
+                    Some(_) => {
+                        if let Some(num) = selected_number {
+                            if let Some(idx) =
+                                self.blocks.items.iter().position(|b| b.number == num)
+                            {
+                                self.blocks.state.select(Some(idx));
+                            } else {
+                                // Block fell off the tail during truncation;
+                                // clamp to the new last item.
+                                self.blocks.select_last();
+                            }
+                        }
+                    }
                 }
             }
             Action::BlockDetailLoaded {
@@ -908,21 +982,22 @@ impl App {
                     );
                 }
 
-                // Update contract calls (merge, not replace)
+                // Update contract calls (merge across sources, not replace).
+                //
+                // Calls can arrive from two paths for the same tx_hash:
+                //   - Dune `starknet.calls` — authoritative and richer (resolved
+                //     function_name, accurate fee).
+                //   - pf-query shared window scan — supplementary, may arrive
+                //     first if Dune is slow/unavailable.
+                //
+                // Previously the reducer skipped any new row whose tx_hash was
+                // already present, which silently dropped Dune's richer data
+                // when pf-query arrived first. Route both sources through
+                // `deduplicate_contract_calls` which merges function_name
+                // (joined), fills missing fee/timestamp, and preserves the
+                // superset — so neither source can hide the other's data.
                 if !contract_calls.is_empty() {
-                    let existing_hashes: std::collections::HashSet<_> =
-                        self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                    let new_calls: Vec<_> = contract_calls
-                        .into_iter()
-                        .filter(|c| !existing_hashes.contains(&c.tx_hash))
-                        .collect();
-                    if !new_calls.is_empty() {
-                        self.address.calls.items.extend(new_calls);
-                        self.address
-                            .calls
-                            .items
-                            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
-                    }
+                    self.address.merge_calls(contract_calls);
                     if self.address.calls.state.selected().is_none()
                         && !self.address.calls.items.is_empty()
                     {
@@ -1020,20 +1095,10 @@ impl App {
                 if self.address.context == Some(address) {
                     let tx_summaries = self.filter_deployment_txs(address, tx_summaries);
                     self.address.merge_tx_summaries(tx_summaries);
-                    // Merge contract calls
-                    if !contract_calls.is_empty() {
-                        let existing_hashes: std::collections::HashSet<_> =
-                            self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                        let new_calls: Vec<_> = contract_calls
-                            .into_iter()
-                            .filter(|c| !existing_hashes.contains(&c.tx_hash))
-                            .collect();
-                        self.address.calls.items.extend(new_calls);
-                        self.address
-                            .calls
-                            .items
-                            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
-                    }
+                    // Merge contract calls across sources (Dune + pf-query) —
+                    // see `merge_calls` for why this is a field-level merge
+                    // rather than a hash-based replace.
+                    self.address.merge_calls(contract_calls);
                     self.address.oldest_event_block = Some(oldest_block);
                     self.address.dune_cursor_block = Some(oldest_block);
                     self.address.rpc_cursor_block = Some(oldest_block);
@@ -1046,6 +1111,7 @@ impl App {
                 address,
                 summaries,
                 next_token,
+                next_window_size,
             } => {
                 if self.address.context == Some(address) {
                     // Merge by hash to avoid dupes across pages.
@@ -1068,31 +1134,38 @@ impl App {
                     }
                     self.address.meta_tx_cursor_block = next_token;
                     self.address.meta_tx_has_more = next_token.is_some();
+                    // Persist adapted window size so the next ExtendDown
+                    // dispatch (auto-page or user-scroll) picks up where this
+                    // page left off.
+                    if let Some(w) = next_window_size {
+                        self.address.meta_tx_last_window = w;
+                    }
                 }
                 self.address.fetching_meta_txs = false;
-                // Progressive fill: keep paging until the visible screen is
-                // full (~FIRST_PAINT_TARGET rows) OR we hit the safety cap
-                // (AUTO_PAGE_CAP). The cap prevents addresses with many events
-                // but zero classified meta-txs from walking their whole
-                // history in the background. Once either limit trips,
-                // pagination goes back to strictly on-demand via
-                // `maybe_fetch_more_meta_txs` on scroll.
-                use crate::app::views::address_info::{
-                    META_TX_AUTO_PAGE_CAP, META_TX_FIRST_PAINT_TARGET,
-                };
+                // Progressive fill: keep paging until the visible list has
+                // `AUTO_FILL_TARGET` rows, or pf-query runs out of blocks to
+                // scan (`meta_tx_has_more == false`), or the user navigates
+                // away (session-token cancellation tears down the in-flight
+                // fetch). No page-count cap — a sparse address with zero
+                // classified meta-txs will walk back to deploy block rather
+                // than silently under-report. Once auto-fill stops, further
+                // pagination is strictly on-demand via
+                // `maybe_fetch_more_meta_txs` on scroll-near-bottom, so the
+                // history-exhausted and user-continuation paths converge.
+                use crate::app::views::address_info::AUTO_FILL_TARGET;
                 if self.address.context == Some(address)
                     && self.address.meta_tx_has_more
-                    && self.address.meta_txs.items.len() < META_TX_FIRST_PAINT_TARGET
-                    && self.address.meta_tx_auto_pages < META_TX_AUTO_PAGE_CAP
+                    && self.address.meta_txs.items.len() < AUTO_FILL_TARGET
                 {
                     let next = self.address.meta_tx_cursor_block;
                     let from_block = self.address.meta_tx_from_block;
+                    let window_size = self.address.meta_tx_last_window;
                     self.address.fetching_meta_txs = true;
-                    self.address.meta_tx_auto_pages += 1;
                     let _ = self.action_tx.send(Action::FetchAddressMetaTxs {
                         address,
                         from_block,
                         continuation_token: next,
+                        window_size,
                         limit: 50,
                     });
                 }
@@ -1101,9 +1174,9 @@ impl App {
                 if self.address.context == Some(address) {
                     let mut seen: std::collections::HashSet<_> =
                         self.address.meta_txs.items.iter().map(|m| m.hash).collect();
-                    for s in summaries {
+                    for s in &summaries {
                         if seen.insert(s.hash) {
-                            self.address.meta_txs.items.push(s);
+                            self.address.meta_txs.items.push(s.clone());
                         }
                     }
                     self.address.meta_txs.items.sort_by(|a, b| {
@@ -1118,6 +1191,33 @@ impl App {
                     }
                     // Keep fetching_meta_txs / cursor as-is: a live fetch may
                     // still be in-flight behind this cache delivery.
+
+                    // Plan §2 invariant: every cached MetaTx is also a Call on
+                    // this address. The live meta-tx scan already emits
+                    // `AddressCallsMerged` for freshly-seen pages, but on
+                    // re-entry the cached rows never pass through that path —
+                    // promote them here so the Calls list reflects the
+                    // MetaTxs ⊆ Calls invariant immediately from cache.
+                    let promoted: Vec<crate::data::types::ContractCallSummary> = summaries
+                        .into_iter()
+                        .map(|m| crate::data::types::ContractCallSummary {
+                            tx_hash: m.hash,
+                            sender: m.paymaster,
+                            function_name: String::new(),
+                            block_number: m.block_number,
+                            timestamp: m.timestamp,
+                            total_fee_fri: m.total_fee_fri,
+                            status: m.status,
+                            nonce: None,
+                            tip: 0,
+                        })
+                        .collect();
+                    if !promoted.is_empty() {
+                        let _ = self.action_tx.send(Action::AddressCallsMerged {
+                            address,
+                            calls: promoted,
+                        });
+                    }
                 }
             }
             Action::AddressMetaTxsStreamed { address, summaries } => {
@@ -1211,6 +1311,21 @@ impl App {
                     self.address.sources_pending = sources.into_iter().collect();
                 }
             }
+            Action::AddressEventWindowUpdated {
+                address,
+                min_searched,
+                max_searched,
+                deferred_gap,
+            } => {
+                if self.address.context == Some(address) {
+                    self.address.event_window =
+                        Some(crate::app::views::address_info::EventWindowHint {
+                            min_searched,
+                            max_searched,
+                            deferred_gap,
+                        });
+                }
+            }
             Action::AddressTxsStreamed {
                 address,
                 source,
@@ -1218,6 +1333,14 @@ impl App {
                 complete,
             } => {
                 if self.address.context != Some(address) {
+                    debug!(
+                        address = %format!("{:#x}", address),
+                        source = ?source,
+                        tx_summaries = tx_summaries.len(),
+                        complete,
+                        current_context = ?self.address.context.map(|c| format!("{:#x}", c)),
+                        "AddressTxsStreamed dropped: stale context"
+                    );
                     return;
                 }
                 let old_deploy_hash = self.address.deployment.as_ref().map(|d| d.hash);
@@ -1282,6 +1405,12 @@ impl App {
                 // Track source completion
                 if complete {
                     self.address.sources_pending.remove(&source);
+                    debug!(
+                        address = %format!("{:#x}", address),
+                        source = ?source,
+                        sources_pending = ?self.address.sources_pending,
+                        "AddressTxsStreamed source completed"
+                    );
                     if self.address.sources_pending.is_empty() {
                         self.is_loading = false;
                         self.loading_detail = None;
@@ -1312,31 +1441,49 @@ impl App {
                     )));
                 }
             }
-            Action::AddressCallsStreamed { address, calls } => {
+            Action::AddressWsEvent { address, event } => {
+                // Fan-out hub for WS-received events. The event has already
+                // been persisted to the per-address event cache in ws.rs; this
+                // reducer is purely about updating in-memory tab state and
+                // dispatching enrichment / classification follow-ups.
                 if self.address.context != Some(address) {
                     return;
                 }
-                if calls.is_empty() {
-                    return;
-                }
-                let existing: std::collections::HashSet<_> =
-                    self.address.calls.items.iter().map(|c| c.tx_hash).collect();
-                let new_calls: Vec<_> = calls
-                    .into_iter()
-                    .filter(|c| !existing.contains(&c.tx_hash))
-                    .collect();
-                if !new_calls.is_empty() {
-                    // Dispatch enrichment for the new stubs (fetch sender/function/fee/timestamp)
-                    let hashes_with_blocks: Vec<_> = new_calls
-                        .iter()
-                        .map(|c| (c.tx_hash, c.block_number))
-                        .collect();
+
+                // --- Events tab: delegate decode to the network task (which
+                // owns the async ABI registry); the resulting
+                // `AddressEventStreamed` arm below merges the decoded row.
+                let _ = self.action_tx.send(Action::DecodeAddressWsEvent {
+                    address,
+                    event: event.clone(),
+                });
+
+                // --- Calls tab: derive a stub summary and merge (dedupe by tx_hash).
+                let tx_hash = event.transaction_hash;
+                let block_number = event.block_number;
+                let already_present = self
+                    .address
+                    .calls
+                    .items
+                    .iter()
+                    .any(|c| c.tx_hash == tx_hash);
+                if !already_present {
+                    let stub = crate::data::types::ContractCallSummary {
+                        tx_hash,
+                        sender: Felt::ZERO, // filled in by EnrichAddressCalls
+                        function_name: String::new(),
+                        block_number,
+                        timestamp: 0,
+                        total_fee_fri: 0,
+                        status: "OK".to_string(), // events only fire for successful txs
+                        nonce: None,              // filled in by EnrichAddressCalls
+                        tip: 0,
+                    };
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
                         address,
-                        hashes_with_blocks,
+                        hashes_with_blocks: vec![(tx_hash, block_number)],
                     });
-
-                    self.address.calls.items.extend(new_calls);
+                    self.address.calls.items.push(stub);
                     self.address
                         .calls
                         .items
@@ -1352,6 +1499,75 @@ impl App {
                     {
                         self.address.tab = AddressTab::Calls;
                     }
+                }
+
+                // --- MetaTxs: for viewed accounts, any TRANSACTION_EXECUTED
+                // event might be an execute_from_outside. Dispatch the
+                // classifier to check and populate the MetaTxs tab live.
+                if event
+                    .keys
+                    .first()
+                    .map(|k| *k == crate::network::ws::tx_executed_selector())
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .action_tx
+                        .send(Action::ClassifyPotentialMetaTx { address, tx_hash });
+                }
+            }
+            Action::AddressEventStreamed {
+                address,
+                decoded_event,
+            } => {
+                // Response arm for DecodeAddressWsEvent. Merge the decoded
+                // event into the Events tab list newest-first, dedup by
+                // `(tx_hash, event_index)` — the same key the cache uses. The
+                // event is already persisted (the WS handler called
+                // `merge_address_events` before broadcasting), so this is
+                // purely an in-memory refresh; a future cache reload will
+                // produce the same list via the cache path.
+                if self.address.context != Some(address) {
+                    return;
+                }
+                let key = (
+                    decoded_event.raw.transaction_hash,
+                    decoded_event.raw.event_index,
+                );
+                let already_present = self
+                    .address
+                    .events
+                    .items
+                    .iter()
+                    .any(|e| (e.raw.transaction_hash, e.raw.event_index) == key);
+                if already_present {
+                    return;
+                }
+                self.address.events.items.insert(0, decoded_event);
+                // `insert(0, …)` preserves newest-first ordering as long as
+                // WS events arrive in block order, which they do. No sort.
+                if self.address.events.state.selected().is_none() {
+                    self.address.events.select_first();
+                }
+            }
+            Action::AddressEventsCacheLoaded {
+                address,
+                decoded_events,
+            } => {
+                // Deferred decode pass for the events cached at entry time.
+                // `fetch_and_send_address_info` now sends `AddressInfoLoaded`
+                // immediately with empty `decoded_events` so the TUI can drop
+                // the "Fetching address info…" spinner while this expensive
+                // per-event ABI decode runs in a background task.
+                if self.address.context != Some(address) {
+                    return; // stale — user navigated away
+                }
+                if decoded_events.is_empty() {
+                    return;
+                }
+                let had_selection = self.address.events.state.selected().is_some();
+                self.address.events.items = decoded_events;
+                if !had_selection {
+                    self.address.events.select_first();
                 }
             }
             Action::AddressCallsEnriched { address, calls } => {
@@ -1382,6 +1598,12 @@ impl App {
                         if existing.status == "?" && enriched.status != "?" {
                             existing.status = enriched.status;
                         }
+                        if existing.nonce.is_none() && enriched.nonce.is_some() {
+                            existing.nonce = enriched.nonce;
+                        }
+                        if existing.tip == 0 && enriched.tip > 0 {
+                            existing.tip = enriched.tip;
+                        }
                     }
                 }
                 // Persist enriched calls to cache so they survive restarts
@@ -1391,6 +1613,28 @@ impl App {
                         calls: self.address.calls.items.clone(),
                     });
                 }
+            }
+            Action::AddressCallsMerged { address, calls } => {
+                // Plan §2: pf-query tx_rows supplement Dune's capped Calls set.
+                // Dune's `starknet.calls` query is LIMIT 500 which collapses to
+                // far fewer unique tx_hashes after dedup for addresses with
+                // many multi-call txs (e.g. meta-tx-heavy accounts). The
+                // meta-tx scan already walks the right tx_rows — merge those
+                // rows so MetaTxs ⊆ Calls stays visible.
+                if self.address.context != Some(address) || calls.is_empty() {
+                    return;
+                }
+                self.address.merge_calls(calls);
+                if self.address.calls.state.selected().is_none()
+                    && !self.address.calls.items.is_empty()
+                {
+                    self.address.calls.select_first();
+                }
+                // Persist the merged set so it survives restarts.
+                let _ = self.action_tx.send(Action::PersistAddressCalls {
+                    address,
+                    calls: self.address.calls.items.clone(),
+                });
             }
             Action::AddressBalancesLoaded { address, balances } => {
                 if self.address.context == Some(address) {
@@ -1428,6 +1672,10 @@ impl App {
                 self.is_loading = true;
                 self.loading_detail = Some(msg);
             }
+            Action::SetActiveQuery { key, label } => match label {
+                Some(l) => self.active_queries.set(&key, l),
+                None => self.active_queries.clear(&key),
+            },
             Action::SourceUpdate { source, status } => {
                 use crate::app::actions::Source;
                 let target = match source {

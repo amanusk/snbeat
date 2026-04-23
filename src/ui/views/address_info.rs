@@ -15,6 +15,165 @@ use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
 
+/// How confident are we in the tab's count?
+///
+/// The address-view revamp locks down two display states:
+///
+/// - [`CountBound::Exact`] — the tab's total is known exactly (e.g. the
+///   on-chain nonce for Txs, a Dune probe total for Calls). Renders as
+///   `"N / total"` while we're filling, or bare `"N"` once `shown == total`.
+/// - [`CountBound::LowerBound`] — "at least N; more may exist". Always
+///   renders with an explicit denominator — `"N / hint+"` if a hint is
+///   available and exceeds `shown`, otherwise `"N / N+"` because we
+///   know at least `shown` items exist. This is the default when no
+///   authoritative probe has completed — every tab starts here on
+///   first paint.
+///
+/// Keeping this enum the single input to [`count_fragment`] prevents
+/// display divergence between tabs: no tab accidentally renders bare `"N"`
+/// when it only has a lower bound (the historical bug was Events/Calls
+/// hiding the `"+"` once a scan paused).
+enum CountBound {
+    Exact(u64),
+    LowerBound { hint: Option<u64> },
+}
+
+/// Render the parens content for a tab count given its [`CountBound`].
+///
+/// The single source of truth for what goes inside the `(...)` on each
+/// tab — shared by the compact `draw_tabs` row and each per-tab body
+/// title. Previously every site recomputed a fragment independently, and
+/// display nits (like the MetaTxs body title lagging the compact row's
+/// `"+"`) crept in.
+///
+/// Format rules:
+/// - `Exact(N)`, `shown == N` → `"N"` (full knowledge, no `+`)
+/// - `Exact(N)`, `shown < N` → `"shown / N"` (filling toward a known total)
+/// - `LowerBound` with hint `H > shown` → `"shown / H+"` (inexact hint)
+/// - `LowerBound` otherwise → `"shown / shown+"` (no better hint; we
+///   still always render a denominator so "0/0+" on a cold tab beats
+///   a lonely "0+")
+fn count_fragment(shown: u64, bound: CountBound) -> String {
+    match bound {
+        CountBound::Exact(total) if shown < total => format!("{shown} / {total}"),
+        CountBound::Exact(_) => shown.to_string(),
+        CountBound::LowerBound { hint: Some(h) } if h > shown => format!("{shown} / {h}+"),
+        CountBound::LowerBound { .. } => format!("{shown} / {shown}+"),
+    }
+}
+
+/// Count fragment for the Txs tab.
+///
+/// Authoritative total is the on-chain nonce (one invoke per sender nonce),
+/// so once nonce is known the bound is [`CountBound::Exact`]. Dune's event
+/// count over-counts on hybrid accounts (it counts emitted events, not
+/// sender txs) — not suitable here.
+fn tx_count_fragment(app: &App) -> String {
+    let count = app.address.txs.items.len() as u64;
+    let bound = match app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce)) {
+        Some(nonce) => CountBound::Exact(nonce),
+        None => CountBound::LowerBound { hint: None },
+    };
+    count_fragment(count, bound)
+}
+
+/// Count fragment for the Calls tab.
+///
+/// Only the Dune probe total counts as "exact" here — pf-query-only
+/// backfill can't promise completeness (misses calls to contracts that
+/// don't emit events). Until Dune returns, we're in `LowerBound`. The
+/// `event_window.min_searched > 0` signal becomes the lower-bound hint's
+/// "+" indicator, not a claim of exactness.
+fn call_count_fragment(app: &App) -> String {
+    let count = app.address.calls.items.len() as u64;
+    let dune_total = app
+        .address
+        .activity_probe
+        .as_ref()
+        .map(|p| p.callee_call_count);
+    let bound = match dune_total {
+        Some(total) => CountBound::Exact(total),
+        None => CountBound::LowerBound { hint: None },
+    };
+    count_fragment(count, bound)
+}
+
+/// Count fragment for the Events tab.
+///
+/// Events are all `from_address == ADDR` logs, sourced via the unkeyed
+/// event-window scan. Per the plan we can only claim [`CountBound::Exact`]
+/// when the backwards scan has reached deploy block; until then we stay
+/// [`CountBound::LowerBound`]. Shares the same `event_window.min_searched`
+/// signal as MetaTxs — technically imprecise because a keyed scan on a
+/// hybrid address could satisfy the floor check here even if the unkeyed
+/// scan hasn't, but that's the only signal the UI has today.
+fn events_count_fragment(app: &App) -> String {
+    let count = app.address.events.items.len() as u64;
+    let reached_floor = match (
+        app.address.event_window.as_ref().map(|w| w.min_searched),
+        app.address.deployment.as_ref().map(|d| d.block_number),
+    ) {
+        (Some(m), Some(d)) if m > 0 => m <= d,
+        _ => false,
+    };
+    let bound = if reached_floor {
+        CountBound::Exact(count)
+    } else {
+        CountBound::LowerBound { hint: None }
+    };
+    count_fragment(count, bound)
+}
+
+/// Count fragment for the MetaTxs tab.
+///
+/// Per the revamp spec we can only claim [`CountBound::Exact`] once the
+/// backwards scan has reached (or crossed) the deploy block — only then
+/// have we demonstrably seen every `execute_from_outside` targeting this
+/// address. Until that holds we stay [`CountBound::LowerBound`], even if
+/// `meta_tx_has_more` has flipped to false because the current fetch
+/// returned no new rows: a dry page doesn't imply history exhausted.
+///
+/// The function now always returns a fragment — callers render the label
+/// even on cold state so the tab doesn't silently hide behind a probe.
+/// "0+" on first paint is strictly more informative than no count at all.
+fn meta_tx_count_fragment(app: &App) -> String {
+    let count = app.address.meta_txs.items.len() as u64;
+    // Reached deploy-floor iff we know both values AND the scan has a
+    // non-zero min_searched <= deploy_block. `min_searched == 0` is the
+    // "never scanned" sentinel — never promote on that.
+    let reached_floor = match (
+        app.address.event_window.as_ref().map(|w| w.min_searched),
+        app.address.deployment.as_ref().map(|d| d.block_number),
+    ) {
+        (Some(m), Some(d)) if m > 0 => m <= d,
+        _ => false,
+    };
+    let bound = if reached_floor {
+        CountBound::Exact(count)
+    } else {
+        CountBound::LowerBound { hint: None }
+    };
+    count_fragment(count, bound)
+}
+
+/// Title suffix describing any passive gap the event-window helper reported
+/// on its last fetch. Shared between the Calls and MetaTxs tabs (Events tab
+/// is intentionally excluded here — see task #13 for a follow-up review).
+/// Returns an empty string when no gap is known, so callers can always
+/// concatenate without a None-check.
+fn event_window_gap_suffix(app: &App) -> String {
+    let Some(hint) = app.address.event_window.as_ref() else {
+        return String::new();
+    };
+    match hint.deferred_gap {
+        Some((lo, hi)) => {
+            let span = hi.saturating_sub(lo).saturating_add(1);
+            format!(" — gap {lo}..{hi} ({span} blocks deferred) ")
+        }
+        None => String::new(),
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let has_deploy = app.address.deployment.is_some();
     let has_deployer = app
@@ -225,62 +384,26 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let tx_count = app.address.txs.items.len();
-    let meta_count = app.address.meta_txs.items.len();
-    let call_count = app.address.calls.items.len();
     let bal_count = app
         .address
         .info
         .as_ref()
         .map(|i| i.token_balances.len())
         .unwrap_or(0);
-    let ev_count = app.address.events.items.len();
-
     let class_count = app.address.class_history.len();
 
-    // Probe gives the authoritative total when it's landed. Surface it as
-    // "loaded / total" so the user sees "3 / 27" instead of just "3" and
-    // knows there's more behind pagination.
-    //
-    // For senders (Txs tab), the authoritative total is the on-chain nonce —
-    // Dune's event count counts emitted events, not sender txs, so it
-    // over-counts wildly on hybrid accounts. For callees (Calls tab), the
-    // probe's event-derived count is the right signal.
-    let probe = app.address.activity_probe.as_ref();
-    let tx_total = app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce));
-    let call_total = probe.map(|p| p.callee_call_count);
-    let tx_label = match tx_total {
-        Some(total) if (tx_count as u64) < total => {
-            format!(" Txs ({tx_count} / {total}) ")
-        }
-        _ => format!(" Txs ({tx_count}) "),
-    };
-    let call_label = match call_total {
-        Some(total) if (call_count as u64) < total => {
-            format!(" Calls ({call_count} / {total}) ")
-        }
-        _ => format!(" Calls ({call_count}) "),
-    };
-
-    // MetaTxs: no upstream count exists (requires classification). Show a
-    // progress indicator instead:
-    //   - before dispatch: " MetaTxs " (body shows spinner)
-    //   - while paging:    " MetaTxs (N+) "  — "+" signals more possible
-    //   - exhausted:       " MetaTxs (N) "   — definitive count
-    let meta_label = if !app.address.meta_txs_dispatched && meta_count == 0 {
-        " MetaTxs ".to_string()
-    } else if app.address.meta_tx_has_more || app.address.fetching_meta_txs {
-        format!(" MetaTxs ({meta_count}+) ")
-    } else {
-        format!(" MetaTxs ({meta_count}) ")
-    };
+    let tx_label = format!(" Txs ({}) ", tx_count_fragment(app));
+    let call_label = format!(" Calls ({}) ", call_count_fragment(app));
+    // The fragment is always rendered — "0+" on cold state beats a bare
+    // label that hides the tab's existence while the classifier spins up.
+    let meta_label = format!(" MetaTxs ({}) ", meta_tx_count_fragment(app));
 
     let titles = vec![
         Span::raw(tx_label),
         Span::raw(meta_label),
         Span::raw(call_label),
         Span::raw(format!(" Balances ({bal_count}) ")),
-        Span::raw(format!(" Events ({ev_count}) ")),
+        Span::raw(format!(" Events ({}) ", events_count_fragment(app))),
         Span::raw(format!(" Class ({class_count}) ")),
     ];
     let selected = match app.address.tab {
@@ -433,18 +556,11 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Some(g) => format!(" — gap of {} txs (press r to retry) ", g.missing_count),
         None => String::new(),
     };
+    let count = tx_count_fragment(app);
     let title = if app.is_loading {
-        format!(
-            " Transactions ({}) fetching...{} ",
-            app.address.txs.items.len(),
-            gap_suffix
-        )
+        format!(" Transactions ({count}) fetching...{gap_suffix} ")
     } else {
-        format!(
-            " Transactions ({}){} ",
-            app.address.txs.items.len(),
-            gap_suffix
-        )
+        format!(" Transactions ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
@@ -489,10 +605,12 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("    Sender              ", theme::SUGGESTION_STYLE),
+        Span::styled("    Sender                   ", theme::SUGGESTION_STYLE),
         Span::styled("Function             ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
+        Span::styled("Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
+        Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
@@ -523,8 +641,8 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|call| {
             let sender_label = app.format_address(&call.sender);
-            let sender_display = if sender_label.chars().count() > 20 {
-                let truncated: String = sender_label.chars().take(19).collect();
+            let sender_display = if sender_label.chars().count() > 25 {
+                let truncated: String = sender_label.chars().take(24).collect();
                 format!("{truncated}…")
             } else {
                 sender_label
@@ -538,6 +656,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             let fee_str = format_strk_u128(call.total_fee_fri)
                 .trim_end_matches(" STRK")
                 .to_string();
+            let nonce_str = match call.nonce {
+                Some(n) => n.to_string(),
+                None => "—".to_string(),
+            };
+            let tip_str = if call.tip > 0 {
+                format_fri(call.tip as u128)
+            } else {
+                "0".to_string()
+            };
             let status_style = match call.status.as_str() {
                 "OK" => theme::STATUS_OK,
                 "REV" => theme::STATUS_REVERTED,
@@ -545,13 +672,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let line = Line::from(vec![
-                Span::styled(format!(" {:<20}", sender_display), theme::LABEL_STYLE),
+                Span::styled(format!(" {:<25} ", sender_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<21}", func), theme::LABEL_STYLE),
                 Span::styled(
                     format!("{:<14}", short_hash(&call.tx_hash)),
                     theme::TX_HASH_STYLE,
                 ),
+                Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+                Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
                 Span::styled(
                     format!("#{:<9}", call.block_number),
                     theme::BLOCK_NUMBER_STYLE,
@@ -563,10 +692,12 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let gap_suffix = event_window_gap_suffix(app);
+    let count = call_count_fragment(app);
     let title = if app.is_loading {
-        format!(" Calls ({}) fetching... ", app.address.calls.items.len())
+        format!(" Calls ({count}) fetching...{gap_suffix} ")
     } else {
-        format!(" Calls ({}) ", app.address.calls.items.len())
+        format!(" Calls ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
@@ -696,13 +827,22 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let gap_suffix = event_window_gap_suffix(app);
+    // The body title shares the same fragment helper as the compact tab row.
+    let count = meta_tx_count_fragment(app);
+    // While an adaptive walk is in flight, surface how far back we've
+    // scanned — helpful signal for sparse addresses where the first few
+    // windows return nothing and the list appears to hang.
+    let scan_suffix = match app.address.event_window.as_ref() {
+        Some(hint) if hint.min_searched > 0 && app.address.fetching_meta_txs => {
+            format!(" scanned to block {}", hint.min_searched)
+        }
+        _ => String::new(),
+    };
     let title = if app.address.fetching_meta_txs {
-        format!(
-            " MetaTxs ({}) fetching... ",
-            app.address.meta_txs.items.len()
-        )
+        format!(" MetaTxs ({count}) fetching...{scan_suffix}{gap_suffix} ")
     } else {
-        format!(" MetaTxs ({}) ", app.address.meta_txs.items.len())
+        format!(" MetaTxs ({count}){gap_suffix} ")
     };
 
     let list = List::new(items)
@@ -832,10 +972,11 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let count = events_count_fragment(app);
     let title = if app.is_loading {
-        format!(" Events ({}) fetching... ", app.address.events.items.len())
+        format!(" Events ({count}) fetching... ")
     } else {
-        format!(" Events ({}) ", app.address.events.items.len())
+        format!(" Events ({count}) ")
     };
 
     let list = List::new(items)
@@ -946,4 +1087,74 @@ fn draw_class_history_tab(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme::BORDER_STYLE),
     );
     f.render_widget(list, list_area);
+}
+
+#[cfg(test)]
+mod count_fragment_tests {
+    //! The count-fragment helper is the single source of truth for what the
+    //! four address-view tabs render inside `(...)`. These tests pin its
+    //! five distinct display outputs so regressions show up here before
+    //! they surface on screen.
+    use super::{CountBound, count_fragment};
+
+    #[test]
+    fn exact_shown_less_than_total_renders_fraction() {
+        assert_eq!(count_fragment(7, CountBound::Exact(20)), "7 / 20");
+    }
+
+    #[test]
+    fn exact_shown_equal_total_renders_bare_count() {
+        assert_eq!(count_fragment(20, CountBound::Exact(20)), "20");
+    }
+
+    #[test]
+    fn exact_shown_greater_than_total_falls_back_to_bare_count() {
+        // Stale probe: Dune total lags an active stream. Never render a
+        // negative-looking "20 / 7" — fall back to the authoritative shown.
+        assert_eq!(count_fragment(20, CountBound::Exact(7)), "20");
+    }
+
+    #[test]
+    fn lower_bound_without_hint_renders_shown_over_shown_plus() {
+        // No hint ⇒ denominator defaults to `shown` itself. We know at
+        // least N items exist, so "N / N+" is both truthful and keeps
+        // the Shown/Known format across every tab state.
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: None }),
+            "7 / 7+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_zero_renders_zero_over_zero_plus() {
+        // The cold-state display the user wants on every tab — never a
+        // bare "0" or an empty label while probes are still warming up.
+        assert_eq!(
+            count_fragment(0, CountBound::LowerBound { hint: None }),
+            "0 / 0+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_with_hint_above_shown_renders_fraction_plus() {
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(100) }),
+            "7 / 100+"
+        );
+    }
+
+    #[test]
+    fn lower_bound_with_hint_at_or_below_shown_falls_back_to_shown_denominator() {
+        // Hint is stale or conservative; we still want the Shown/Known
+        // format, so fall back to "shown / shown+" rather than a
+        // misleading "7 / 3+".
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(3) }),
+            "7 / 7+"
+        );
+        assert_eq!(
+            count_fragment(7, CountBound::LowerBound { hint: Some(7) }),
+            "7 / 7+"
+        );
+    }
 }

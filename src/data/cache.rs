@@ -11,9 +11,9 @@ use rusqlite::{Connection, params};
 use starknet::core::types::{ContractClass, Felt};
 use tracing::{debug, trace, warn};
 
-use super::DataSource;
 #[allow(unused_imports)]
 use super::types::*;
+use super::{DataSource, FilterKind};
 use crate::error::{Result, SnbeatError};
 
 /// Shared future output: errors are stringified so the future is `Clone`-able
@@ -120,9 +120,15 @@ impl CachingDataSource {
                 block_number INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS address_search_progress (
-                address TEXT PRIMARY KEY,
+                address TEXT NOT NULL,
+                filter_kind TEXT NOT NULL DEFAULT 'unkeyed',
                 max_searched_block INTEGER NOT NULL,
-                min_searched_block INTEGER NOT NULL DEFAULT 0
+                min_searched_block INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (address, filter_kind)
+            );
+            CREATE TABLE IF NOT EXISTS address_activity_total (
+                address TEXT PRIMARY KEY,
+                total_known INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS address_activity_total (
                 address TEXT PRIMARY KEY,
@@ -199,6 +205,35 @@ impl CachingDataSource {
                 SnbeatError::Config(format!("Migration v5 version bump failed: {e}"))
             })?;
             debug!("Migration v5: added address_activity_total table");
+        }
+
+        if version < 6 {
+            // v6: split address_search_progress by filter_kind. Legacy rows
+            // can't be attributed to a specific kind after the fact
+            // (TASK C wrote either Account/keyed or Contract/unkeyed
+            // scans here indiscriminately), so migrate them as `unkeyed`.
+            // Consequence: accounts revisited post-upgrade will pay for
+            // one keyed re-scan of the previously-covered range. Safe and
+            // acceptably small.
+            db.execute_batch(
+                "CREATE TABLE address_search_progress_v6 (
+                     address TEXT NOT NULL,
+                     filter_kind TEXT NOT NULL DEFAULT 'unkeyed',
+                     max_searched_block INTEGER NOT NULL,
+                     min_searched_block INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (address, filter_kind)
+                 );
+                 INSERT INTO address_search_progress_v6
+                     (address, filter_kind, max_searched_block, min_searched_block)
+                     SELECT address, 'unkeyed', max_searched_block, min_searched_block
+                     FROM address_search_progress;
+                 DROP TABLE address_search_progress;
+                 ALTER TABLE address_search_progress_v6
+                     RENAME TO address_search_progress;
+                 PRAGMA user_version = 6;",
+            )
+            .map_err(|e| SnbeatError::Config(format!("Migration v6 failed: {e}")))?;
+            debug!("Migration v6: split address_search_progress by filter_kind");
         }
 
         Ok(Self {
@@ -516,13 +551,20 @@ impl CachingDataSource {
 
     // --- search progress cache ---
 
-    fn get_cached_search_progress(&self, address: &Felt) -> Option<(u64, u64)> {
+    fn get_cached_search_progress(
+        &self,
+        address: &Felt,
+        filter_kind: FilterKind,
+    ) -> Option<(u64, u64)> {
         let db = self.db.lock().ok()?;
         let addr_hex = format!("{:#x}", address);
         let mut stmt = db
-            .prepare("SELECT min_searched_block, max_searched_block FROM address_search_progress WHERE address = ?1")
+            .prepare(
+                "SELECT min_searched_block, max_searched_block FROM address_search_progress \
+                 WHERE address = ?1 AND filter_kind = ?2",
+            )
             .ok()?;
-        stmt.query_row(params![addr_hex], |row| {
+        stmt.query_row(params![addr_hex, filter_kind.as_str()], |row| {
             let min: i64 = row.get(0)?;
             let max: i64 = row.get(1)?;
             Ok((min as u64, max as u64))
@@ -530,15 +572,24 @@ impl CachingDataSource {
         .ok()
     }
 
-    fn cache_search_progress(&self, address: &Felt, min_block: u64, max_block: u64) {
+    fn cache_search_progress(
+        &self,
+        address: &Felt,
+        filter_kind: FilterKind,
+        min_block: u64,
+        max_block: u64,
+    ) {
         if let Ok(db) = self.db.lock() {
             let addr_hex = format!("{:#x}", address);
-            // Merge: expand existing range
+            // Merge: expand existing range for this (address, filter_kind) row.
             let existing = db
-                .prepare("SELECT min_searched_block, max_searched_block FROM address_search_progress WHERE address = ?1")
+                .prepare(
+                    "SELECT min_searched_block, max_searched_block FROM address_search_progress \
+                     WHERE address = ?1 AND filter_kind = ?2",
+                )
                 .ok()
                 .and_then(|mut s| {
-                    s.query_row(params![addr_hex], |row| {
+                    s.query_row(params![addr_hex, filter_kind.as_str()], |row| {
                         let min: i64 = row.get(0)?;
                         let max: i64 = row.get(1)?;
                         Ok((min as u64, max as u64))
@@ -551,8 +602,15 @@ impl CachingDataSource {
                 (min_block, max_block)
             };
             let _ = db.execute(
-                "INSERT OR REPLACE INTO address_search_progress (address, min_searched_block, max_searched_block) VALUES (?1, ?2, ?3)",
-                params![addr_hex, final_min as i64, final_max as i64],
+                "INSERT OR REPLACE INTO address_search_progress \
+                 (address, filter_kind, min_searched_block, max_searched_block) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    addr_hex,
+                    filter_kind.as_str(),
+                    final_min as i64,
+                    final_max as i64
+                ],
             );
         }
     }
@@ -979,6 +1037,24 @@ impl DataSource for CachingDataSource {
         .ok()
     }
 
+    fn load_cached_activity_range_any_age(&self, address: &Felt) -> Option<(u64, u64, u64)> {
+        let db = self.db.lock().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare(
+                "SELECT min_block, max_block, event_count FROM address_activity \
+                 WHERE address = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let min: i64 = row.get(0)?;
+            let max: i64 = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            Ok((min as u64, max as u64, count as u64))
+        })
+        .ok()
+    }
+
     fn save_activity_range(&self, address: &Felt, min_block: u64, max_block: u64) {
         self.save_activity_range_with_count(address, min_block, max_block, 0);
     }
@@ -1131,12 +1207,18 @@ impl DataSource for CachingDataSource {
         self.cache_nonce_info(address, nonce, block);
     }
 
-    fn load_search_progress(&self, address: &Felt) -> Option<(u64, u64)> {
-        self.get_cached_search_progress(address)
+    fn load_search_progress(&self, address: &Felt, filter_kind: FilterKind) -> Option<(u64, u64)> {
+        self.get_cached_search_progress(address, filter_kind)
     }
 
-    fn save_search_progress(&self, address: &Felt, min_block: u64, max_block: u64) {
-        self.cache_search_progress(address, min_block, max_block);
+    fn save_search_progress(
+        &self,
+        address: &Felt,
+        filter_kind: FilterKind,
+        min_block: u64,
+        max_block: u64,
+    ) {
+        self.cache_search_progress(address, filter_kind, min_block, max_block);
     }
 
     fn load_activity_total(&self, address: &Felt) -> Option<u64> {
@@ -1391,13 +1473,16 @@ mod tests {
 
         ds.save_activity_total(&addr, 11400);
         // Seed an initial scanned range.
-        ds.save_search_progress(&addr, 3_000_000, 8_900_000);
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 3_000_000, 8_900_000);
         assert_eq!(ds.load_activity_total(&addr), Some(11400));
 
         // Extending the range (e.g. fetching newer events) must keep total_known.
-        ds.save_search_progress(&addr, 3_000_000, 8_941_000);
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 3_000_000, 8_941_000);
         assert_eq!(ds.load_activity_total(&addr), Some(11400));
-        assert_eq!(ds.load_search_progress(&addr), Some((3_000_000, 8_941_000)));
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Unkeyed),
+            Some((3_000_000, 8_941_000))
+        );
     }
 
     #[test]
@@ -1405,13 +1490,49 @@ mod tests {
         let (ds, _d) = new_cache();
         let addr = Felt::from_hex("0xbeef").unwrap();
 
-        ds.save_search_progress(&addr, 100, 200);
-        ds.save_search_progress(&addr, 50, 150);
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 100, 200);
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 50, 150);
         // Min shrinks, max doesn't regress.
-        assert_eq!(ds.load_search_progress(&addr), Some((50, 200)));
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Unkeyed),
+            Some((50, 200))
+        );
 
-        ds.save_search_progress(&addr, 300, 400);
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 300, 400);
         // Max extends, min doesn't grow past the remembered floor.
-        assert_eq!(ds.load_search_progress(&addr), Some((50, 400)));
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Unkeyed),
+            Some((50, 400))
+        );
+    }
+
+    #[test]
+    fn search_progress_split_by_filter_kind() {
+        // Regression test for v6 migration: keyed and unkeyed coverage are
+        // tracked independently. A keyed scan must not appear to cover the
+        // unkeyed region (which would be a lie — keyed scans miss non-
+        // TRANSACTION_EXECUTED events).
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0xface").unwrap();
+
+        // Record a wide keyed scan.
+        ds.save_search_progress(&addr, FilterKind::Keyed, 1_000_000, 9_000_000);
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Keyed),
+            Some((1_000_000, 9_000_000))
+        );
+        // Unkeyed is still unrecorded — not satisfied by the keyed scan.
+        assert_eq!(ds.load_search_progress(&addr, FilterKind::Unkeyed), None);
+
+        // Recording an unkeyed scan does not disturb the keyed row.
+        ds.save_search_progress(&addr, FilterKind::Unkeyed, 8_000_000, 9_000_000);
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Unkeyed),
+            Some((8_000_000, 9_000_000))
+        );
+        assert_eq!(
+            ds.load_search_progress(&addr, FilterKind::Keyed),
+            Some((1_000_000, 9_000_000))
+        );
     }
 }
