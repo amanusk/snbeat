@@ -57,10 +57,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw(" "));
 
         // Capture first error for display
-        if first_error.is_none() {
-            if let Some(msg) = status.error_msg() {
-                first_error = Some((name, msg));
-            }
+        if first_error.is_none()
+            && let Some(msg) = status.error_msg()
+        {
+            first_error = Some((name, msg));
         }
     }
     spans.push(Span::raw("| "));

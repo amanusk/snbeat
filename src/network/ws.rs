@@ -243,12 +243,12 @@ impl ConnectionState {
     fn active_address_commands(&self) -> Vec<WsCommand> {
         let mut seen = std::collections::HashSet::new();
         let mut cmds = Vec::new();
-        for (_, kind) in &self.subscriptions {
-            if let Some(addr) = kind_address(kind) {
-                if seen.insert(addr) {
-                    cmds.push(WsCommand::SubscribeEvents { address: addr });
-                    cmds.push(WsCommand::SubscribeTransactions { address: addr });
-                }
+        for kind in self.subscriptions.values() {
+            if let Some(addr) = kind_address(kind)
+                && seen.insert(addr)
+            {
+                cmds.push(WsCommand::SubscribeEvents { address: addr });
+                cmds.push(WsCommand::SubscribeTransactions { address: addr });
             }
         }
         cmds
@@ -491,11 +491,11 @@ async fn handle_message(
     }
 
     // Handle push notifications
-    if let Some(method) = &raw.method {
-        if !method.starts_with("starknet_subscription") {
-            debug!(method, "Ignoring non-subscription notification");
-            return;
-        }
+    if let Some(method) = &raw.method
+        && !method.starts_with("starknet_subscription")
+    {
+        debug!(method, "Ignoring non-subscription notification");
+        return;
     }
 
     let params = match raw.params {
@@ -615,7 +615,7 @@ fn handle_event(
     // Route through the shared event cache so subsequent helper calls
     // (`ensure_address_events_window`, tab loaders) see the new event
     // without a round trip.
-    data_source.merge_address_events(&address, &[sn_event.clone()]);
+    data_source.merge_address_events(&address, std::slice::from_ref(&sn_event));
 
     // Single broadcast — the reducer fans out to Calls, MetaTxs classifier,
     // and Events tab. Avoids multiple per-tab streaming actions diverging.
@@ -1078,7 +1078,7 @@ mod tests {
 
         let event_json = format!(
             r#"{{
-                "from_address": "{addr}",
+                "from_address": "{address:#x}",
                 "keys": ["{sel}"],
                 "data": [],
                 "block_hash": "0xabc",
@@ -1088,7 +1088,6 @@ mod tests {
                 "event_index": 0,
                 "finality_status": "ACCEPTED_ON_L2"
             }}"#,
-            addr = format!("{:#x}", address),
             sel = selector,
             tx = tx_hash_hex,
         );
@@ -1134,7 +1133,7 @@ mod tests {
 
         let event_json = format!(
             r#"{{
-                "from_address": "{addr}",
+                "from_address": "{address:#x}",
                 "keys": ["{sel}"],
                 "data": [],
                 "block_hash": "0xabc",
@@ -1144,7 +1143,6 @@ mod tests {
                 "event_index": 0,
                 "finality_status": "ACCEPTED_ON_L2"
             }}"#,
-            addr = format!("{:#x}", address),
             sel = other_selector,
         );
         let result: Value = serde_json::from_str(&event_json).unwrap();

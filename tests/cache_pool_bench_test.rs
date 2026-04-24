@@ -189,12 +189,10 @@ fn seed_cache(ds: &CachingDataSource, addr: Felt, events: usize, txs: usize, cal
     let tx_sums: Vec<AddressTxSummary> = (0..txs as u64).map(|i| mk_tx_summary(addr, i)).collect();
     ds.save_address_txs(&addr, &tx_sums);
 
-    let call_sums: Vec<ContractCallSummary> =
-        (0..calls as u64).map(|i| mk_call_summary(i)).collect();
+    let call_sums: Vec<ContractCallSummary> = (0..calls as u64).map(mk_call_summary).collect();
     ds.save_address_calls(&addr, &call_sums);
 
-    let meta_sums: Vec<MetaTxIntenderSummary> =
-        (0..(txs / 2) as u64).map(|i| mk_meta_tx(i)).collect();
+    let meta_sums: Vec<MetaTxIntenderSummary> = (0..(txs / 2) as u64).map(mk_meta_tx).collect();
     ds.save_meta_txs(&addr, &meta_sums);
 
     ds.save_activity_range_with_count(&addr, 1_000_000, 1_000_000 + events as u64, events as u64);

@@ -35,7 +35,7 @@ fn test_classify_known_label() {
     let reg = registry();
     let result = snbeat::search::parser::classify("ETH", &reg).unwrap();
     match result {
-        snbeat::search::parser::SearchQuery::Label(name, addr) => {
+        snbeat::search::parser::SearchQuery::Label(_name, addr) => {
             assert_eq!(addr, Felt::from_hex(ETH_TOKEN).unwrap());
         }
         other => panic!("Expected Label, got {:?}", other),
@@ -114,12 +114,11 @@ fn test_user_labels_prioritized() {
 
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
-        format!(
-            r#"
+        r#"
 [addresses]
 "0x0000000000000000000000000000000000000000000000000000000000001234" = "MyAddr"
 "#
-        )
+        .to_string()
         .as_bytes(),
     )
     .unwrap();

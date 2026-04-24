@@ -272,12 +272,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Class: ", theme::NORMAL_STYLE),
             Span::styled(&class_hash_str, ch_style),
         ];
-        if let Some(vl) = app.voyager_labels.get(&info.address) {
-            if let Some(ca) = &vl.class_alias {
-                if !ca.is_empty() {
-                    class_line.push(Span::styled(format!(" [{}]", ca), theme::LABEL_STYLE));
-                }
-            }
+        if let Some(vl) = app.voyager_labels.get(&info.address)
+            && let Some(ca) = &vl.class_alias
+            && !ca.is_empty()
+        {
+            class_line.push(Span::styled(format!(" [{}]", ca), theme::LABEL_STYLE));
         }
         class_line.push(Span::styled(
             format!("  Nonce: {}", felt_to_u64(&info.nonce)),
@@ -341,36 +340,37 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         }
 
         // Show deployer on its own line when it's a different address
-        if let Some(sender) = deploy.sender {
-            if sender != info.address && sender != Felt::ZERO {
-                let addr_selected = matches!(selected, Some(TxNavItem::Address(a)) if *a == sender);
-                let addr_style = if addr_selected {
-                    theme::VISUAL_SELECTED_STYLE
-                } else {
-                    theme::LABEL_STYLE
-                };
-                let addr_marker = if addr_selected { "►" } else { " " };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        addr_marker,
-                        if addr_selected {
-                            theme::VISUAL_SELECTED_STYLE
-                        } else {
-                            theme::NORMAL_STYLE
-                        },
-                    ),
-                    Span::styled("Deployed by: ", theme::NORMAL_STYLE),
-                    Span::styled(format!("{:#x}", sender), addr_style),
-                    {
-                        let label = app.format_address_full(&sender);
-                        if label.starts_with("0x") {
-                            Span::raw("")
-                        } else {
-                            Span::styled(format!("  {}", label), theme::LABEL_STYLE)
-                        }
+        if let Some(sender) = deploy.sender
+            && sender != info.address
+            && sender != Felt::ZERO
+        {
+            let addr_selected = matches!(selected, Some(TxNavItem::Address(a)) if *a == sender);
+            let addr_style = if addr_selected {
+                theme::VISUAL_SELECTED_STYLE
+            } else {
+                theme::LABEL_STYLE
+            };
+            let addr_marker = if addr_selected { "►" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    addr_marker,
+                    if addr_selected {
+                        theme::VISUAL_SELECTED_STYLE
+                    } else {
+                        theme::NORMAL_STYLE
                     },
-                ]));
-            }
+                ),
+                Span::styled("Deployed by: ", theme::NORMAL_STYLE),
+                Span::styled(format!("{:#x}", sender), addr_style),
+                {
+                    let label = app.format_address_full(&sender);
+                    if label.starts_with("0x") {
+                        Span::raw("")
+                    } else {
+                        Span::styled(format!("  {}", label), theme::LABEL_STYLE)
+                    }
+                },
+            ]));
         }
     }
 

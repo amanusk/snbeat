@@ -8,6 +8,7 @@
 //! - `class` — fetch class ABI, declaration info, deployed contracts
 //! - `search` — resolve search queries (block number / address / tx hash / class hash)
 //! - `helpers` — shared utilities (build_tx_summary, backfill_timestamps, etc.)
+#![allow(clippy::too_many_arguments)]
 
 mod address;
 mod block;
@@ -173,30 +174,27 @@ pub async fn run_network_task(
                                 // Check a batch of txs to find the right nonce
                                 let target_felt = starknet::core::types::Felt::from(target_nonce);
                                 for hash in &tx_hashes {
-                                    if let Ok(fetched_tx) = ds.get_transaction(*hash).await {
-                                        if let crate::data::types::SnTransaction::Invoke(ref inv) =
+                                    if let Ok(fetched_tx) = ds.get_transaction(*hash).await
+                                        && let crate::data::types::SnTransaction::Invoke(ref inv) =
                                             fetched_tx
-                                        {
-                                            if inv.nonce == Some(target_felt)
-                                                && inv.sender_address == sender
-                                            {
-                                                // Found it — reuse fetched_tx, only fetch receipt
-                                                match ds.get_receipt(*hash).await {
-                                                    Ok(receipt) => {
-                                                        transaction::decode_and_send_transaction(
-                                                            fetched_tx, receipt, &ds, &abi_reg, &tx,
-                                                        )
-                                                        .await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx.send(Action::Error(format!(
-                                                            "Fetch receipt: {e}"
-                                                        )));
-                                                    }
-                                                }
-                                                return;
+                                        && inv.nonce == Some(target_felt)
+                                        && inv.sender_address == sender
+                                    {
+                                        // Found it — reuse fetched_tx, only fetch receipt
+                                        match ds.get_receipt(*hash).await {
+                                            Ok(receipt) => {
+                                                transaction::decode_and_send_transaction(
+                                                    fetched_tx, receipt, &ds, &abi_reg, &tx,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(Action::Error(format!(
+                                                    "Fetch receipt: {e}"
+                                                )));
                                             }
                                         }
+                                        return;
                                     }
                                 }
                                 let _ = tx.send(Action::Error(format!(
@@ -389,17 +387,17 @@ pub async fn run_network_task(
                         ds.save_address_calls(&address, &calls);
                     }
                     Action::FetchTokenPricesToday { tokens } => {
-                        if let Some(pc) = &prices {
-                            if pc.ensure_today(&tokens).await {
-                                let _ = tx.send(Action::PricesUpdated);
-                            }
+                        if let Some(pc) = &prices
+                            && pc.ensure_today(&tokens).await
+                        {
+                            let _ = tx.send(Action::PricesUpdated);
                         }
                     }
                     Action::FetchTokenPricesHistoric { requests } => {
-                        if let Some(pc) = &prices {
-                            if pc.ensure_historic(&requests).await {
-                                let _ = tx.send(Action::PricesUpdated);
-                            }
+                        if let Some(pc) = &prices
+                            && pc.ensure_historic(&requests).await
+                        {
+                            let _ = tx.send(Action::PricesUpdated);
                         }
                     }
                     // Response actions are not handled here

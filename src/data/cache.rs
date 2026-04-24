@@ -283,20 +283,20 @@ impl CachingDataSource {
     }
 
     fn cache_block(&self, block: &SnBlock) {
-        if let Ok(json) = serde_json::to_string(block) {
-            if let Ok(db) = self.db.get() {
+        if let Ok(json) = serde_json::to_string(block)
+            && let Ok(db) = self.db.get()
+        {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
+                params![block.number, json],
+            );
+            // Also index hash→number for get_block_by_hash cache
+            if block.hash != Felt::ZERO {
+                let hash_hex = format!("{:#x}", block.hash);
                 let _ = db.execute(
-                    "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
-                    params![block.number, json],
+                    "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
+                    params![hash_hex, block.number as i64],
                 );
-                // Also index hash→number for get_block_by_hash cache
-                if block.hash != Felt::ZERO {
-                    let hash_hex = format!("{:#x}", block.hash);
-                    let _ = db.execute(
-                        "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
-                        params![hash_hex, block.number as i64],
-                    );
-                }
             }
         }
     }
@@ -392,14 +392,14 @@ impl CachingDataSource {
     }
 
     fn cache_transaction(&self, tx: &SnTransaction) {
-        if let Ok(json) = serde_json::to_string(tx) {
-            if let Ok(db) = self.db.get() {
-                let hash_hex = format!("{:#x}", tx.hash());
-                let _ = db.execute(
+        if let Ok(json) = serde_json::to_string(tx)
+            && let Ok(db) = self.db.get()
+        {
+            let hash_hex = format!("{:#x}", tx.hash());
+            let _ = db.execute(
                     "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
                     params![hash_hex, 0i64, json],
                 );
-            }
         }
     }
 
@@ -548,14 +548,14 @@ impl CachingDataSource {
     }
 
     fn cache_receipt(&self, receipt: &SnReceipt) {
-        if let Ok(json) = serde_json::to_string(receipt) {
-            if let Ok(db) = self.db.get() {
-                let hash_hex = format!("{:#x}", receipt.transaction_hash);
-                let _ = db.execute(
-                    "INSERT OR REPLACE INTO receipts (tx_hash, data) VALUES (?1, ?2)",
-                    params![hash_hex, json],
-                );
-            }
+        if let Ok(json) = serde_json::to_string(receipt)
+            && let Ok(db) = self.db.get()
+        {
+            let hash_hex = format!("{:#x}", receipt.transaction_hash);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO receipts (tx_hash, data) VALUES (?1, ?2)",
+                params![hash_hex, json],
+            );
         }
     }
 
@@ -1556,7 +1556,6 @@ impl DataSource for CachingDataSource {
 mod tests {
     use super::*;
     use crate::data::DataSource;
-    use crate::data::types::*;
     use starknet::core::types::ContractClass;
 
     /// Minimal upstream stub — the search_progress / activity_total tests only

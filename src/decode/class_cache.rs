@@ -32,16 +32,16 @@ impl ClassCache {
 
         // Preload selector names into memory
         let mut selector_names = HashMap::new();
-        if let Ok(mut stmt) = db.prepare("SELECT selector, name FROM selector_names") {
-            if let Ok(rows) = stmt.query_map([], |row| {
+        if let Ok(mut stmt) = db.prepare("SELECT selector, name FROM selector_names")
+            && let Ok(rows) = stmt.query_map([], |row| {
                 let selector_hex: String = row.get(0)?;
                 let name: String = row.get(1)?;
                 Ok((selector_hex, name))
-            }) {
-                for row in rows.flatten() {
-                    if let Ok(felt) = Felt::from_hex(&row.0) {
-                        selector_names.insert(felt, row.1);
-                    }
+            })
+        {
+            for row in rows.flatten() {
+                if let Ok(felt) = Felt::from_hex(&row.0) {
+                    selector_names.insert(felt, row.1);
                 }
             }
         }
@@ -62,11 +62,11 @@ impl ClassCache {
     /// Look up a parsed ABI by class hash.
     pub fn get(&self, class_hash: &Felt) -> Option<Arc<ParsedAbi>> {
         // Check memory first
-        if let Ok(mut mem) = self.memory.lock() {
-            if let Some(abi) = mem.get(class_hash) {
-                trace!(class_hash = %format!("{:#x}", class_hash), "ABI cache hit (memory)");
-                return Some(Arc::clone(abi));
-            }
+        if let Ok(mut mem) = self.memory.lock()
+            && let Some(abi) = mem.get(class_hash)
+        {
+            trace!(class_hash = %format!("{:#x}", class_hash), "ABI cache hit (memory)");
+            return Some(Arc::clone(abi));
         }
 
         // Check SQLite
@@ -137,14 +137,14 @@ impl ClassCache {
     }
 
     fn save_to_db(&self, class_hash: &Felt, abi: &ParsedAbi) {
-        if let Ok(json) = serde_json::to_string(abi) {
-            if let Ok(db) = self.db.lock() {
-                let hash_hex = format!("{:#x}", class_hash);
-                let _ = db.execute(
-                    "INSERT OR REPLACE INTO parsed_abis (class_hash, data) VALUES (?1, ?2)",
-                    params![hash_hex, json],
-                );
-            }
+        if let Ok(json) = serde_json::to_string(abi)
+            && let Ok(db) = self.db.lock()
+        {
+            let hash_hex = format!("{:#x}", class_hash);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO parsed_abis (class_hash, data) VALUES (?1, ?2)",
+                params![hash_hex, json],
+            );
         }
     }
 }

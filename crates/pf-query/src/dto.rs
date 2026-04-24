@@ -36,13 +36,6 @@ impl MinimalFelt {
         buf.copy_from_slice(&self.0[24..32]);
         u64::from_be_bytes(buf)
     }
-
-    /// Interpret as u128 (last 16 bytes, big-endian).
-    pub fn as_u128(&self) -> u128 {
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&self.0[16..32]);
-        u128::from_be_bytes(buf)
-    }
 }
 
 impl serde::Serialize for MinimalFelt {
@@ -927,85 +920,6 @@ impl TransactionVariantV3 {
             | Self::DeclareV2(_)
             | Self::DeclareV3(_)
             | Self::DeclareV4(_) => &[],
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Convenience: extract sender + nonce + type from TransactionVariantV2
-// ---------------------------------------------------------------------------
-
-impl TransactionVariantV2 {
-    /// Extract the sender address (if applicable to this tx type).
-    pub fn sender_address(&self) -> Option<&MinimalFelt> {
-        match self {
-            Self::DeclareV0(tx) | Self::DeclareV1(tx) => Some(&tx.sender_address),
-            Self::DeclareV2(tx) => Some(&tx.sender_address),
-            Self::DeclareV3(tx) => Some(&tx.sender_address),
-            Self::DeclareV4(tx) => Some(&tx.sender_address),
-            Self::DeployV0(tx) => Some(&tx.contract_address),
-            Self::DeployV1(tx) => Some(&tx.contract_address),
-            Self::DeployAccountV1(tx) => Some(&tx.contract_address),
-            Self::DeployAccountV3(tx) => Some(&tx.sender_address),
-            Self::DeployAccountV4(tx) => Some(&tx.sender_address),
-            Self::InvokeV0(tx) => Some(&tx.sender_address),
-            Self::InvokeV1(tx) => Some(&tx.sender_address),
-            Self::InvokeV3(tx) => Some(&tx.sender_address),
-            Self::InvokeV4(tx) => Some(&tx.sender_address),
-            Self::L1HandlerV0(_) => None,
-        }
-    }
-
-    /// Extract the nonce (if present).
-    pub fn nonce(&self) -> Option<u64> {
-        match self {
-            Self::DeclareV0(tx) | Self::DeclareV1(tx) => Some(tx.nonce.as_u64()),
-            Self::DeclareV2(tx) => Some(tx.nonce.as_u64()),
-            Self::DeclareV3(tx) => Some(tx.nonce.as_u64()),
-            Self::DeclareV4(tx) => Some(tx.nonce.as_u64()),
-            Self::DeployV0(_) | Self::DeployV1(_) => None,
-            Self::DeployAccountV1(tx) => Some(tx.nonce.as_u64()),
-            Self::DeployAccountV3(tx) => Some(tx.nonce.as_u64()),
-            Self::DeployAccountV4(tx) => Some(tx.nonce.as_u64()),
-            Self::InvokeV0(_) => None,
-            Self::InvokeV1(tx) => Some(tx.nonce.as_u64()),
-            Self::InvokeV3(tx) => Some(tx.nonce.as_u64()),
-            Self::InvokeV4(tx) => Some(tx.nonce.as_u64()),
-            Self::L1HandlerV0(tx) => Some(tx.nonce.as_u64()),
-        }
-    }
-
-    /// Get the tip value (v3+ transactions only).
-    pub fn tip(&self) -> u64 {
-        match self {
-            Self::DeclareV3(tx) => tx.tip.0,
-            Self::DeclareV4(tx) => tx.tip.0,
-            Self::DeployAccountV3(tx) => tx.tip.0,
-            Self::DeployAccountV4(tx) => tx.tip.0,
-            Self::InvokeV3(tx) => tx.tip.0,
-            Self::InvokeV4(tx) => tx.tip.0,
-            _ => 0,
-        }
-    }
-
-    /// Human-readable transaction type string.
-    pub fn tx_type(&self) -> &'static str {
-        match self {
-            Self::DeclareV0(_) => "DECLARE_V0",
-            Self::DeclareV1(_) => "DECLARE_V1",
-            Self::DeclareV2(_) => "DECLARE_V2",
-            Self::DeclareV3(_) => "DECLARE_V3",
-            Self::DeclareV4(_) => "DECLARE_V4",
-            Self::DeployV0(_) => "DEPLOY_V0",
-            Self::DeployV1(_) => "DEPLOY_V1",
-            Self::DeployAccountV1(_) => "DEPLOY_ACCOUNT_V1",
-            Self::DeployAccountV3(_) => "DEPLOY_ACCOUNT_V3",
-            Self::DeployAccountV4(_) => "DEPLOY_ACCOUNT_V4",
-            Self::InvokeV0(_) => "INVOKE_V0",
-            Self::InvokeV1(_) => "INVOKE_V1",
-            Self::InvokeV3(_) => "INVOKE_V3",
-            Self::InvokeV4(_) => "INVOKE_V4",
-            Self::L1HandlerV0(_) => "L1_HANDLER",
         }
     }
 }

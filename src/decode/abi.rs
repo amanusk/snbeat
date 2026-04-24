@@ -152,26 +152,22 @@ fn parse_sierra_abi(class: &FlattenedSierraClass) -> ParsedAbi {
             SierraAbiItem::Interface(iface) => {
                 // Interfaces contain functions — parse them too.
                 for f in &iface.items {
-                    if let SierraAbiItem::Function(func) | SierraAbiItem::L1Handler(func) = f {
-                        if let Ok(selector) = get_selector_from_name(&func.name) {
-                            abi.functions.insert(
-                                FeltKey(selector),
-                                FunctionDef {
-                                    name: func.name.clone(),
-                                    inputs: func
-                                        .inputs
-                                        .iter()
-                                        .map(|p| (p.name.clone(), p.r#type.clone()))
-                                        .collect(),
-                                    outputs: func
-                                        .outputs
-                                        .iter()
-                                        .map(|p| p.r#type.clone())
-                                        .collect(),
-                                    state_mutability: func.state_mutability.clone(),
-                                },
-                            );
-                        }
+                    if let SierraAbiItem::Function(func) | SierraAbiItem::L1Handler(func) = f
+                        && let Ok(selector) = get_selector_from_name(&func.name)
+                    {
+                        abi.functions.insert(
+                            FeltKey(selector),
+                            FunctionDef {
+                                name: func.name.clone(),
+                                inputs: func
+                                    .inputs
+                                    .iter()
+                                    .map(|p| (p.name.clone(), p.r#type.clone()))
+                                    .collect(),
+                                outputs: func.outputs.iter().map(|p| p.r#type.clone()).collect(),
+                                state_mutability: func.state_mutability.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -399,10 +395,13 @@ fn extract_event_name(full_name: &str) -> String {
         .to_string()
 }
 
+/// (field-name, field-type) pair used to describe an event's keys or data.
+type NamedField = (String, String);
+
 /// Parse a Sierra ABI's event definition into keys and data vectors,
 /// looking at members directly.
 impl SierraEventDef {
-    fn keys_and_data(&self) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    fn keys_and_data(&self) -> (Vec<NamedField>, Vec<NamedField>) {
         let mut keys = Vec::new();
         let mut data = Vec::new();
         for m in &self.members {

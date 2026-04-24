@@ -9,6 +9,7 @@ use crate::data::types::{ClassContractEntry, ClassDeclareInfo};
 use crate::decode::abi::ParsedAbi;
 
 /// All state related to the class info view.
+#[derive(Default)]
 pub struct ClassInfoState {
     pub hash: Option<Felt>,
     pub abi: Option<Arc<ParsedAbi>>,
@@ -23,25 +24,6 @@ pub struct ClassInfoState {
     pub visual_mode: bool,
     /// Whether to expand the ABI section.
     pub show_abi: bool,
-}
-
-impl Default for ClassInfoState {
-    fn default() -> Self {
-        Self {
-            hash: None,
-            abi: None,
-            abi_loaded: false,
-            declare: None,
-            contracts: Vec::new(),
-            decl_block: None,
-            scroll: 0,
-            nav_items: Vec::new(),
-            nav_cursor: 0,
-            nav_item_lines: Vec::new(),
-            visual_mode: false,
-            show_abi: false,
-        }
-    }
 }
 
 impl ClassInfoState {

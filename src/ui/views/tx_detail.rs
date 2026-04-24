@@ -643,15 +643,14 @@ fn draw_scrollable_detail(
                     );
                     event_spans.append(&mut param_spans);
                     let (today, historic) = event_prices;
-                    if today.is_some() || historic.is_some() {
-                        if let Some((amount, _)) =
+                    if (today.is_some() || historic.is_some())
+                        && let Some((amount, _)) =
                             price::token_amount_from_param(p, &event.contract_address, registry)
-                        {
-                            event_spans.push(Span::styled(
-                                format_usd_pair(amount, today, historic),
-                                theme::SUGGESTION_STYLE,
-                            ));
-                        }
+                    {
+                        event_spans.push(Span::styled(
+                            format_usd_pair(amount, today, historic),
+                            theme::SUGGESTION_STYLE,
+                        ));
                     }
                     if pi < all_params.len() - 1 {
                         event_spans.push(Span::raw(", "));
@@ -802,7 +801,7 @@ fn render_decoded_calldata(
         let type_str = param
             .type_name
             .as_deref()
-            .map(|t| short_type_name(t))
+            .map(short_type_name)
             .unwrap_or_default();
 
         let mut spans: Vec<Span<'static>> = vec![Span::raw("        ")];

@@ -495,13 +495,14 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     // Validate WS URL if provided
-    if let Some(ws_url) = &config.ws_url {
-        if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
-            anyhow::bail!(
-                "APP_WS_URL must start with ws:// or wss://. Got: {}",
-                ws_url
-            );
-        }
+    if let Some(ws_url) = &config.ws_url
+        && !ws_url.starts_with("ws://")
+        && !ws_url.starts_with("wss://")
+    {
+        anyhow::bail!(
+            "APP_WS_URL must start with ws:// or wss://. Got: {}",
+            ws_url
+        );
     }
 
     // Check config directory is writable
@@ -532,16 +533,12 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     // Check optional API keys
-    if config.dune_api_key.as_ref().map_or(true, |k| k.is_empty()) {
+    if config.dune_api_key.as_ref().is_none_or(|k| k.is_empty()) {
         warnings.push(
             "DUNE_API_KEY not set — account history and contract call discovery will be limited",
         );
     }
-    if config
-        .voyager_api_key
-        .as_ref()
-        .map_or(true, |k| k.is_empty())
-    {
+    if config.voyager_api_key.as_ref().is_none_or(|k| k.is_empty()) {
         warnings.push("VOYAGER_API_KEY not set — address metadata enrichment unavailable");
     }
 
@@ -560,8 +557,8 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     info!(
         rpc = %config.rpc_url,
         cache_dir = %config_dir.display(),
-        dune = config.dune_api_key.as_ref().map_or(false, |k| !k.is_empty()),
-        voyager = config.voyager_api_key.as_ref().map_or(false, |k| !k.is_empty()),
+        dune = config.dune_api_key.as_ref().is_some_and(|k| !k.is_empty()),
+        voyager = config.voyager_api_key.as_ref().is_some_and(|k| !k.is_empty()),
         labels = labels_path.exists(),
         "Startup checks passed"
     );

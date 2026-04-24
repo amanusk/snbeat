@@ -14,6 +14,7 @@ pub struct MetaTxSummary {
 }
 
 /// All state related to the block detail view.
+#[derive(Default)]
 pub struct BlockDetailState {
     pub block: Option<SnBlock>,
     pub txs: StatefulList<SnTransaction>,
@@ -27,20 +28,6 @@ pub struct BlockDetailState {
     pub visual_mode: bool,
     /// Cursor index into txs (only meaningful when visual_mode is true).
     pub nav_cursor: usize,
-}
-
-impl Default for BlockDetailState {
-    fn default() -> Self {
-        Self {
-            block: None,
-            txs: StatefulList::new(),
-            endpoint_names: Vec::new(),
-            tx_statuses: Vec::new(),
-            meta_tx_info: Vec::new(),
-            visual_mode: false,
-            nav_cursor: 0,
-        }
-    }
 }
 
 impl BlockDetailState {

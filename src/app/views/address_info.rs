@@ -254,10 +254,10 @@ impl AddressInfoState {
         let mut items: Vec<TxNavItem> = Vec::new();
 
         // Class hash -> ClassInfo view
-        if let Some(info) = &self.info {
-            if let Some(ch) = info.class_hash {
-                items.push(TxNavItem::ClassHash(ch));
-            }
+        if let Some(info) = &self.info
+            && let Some(ch) = info.class_hash
+        {
+            items.push(TxNavItem::ClassHash(ch));
         }
 
         // Deployment info
@@ -271,12 +271,12 @@ impl AddressInfoState {
                 items.push(TxNavItem::Block(deploy.block_number));
             }
             // Deployer address
-            if let Some(sender) = deploy.sender {
-                if let Some(info) = &self.info {
-                    if sender != info.address && sender != Felt::ZERO {
-                        items.push(TxNavItem::Address(sender));
-                    }
-                }
+            if let Some(sender) = deploy.sender
+                && let Some(info) = &self.info
+                && sender != info.address
+                && sender != Felt::ZERO
+            {
+                items.push(TxNavItem::Address(sender));
             }
         }
 

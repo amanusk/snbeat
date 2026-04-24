@@ -41,7 +41,7 @@ static SIPS: LazyLock<[SipHasher13; 2]> = LazyLock::new(|| {
 /// Compute the bloom bit index for a key at hash function index k_i.
 fn bloom_hash(hashes: &mut [u64; 2], item: &[u8; 32], k_i: usize) -> u64 {
     if k_i < 2 {
-        let mut sip = SIPS[k_i].clone();
+        let mut sip = SIPS[k_i];
         // pathfinder's Felt derives Hash, which for [u8; 32] does hash_slice(&self.0)
         item.hash(&mut sip);
         let hash = sip.finish();
@@ -56,8 +56,8 @@ fn bloom_hash(hashes: &mut [u64; 2], item: &[u8; 32], k_i: usize) -> u64 {
 fn indices_for_key(key: &[u8; 32]) -> [usize; K_NUM] {
     let mut indices = [0usize; K_NUM];
     let mut hashes = [0u64; 2];
-    for k_i in 0..K_NUM {
-        indices[k_i] = bloom_hash(&mut hashes, key, k_i) as usize % BITVEC_BITS;
+    for (k_i, slot) in indices.iter_mut().enumerate() {
+        *slot = bloom_hash(&mut hashes, key, k_i) as usize % BITVEC_BITS;
     }
     indices
 }
@@ -94,7 +94,6 @@ impl AggregateBloom {
 
         for row_idx in indices {
             let row_start = row_idx * BLOCK_RANGE_BYTES;
-            let row_end = row_start + BLOCK_RANGE_BYTES;
             for (i, byte) in result.iter_mut().enumerate() {
                 *byte &= self.bitmap[row_start + i];
             }

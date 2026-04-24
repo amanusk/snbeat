@@ -141,15 +141,15 @@ pub(super) async fn fetch_class_info(
                                 declare_count, "Block txs fetched for declare lookup"
                             );
                             let result = txs.into_iter().find_map(|t| {
-                                if let SnTransaction::Declare(decl) = t {
-                                    if decl.class_hash == class_hash {
-                                        return Some(crate::data::types::ClassDeclareInfo {
-                                            tx_hash: decl.hash,
-                                            sender: decl.sender_address,
-                                            block_number: decl.block_number,
-                                            timestamp: 0,
-                                        });
-                                    }
+                                if let SnTransaction::Declare(decl) = t
+                                    && decl.class_hash == class_hash
+                                {
+                                    return Some(crate::data::types::ClassDeclareInfo {
+                                        tx_hash: decl.hash,
+                                        sender: decl.sender_address,
+                                        block_number: decl.block_number,
+                                        timestamp: 0,
+                                    });
                                 }
                                 None
                             });

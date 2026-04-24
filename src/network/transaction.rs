@@ -19,7 +19,7 @@ use crate::decode::outside_execution::{
 /// Resolve selector names, function definitions, and contract ABIs for a list of calls.
 /// Shared by all code paths that produce a `TransactionLoaded` action.
 pub(super) async fn resolve_call_abis(
-    calls: &mut Vec<crate::decode::functions::RawCall>,
+    calls: &mut [crate::decode::functions::RawCall],
     abi_reg: &Arc<AbiRegistry>,
 ) {
     for call in calls.iter_mut() {

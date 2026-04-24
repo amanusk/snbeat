@@ -260,11 +260,11 @@ impl App {
 
     /// Unsubscribe WS for the currently viewed address, if any.
     fn unsubscribe_current_address(&mut self) {
-        if let (Some(addr), Some(mgr)) = (self.address.context, &self.ws_manager) {
-            if self.address.ws_subscribed {
-                mgr.unsubscribe_address(addr);
-                self.address.ws_subscribed = false;
-            }
+        if let (Some(addr), Some(mgr)) = (self.address.context, &self.ws_manager)
+            && self.address.ws_subscribed
+        {
+            mgr.unsubscribe_address(addr);
+            self.address.ws_subscribed = false;
         }
     }
 
@@ -586,15 +586,15 @@ impl App {
             return;
         }
         // Trigger when within 5 items of the end
-        if self.blocks.is_near_bottom(5) {
-            if let Some(oldest) = self.blocks.items.last() {
-                let before = oldest.number;
-                if before > 0 {
-                    self.fetching_older_blocks = true;
-                    let _ = self
-                        .action_tx
-                        .send(Action::FetchOlderBlocks { before, count: 30 });
-                }
+        if self.blocks.is_near_bottom(5)
+            && let Some(oldest) = self.blocks.items.last()
+        {
+            let before = oldest.number;
+            if before > 0 {
+                self.fetching_older_blocks = true;
+                let _ = self
+                    .action_tx
+                    .send(Action::FetchOlderBlocks { before, count: 30 });
             }
         }
     }
@@ -615,22 +615,21 @@ impl App {
 
         // Priority 1: on-demand fill of a deferred large nonce gap (issue #10).
         // Only fires once per gap; the handler clears `unfilled_gap` on completion.
-        if let Some(gap) = self.address.unfilled_gap.as_ref() {
-            if !gap.fill_dispatched {
-                if let Some(address) = self.address.context {
-                    let gap_clone = gap.clone();
-                    if let Some(g) = self.address.unfilled_gap.as_mut() {
-                        g.fill_dispatched = true;
-                    }
-                    self.address.fetching_more_txs = true;
-                    let _ = self.action_tx.send(Action::FillAddressNonceGaps {
-                        address,
-                        known_txs: self.address.txs.items.clone(),
-                        gap: gap_clone,
-                    });
-                    return;
-                }
+        if let Some(gap) = self.address.unfilled_gap.as_ref()
+            && !gap.fill_dispatched
+            && let Some(address) = self.address.context
+        {
+            let gap_clone = gap.clone();
+            if let Some(g) = self.address.unfilled_gap.as_mut() {
+                g.fill_dispatched = true;
             }
+            self.address.fetching_more_txs = true;
+            let _ = self.action_tx.send(Action::FillAddressNonceGaps {
+                address,
+                known_txs: self.address.txs.items.clone(),
+                gap: gap_clone,
+            });
+            return;
         }
 
         // Priority 2: chronological pagination (older than oldest known block).
@@ -642,15 +641,15 @@ impl App {
             return;
         }
         let cursor = self.address.pagination_cursor();
-        if let (Some(address), Some(before_block)) = (self.address.context, cursor) {
-            if before_block > 0 {
-                self.address.fetching_more_txs = true;
-                let _ = self.action_tx.send(Action::FetchMoreAddressTxs {
-                    address,
-                    before_block,
-                    is_contract: self.address.is_contract,
-                });
-            }
+        if let (Some(address), Some(before_block)) = (self.address.context, cursor)
+            && before_block > 0
+        {
+            self.address.fetching_more_txs = true;
+            let _ = self.action_tx.send(Action::FetchMoreAddressTxs {
+                address,
+                before_block,
+                is_contract: self.address.is_contract,
+            });
         }
     }
 
@@ -720,10 +719,10 @@ impl App {
             }
         }
         // Voyager fallback
-        if let Some(label) = self.voyager_labels.get(address) {
-            if let Some(name) = &label.name {
-                return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡ marker for Voyager-sourced
-            }
+        if let Some(label) = self.voyager_labels.get(address)
+            && let Some(name) = &label.name
+        {
+            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡ marker for Voyager-sourced
         }
         if let Some(engine) = &self.search_engine {
             engine.registry().format_address(address)
@@ -742,10 +741,10 @@ impl App {
             }
         }
         // Voyager fallback
-        if let Some(label) = self.voyager_labels.get(address) {
-            if let Some(name) = &label.name {
-                return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡
-            }
+        if let Some(label) = self.voyager_labels.get(address)
+            && let Some(name) = &label.name
+        {
+            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡
         }
         if let Some(engine) = &self.search_engine {
             engine.registry().format_address_full(address)
@@ -909,10 +908,10 @@ impl App {
                 contract_calls,
             } => {
                 // Guard: ignore stale results from a previously navigated address.
-                if let Some(ctx) = self.address.context {
-                    if ctx != info.address {
-                        return; // stale result for a different address — discard
-                    }
+                if let Some(ctx) = self.address.context
+                    && ctx != info.address
+                {
+                    return; // stale result for a different address — discard
                 }
                 let address = info.address;
                 self.address.context = Some(address);
@@ -944,19 +943,17 @@ impl App {
                 // past the (now slightly stale) RPC read. Without this
                 // clamp, the RPC value would overwrite the more-recent
                 // streamed value and the header would regress.
-                if let Some(existing) = self.address.info.as_ref() {
-                    if crate::utils::felt_to_u64(&existing.nonce)
+                if let Some(existing) = self.address.info.as_ref()
+                    && crate::utils::felt_to_u64(&existing.nonce)
                         > crate::utils::felt_to_u64(&info.nonce)
-                    {
-                        info.nonce = existing.nonce;
-                    }
+                {
+                    info.nonce = existing.nonce;
                 }
                 if info.nonce != starknet::core::types::Felt::ZERO
                     || !info.token_balances.is_empty()
                     || info.class_hash.is_some()
+                    || self.address.info.is_none()
                 {
-                    self.address.info = Some(info);
-                } else if self.address.info.is_none() {
                     self.address.info = Some(info);
                 }
 
@@ -1084,18 +1081,17 @@ impl App {
                     if !self.address.is_contract
                         && !self.address.txs.items.is_empty()
                         && !self.address.sanity_check_dispatched
+                        && let Some(info) = &self.address.info
                     {
-                        if let Some(info) = &self.address.info {
-                            let current_nonce = crate::utils::felt_to_u64(&info.nonce);
-                            if current_nonce > 0 {
-                                self.address.unfilled_gap = self.address.detect_unfilled_gap();
-                                self.address.sanity_check_dispatched = true;
-                                let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
-                                    address,
-                                    current_nonce,
-                                    known_txs: self.address.txs.items.clone(),
-                                });
-                            }
+                        let current_nonce = crate::utils::felt_to_u64(&info.nonce);
+                        if current_nonce > 0 {
+                            self.address.unfilled_gap = self.address.detect_unfilled_gap();
+                            self.address.sanity_check_dispatched = true;
+                            let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
+                                address,
+                                current_nonce,
+                                known_txs: self.address.txs.items.clone(),
+                            });
                         }
                     }
                 }
@@ -1268,22 +1264,22 @@ impl App {
             Action::ClassHistoryLoaded { address, entries } => {
                 if self.address.context == Some(address) {
                     // Fallback: if no deploy info yet, use earliest class_history block
-                    if self.address.deployment.is_none() {
-                        if let Some(first) = entries.last() {
-                            self.address.deployment = Some(AddressTxSummary {
-                                hash: starknet::core::types::Felt::ZERO,
-                                nonce: 0,
-                                block_number: first.block_number,
-                                timestamp: 0,
-                                endpoint_names: String::new(),
-                                total_fee_fri: 0,
-                                tip: 0,
-                                tx_type: "DEPLOY".into(),
-                                status: "OK".into(),
-                                sender: None,
-                            });
-                            self.build_address_nav_items();
-                        }
+                    if self.address.deployment.is_none()
+                        && let Some(first) = entries.last()
+                    {
+                        self.address.deployment = Some(AddressTxSummary {
+                            hash: starknet::core::types::Felt::ZERO,
+                            nonce: 0,
+                            block_number: first.block_number,
+                            timestamp: 0,
+                            endpoint_names: String::new(),
+                            total_fee_fri: 0,
+                            tip: 0,
+                            tx_type: "DEPLOY".into(),
+                            status: "OK".into(),
+                            sender: None,
+                        });
+                        self.build_address_nav_items();
                     }
                     self.address.class_history = entries;
                     self.address.class_history_scroll = 0;
@@ -1468,17 +1464,17 @@ impl App {
                         // Post-display: detect any large nonce gap and defer it for
                         // on-demand fill (issue #10). Small gaps + endpoint
                         // enrichment still run automatically.
-                        if !self.address.is_contract {
-                            if let Some(info) = &self.address.info {
-                                let current_nonce = crate::utils::felt_to_u64(&info.nonce);
-                                self.address.unfilled_gap = self.address.detect_unfilled_gap();
-                                self.address.sanity_check_dispatched = true;
-                                let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
-                                    address,
-                                    current_nonce,
-                                    known_txs: self.address.txs.items.clone(),
-                                });
-                            }
+                        if !self.address.is_contract
+                            && let Some(info) = &self.address.info
+                        {
+                            let current_nonce = crate::utils::felt_to_u64(&info.nonce);
+                            self.address.unfilled_gap = self.address.detect_unfilled_gap();
+                            self.address.sanity_check_dispatched = true;
+                            let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
+                                address,
+                                current_nonce,
+                                known_txs: self.address.txs.items.clone(),
+                            });
                         }
                     }
                 }
@@ -1711,10 +1707,10 @@ impl App {
             }
             Action::VoyagerLabelLoaded { address, label } => {
                 // Add to search index so Voyager labels are searchable
-                if let Some(name) = &label.name {
-                    if let Some(engine) = &self.search_engine {
-                        engine.registry().add_voyager_label(address, name);
-                    }
+                if let Some(name) = &label.name
+                    && let Some(engine) = &self.search_engine
+                {
+                    engine.registry().add_voyager_label(address, name);
                 }
                 self.voyager_labels.insert(address, label);
             }
@@ -1803,10 +1799,9 @@ impl App {
                 if self.current_view() == View::AddressInfo
                     && self.data_sources.ws != SourceStatus::Live
                     && !self.address.is_contract
+                    && let Some(address) = self.address.context
                 {
-                    if let Some(address) = self.address.context {
-                        let _ = self.action_tx.send(Action::RefreshAddressRpc { address });
-                    }
+                    let _ = self.action_tx.send(Action::RefreshAddressRpc { address });
                 }
             }
             // Request actions are not handled here (they go to the network task)

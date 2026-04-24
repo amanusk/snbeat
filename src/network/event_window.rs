@@ -131,6 +131,7 @@ pub(crate) struct EventWindowOutcome {
     /// - `>= EVENT_PAGE_LIMIT` events → halve (dense address; we may have
     ///   truncated at the page cap, narrow the next window).
     /// - otherwise → keep the current size.
+    ///
     /// Clamped to `[EXTEND_DOWN_MIN_WINDOW, EXTEND_DOWN_MAX_WINDOW]`.
     /// `None` for non-`ExtendDown` policies and short-circuit paths.
     pub suggested_next_window: Option<u64>,

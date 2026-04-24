@@ -1,5 +1,6 @@
 //! Address-related network functions: fetching address info, enriching txs,
 //! filling nonce gaps, fetching token balances, and deploy tx lookups.
+#![allow(clippy::too_many_arguments)]
 
 use std::sync::Arc;
 
@@ -1093,70 +1094,68 @@ pub(super) async fn fetch_and_send_address_info(
     // =====================================================================
     // TASK A: Pathfinder get_sender_txs() — fastest for accounts (1-3s)
     // =====================================================================
-    if !is_contract {
-        if let Some(pf_client) = pf {
-            let pf_c = Arc::clone(pf_client);
-            let tx_a = tx.clone();
-            let ds_a = Arc::clone(ds);
-            let pf_ok = Arc::clone(&pf_succeeded);
-            spawn_cancellable(cancel.clone(), async move {
-                const PF_LIMIT: u32 = 200;
-                let _ = tx_a.send(Action::LoadingStatus("PF: fetching tx history...".into()));
-                match pf_c.get_sender_txs(address, PF_LIMIT).await {
-                    Ok(pf_txs) => {
-                        let _ = tx_a.send(Action::SourceUpdate {
-                            source: Source::Pathfinder,
-                            status: crate::app::state::SourceStatus::Live,
-                        });
-                        let real_count = pf_txs.iter().filter(|t| !t.hash.is_empty()).count();
-                        info!(
-                            pf_txs = pf_txs.len(),
-                            real_txs = real_count,
-                            "PF sender-txs returned"
-                        );
-                        let summaries = pf_txs_to_summaries(pf_txs);
-                        // Save to cache
-                        if !summaries.is_empty() {
-                            let min_b = summaries.iter().map(|s| s.block_number).min().unwrap_or(0);
-                            let max_b = summaries.iter().map(|s| s.block_number).max().unwrap_or(0);
-                            let _ = tx_a.send(Action::LoadingStatus(format!(
-                                "PF: {} txs, blocks {}..{}",
-                                summaries.len(),
-                                min_b,
-                                max_b
-                            )));
-                            ds_a.save_address_txs(&address, &summaries);
-                            // Cache activity range from PF results
-                            if min_b > 0 {
-                                ds_a.save_activity_range(&address, min_b, max_b);
-                            }
-                            // Only signal success when PF actually returned txs —
-                            // otherwise RPC should still do its deep search.
-                            pf_ok.store(true, Ordering::Release);
+    if !is_contract && let Some(pf_client) = pf {
+        let pf_c = Arc::clone(pf_client);
+        let tx_a = tx.clone();
+        let ds_a = Arc::clone(ds);
+        let pf_ok = Arc::clone(&pf_succeeded);
+        spawn_cancellable(cancel.clone(), async move {
+            const PF_LIMIT: u32 = 200;
+            let _ = tx_a.send(Action::LoadingStatus("PF: fetching tx history...".into()));
+            match pf_c.get_sender_txs(address, PF_LIMIT).await {
+                Ok(pf_txs) => {
+                    let _ = tx_a.send(Action::SourceUpdate {
+                        source: Source::Pathfinder,
+                        status: crate::app::state::SourceStatus::Live,
+                    });
+                    let real_count = pf_txs.iter().filter(|t| !t.hash.is_empty()).count();
+                    info!(
+                        pf_txs = pf_txs.len(),
+                        real_txs = real_count,
+                        "PF sender-txs returned"
+                    );
+                    let summaries = pf_txs_to_summaries(pf_txs);
+                    // Save to cache
+                    if !summaries.is_empty() {
+                        let min_b = summaries.iter().map(|s| s.block_number).min().unwrap_or(0);
+                        let max_b = summaries.iter().map(|s| s.block_number).max().unwrap_or(0);
+                        let _ = tx_a.send(Action::LoadingStatus(format!(
+                            "PF: {} txs, blocks {}..{}",
+                            summaries.len(),
+                            min_b,
+                            max_b
+                        )));
+                        ds_a.save_address_txs(&address, &summaries);
+                        // Cache activity range from PF results
+                        if min_b > 0 {
+                            ds_a.save_activity_range(&address, min_b, max_b);
                         }
-                        let _ = tx_a.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Pathfinder,
-                            tx_summaries: summaries,
-                            complete: true,
-                        });
+                        // Only signal success when PF actually returned txs —
+                        // otherwise RPC should still do its deep search.
+                        pf_ok.store(true, Ordering::Release);
                     }
-                    Err(e) => {
-                        warn!(error = %e, "PF sender-txs failed");
-                        let _ = tx_a.send(Action::SourceUpdate {
-                            source: Source::Pathfinder,
-                            status: crate::app::state::SourceStatus::FetchError(e.to_string()),
-                        });
-                        let _ = tx_a.send(Action::AddressTxsStreamed {
-                            address,
-                            source: Source::Pathfinder,
-                            tx_summaries: Vec::new(),
-                            complete: true,
-                        });
-                    }
+                    let _ = tx_a.send(Action::AddressTxsStreamed {
+                        address,
+                        source: Source::Pathfinder,
+                        tx_summaries: summaries,
+                        complete: true,
+                    });
                 }
-            });
-        }
+                Err(e) => {
+                    warn!(error = %e, "PF sender-txs failed");
+                    let _ = tx_a.send(Action::SourceUpdate {
+                        source: Source::Pathfinder,
+                        status: crate::app::state::SourceStatus::FetchError(e.to_string()),
+                    });
+                    let _ = tx_a.send(Action::AddressTxsStreamed {
+                        address,
+                        source: Source::Pathfinder,
+                        tx_summaries: Vec::new(),
+                        complete: true,
+                    });
+                }
+            }
+        });
     }
 
     // =====================================================================
@@ -1745,112 +1744,111 @@ pub(super) async fn fetch_and_send_address_info(
                         )
                         .await;
 
-                        if let Ok(deeper_events) = deeper_events {
-                            if !deeper_events.is_empty() {
-                                any_events_found = true;
-                                // Cache discovered range
-                                let min_b = deeper_events
+                        if let Ok(deeper_events) = deeper_events
+                            && !deeper_events.is_empty()
+                        {
+                            any_events_found = true;
+                            // Cache discovered range
+                            let min_b = deeper_events
+                                .iter()
+                                .map(|e| e.block_number)
+                                .min()
+                                .unwrap_or(0);
+                            let max_b = deeper_events
+                                .iter()
+                                .map(|e| e.block_number)
+                                .max()
+                                .unwrap_or(0);
+                            if min_b > 0 {
+                                ds_c.save_activity_range(&address, min_b, max_b);
+                            }
+
+                            let mut deep_seen = std::collections::HashSet::new();
+                            let deep_hashes: Vec<_> = deeper_events
+                                .iter()
+                                .filter_map(|e| {
+                                    let h = e.transaction_hash;
+                                    if h != starknet::core::types::Felt::ZERO && deep_seen.insert(h)
+                                    {
+                                        Some(h)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let deep_block_map: std::collections::HashMap<_, _> = deeper_events
+                                .iter()
+                                .map(|e| (e.transaction_hash, e.block_number))
+                                .collect();
+
+                            let mut deep_decoded = Vec::new();
+                            for event in &deeper_events {
+                                let abi = abi_c.get_abi_for_address(&event.from_address).await;
+                                deep_decoded.push(decode_event(event, abi.as_deref()));
+                            }
+
+                            if is_contract && !deep_hashes.is_empty() {
+                                let call_hashes: Vec<_> = deep_hashes
                                     .iter()
-                                    .map(|e| e.block_number)
-                                    .min()
-                                    .unwrap_or(0);
-                                let max_b = deeper_events
-                                    .iter()
-                                    .map(|e| e.block_number)
-                                    .max()
-                                    .unwrap_or(0);
-                                if min_b > 0 {
-                                    ds_c.save_activity_range(&address, min_b, max_b);
+                                    .map(|h| (*h, deep_block_map.get(h).copied().unwrap_or(0)))
+                                    .collect();
+                                let mut contract_calls_list = build_contract_calls_from_hashes(
+                                    address,
+                                    &call_hashes,
+                                    &ds_c,
+                                    pf_c.as_ref(),
+                                    &abi_c,
+                                )
+                                .await;
+                                contract_calls_list
+                                    .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+
+                                {
+                                    let callers = contract_calls_list.iter().map(|c| c.sender);
+                                    spawn_voyager_prefetch(callers, &voyager_c2, &tx_c);
                                 }
 
-                                let mut deep_seen = std::collections::HashSet::new();
-                                let deep_hashes: Vec<_> = deeper_events
-                                    .iter()
-                                    .filter_map(|e| {
-                                        let h = e.transaction_hash;
-                                        if h != starknet::core::types::Felt::ZERO
-                                            && deep_seen.insert(h)
-                                        {
-                                            Some(h)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-
-                                let deep_block_map: std::collections::HashMap<_, _> = deeper_events
-                                    .iter()
-                                    .map(|e| (e.transaction_hash, e.block_number))
-                                    .collect();
-
-                                let mut deep_decoded = Vec::new();
-                                for event in &deeper_events {
-                                    let abi = abi_c.get_abi_for_address(&event.from_address).await;
-                                    deep_decoded.push(decode_event(event, abi.as_deref()));
-                                }
-
-                                if is_contract && !deep_hashes.is_empty() {
-                                    let call_hashes: Vec<_> = deep_hashes
-                                        .iter()
-                                        .map(|h| (*h, deep_block_map.get(h).copied().unwrap_or(0)))
-                                        .collect();
-                                    let mut contract_calls_list = build_contract_calls_from_hashes(
+                                let _ = tx_c.send(Action::AddressInfoLoaded {
+                                    info: crate::data::types::SnAddressInfo {
                                         address,
-                                        &call_hashes,
+                                        nonce,
+                                        class_hash,
+                                        recent_events: deeper_events,
+                                        token_balances: Vec::new(),
+                                    },
+                                    decoded_events: deep_decoded,
+                                    tx_summaries: Vec::new(),
+                                    contract_calls: contract_calls_list,
+                                });
+                            } else if !is_contract && !deep_hashes.is_empty() {
+                                let to_fetch: Vec<_> = {
+                                    let cached_txs = ds_c.load_cached_address_txs(&address);
+                                    let cached_set: std::collections::HashSet<_> =
+                                        cached_txs.iter().map(|t| t.hash).collect();
+                                    deep_hashes
+                                        .into_iter()
+                                        .filter(|h| !cached_set.contains(h))
+                                        .collect()
+                                };
+                                if !to_fetch.is_empty() {
+                                    let summaries = fetch_tx_summaries_from_hashes(
+                                        &to_fetch,
+                                        &deep_block_map,
                                         &ds_c,
                                         pf_c.as_ref(),
                                         &abi_c,
+                                        &tx_c,
+                                        "RPC: fetching probe-guided txs",
                                     )
                                     .await;
-                                    contract_calls_list
-                                        .sort_by(|a, b| b.block_number.cmp(&a.block_number));
-
-                                    {
-                                        let callers = contract_calls_list.iter().map(|c| c.sender);
-                                        spawn_voyager_prefetch(callers, &voyager_c2, &tx_c);
-                                    }
-
-                                    let _ = tx_c.send(Action::AddressInfoLoaded {
-                                        info: crate::data::types::SnAddressInfo {
+                                    if !summaries.is_empty() {
+                                        let _ = tx_c.send(Action::AddressTxsStreamed {
                                             address,
-                                            nonce,
-                                            class_hash,
-                                            recent_events: deeper_events,
-                                            token_balances: Vec::new(),
-                                        },
-                                        decoded_events: deep_decoded,
-                                        tx_summaries: Vec::new(),
-                                        contract_calls: contract_calls_list,
-                                    });
-                                } else if !is_contract && !deep_hashes.is_empty() {
-                                    let to_fetch: Vec<_> = {
-                                        let cached_txs = ds_c.load_cached_address_txs(&address);
-                                        let cached_set: std::collections::HashSet<_> =
-                                            cached_txs.iter().map(|t| t.hash).collect();
-                                        deep_hashes
-                                            .into_iter()
-                                            .filter(|h| !cached_set.contains(h))
-                                            .collect()
-                                    };
-                                    if !to_fetch.is_empty() {
-                                        let summaries = fetch_tx_summaries_from_hashes(
-                                            &to_fetch,
-                                            &deep_block_map,
-                                            &ds_c,
-                                            pf_c.as_ref(),
-                                            &abi_c,
-                                            &tx_c,
-                                            "RPC: fetching probe-guided txs",
-                                        )
-                                        .await;
-                                        if !summaries.is_empty() {
-                                            let _ = tx_c.send(Action::AddressTxsStreamed {
-                                                address,
-                                                source: Source::Rpc,
-                                                tx_summaries: summaries,
-                                                complete: false,
-                                            });
-                                        }
+                                            source: Source::Rpc,
+                                            tx_summaries: summaries,
+                                            complete: false,
+                                        });
                                     }
                                 }
                             }
@@ -2527,7 +2525,6 @@ pub(super) async fn fetch_more_address_txs(
             callee_max_block: max_b,
             sender_tx_count: 1,
             callee_call_count: 1,
-            ..Default::default()
         };
         p.recommended_window()
     } else {
@@ -2538,18 +2535,18 @@ pub(super) async fn fetch_more_address_txs(
     let deploy_block = ds
         .load_cached_deploy_info(&address)
         .map(|(_, block, _)| block);
-    if let Some(db) = deploy_block {
-        if before_block <= db {
-            debug!(address = %format!("{:#x}", address), deploy_block = db, "Already at deploy block, no more txs to fetch");
-            let _ = tx.send(Action::MoreAddressTxsLoaded {
-                address,
-                tx_summaries: Vec::new(),
-                contract_calls: Vec::new(),
-                oldest_block: db,
-                has_more: false,
-            });
-            return;
-        }
+    if let Some(db) = deploy_block
+        && before_block <= db
+    {
+        debug!(address = %format!("{:#x}", address), deploy_block = db, "Already at deploy block, no more txs to fetch");
+        let _ = tx.send(Action::MoreAddressTxsLoaded {
+            address,
+            tx_summaries: Vec::new(),
+            contract_calls: Vec::new(),
+            oldest_block: db,
+            has_more: false,
+        });
+        return;
     }
 
     let mut from_block = before_block.saturating_sub(window_size);
@@ -2814,26 +2811,23 @@ pub(super) async fn enrich_dune_calls(
     // Resolve selectors
     let mut unresolved = false;
     for call in &mut dune_calls {
-        if call.function_name.starts_with("0x") {
-            if let Ok(sel) = starknet::core::types::Felt::from_hex(&call.function_name) {
-                if let Some(name) = abi_reg.get_selector_name(&sel) {
-                    call.function_name = name;
-                } else {
-                    unresolved = true;
-                }
+        if call.function_name.starts_with("0x")
+            && let Ok(sel) = starknet::core::types::Felt::from_hex(&call.function_name)
+        {
+            if let Some(name) = abi_reg.get_selector_name(&sel) {
+                call.function_name = name;
+            } else {
+                unresolved = true;
             }
         }
     }
-    if unresolved {
-        if let Some(abi) = abi_reg.get_abi_for_address(&address).await {
-            for call in &mut dune_calls {
-                if call.function_name.starts_with("0x") {
-                    if let Ok(sel) = starknet::core::types::Felt::from_hex(&call.function_name) {
-                        if let Some(func) = abi.get_function(&sel) {
-                            call.function_name = func.name.clone();
-                        }
-                    }
-                }
+    if unresolved && let Some(abi) = abi_reg.get_abi_for_address(&address).await {
+        for call in &mut dune_calls {
+            if call.function_name.starts_with("0x")
+                && let Ok(sel) = starknet::core::types::Felt::from_hex(&call.function_name)
+                && let Some(func) = abi.get_function(&sel)
+            {
+                call.function_name = func.name.clone();
             }
         }
     }

@@ -5,3 +5,4 @@ logs/*
 scripts/
 CLAUDE.md
 *.tape
+.claude/*

@@ -15,6 +15,7 @@ use crate::network::dune::AddressActivityProbe;
 
 /// Actions dispatched from the UI to the network task, or responses back.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     // --- Requests (UI → network) ---
     /// Fetch the N most recent blocks.

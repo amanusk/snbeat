@@ -15,6 +15,12 @@ pub struct AddressColorMap {
     next_slot: usize,
 }
 
+impl Default for AddressColorMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AddressColorMap {
     pub fn new() -> Self {
         Self {

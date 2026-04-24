@@ -73,12 +73,12 @@ fn collect_all_addresses() -> Vec<(Felt, String)> {
 
     // Load from labels.toml
     let labels_path = Path::new("labels.toml");
-    if labels_path.exists() {
-        if let Ok((labels, _)) = snbeat::registry::user_labels::load_user_labels(labels_path) {
-            for label in labels {
-                if seen.insert(label.address) {
-                    addresses.push((label.address, label.name));
-                }
+    if labels_path.exists()
+        && let Ok((labels, _)) = snbeat::registry::user_labels::load_user_labels(labels_path)
+    {
+        for label in labels {
+            if seen.insert(label.address) {
+                addresses.push((label.address, label.name));
             }
         }
     }
@@ -272,7 +272,7 @@ async fn populate_selectors() {
                     }
                 }
                 Err(e) => {
-                    println!("  SKIP {}: {} ({})", name, format!("{:#x}", addr), e);
+                    println!("  SKIP {name}: {addr:#x} ({e})");
                     failed += 1;
                 }
             }

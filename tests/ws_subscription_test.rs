@@ -136,17 +136,16 @@ async fn wait_for_notification(
         if let Message::Text(text) = msg {
             let raw: RawMessage = serde_json::from_str(&text)
                 .unwrap_or_else(|e| panic!("failed to parse ws message: {e}\nraw: {text}"));
-            if let Some(method) = &raw.method {
-                if method.starts_with("starknet_subscription") {
-                    if let Some(params) = raw.params {
-                        // Match by subscription_id (handles both string and int forms)
-                        let our_id = serde_json::to_value(&subscription_id.0).unwrap();
-                        if params.subscription_id == our_id
-                            || params.subscription_id.as_str() == Some(&subscription_id.0)
-                        {
-                            return params;
-                        }
-                    }
+            if let Some(method) = &raw.method
+                && method.starts_with("starknet_subscription")
+                && let Some(params) = raw.params
+            {
+                // Match by subscription_id (handles both string and int forms)
+                let our_id = serde_json::to_value(&subscription_id.0).unwrap();
+                if params.subscription_id == our_id
+                    || params.subscription_id.as_str() == Some(&subscription_id.0)
+                {
+                    return params;
                 }
             }
         }
@@ -458,10 +457,10 @@ async fn test_unsubscribe_stops_notifications() {
             let msg = read.next().await?.ok()?;
             if let Message::Text(text) = msg {
                 let raw: RawMessage = serde_json::from_str(&text).ok()?;
-                if let Some(params) = raw.params {
-                    if params.subscription_id.as_str() == Some(&sub_id.0) {
-                        return Some(params.result);
-                    }
+                if let Some(params) = raw.params
+                    && params.subscription_id.as_str() == Some(&sub_id.0)
+                {
+                    return Some(params.result);
                 }
             }
         }

@@ -47,7 +47,7 @@ fn test_known_function_selectors() {
     let name = get_selector_from_name("name").unwrap();
 
     // All must be distinct
-    let selectors = vec![transfer, approve, balance_of, name];
+    let selectors = [transfer, approve, balance_of, name];
     for (i, a) in selectors.iter().enumerate() {
         for (j, b) in selectors.iter().enumerate() {
             if i != j {
@@ -260,7 +260,7 @@ fn test_decode_event_without_abi() {
 #[test]
 fn test_group_events_by_contract() {
     use snbeat::data::types::SnEvent;
-    use snbeat::decode::events::{DecodedEvent, DecodedParam, group_events_by_contract};
+    use snbeat::decode::events::{DecodedEvent, group_events_by_contract};
 
     let eth = Felt::from_hex(ETH_TOKEN).unwrap();
     let usdc = Felt::from_hex(USDC_TOKEN).unwrap();
@@ -353,7 +353,7 @@ fn test_parse_multicall_empty() {
 
 #[test]
 fn test_parsed_abi_serde_roundtrip() {
-    use snbeat::decode::abi::{EventDef, FeltKey, FunctionDef, ParsedAbi};
+    use snbeat::decode::abi::{FeltKey, FunctionDef, ParsedAbi};
 
     let mut abi = ParsedAbi::default();
     let selector = get_selector_from_name("transfer").unwrap();
@@ -383,7 +383,7 @@ fn test_parsed_abi_serde_roundtrip() {
 
 #[test]
 fn test_raw_call_function_name_field() {
-    use snbeat::decode::functions::{RawCall, parse_multicall};
+    use snbeat::decode::functions::parse_multicall;
 
     let contract = Felt::from_hex("0x1111").unwrap();
     let selector = get_selector_from_name("transfer").unwrap();

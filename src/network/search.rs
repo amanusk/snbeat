@@ -1,5 +1,6 @@
 //! Search resolution: dispatches a user query to the appropriate handler
 //! (block number, address, tx hash, block hash, or class hash).
+#![allow(clippy::too_many_arguments)]
 
 use std::sync::Arc;
 
@@ -73,7 +74,6 @@ pub(super) async fn resolve_search(
                         )));
                     }
                 }
-                return;
             }
             Err(_) => {
                 // Step 3: Not a tx — try as block hash

@@ -86,11 +86,11 @@ async fn main() {
                 address: Some(AddressFilter::Single(address)),
                 keys: None,
             };
-            if let Ok(page) = provider.get_events(filter, None, 1).await {
-                if !page.events.is_empty() {
-                    found_in = label;
-                    break;
-                }
+            if let Ok(page) = provider.get_events(filter, None, 1).await
+                && !page.events.is_empty()
+            {
+                found_in = label;
+                break;
             }
         }
         let ms = t.elapsed().as_millis();

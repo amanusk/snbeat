@@ -68,18 +68,15 @@ impl NavTarget {
 }
 
 /// Connection status shown in the status bar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectionStatus {
+    #[default]
     Disconnected,
     Connecting,
-    Connected { network: String },
+    Connected {
+        network: String,
+    },
     Error(String),
-}
-
-impl Default for ConnectionStatus {
-    fn default() -> Self {
-        ConnectionStatus::Disconnected
-    }
 }
 
 /// Health state of an external data source.

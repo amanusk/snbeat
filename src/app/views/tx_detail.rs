@@ -9,6 +9,7 @@ use crate::decode::functions::RawCall;
 use crate::decode::outside_execution::OutsideExecutionInfo;
 
 /// All state related to the transaction detail view.
+#[derive(Default)]
 pub struct TxDetailState {
     pub transaction: Option<SnTransaction>,
     pub receipt: Option<SnReceipt>,
@@ -32,27 +33,6 @@ pub struct TxDetailState {
     /// Whether to show the expanded outside execution intent view.
     pub show_outside_execution: bool,
     pub block_timestamp: Option<u64>,
-}
-
-impl Default for TxDetailState {
-    fn default() -> Self {
-        Self {
-            transaction: None,
-            receipt: None,
-            decoded_events: Vec::new(),
-            decoded_calls: Vec::new(),
-            scroll: 0,
-            nav_items: Vec::new(),
-            nav_cursor: 0,
-            nav_item_lines: Vec::new(),
-            visual_mode: false,
-            show_calldata: false,
-            show_decoded_calldata: false,
-            outside_executions: Vec::new(),
-            show_outside_execution: false,
-            block_timestamp: None,
-        }
-    }
 }
 
 impl TxDetailState {
@@ -146,10 +126,8 @@ impl TxDetailState {
                     && type_name.is_empty()
                     && p.value != starknet::core::types::Felt::ZERO
                     && is_known(&p.value);
-                if is_address_type || is_known_label {
-                    if seen.insert(p.value) {
-                        items.push(TxNavItem::Address(p.value));
-                    }
+                if (is_address_type || is_known_label) && seen.insert(p.value) {
+                    items.push(TxNavItem::Address(p.value));
                 }
             }
         }

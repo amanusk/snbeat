@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
-use crate::ui::widgets::hex_display::{format_commas, format_fee, format_fri, short_hash};
+use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash};
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::felt_to_u64;
 

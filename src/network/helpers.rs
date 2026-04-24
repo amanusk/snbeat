@@ -228,10 +228,10 @@ pub async fn backfill_timestamps(
     }
     let ts_map = fetch_block_timestamps(blocks_needing_ts, ds, pf).await;
     for s in summaries.iter_mut() {
-        if s.timestamp == 0 {
-            if let Some(&ts) = ts_map.get(&s.block_number) {
-                s.timestamp = ts;
-            }
+        if s.timestamp == 0
+            && let Some(&ts) = ts_map.get(&s.block_number)
+        {
+            s.timestamp = ts;
         }
     }
 }
@@ -252,10 +252,10 @@ pub async fn backfill_call_timestamps(
     }
     let ts_map = fetch_block_timestamps(blocks_needing_ts, ds, pf).await;
     for c in calls.iter_mut() {
-        if c.timestamp == 0 {
-            if let Some(&ts) = ts_map.get(&c.block_number) {
-                c.timestamp = ts;
-            }
+        if c.timestamp == 0
+            && let Some(&ts) = ts_map.get(&c.block_number)
+        {
+            c.timestamp = ts;
         }
     }
 }

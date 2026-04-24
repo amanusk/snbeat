@@ -39,7 +39,7 @@ pub struct KnownAddress {
 pub fn load_known_addresses() -> Result<Vec<KnownAddress>> {
     let content = BUNDLED_KNOWN_ADDRESSES;
 
-    let file: KnownAddressesFile = toml::from_str(&content)?;
+    let file: KnownAddressesFile = toml::from_str(content)?;
     let mut addresses = Vec::new();
 
     for (hex, entry) in &file.addresses {
