@@ -27,7 +27,9 @@ use crate::search::SearchEngine;
 use crate::ui::widgets::stateful_list::StatefulList;
 use actions::{Action, Source};
 use starknet::core::types::Felt;
-use state::{ActiveQueries, ConnectionStatus, DataSources, Focus, InputMode, NavTarget, View};
+use state::{
+    ActiveQueries, ConnectionStatus, DataSources, Focus, InputMode, NavTarget, SourceStatus, View,
+};
 use views::{AddressInfoState, BlockDetailState, ClassInfoState, TxDetailState};
 
 /// Maximum number of blocks retained in the main blocks list.
@@ -936,6 +938,19 @@ impl App {
                 if info.token_balances.is_empty() && !preserved_balances.is_empty() {
                     info.token_balances = preserved_balances;
                 }
+                // Clamp the incoming nonce against whatever we've already
+                // observed — a WS `AddressTxsStreamed` can arrive before
+                // this initial RPC-loaded info and bump the header nonce
+                // past the (now slightly stale) RPC read. Without this
+                // clamp, the RPC value would overwrite the more-recent
+                // streamed value and the header would regress.
+                if let Some(existing) = self.address.info.as_ref() {
+                    if crate::utils::felt_to_u64(&existing.nonce)
+                        > crate::utils::felt_to_u64(&info.nonce)
+                    {
+                        info.nonce = existing.nonce;
+                    }
+                }
                 if info.nonce != starknet::core::types::Felt::ZERO
                     || !info.token_balances.is_empty()
                     || info.class_hash.is_some()
@@ -1350,7 +1365,42 @@ impl App {
                 if old_deploy_hash != new_deploy_hash {
                     self.build_address_nav_items();
                 }
+
+                // Derive an up-to-date account nonce from the incoming
+                // (post-deployment-filter) txs. After a tx with nonce N lands,
+                // the account's next nonce is N+1. This keeps the header
+                // `Nonce:` field in sync with newly streamed txs (WS today,
+                // RPC fallback poll in the future) instead of drifting behind
+                // the initial RPC load value.
+                let max_incoming_nonce = if self.address.is_contract {
+                    None
+                } else {
+                    tx_summaries.iter().map(|t| t.nonce).max()
+                };
+
                 self.address.merge_tx_summaries(tx_summaries);
+
+                if let Some(max_n) = max_incoming_nonce {
+                    // Seed a minimal info if the WS tx beat `AddressInfoLoaded`
+                    // here — otherwise the bump would be skipped and the
+                    // later-arriving initial RPC nonce would overwrite
+                    // unconditionally, leaving the header stale until the
+                    // next tx. `AddressInfoLoaded` below clamps its incoming
+                    // nonce against `existing.nonce` to preserve this bump.
+                    let info = self.address.info.get_or_insert_with(|| {
+                        crate::data::types::SnAddressInfo {
+                            address,
+                            nonce: Felt::ZERO,
+                            class_hash: None,
+                            recent_events: Vec::new(),
+                            token_balances: Vec::new(),
+                        }
+                    });
+                    let new_nonce = max_n.saturating_add(1);
+                    if new_nonce > crate::utils::felt_to_u64(&info.nonce) {
+                        info.nonce = Felt::from(new_nonce);
+                    }
+                }
 
                 // Trigger enrichment for visible window
                 if !self.address.txs.items.is_empty() {
@@ -1744,6 +1794,20 @@ impl App {
             Action::Error(msg) => {
                 self.error_message = Some(msg);
                 self.is_loading = false;
+            }
+            Action::PeriodicAddressPollTick => {
+                // Only refresh when the user is actually sitting on an address
+                // view, WS isn't live (otherwise the WS stream covers this),
+                // and the context is an account (contracts don't have a
+                // meaningful account nonce and are topped up via other paths).
+                if self.current_view() == View::AddressInfo
+                    && self.data_sources.ws != SourceStatus::Live
+                    && !self.address.is_contract
+                {
+                    if let Some(address) = self.address.context {
+                        let _ = self.action_tx.send(Action::RefreshAddressRpc { address });
+                    }
+                }
             }
             // Request actions are not handled here (they go to the network task)
             _ => {}
