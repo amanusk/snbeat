@@ -90,6 +90,47 @@ fn streamed_tx_with_lower_nonce_does_not_downgrade_header() {
 }
 
 #[test]
+fn ws_tx_before_address_info_loaded_is_not_clobbered() {
+    // Race: a WS tx can arrive between `NavigateToAddress` (which fires the
+    // subscribe) and `AddressInfoLoaded` (which lands the initial RPC-read
+    // nonce). If the WS tx bumps the header to N+1, the later-arriving RPC
+    // nonce must not overwrite it with a smaller value.
+    let (mut app, _rx) = make_app();
+    let addr = Felt::from(0xa11ceu64);
+    // Simulate the pre-AddressInfoLoaded state: view pushed + context set by
+    // `NavigateToAddress`, but `info` still None.
+    app.push_view(View::AddressInfo);
+    app.address.context = Some(addr);
+    app.address.is_contract = false;
+    assert!(app.address.info.is_none());
+
+    // WS arrives first with nonce 7 → header should be seeded to 8.
+    app.handle_action(Action::AddressTxsStreamed {
+        address: addr,
+        source: Source::Ws,
+        tx_summaries: vec![tx_summary(0x7777, 7, addr)],
+        complete: false,
+    });
+    assert_eq!(app.address.info.as_ref().unwrap().nonce, Felt::from(8u64));
+
+    // Now `AddressInfoLoaded` lands with the stale RPC read (nonce 5). The
+    // clamp must keep the header at 8, not regress to 5.
+    app.handle_action(Action::AddressInfoLoaded {
+        info: SnAddressInfo {
+            address: addr,
+            nonce: Felt::from(5u64),
+            class_hash: None,
+            recent_events: Vec::new(),
+            token_balances: Vec::new(),
+        },
+        decoded_events: Vec::new(),
+        tx_summaries: Vec::new(),
+        contract_calls: Vec::new(),
+    });
+    assert_eq!(app.address.info.as_ref().unwrap().nonce, Felt::from(8u64));
+}
+
+#[test]
 fn streamed_tx_on_contract_does_not_touch_nonce() {
     let (mut app, _rx) = make_app();
     let addr = Felt::from(0xc0deu64);

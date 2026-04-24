@@ -3716,15 +3716,20 @@ pub(super) async fn refresh_address_rpc(
         }
     };
 
-    // Always emit `complete: true` so the reducer's cursor/source-completion
-    // bookkeeping stays consistent. An empty `tx_summaries` is the common
-    // case when nothing new landed since the last tick.
-    let _ = action_tx.send(Action::AddressTxsStreamed {
-        address,
-        source: Source::Rpc,
-        tx_summaries: summaries,
-        complete: true,
-    });
+    // Emit with `complete: false` — this is a silent background refresh, not
+    // an initial-load source completing. `complete: true` would re-fire
+    // `EnrichAddressEndpoints` and flash a "Loaded N txs" `LoadingStatus`
+    // every tick, which is wrong for a heartbeat refresh. Skipping the emit
+    // entirely when there's nothing new keeps the UI fully silent in the
+    // common case (no new txs since the last tick).
+    if !summaries.is_empty() {
+        let _ = action_tx.send(Action::AddressTxsStreamed {
+            address,
+            source: Source::Rpc,
+            tx_summaries: summaries,
+            complete: false,
+        });
+    }
 }
 
 #[cfg(test)]

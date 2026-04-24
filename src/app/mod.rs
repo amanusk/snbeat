@@ -938,6 +938,19 @@ impl App {
                 if info.token_balances.is_empty() && !preserved_balances.is_empty() {
                     info.token_balances = preserved_balances;
                 }
+                // Clamp the incoming nonce against whatever we've already
+                // observed — a WS `AddressTxsStreamed` can arrive before
+                // this initial RPC-loaded info and bump the header nonce
+                // past the (now slightly stale) RPC read. Without this
+                // clamp, the RPC value would overwrite the more-recent
+                // streamed value and the header would regress.
+                if let Some(existing) = self.address.info.as_ref() {
+                    if crate::utils::felt_to_u64(&existing.nonce)
+                        > crate::utils::felt_to_u64(&info.nonce)
+                    {
+                        info.nonce = existing.nonce;
+                    }
+                }
                 if info.nonce != starknet::core::types::Felt::ZERO
                     || !info.token_balances.is_empty()
                     || info.class_hash.is_some()
@@ -1368,11 +1381,24 @@ impl App {
                 self.address.merge_tx_summaries(tx_summaries);
 
                 if let Some(max_n) = max_incoming_nonce {
-                    if let Some(info) = self.address.info.as_mut() {
-                        let new_nonce = max_n.saturating_add(1);
-                        if new_nonce > crate::utils::felt_to_u64(&info.nonce) {
-                            info.nonce = Felt::from(new_nonce);
+                    // Seed a minimal info if the WS tx beat `AddressInfoLoaded`
+                    // here — otherwise the bump would be skipped and the
+                    // later-arriving initial RPC nonce would overwrite
+                    // unconditionally, leaving the header stale until the
+                    // next tx. `AddressInfoLoaded` below clamps its incoming
+                    // nonce against `existing.nonce` to preserve this bump.
+                    let info = self.address.info.get_or_insert_with(|| {
+                        crate::data::types::SnAddressInfo {
+                            address,
+                            nonce: Felt::ZERO,
+                            class_hash: None,
+                            recent_events: Vec::new(),
+                            token_balances: Vec::new(),
                         }
+                    });
+                    let new_nonce = max_n.saturating_add(1);
+                    if new_nonce > crate::utils::felt_to_u64(&info.nonce) {
+                        info.nonce = Felt::from(new_nonce);
                     }
                 }
 
