@@ -61,16 +61,16 @@ async-trait = "0.1"
 
 # Local cache (SQLite for persistent storage across restarts)
 rusqlite = { version = "0.33", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.26"
 
 # Pathfinder DB (optional — for direct pathfinder node access)
-r2d2 = { version = "0.8", optional = true }
-r2d2_sqlite = { version = "0.26", optional = true }
 zstd = { version = "0.13", optional = true }
 bincode = { version = "2.0", features = ["serde"], optional = true }
 
 [features]
 default = []
-pathfinder = ["dep:r2d2", "dep:r2d2_sqlite", "dep:zstd", "dep:bincode"]
+pathfinder = ["dep:zstd", "dep:bincode"]
 
 [dev-dependencies]
 tokio-test = "0.4"
