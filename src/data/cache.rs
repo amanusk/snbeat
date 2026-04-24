@@ -9,7 +9,7 @@ use futures::FutureExt;
 use futures::future::Shared;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::params;
+use rusqlite::{TransactionBehavior, params};
 use starknet::core::types::{ContractClass, Felt};
 use tracing::{debug, trace, warn};
 
@@ -325,33 +325,59 @@ impl CachingDataSource {
         Some((block, txs))
     }
 
+    /// Atomically write the block row, its hash index, and the full tx list
+    /// so readers never observe a half-populated state. With the r2d2 pool, a
+    /// prior split (block inserted on conn A, tx list on conn B) let readers
+    /// hitting `get_cached_block_with_txs` between the two commits see the
+    /// block but an empty tx list and return `None` at the `txs.is_empty()`
+    /// guard — a false miss that caused upstream re-fetches. Everything now
+    /// runs inside one transaction on a single pooled connection.
     fn cache_block_with_txs(&self, block: &SnBlock, txs: &[SnTransaction]) {
-        self.cache_block(block);
-        if let Ok(mut db) = self.db.get() {
-            let tx_db = match db.transaction() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "cache_block_with_txs: begin transaction failed");
-                    return;
-                }
-            };
-            for (i, tx) in txs.iter().enumerate() {
-                if let Ok(json) = serde_json::to_string(tx) {
-                    let hash_hex = format!("{:#x}", tx.hash());
-                    let _ = tx_db.execute(
-                        "INSERT OR REPLACE INTO block_transactions (block_number, tx_index, tx_hash, data) VALUES (?1, ?2, ?3, ?4)",
-                        params![block.number, i as i64, hash_hex, json],
-                    );
-                    // Also cache in transactions table for hash lookup
-                    let _ = tx_db.execute(
-                        "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
-                        params![hash_hex, block.number, json],
-                    );
-                }
+        let block_json = match serde_json::to_string(block) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut db = match self.db.get() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "cache_block_with_txs: pool get failed");
+                return;
             }
-            if let Err(e) = tx_db.commit() {
-                warn!(error = %e, "cache_block_with_txs: commit failed");
+        };
+        let tx_db = match db.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "cache_block_with_txs: begin transaction failed");
+                return;
             }
+        };
+        let _ = tx_db.execute(
+            "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
+            params![block.number, block_json],
+        );
+        if block.hash != Felt::ZERO {
+            let hash_hex = format!("{:#x}", block.hash);
+            let _ = tx_db.execute(
+                "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
+                params![hash_hex, block.number as i64],
+            );
+        }
+        for (i, tx) in txs.iter().enumerate() {
+            if let Ok(json) = serde_json::to_string(tx) {
+                let hash_hex = format!("{:#x}", tx.hash());
+                let _ = tx_db.execute(
+                    "INSERT OR REPLACE INTO block_transactions (block_number, tx_index, tx_hash, data) VALUES (?1, ?2, ?3, ?4)",
+                    params![block.number, i as i64, hash_hex, json],
+                );
+                // Also cache in transactions table for hash lookup
+                let _ = tx_db.execute(
+                    "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
+                    params![hash_hex, block.number, json],
+                );
+            }
+        }
+        if let Err(e) = tx_db.commit() {
+            warn!(error = %e, "cache_block_with_txs: commit failed");
         }
     }
 
@@ -431,8 +457,50 @@ impl CachingDataSource {
     /// rewrite the combined list sorted newest-first. Unlike `save_address_events`
     /// (which replaces everything), this preserves older cached events when a
     /// caller only supplies a fresh top-of-tip window. Returns the merged list.
+    ///
+    /// Runs the read → merge → `DELETE` → `INSERT` entirely inside one
+    /// `BEGIN IMMEDIATE` transaction on a single pooled connection. With the
+    /// r2d2 pool in place there is no global `Mutex<Connection>` anymore, so
+    /// without this serialization two concurrent merges for the same address
+    /// (e.g. WS tick vs. address-view refresh) could each read the same
+    /// baseline, each dedupe against it, then both DELETE+INSERT — and the
+    /// second commit would drop the first's additions. `BEGIN IMMEDIATE`
+    /// acquires the SQLite reserved lock up front so the second merge blocks
+    /// until the first commits.
     fn merge_address_events_impl(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
-        let cached = self.get_cached_address_events(address);
+        let addr_hex = format!("{:#x}", address);
+        let mut db = match self.db.get() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "merge_address_events: pool get failed");
+                return new_events.to_vec();
+            }
+        };
+        let tx = match db.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "merge_address_events: begin immediate failed");
+                return new_events.to_vec();
+            }
+        };
+
+        // Read existing cached events inside the transaction.
+        let cached: Vec<SnEvent> = (|| -> Vec<SnEvent> {
+            let mut stmt = match tx
+                .prepare("SELECT data FROM address_events WHERE address = ?1 ORDER BY event_index")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = match stmt.query_map(params![&addr_hex], |row| row.get::<_, String>(0)) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            rows.filter_map(|r| r.ok())
+                .filter_map(|json| serde_json::from_str::<SnEvent>(&json).ok())
+                .collect()
+        })();
+
         let mut merged: Vec<SnEvent> = new_events.to_vec();
         for event in cached {
             let dup = merged.iter().any(|e| {
@@ -449,7 +517,23 @@ impl CachingDataSource {
                 .cmp(&a.block_number)
                 .then_with(|| b.event_index.cmp(&a.event_index))
         });
-        self.save_address_events(address, &merged);
+
+        // Rewrite atomically inside the same transaction.
+        let _ = tx.execute(
+            "DELETE FROM address_events WHERE address = ?1",
+            params![&addr_hex],
+        );
+        for (i, event) in merged.iter().enumerate() {
+            if let Ok(json) = serde_json::to_string(event) {
+                let _ = tx.execute(
+                    "INSERT OR REPLACE INTO address_events (address, event_index, data) VALUES (?1, ?2, ?3)",
+                    params![&addr_hex, i as i64, json],
+                );
+            }
+        }
+        if let Err(e) = tx.commit() {
+            warn!(error = %e, "merge_address_events: commit failed");
+        }
         merged
     }
 

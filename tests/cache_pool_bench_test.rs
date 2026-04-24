@@ -15,12 +15,11 @@
 //!
 //! What it measures, per read method, under two scenarios:
 //!   1. READ-ONLY: no writer running (pure contention-free baseline)
-//!   2. UNDER-LOAD: writer task bursts every 100ms with the same mix of
-//!      writes the WS/stream path performs (save_address_events merge,
-//!      save_address_txs, save_address_calls, save_meta_txs, cache_block,
-//!      save_activity_range_with_count, save_cached_nonce, save_search_progress)
-//!      plus a concurrent ClassCache.put_selector_name burst simulating an
-//!      ABI-decode flurry.
+//!   2. UNDER-LOAD: writer task runs every 500ms and performs the same
+//!      small-table writes that `writer_tick` issues in this benchmark:
+//!      save_activity_range_with_count, save_cached_nonce, and
+//!      save_search_progress — plus a concurrent ClassCache.put_selector_name
+//!      burst every 1s simulating an ABI-decode flurry.
 //!
 //! Reader methods measured (= what `fetch_and_send_address_info` hits):
 //!   - load_cached_nonce
@@ -339,8 +338,18 @@ async fn run_bench(label: &str, cache_path: &Path) {
     let upstream: Arc<dyn DataSource> = Arc::new(NullUpstream);
     let ds = Arc::new(CachingDataSource::new(upstream, cache_path).expect("open cache"));
 
-    // Shared ClassCache on the SAME file — models the real deployment.
+    // Shared ClassCache on the SAME file — models the real deployment. Apply
+    // the same PRAGMAs the main cache pool uses so this connection doesn't
+    // trip SQLITE_BUSY on every concurrent write and silently drop selector
+    // rows (which would under-count contention on `put_selector_name`).
     let class_db = rusqlite::Connection::open(cache_path).expect("class cache open");
+    class_db
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA synchronous = NORMAL; \
+             PRAGMA busy_timeout = 5000;",
+        )
+        .expect("configure class cache connection");
     let class_cache = Arc::new(ClassCache::new(class_db, 500));
 
     let watched = felt(0x0_59AA_7EAF);
@@ -353,7 +362,17 @@ async fn run_bench(label: &str, cache_path: &Path) {
     let (n_events, n_txs, n_calls) = (500usize, 300usize, 300usize);
     println!("Seeding cache ({n_events} events, {n_txs} txs, {n_calls} calls)...");
     let t0 = Instant::now();
-    seed_cache(&ds, watched, n_events, n_txs, n_calls);
+    // Seeding hammers SQLite synchronously; wrap in spawn_blocking so it
+    // doesn't park a Tokio worker (and starve other runtime tasks) while
+    // the bench is still setting up.
+    {
+        let ds_for_seed = Arc::clone(&ds);
+        tokio::task::spawn_blocking(move || {
+            seed_cache(&ds_for_seed, watched, n_events, n_txs, n_calls);
+        })
+        .await
+        .expect("seed_cache task panicked");
+    }
     println!("  seed took {} ms", t0.elapsed().as_millis());
 
     // ----------------- PHASE 1: pure-reader baseline ---------------------
@@ -396,9 +415,11 @@ async fn run_bench(label: &str, cache_path: &Path) {
                     let ds_c = Arc::clone(&writer_ds);
                     let addr = writer_addr;
                     let t = tick;
-                    let _ = tokio::task::spawn_blocking(move || {
+                    // Surface JoinError (panic/cancel) so the bench fails
+                    // loudly instead of silently dropping write load.
+                    tokio::task::spawn_blocking(move || {
                         writer_tick(&ds_c, &addr, t);
-                    }).await;
+                    }).await.expect("writer_tick task panicked");
                     tick += 1;
                 }
             }
@@ -418,9 +439,11 @@ async fn run_bench(label: &str, cache_path: &Path) {
                 _ = interval.tick() => {
                     let cc_c = Arc::clone(&cc);
                     let b = base;
-                    let _ = tokio::task::spawn_blocking(move || {
+                    // Surface JoinError so a panic in the indexer can't
+                    // silently reduce the contention the bench is measuring.
+                    tokio::task::spawn_blocking(move || {
                         class_cache_burst(&cc_c, b);
-                    }).await;
+                    }).await.expect("class_cache_burst task panicked");
                     base += 1;
                 }
             }
