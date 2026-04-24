@@ -332,6 +332,24 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
+    // Periodic address-view refresh ticker: every 60s, nudge the reducer to
+    // re-fetch the currently viewed address from RPC if WS isn't `Live`.
+    // The reducer checks view/source/context guards before dispatching work,
+    // so this timer is a cheap unconditional heartbeat.
+    let resp_tx_poll = response_tx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        // Burn the immediate first tick so we don't fire at t=0 before any
+        // address view exists.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if resp_tx_poll.send(Action::PeriodicAddressPollTick).is_err() {
+                break;
+            }
+        }
+    });
+
     // Request initial data
     info!("Requesting initial block fetch");
     let _ = action_tx.send(Action::FetchRecentBlocks { count: 30 });

@@ -3585,6 +3585,148 @@ pub(super) fn sort_meta_txs_recency(summaries: &mut [crate::data::types::MetaTxI
     });
 }
 
+/// Lightweight RPC-only refresh for the currently-viewed account address.
+///
+/// Called on the periodic 60s tick when WS isn't `Live`. Scans only the top
+/// of the chain (via `event_window::ensure_address_events_window` with
+/// `TopDelta` policy, which reuses the cached `address_search_progress`
+/// cursor so repeated calls are cheap when nothing changed) and emits new
+/// tx summaries via `AddressTxsStreamed { source: Rpc, complete: true }`.
+///
+/// Deliberately does *not* fire Dune / Pathfinder / Voyager / balance fetches
+/// — those are first-load concerns, not background refresh.
+pub(super) async fn refresh_address_rpc(
+    address: starknet::core::types::Felt,
+    ds: &Arc<dyn DataSource>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    // Refresh the cached nonce — helps the next cold load short-circuit the
+    // scan window (see `nonce_delta` logic in `fetch_and_send_address_info`).
+    let nonce = match ds.get_nonce(address).await {
+        Ok(n) => n,
+        Err(e) => {
+            debug!(addr = %format!("{:#x}", address), error = %e, "refresh_address_rpc: get_nonce failed");
+            return;
+        }
+    };
+    let latest_block = match ds.get_latest_block_number().await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(addr = %format!("{:#x}", address), error = %e, "refresh_address_rpc: get_latest_block_number failed");
+            return;
+        }
+    };
+    if nonce != starknet::core::types::Felt::ZERO {
+        ds.save_cached_nonce(&address, &nonce, latest_block);
+    }
+
+    let ds_dyn: Arc<dyn DataSource> = Arc::clone(ds);
+    let page = match crate::network::event_window::ensure_address_events_window(
+        address,
+        EventQueryKind::Account,
+        crate::network::event_window::EventWindowPolicy::TopDelta,
+        pf.as_ref(),
+        &ds_dyn,
+        latest_block,
+        0, // TopDelta doesn't scan old history; floor unused.
+    )
+    .await
+    {
+        Ok(o) => {
+            let _ = action_tx.send(Action::AddressEventWindowUpdated {
+                address,
+                min_searched: o.min_searched,
+                max_searched: o.max_searched,
+                deferred_gap: o.deferred_gap,
+            });
+            o.page
+        }
+        Err(e) => {
+            debug!(addr = %format!("{:#x}", address), error = %e, "refresh_address_rpc: event_window fetch failed");
+            return;
+        }
+    };
+
+    // Build a (hashes, tx_block_map) pair matching the pf-vs-RPC shape used
+    // by the initial-load TASK C path.
+    let (unique_hashes, tx_block_map): (
+        Vec<starknet::core::types::Felt>,
+        std::collections::HashMap<starknet::core::types::Felt, u64>,
+    ) = if !page.tx_rows.is_empty() {
+        (page.unique_hashes.clone(), page.tx_block_map.clone())
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut hashes: Vec<starknet::core::types::Felt> = Vec::with_capacity(page.events.len());
+        let mut map: std::collections::HashMap<starknet::core::types::Felt, u64> =
+            std::collections::HashMap::new();
+        for e in &page.events {
+            if e.transaction_hash != starknet::core::types::Felt::ZERO
+                && seen.insert(e.transaction_hash)
+            {
+                hashes.push(e.transaction_hash);
+            }
+            map.entry(e.transaction_hash).or_insert(e.block_number);
+        }
+        (hashes, map)
+    };
+
+    let cached_hashes: std::collections::HashSet<_> = ds
+        .load_cached_address_txs(&address)
+        .iter()
+        .map(|t| t.hash)
+        .collect();
+
+    let summaries: Vec<crate::data::types::AddressTxSummary> = if !page.tx_rows.is_empty() {
+        let new_rows: Vec<_> = page
+            .tx_rows
+            .iter()
+            .filter(|r| {
+                starknet::core::types::Felt::from_hex(&r.hash)
+                    .map(|h| !cached_hashes.contains(&h))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if new_rows.is_empty() {
+            Vec::new()
+        } else {
+            build_tx_summaries_from_pf_rows(&new_rows, abi_reg).await
+        }
+    } else {
+        let hashes_to_fetch: Vec<_> = unique_hashes
+            .iter()
+            .filter(|h| !cached_hashes.contains(h))
+            .copied()
+            .collect();
+        if hashes_to_fetch.is_empty() {
+            Vec::new()
+        } else {
+            fetch_tx_summaries_from_hashes(
+                &hashes_to_fetch,
+                &tx_block_map,
+                ds,
+                pf.as_ref(),
+                abi_reg,
+                action_tx,
+                "RPC refresh: fetching txs",
+            )
+            .await
+        }
+    };
+
+    // Always emit `complete: true` so the reducer's cursor/source-completion
+    // bookkeeping stays consistent. An empty `tx_summaries` is the common
+    // case when nothing new landed since the last tick.
+    let _ = action_tx.send(Action::AddressTxsStreamed {
+        address,
+        source: Source::Rpc,
+        tx_summaries: summaries,
+        complete: true,
+    });
+}
+
 #[cfg(test)]
 mod meta_tx_tests {
     use super::*;

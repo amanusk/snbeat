@@ -138,6 +138,9 @@ pub async fn run_network_task(
                         )
                         .await;
                     }
+                    Action::RefreshAddressRpc { address } => {
+                        address::refresh_address_rpc(address, &ds, &pf, &abi_reg, &tx).await;
+                    }
                     Action::FetchTxByNonce {
                         sender,
                         current_nonce,
@@ -452,6 +455,7 @@ fn action_is_cancellable(action: &Action) -> bool {
             | Action::ClassifyPotentialMetaTx { .. }
             | Action::DecodeAddressWsEvent { .. }
             | Action::FetchMoreAddressTxs { .. }
+            | Action::RefreshAddressRpc { .. }
     )
 }
 

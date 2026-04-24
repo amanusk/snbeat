@@ -33,6 +33,16 @@ pub enum Action {
     FetchAddressInfo {
         address: Felt,
     },
+    /// Periodic 60s tick that triggers an RPC-only refresh of the currently
+    /// viewed address when WS is not `Live`. No payload — the reducer checks
+    /// the current view/address/ws status before dispatching work.
+    PeriodicAddressPollTick,
+    /// Lightweight RPC-only refresh of an address: re-reads nonce and scans
+    /// the top of the chain for new activity. Distinct from `FetchAddressInfo`
+    /// which also fires Dune + Pathfinder.
+    RefreshAddressRpc {
+        address: Felt,
+    },
     /// Navigate to address view immediately (before data loads).
     NavigateToAddress {
         address: Felt,
