@@ -192,6 +192,15 @@ pub trait DataSource: Send + Sync {
     /// Persist the full class-hash history for an address. Replaces any
     /// existing rows so a refreshed pf-query response is the source of truth.
     fn save_class_history(&self, _address: &Felt, _entries: &[ClassHashEntry]) {}
+    /// Highest block at which a pf-query response confirmed the cached
+    /// class-history is complete. `None` if never validated by pf.
+    fn load_class_history_max_block(&self, _address: &Felt) -> Option<u64> {
+        None
+    }
+    /// Record the block at which pf-query just re-validated the cached
+    /// class-history. Callers must NOT advance this when pf is unavailable —
+    /// the watermark must reflect verified coverage only.
+    fn save_class_history_max_block(&self, _address: &Felt, _block: u64) {}
 
     // --- Nonce cache ---
     /// Load cached nonce + block number for an address.

@@ -150,6 +150,10 @@ impl CachingDataSource {
             );
             CREATE INDEX IF NOT EXISTS idx_class_history_addr
                 ON class_history(address, block_number DESC);
+            CREATE TABLE IF NOT EXISTS class_history_meta (
+                address TEXT PRIMARY KEY,
+                last_known_block INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cached_nonces (
                 address TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
@@ -281,6 +285,19 @@ impl CachingDataSource {
                 SnbeatError::Config(format!("Migration v7 version bump failed: {e}"))
             })?;
             debug!("Migration v7: added class_history table");
+        }
+
+        if version < 8 {
+            // v8: introduce class_history_meta. Tracks the highest block at
+            // which a pf-query response confirmed the cached class history was
+            // complete. Only advanced on pf-validated reads — when pf is
+            // unavailable we keep showing the cached list but leave the
+            // watermark alone, so the next pf-enabled visit can detect (via
+            // class-hash divergence) that gaps may exist and refetch.
+            db.execute("PRAGMA user_version = 8", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v8 version bump failed: {e}"))
+            })?;
+            debug!("Migration v8: added class_history_meta table");
         }
 
         drop(db);
@@ -741,6 +758,30 @@ impl CachingDataSource {
             }
         }
         let _ = tx.commit();
+    }
+
+    fn get_cached_class_history_max_block(&self, address: &Felt) -> Option<u64> {
+        let db = self.db.get().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT last_known_block FROM class_history_meta WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let block: i64 = row.get(0)?;
+            Ok(block as u64)
+        })
+        .ok()
+    }
+
+    fn cache_class_history_max_block(&self, address: &Felt, block: u64) {
+        if let Ok(db) = self.db.get() {
+            let addr_hex = format!("{:#x}", address);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO class_history_meta (address, last_known_block) \
+                 VALUES (?1, ?2)",
+                params![addr_hex, block as i64],
+            );
+        }
     }
 
     // --- nonce cache ---
@@ -1474,6 +1515,14 @@ impl DataSource for CachingDataSource {
         entries: &[crate::data::pathfinder::ClassHashEntry],
     ) {
         self.cache_class_history(address, entries);
+    }
+
+    fn load_class_history_max_block(&self, address: &Felt) -> Option<u64> {
+        self.get_cached_class_history_max_block(address)
+    }
+
+    fn save_class_history_max_block(&self, address: &Felt, block: u64) {
+        self.cache_class_history_max_block(address, block);
     }
 
     fn load_cached_nonce(&self, address: &Felt) -> Option<(Felt, u64)> {
