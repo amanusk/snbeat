@@ -225,6 +225,12 @@ struct NonceHistoryParams {
 #[derive(Deserialize)]
 struct SenderTxParams {
     limit: Option<u32>,
+    /// Exclusive upper bound on block_number. Lets the client paginate
+    /// older-than-X without re-fetching the most recent N every time.
+    before_block: Option<u64>,
+    /// Inclusive lower bound on block_number. Together with `before_block`
+    /// supports range scans (e.g. nonce-gap fills).
+    from_block: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +755,8 @@ async fn handler_sender_txs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<SenderTxEntry>> {
     let limit = params.limit.unwrap_or(500).min(2000);
+    let before_block = params.before_block.unwrap_or(u64::MAX);
+    let from_block = params.from_block.unwrap_or(0);
     let addr_bytes = parse_address(&address)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid address: {e}")))?;
     let db_path = Arc::clone(&state.db_path);
@@ -759,7 +767,9 @@ async fn handler_sender_txs(
     let results = tokio::task::spawn_blocking(move || {
         let conn = open_db(&db_path).map_err(db_err)?;
 
-        // Step 1: Get block numbers from nonce_updates + timestamps
+        // Step 1: Get block numbers from nonce_updates + timestamps.
+        // before_block / from_block default to (u64::MAX, 0) so the bounds
+        // are no-ops when the client doesn't paginate.
         let mut stmt = conn
             .prepare(
                 "SELECT nu.block_number, nu.nonce, bh.timestamp \
@@ -767,14 +777,17 @@ async fn handler_sender_txs(
                  JOIN contract_addresses ca ON nu.contract_address_id = ca.id \
                  JOIN block_headers bh ON nu.block_number = bh.number \
                  WHERE ca.contract_address = ?1 \
-                 ORDER BY nu.block_number DESC LIMIT ?2",
+                 AND nu.block_number < ?2 \
+                 AND nu.block_number >= ?3 \
+                 ORDER BY nu.block_number DESC LIMIT ?4",
             )
             .map_err(db_err)?;
 
         let nonce_entries: Vec<(u64, u64, u64)> = stmt
-            .query_map(rusqlite::params![addr_bytes.as_slice(), limit], |row| {
-                Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?))
-            })
+            .query_map(
+                rusqlite::params![addr_bytes.as_slice(), before_block, from_block, limit],
+                |row| Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?)),
+            )
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;

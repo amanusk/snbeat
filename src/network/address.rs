@@ -1183,7 +1183,7 @@ pub(super) async fn fetch_and_send_address_info(
         spawn_cancellable(cancel.clone(), async move {
             const PF_LIMIT: u32 = 200;
             let _ = tx_a.send(Action::LoadingStatus("PF: fetching tx history...".into()));
-            match pf_c.get_sender_txs(address, PF_LIMIT).await {
+            match pf_c.get_sender_txs(address, PF_LIMIT, None, None).await {
                 Ok(pf_txs) => {
                     let _ = tx_a.send(Action::SourceUpdate {
                         source: Source::Pathfinder,
@@ -2702,6 +2702,34 @@ pub(super) async fn fetch_more_address_txs(
         .unwrap_or_default()
     };
 
+    // Pathfinder's /sender-txs handles the account pagination case in ~100ms
+    // (same fast path the initial fetch uses). When PF is wired up we skip
+    // Dune for accounts entirely; the windowed Dune query is the slow leg
+    // (sometimes 80+s) and PF is strictly better for sender txs.
+    //
+    // Dune is still the only source for contract-side pagination (calls TO
+    // the address), and the fallback for accounts when PF is unavailable.
+    let pf_pagination = pf.as_ref().map(Arc::clone);
+    let pf_fut = async move {
+        if is_contract {
+            return Vec::new();
+        }
+        let Some(pf_client) = pf_pagination else {
+            return Vec::new();
+        };
+        match pf_client
+            .get_sender_txs(address, 200, Some(before_block), Some(from_block))
+            .await
+        {
+            Ok(entries) => pf_txs_to_summaries(entries),
+            Err(e) => {
+                warn!(error = %e, "PF pagination sender-txs failed");
+                Vec::new()
+            }
+        }
+    };
+
+    let pf_active = !is_contract && pf.is_some();
     let dune_c = dune.as_ref().map(Arc::clone);
     let dune_fut = async move {
         let Some(dune_client) = dune_c else {
@@ -2723,6 +2751,9 @@ pub(super) async fn fetch_more_address_txs(
                     (Vec::new(), Vec::new())
                 }
             }
+        } else if pf_active {
+            // PF covers accounts; skip the slow windowed Dune sender-txs query.
+            (Vec::new(), Vec::new())
         } else {
             match dune_client
                 .query_account_txs_windowed(address, from_block, dune_to, 100)
@@ -2737,7 +2768,7 @@ pub(super) async fn fetch_more_address_txs(
         }
     };
 
-    let (events, (dune_txs, dune_calls)) = tokio::join!(rpc_fut, dune_fut);
+    let (events, (dune_txs, dune_calls), pf_txs) = tokio::join!(rpc_fut, dune_fut, pf_fut);
 
     // Build tx summaries from RPC events
     let mut seen = std::collections::HashSet::new();
@@ -2805,6 +2836,17 @@ pub(super) async fn fetch_more_address_txs(
             }
         }
         helpers::backfill_timestamps(&mut summaries, ds, pf.as_ref()).await;
+    }
+
+    // Merge PF account txs into summaries (dedup by hash). PF wins over Dune
+    // when both are present — same precedence the initial fetch uses.
+    if !pf_txs.is_empty() {
+        let existing: std::collections::HashSet<_> = summaries.iter().map(|s| s.hash).collect();
+        for ptx in pf_txs {
+            if !existing.contains(&ptx.hash) {
+                summaries.push(ptx);
+            }
+        }
     }
 
     // Merge Dune account txs into summaries (dedup by hash)
