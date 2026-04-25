@@ -387,14 +387,20 @@ impl App {
     }
 
     /// Scroll the active address list by a delta and trigger viewport
-    /// enrichment for any rows newly exposed.
+    /// enrichment for any rows newly exposed. Also re-arms older-tx
+    /// pagination, so Ctrl+D landing near the tail behaves like `j`/`G`
+    /// did when the same row gets selected via single-step or jump-to-end.
     pub fn address_list_scroll_by(&mut self, delta: i64) {
         match self.address.tab {
             AddressTab::Transactions => {
                 self.address.txs.scroll_by(delta);
+                self.maybe_fetch_more_address_txs();
                 self.maybe_enrich_visible_address_txs();
             }
-            AddressTab::Calls => self.address.calls.scroll_by(delta),
+            AddressTab::Calls => {
+                self.address.calls.scroll_by(delta);
+                self.maybe_fetch_more_address_txs();
+            }
             AddressTab::MetaTxs => {
                 self.address.meta_txs.scroll_by(delta);
                 self.maybe_fetch_more_meta_txs();

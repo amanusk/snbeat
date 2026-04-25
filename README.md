@@ -350,7 +350,7 @@ APP_PATHFINDER_SERVICE_URL=http://192.168.1.10:8234
 | `GET /class-declaration/{class_hash}`  | Returns declaration info for a class hash               |
 | `GET /tx-by-hash/{hash}`               | Looks up a transaction by hash                          |
 | `GET /block-txs/{block_number}`        | Returns decoded transactions in a block                 |
-| `GET /sender-txs/{address}`            | Returns transactions sent by an address                 |
+| `GET /sender-txs/{address}`            | Returns transactions sent by an address. Supports `?limit=N&before_block=B&from_block=F` for pagination. |
 | `GET /contract-events/{address}`       | Returns events emitted by a contract                    |
 
 ---

@@ -225,6 +225,12 @@ struct NonceHistoryParams {
 #[derive(Deserialize)]
 struct SenderTxParams {
     limit: Option<u32>,
+    /// Exclusive upper bound on block_number. Lets the client paginate
+    /// older-than-X without re-fetching the most recent N every time.
+    before_block: Option<u64>,
+    /// Inclusive lower bound on block_number. Together with `before_block`
+    /// supports range scans (e.g. nonce-gap fills).
+    from_block: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +755,15 @@ async fn handler_sender_txs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<SenderTxEntry>> {
     let limit = params.limit.unwrap_or(500).min(2000);
+    // SQLite INTEGER is i64. rusqlite refuses to bind u64 values above
+    // `i64::MAX`, so cap the unbounded sentinel at i64::MAX — far above any
+    // realistic block number. `from_block` defaults to 0 so the lower bound
+    // is a no-op when the client doesn't paginate.
+    let before_block = params
+        .before_block
+        .unwrap_or(i64::MAX as u64)
+        .min(i64::MAX as u64) as i64;
+    let from_block = params.from_block.unwrap_or(0).min(i64::MAX as u64) as i64;
     let addr_bytes = parse_address(&address)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid address: {e}")))?;
     let db_path = Arc::clone(&state.db_path);
@@ -759,7 +774,9 @@ async fn handler_sender_txs(
     let results = tokio::task::spawn_blocking(move || {
         let conn = open_db(&db_path).map_err(db_err)?;
 
-        // Step 1: Get block numbers from nonce_updates + timestamps
+        // Step 1: Get block numbers from nonce_updates + timestamps.
+        // before_block / from_block default to (u64::MAX, 0) so the bounds
+        // are no-ops when the client doesn't paginate.
         let mut stmt = conn
             .prepare(
                 "SELECT nu.block_number, nu.nonce, bh.timestamp \
@@ -767,14 +784,17 @@ async fn handler_sender_txs(
                  JOIN contract_addresses ca ON nu.contract_address_id = ca.id \
                  JOIN block_headers bh ON nu.block_number = bh.number \
                  WHERE ca.contract_address = ?1 \
-                 ORDER BY nu.block_number DESC LIMIT ?2",
+                 AND nu.block_number < ?2 \
+                 AND nu.block_number >= ?3 \
+                 ORDER BY nu.block_number DESC LIMIT ?4",
             )
             .map_err(db_err)?;
 
         let nonce_entries: Vec<(u64, u64, u64)> = stmt
-            .query_map(rusqlite::params![addr_bytes.as_slice(), limit], |row| {
-                Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?))
-            })
+            .query_map(
+                rusqlite::params![addr_bytes.as_slice(), before_block, from_block, limit],
+                |row| Ok((row.get(0)?, decode_nonce(row, 1)?, row.get(2)?)),
+            )
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
@@ -1631,5 +1651,165 @@ mod tests {
         let keys = vec![mfelt(0xAA)];
         let filter = vec![vec![felt(0xAA)], vec![]];
         assert!(event_keys_match(&keys, &filter));
+    }
+
+    // ----- handler smoke tests -----------------------------------------------
+    //
+    // These exercise the bind/prepare path of each route handler against a
+    // freshly-created in-memory schema. They don't try to validate result
+    // shape on real data — they catch the class of bug where a refactor
+    // (cursor params, type changes, schema drift) breaks the SQL prepare or
+    // bind step. The original motivation: a `u64::MAX` sentinel that hit
+    // rusqlite's `ToSql for u64` overflow check and returned 500 on every
+    // call. An empty-DB smoke test would have caught it because the bind
+    // happens before any rows are fetched.
+
+    use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
+
+    /// Build a tempfile-backed SQLite DB with the minimal pf-query schema and
+    /// one fixture block_header so handlers requiring `MAX(block_number)` or
+    /// `latest_block` don't fail before bind. Returns a guard that holds the
+    /// tempdir alive plus an AppState pointing at the file.
+    ///
+    /// Schema is inlined (rather than parsed from a real Pathfinder DB) so the
+    /// test stays hermetic — we verify the exact column names + types each
+    /// handler binds against.
+    fn setup_test_db() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open rw");
+        conn.execute_batch(
+            "
+            CREATE TABLE block_headers (
+                number INTEGER PRIMARY KEY,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE TABLE contract_addresses (
+                id INTEGER PRIMARY KEY,
+                contract_address BLOB NOT NULL UNIQUE
+            );
+            CREATE TABLE nonce_updates (
+                block_number INTEGER NOT NULL,
+                contract_address_id INTEGER NOT NULL,
+                nonce BLOB NOT NULL
+            );
+            CREATE TABLE contract_updates (
+                block_number INTEGER NOT NULL,
+                contract_address BLOB NOT NULL,
+                class_hash BLOB NOT NULL
+            );
+            CREATE TABLE class_definitions (
+                hash BLOB PRIMARY KEY,
+                block_number INTEGER NOT NULL
+            );
+            CREATE TABLE transactions (
+                block_number INTEGER PRIMARY KEY,
+                transactions BLOB NOT NULL,
+                events BLOB
+            );
+            CREATE TABLE transaction_hashes (
+                hash BLOB PRIMARY KEY,
+                block_number INTEGER NOT NULL,
+                idx INTEGER NOT NULL
+            );
+            CREATE TABLE event_filters (
+                from_block INTEGER NOT NULL,
+                to_block INTEGER NOT NULL,
+                bitmap BLOB NOT NULL
+            );
+            INSERT INTO block_headers(number, timestamp) VALUES (1, 1000);
+            ",
+        )
+        .expect("init schema");
+        drop(conn);
+
+        let state = AppState {
+            db_path: Arc::new(db_path.to_string_lossy().into_owned()),
+        };
+        (dir, state)
+    }
+
+    const TEST_ADDR: &str = "0x6acfcef048dcaac4a11fab313507d53145ed2a468f2a6188527918f1b12d935";
+
+    /// /sender-txs with no cursor params — the case that broke when
+    /// `before_block` was `u64::MAX` and rusqlite refused to bind it.
+    #[tokio::test]
+    async fn handler_sender_txs_default_bounds_smoke() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_sender_txs(
+            AxumPath(TEST_ADDR.to_string()),
+            AxumQuery(SenderTxParams {
+                limit: None,
+                before_block: None,
+                from_block: None,
+            }),
+            AxumState(state),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.is_empty(), "empty DB should yield no rows");
+    }
+
+    /// /sender-txs with both cursor params set — exercises the new bind
+    /// shape end-to-end.
+    #[tokio::test]
+    async fn handler_sender_txs_with_cursor_smoke() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_sender_txs(
+            AxumPath(TEST_ADDR.to_string()),
+            AxumQuery(SenderTxParams {
+                limit: Some(50),
+                before_block: Some(100_000),
+                from_block: Some(50_000),
+            }),
+            AxumState(state),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handler_class_history_smoke() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_class_history(AxumPath(TEST_ADDR.to_string()), AxumState(state)).await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handler_contract_events_smoke() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_contract_events(
+            AxumPath(TEST_ADDR.to_string()),
+            AxumQuery(ContractEventsParams {
+                from_block: None,
+                to_block: None,
+                keys: None,
+                limit: None,
+                continuation_token: None,
+            }),
+            AxumState(state),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.events.is_empty());
+        assert!(json.0.continuation_token.is_none());
+    }
+
+    /// /txs-by-hash with a hash that doesn't exist in the empty DB. Exercises
+    /// the per-hash lookup loop and the early-return-on-empty-locations path.
+    #[tokio::test]
+    async fn handler_txs_by_hash_smoke() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_txs_by_hash(
+            AxumState(state),
+            axum::Json(TxsByHashRequest {
+                hashes: vec!["0xdeadbeef".to_string()],
+            }),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.is_empty());
     }
 }

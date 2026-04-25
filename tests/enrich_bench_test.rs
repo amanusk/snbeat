@@ -450,14 +450,14 @@ async fn bench_pf_sender_txs_heavy() {
 
     for &limit in &[500u32, 2000] {
         // Warm-up run (discarded).
-        let _ = pf.get_sender_txs(addr, limit).await;
+        let _ = pf.get_sender_txs(addr, limit, None, None).await;
 
         let mut samples = Vec::with_capacity(5);
         let mut rows_last = 0usize;
         for _ in 0..5 {
             let t0 = Instant::now();
             let rows = pf
-                .get_sender_txs(addr, limit)
+                .get_sender_txs(addr, limit, None, None)
                 .await
                 .expect("pf get_sender_txs");
             samples.push(t0.elapsed().as_millis());

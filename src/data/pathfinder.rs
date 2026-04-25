@@ -230,13 +230,26 @@ impl PathfinderClient {
 
     /// Fetch full decoded transaction history for an account.
     /// Combines nonce_updates + block blob decoding server-side.
+    ///
+    /// `before_block` (exclusive) and `from_block` (inclusive) bound the
+    /// scan; pass `None` for either side to leave it unbounded. Pagination
+    /// callers use `before_block = oldest_known_block` to walk backward;
+    /// gap-fill callers set both bounds.
     pub async fn get_sender_txs(
         &self,
         address: Felt,
         limit: u32,
+        before_block: Option<u64>,
+        from_block: Option<u64>,
     ) -> anyhow::Result<Vec<SenderTxEntry>> {
         let addr_hex = format!("{:#x}", address);
-        let url = format!("{}/sender-txs/{}?limit={}", self.base_url, addr_hex, limit);
+        let mut url = format!("{}/sender-txs/{}?limit={}", self.base_url, addr_hex, limit);
+        if let Some(b) = before_block {
+            url.push_str(&format!("&before_block={b}"));
+        }
+        if let Some(f) = from_block {
+            url.push_str(&format!("&from_block={f}"));
+        }
         debug!(url = %url, "Fetching sender txs from pf-query");
         let entries = self
             .client

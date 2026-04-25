@@ -70,8 +70,32 @@ fn count_fragment(shown: u64, bound: CountBound) -> String {
 /// sender txs) — not suitable here.
 fn tx_count_fragment(app: &App) -> String {
     let count = app.address.txs.items.len() as u64;
+    // The on-chain `nonce` is the *next* nonce to use. For a self-deployed
+    // account (DEPLOY_ACCOUNT), the deploy itself consumed nonce 0 and is
+    // pulled out of `txs.items` by `filter_deployment_txs`, so the Txs tab
+    // ends up holding `nonce - 1` rows. For a UDC-deployed account the
+    // "deployment" entry is the *deployer's* tx (sender != address), the
+    // account's own nonce 0 is its first invoke and stays in `txs.items`,
+    // so the tab holds the full `nonce` rows.
+    //
+    // Distinguish on `deployment.sender`: when it equals the account
+    // address, the deploy was self-sent; otherwise it was UDC-style.
     let bound = match app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce)) {
-        Some(nonce) => CountBound::Exact(nonce),
+        Some(nonce) => {
+            let self_deployed = matches!(
+                (
+                    app.address.context,
+                    app.address.deployment.as_ref().and_then(|d| d.sender),
+                ),
+                (Some(addr), Some(sender)) if sender == addr
+            );
+            let total = if self_deployed {
+                nonce.saturating_sub(1)
+            } else {
+                nonce
+            };
+            CountBound::Exact(total)
+        }
         None => CountBound::LowerBound { hint: None },
     };
     count_fragment(count, bound)
