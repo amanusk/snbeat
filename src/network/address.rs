@@ -2797,46 +2797,30 @@ pub(super) async fn fetch_more_address_txs(
         .unwrap_or_default()
     };
 
-    // Pathfinder's /sender-txs handles the account pagination case in ~100ms
-    // (same fast path the initial fetch uses). When PF is wired up we skip
-    // Dune for accounts entirely; the windowed Dune query is the slow leg
-    // (sometimes 80+s) and PF is strictly better for sender txs.
+    // Pick the right tx source for this address kind, falling back as
+    // needed:
     //
-    // Dune is still the only source for contract-side pagination (calls TO
-    // the address), and the fallback for accounts when PF is unavailable.
-    let pf_pagination = pf.as_ref().map(Arc::clone);
-    let pf_fut = async move {
-        if is_contract {
-            return Vec::new();
-        }
-        let Some(pf_client) = pf_pagination else {
-            return Vec::new();
-        };
-        match pf_client
-            .get_sender_txs(address, 200, Some(before_block), Some(from_block))
-            .await
-        {
-            Ok(entries) => pf_txs_to_summaries(entries),
-            Err(e) => {
-                warn!(error = %e, "PF pagination sender-txs failed");
-                Vec::new()
-            }
-        }
-    };
-
-    let pf_active = !is_contract && pf.is_some();
-    let dune_c = dune.as_ref().map(Arc::clone);
-    let dune_fut = async move {
-        let Some(dune_client) = dune_c else {
-            return (Vec::new(), Vec::new());
-        };
+    //  * Contracts: Dune `query_contract_calls_windowed` is the only source
+    //    for "calls TO this contract" — pf-query has no equivalent.
+    //  * Accounts: Pathfinder `/sender-txs` is the fast happy path
+    //    (~100ms vs Dune windowed at 5–80s). On PF error we fall through to
+    //    Dune sequentially so a transient pf-query outage doesn't leave the
+    //    user with empty pagination — the slow Dune query is still
+    //    preferable to no data.
+    let pf_source = pf.as_ref().map(Arc::clone);
+    let dune_source = dune.as_ref().map(Arc::clone);
+    let txs_source_fut = async move {
         let dune_to = before_block.saturating_sub(1);
+
         if is_contract {
+            let Some(dune_client) = dune_source else {
+                return (Vec::new(), Vec::new());
+            };
             // Pagination walks backward from `before_block`; we don't keep a
-            // reliable timestamp for arbitrary historical windows, so skip the
-            // `block_date` hint here. The narrower LIMIT (100) and user-capped
-            // `window_size` keep Dune's scan bounded in practice.
-            match dune_client
+            // reliable timestamp for arbitrary historical windows, so skip
+            // the `block_date` hint here. The narrower LIMIT (100) and
+            // user-capped `window_size` keep Dune's scan bounded in practice.
+            return match dune_client
                 .query_contract_calls_windowed(address, from_block, dune_to, 100, None)
                 .await
             {
@@ -2845,25 +2829,39 @@ pub(super) async fn fetch_more_address_txs(
                     warn!(error = %e, "Dune pagination contract calls failed");
                     (Vec::new(), Vec::new())
                 }
-            }
-        } else if pf_active {
-            // PF covers accounts; skip the slow windowed Dune sender-txs query.
-            (Vec::new(), Vec::new())
-        } else {
-            match dune_client
-                .query_account_txs_windowed(address, from_block, dune_to, 100)
+            };
+        }
+
+        // Account branch.
+        if let Some(pf_client) = pf_source {
+            match pf_client
+                .get_sender_txs(address, 200, Some(before_block), Some(from_block))
                 .await
             {
-                Ok(txs) => (txs, Vec::new()),
+                Ok(entries) => return (pf_txs_to_summaries(entries), Vec::new()),
                 Err(e) => {
-                    warn!(error = %e, "Dune pagination account txs failed");
-                    (Vec::new(), Vec::new())
+                    warn!(error = %e, "PF pagination sender-txs failed; falling back to Dune");
+                    // Fall through to Dune below.
                 }
+            }
+        }
+
+        let Some(dune_client) = dune_source else {
+            return (Vec::new(), Vec::new());
+        };
+        match dune_client
+            .query_account_txs_windowed(address, from_block, dune_to, 100)
+            .await
+        {
+            Ok(txs) => (txs, Vec::new()),
+            Err(e) => {
+                warn!(error = %e, "Dune pagination account txs failed");
+                (Vec::new(), Vec::new())
             }
         }
     };
 
-    let (events, (dune_txs, dune_calls), pf_txs) = tokio::join!(rpc_fut, dune_fut, pf_fut);
+    let (events, (account_txs, dune_calls)) = tokio::join!(rpc_fut, txs_source_fut);
 
     // Build tx summaries from RPC events
     let mut seen = std::collections::HashSet::new();
@@ -2933,23 +2931,14 @@ pub(super) async fn fetch_more_address_txs(
         helpers::backfill_timestamps(&mut summaries, ds, pf.as_ref()).await;
     }
 
-    // Merge PF account txs into summaries (dedup by hash). PF wins over Dune
-    // when both are present — same precedence the initial fetch uses.
-    if !pf_txs.is_empty() {
+    // Merge account txs (whichever source `txs_source_fut` picked) into
+    // summaries (dedup by hash). For accounts the source is PF when it
+    // succeeded, otherwise the Dune fallback; for contracts it's empty.
+    if !account_txs.is_empty() {
         let existing: std::collections::HashSet<_> = summaries.iter().map(|s| s.hash).collect();
-        for ptx in pf_txs {
-            if !existing.contains(&ptx.hash) {
-                summaries.push(ptx);
-            }
-        }
-    }
-
-    // Merge Dune account txs into summaries (dedup by hash)
-    if !dune_txs.is_empty() {
-        let existing: std::collections::HashSet<_> = summaries.iter().map(|s| s.hash).collect();
-        for dtx in dune_txs {
-            if !existing.contains(&dtx.hash) {
-                summaries.push(dtx);
+        for atx in account_txs {
+            if !existing.contains(&atx.hash) {
+                summaries.push(atx);
             }
         }
     }
