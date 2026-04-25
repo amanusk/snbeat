@@ -119,7 +119,7 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Sender               ", theme::SUGGESTION_STYLE),
         Span::styled("Intender             ", theme::SUGGESTION_STYLE),
-        Span::styled("Endpoint                     ", theme::SUGGESTION_STYLE),
+        Span::styled("Endpoint(s)                            ", theme::SUGGESTION_STYLE),
         Span::styled("Nonce      ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
         Span::styled("Tip             ", theme::SUGGESTION_STYLE),
@@ -196,8 +196,8 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 .get(i)
                 .and_then(|n| n.as_deref())
                 .unwrap_or("");
-            let endpoint_display = if endpoint.chars().count() > 28 {
-                let truncated: String = endpoint.chars().take(27).collect();
+            let endpoint_display = if endpoint.chars().count() > 38 {
+                let truncated: String = endpoint.chars().take(37).collect();
                 format!("{truncated}…")
             } else {
                 endpoint.to_string()
@@ -302,7 +302,7 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 ),
                 Span::styled(format!("{:<21}", sender_display), sender_style),
                 Span::styled(format!("{:<21}", intender_display), intender_style),
-                Span::styled(format!("{:<28} ", endpoint_display), theme::LABEL_STYLE),
+                Span::styled(format!("{:<38} ", endpoint_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<11}", nonce_str), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<16}", tip_str), theme::TX_FEE_STYLE),
