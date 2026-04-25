@@ -57,6 +57,14 @@ pub trait DataSource: Send + Sync {
     async fn get_receipt(&self, hash: Felt) -> Result<SnReceipt>;
     async fn get_nonce(&self, address: Felt) -> Result<Felt>;
     async fn get_class_hash(&self, address: Felt) -> Result<Felt>;
+    /// Class hash that was active for `address` at `block`. Used by tx
+    /// decoding so old transactions render with the ABI that was deployed
+    /// when they ran, not the current one. Default implementation falls
+    /// back to `get_class_hash` (latest) — sources backed by RPC override
+    /// to use `BlockId::Number(block)`.
+    async fn get_class_hash_at(&self, address: Felt, _block: u64) -> Result<Felt> {
+        self.get_class_hash(address).await
+    }
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass>;
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>>;
     /// Fetch recent events emitted by or targeting an address.

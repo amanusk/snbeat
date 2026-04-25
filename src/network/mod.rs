@@ -130,7 +130,14 @@ pub async fn run_network_task(
                             .await;
                     }
                     Action::FetchTransaction { hash } => {
-                        transaction::fetch_and_send_transaction(hash, &ds, &abi_reg, &tx).await;
+                        transaction::fetch_and_send_transaction(
+                            hash,
+                            &ds,
+                            pf.as_ref(),
+                            &abi_reg,
+                            &tx,
+                        )
+                        .await;
                     }
                     Action::FetchAddressInfo { address } => {
                         let _ = tx.send(Action::NavigateToAddress { address });
@@ -184,7 +191,12 @@ pub async fn run_network_task(
                                         match ds.get_receipt(*hash).await {
                                             Ok(receipt) => {
                                                 transaction::decode_and_send_transaction(
-                                                    fetched_tx, receipt, &ds, &abi_reg, &tx,
+                                                    fetched_tx,
+                                                    receipt,
+                                                    &ds,
+                                                    pf.as_ref(),
+                                                    &abi_reg,
+                                                    &tx,
                                                 )
                                                 .await;
                                             }

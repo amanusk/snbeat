@@ -433,7 +433,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("   Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
-        Span::styled("Endpoint             ", theme::SUGGESTION_STYLE),
+        Span::styled("Endpoint(s)                    ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
@@ -483,8 +483,8 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 "0".to_string()
             };
             let age = format_age(tx.timestamp);
-            let endpoint = if tx.endpoint_names.chars().count() > 20 {
-                let truncated: String = tx.endpoint_names.chars().take(19).collect();
+            let endpoint = if tx.endpoint_names.chars().count() > 30 {
+                let truncated: String = tx.endpoint_names.chars().take(29).collect();
                 format!("{truncated}…")
             } else {
                 tx.endpoint_names.clone()
@@ -511,7 +511,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{:<14}", short_hash(&tx.hash)),
                     theme::TX_HASH_STYLE,
                 ),
-                Span::styled(format!("{:<21}", endpoint), theme::LABEL_STYLE),
+                Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
                 Span::styled(
@@ -606,7 +606,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let header = Paragraph::new(Line::from(vec![
         Span::styled("    Sender                   ", theme::SUGGESTION_STYLE),
-        Span::styled("Function             ", theme::SUGGESTION_STYLE),
+        Span::styled("Endpoint(s)                    ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
@@ -647,8 +647,8 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 sender_label
             };
-            let func = if call.function_name.chars().count() > 20 {
-                let truncated: String = call.function_name.chars().take(19).collect();
+            let func = if call.function_name.chars().count() > 30 {
+                let truncated: String = call.function_name.chars().take(29).collect();
                 format!("{truncated}…")
             } else {
                 call.function_name.clone()
@@ -673,7 +673,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
 
             let line = Line::from(vec![
                 Span::styled(format!(" {:<25} ", sender_display), theme::LABEL_STYLE),
-                Span::styled(format!("{:<21}", func), theme::LABEL_STYLE),
+                Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
                 Span::styled(
                     format!("{:<14}", short_hash(&call.tx_hash)),
                     theme::TX_HASH_STYLE,
@@ -728,7 +728,10 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Paymaster            ", theme::SUGGESTION_STYLE),
         Span::styled("Ver   ", theme::SUGGESTION_STYLE),
         Span::styled("Protocol(s)          ", theme::SUGGESTION_STYLE),
-        Span::styled("Endpoint(s)              ", theme::SUGGESTION_STYLE),
+        Span::styled(
+            "Endpoint(s)                        ",
+            theme::SUGGESTION_STYLE,
+        ),
         Span::styled("Fee(STRK)      ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
     ]));
@@ -792,8 +795,8 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 protocol
             };
 
-            let endpoint = if m.inner_endpoints.chars().count() > 24 {
-                let truncated: String = m.inner_endpoints.chars().take(23).collect();
+            let endpoint = if m.inner_endpoints.chars().count() > 34 {
+                let truncated: String = m.inner_endpoints.chars().take(33).collect();
                 format!("{truncated}…")
             } else {
                 m.inner_endpoints.clone()
@@ -819,7 +822,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
                 Span::styled(format!("{:<21}", protocol_display), theme::LABEL_STYLE),
-                Span::styled(format!("{:<25}", endpoint), theme::LABEL_STYLE),
+                Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<4}", &m.status), status_style),
             ]);

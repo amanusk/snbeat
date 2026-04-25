@@ -276,6 +276,13 @@ impl DataSource for RpcDataSource {
             .map_err(|e| SnbeatError::Provider(e.to_string()))
     }
 
+    async fn get_class_hash_at(&self, address: Felt, block: u64) -> Result<Felt> {
+        self.provider
+            .get_class_hash_at(BlockId::Number(block), address)
+            .await
+            .map_err(|e| SnbeatError::Provider(e.to_string()))
+    }
+
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass> {
         self.provider
             .get_class(BlockId::Tag(BlockTag::Latest), class_hash)

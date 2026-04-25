@@ -63,6 +63,7 @@ pub(super) async fn resolve_search(
                             transaction,
                             receipt,
                             ds,
+                            pf.as_ref(),
                             abi_reg,
                             tx,
                         )
