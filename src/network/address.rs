@@ -825,8 +825,25 @@ pub(super) async fn fetch_and_send_address_info(
             // immediately on hit, so no network work runs here.
             find_deploy_tx(address, cached_deploy_block, &ds_c, &tx_c).await;
         });
+    } else if let Some(earliest) = cached_class_history.last() {
+        // No deploy_info cached, but class history is — meaning a previous
+        // flow (tx-detail decode, class info view) warmed class history but
+        // never triggered the deploy-tx scan. Kick it off here using the
+        // earliest cached entry as the deploy block. Without this, the pf
+        // re-fetch branch below only fires the lookup when the cache is
+        // *stale*, so a fresh-but-deploy-info-less cache would never show
+        // the deployment tx.
+        let deploy_block = earliest.block_number;
+        let ds_c = Arc::clone(ds);
+        let tx_c = tx.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            find_deploy_tx(address, deploy_block, &ds_c, &tx_c).await;
+        });
     }
     let had_cached_deploy = cached_deploy.is_some();
+    // Whether the cached fast-path above already kicked off a find_deploy_tx
+    // run. Used to suppress a duplicate launch from the pf re-fetch branch.
+    let kicked_deploy_lookup = had_cached_deploy || !cached_class_history.is_empty();
 
     // Decide whether the cached class-history is still authoritative. If the
     // live class_hash matches the latest cached entry, no replace_class can
@@ -868,9 +885,12 @@ pub(super) async fn fetch_and_send_address_info(
                         ds_c.save_class_history(&addr, &entries);
                         ds_c.save_class_history_max_block(&addr, latest_block);
                         // Skip the deploy-tx lookup if the cached fast-path
-                        // already emitted the deploy summary above. Avoids a
-                        // duplicate AddressTxsStreamed for the same hash.
-                        if !had_cached_deploy && let Some(deploy_entry) = entries.last() {
+                        // (or the cached-class-history fallback) already
+                        // kicked one off. find_deploy_tx itself is cache-first,
+                        // but launching it twice causes duplicate
+                        // AddressTxsStreamed emits when both runs miss cache
+                        // and race the same block scan.
+                        if !kicked_deploy_lookup && let Some(deploy_entry) = entries.last() {
                             let deploy_block = deploy_entry.block_number;
                             let tx_c2 = tx_c.clone();
                             let ds_c2 = Arc::clone(&ds_c);
@@ -1231,6 +1251,7 @@ pub(super) async fn fetch_and_send_address_info(
         let abi_b = Arc::clone(abi_reg);
         let dune_b = dune.as_ref().map(Arc::clone);
         let pf_b = pf.as_ref().map(Arc::clone);
+        let voyager_b = voyager_c.as_ref().map(Arc::clone);
         spawn_cancellable(cancel.clone(), async move {
             let _ = tx_b.send(Action::LoadingStatus("Calls: fetching from Dune...".into()));
             fetch_address_contract_calls(
@@ -1238,6 +1259,7 @@ pub(super) async fn fetch_and_send_address_info(
                 &ds_b,
                 dune_b.as_ref(),
                 pf_b.as_ref(),
+                voyager_b.as_ref(),
                 &abi_b,
                 &tx_b,
                 nonce,
@@ -3400,6 +3422,74 @@ pub(super) async fn fetch_address_meta_txs(
     });
 }
 
+/// Which Dune query variant the calls fetch should issue.
+///
+/// Pulled out as a pure decision so the choice can be unit-tested without
+/// mocking Dune/PF/Voyager — see `pick_calls_dune_query`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CallsDuneQuery {
+    /// We have cached calls. Pull only blocks newer than the highest cached
+    /// row; reuse the cached row's date as a partition hint.
+    TopDelta {
+        from_block: u64,
+        min_date: Option<chrono::NaiveDate>,
+    },
+    /// Cold cache, but we resolved the deploy block AND its timestamp.
+    /// Scope the windowed query to `[deploy_block, ∞)` with the deploy
+    /// date (minus a 1-day cushion) as the partition hint.
+    DeployScoped {
+        from_block: u64,
+        min_date: chrono::NaiveDate,
+    },
+    /// Cold cache and either no deploy floor or no timestamp for it.
+    /// Falls back to the legacy unwindowed `block_date >= '2024-01-01'`
+    /// query — slow on dense contracts but always correct.
+    Unwindowed,
+}
+
+/// Choose the Dune query variant for the contract-calls fetch.
+///
+/// The two inputs that drive the choice:
+///   * `newest_cached_pair` — `Some((block_number, timestamp))` if we have
+///     prior cached calls. `timestamp == 0` means "block known but date
+///     unknown" — we drop the partition hint in that case.
+///   * `deploy_floor` + `deploy_floor_ts` — both `Some` to qualify for
+///     `DeployScoped`. Either being `None` collapses to `Unwindowed`.
+///
+/// `min_date` for the windowed variants is `block_date - 1 day` to guard
+/// against the pinning row sitting right before a UTC day boundary.
+pub(super) fn pick_calls_dune_query(
+    newest_cached_pair: Option<(u64, u64)>,
+    deploy_floor: Option<u64>,
+    deploy_floor_ts: Option<u64>,
+) -> CallsDuneQuery {
+    if let Some((block, ts)) = newest_cached_pair {
+        let min_date = (ts > 0)
+            .then(|| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .flatten()
+            .map(|dt| dt.date_naive() - chrono::Duration::days(1));
+        return CallsDuneQuery::TopDelta {
+            from_block: block + 1,
+            min_date,
+        };
+    }
+
+    match (deploy_floor, deploy_floor_ts) {
+        (Some(from_block), Some(ts)) if ts > 0 => {
+            match chrono::DateTime::from_timestamp(ts as i64, 0)
+                .map(|dt| dt.date_naive() - chrono::Duration::days(1))
+            {
+                Some(min_date) => CallsDuneQuery::DeployScoped {
+                    from_block,
+                    min_date,
+                },
+                None => CallsDuneQuery::Unwindowed,
+            }
+        }
+        _ => CallsDuneQuery::Unwindowed,
+    }
+}
+
 /// Fetch calls-to-contract for `address` via Dune and emit the resulting
 /// [`ContractCallSummary`](crate::data::types::ContractCallSummary) rows as
 /// `AddressInfoLoaded { contract_calls, .. }`.
@@ -3418,6 +3508,7 @@ pub(super) async fn fetch_address_contract_calls(
     ds: &Arc<dyn crate::data::DataSource>,
     dune: Option<&Arc<dune::DuneClient>>,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    voyager_c: Option<&Arc<voyager::VoyagerClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
     nonce: starknet::core::types::Felt,
@@ -3453,28 +3544,115 @@ pub(super) async fn fetch_address_contract_calls(
     // dense contracts. A 1-day UTC cushion guards against the cached row
     // sitting right before a day boundary.
     let cached_calls = ds.load_cached_address_calls(&address);
-    let newest_cached = cached_calls
+    let newest_cached_pair = cached_calls
         .iter()
         .filter(|c| c.block_number > 0)
-        .max_by_key(|c| c.block_number);
+        .max_by_key(|c| c.block_number)
+        .map(|c| (c.block_number, c.timestamp));
 
-    let dune_calls_result = match newest_cached {
-        Some(c) => {
-            let min_date = (c.timestamp > 0)
-                .then(|| chrono::DateTime::from_timestamp(c.timestamp as i64, 0))
-                .flatten()
-                .map(|dt| dt.date_naive() - chrono::Duration::days(1));
+    // Cold-cache path: resolve a deploy-block floor before deciding the Dune
+    // query variant. Sources, in order: cached deploy_info → cached
+    // class_history → pf class-history (~500ms) → Voyager label (~600ms).
+    // Either pf or voyager unblocks the deploy-scoped query; the cold path
+    // works against RPC + Voyager alone when pf isn't wired up.
+    let mut deploy_floor: Option<u64> = None;
+    if newest_cached_pair.is_none() {
+        deploy_floor = ds
+            .load_cached_deploy_info(&address)
+            .map(|(_, block, _)| block)
+            .or_else(|| {
+                ds.load_cached_class_history(&address)
+                    .iter()
+                    .map(|e| e.block_number)
+                    .min()
+            });
+
+        if deploy_floor.is_none()
+            && let Some(pf_client) = pf
+        {
+            match pf_client.get_class_history(address).await {
+                Ok(entries) => {
+                    if !entries.is_empty() {
+                        ds.save_class_history(&address, &entries);
+                    }
+                    deploy_floor = entries.iter().map(|e| e.block_number).min();
+                }
+                Err(e) => {
+                    debug!(
+                        addr = %format!("{:#x}", address),
+                        error = %e,
+                        "Calls: pf class-history fetch failed; trying Voyager"
+                    );
+                }
+            }
+        }
+
+        if deploy_floor.is_none()
+            && let Some(vc) = voyager_c
+        {
+            match vc.get_label(address).await {
+                Ok(label) => deploy_floor = label.deploy_block,
+                Err(e) => {
+                    debug!(
+                        addr = %format!("{:#x}", address),
+                        error = %e,
+                        "Calls: Voyager label fetch failed"
+                    );
+                }
+            }
+        }
+    }
+
+    // Block timestamp for the deploy floor. `ds.get_block` serves from cache
+    // or falls back to RPC, so this works without pf.
+    let deploy_floor_ts = match deploy_floor {
+        Some(b) => ds.get_block(b).await.ok().map(|blk| blk.timestamp),
+        None => None,
+    };
+
+    let plan = pick_calls_dune_query(newest_cached_pair, deploy_floor, deploy_floor_ts);
+    if let CallsDuneQuery::DeployScoped {
+        from_block,
+        min_date,
+    } = &plan
+    {
+        debug!(
+            addr = %format!("{:#x}", address),
+            from_block,
+            ?min_date,
+            "Calls: cold-cache windowed Dune query (deploy-scoped)"
+        );
+    }
+    let dune_calls_result = match plan {
+        CallsDuneQuery::TopDelta {
+            from_block,
+            min_date,
+        } => {
             dune_client
                 .query_contract_calls_windowed(
                     address,
-                    c.block_number + 1,
+                    from_block,
                     u64::MAX,
                     CONTRACT_CALL_LIMIT,
                     min_date,
                 )
                 .await
         }
-        None => {
+        CallsDuneQuery::DeployScoped {
+            from_block,
+            min_date,
+        } => {
+            dune_client
+                .query_contract_calls_windowed(
+                    address,
+                    from_block,
+                    u64::MAX,
+                    CONTRACT_CALL_LIMIT,
+                    Some(min_date),
+                )
+                .await
+        }
+        CallsDuneQuery::Unwindowed => {
             dune_client
                 .query_contract_calls(address, CONTRACT_CALL_LIMIT)
                 .await
@@ -4296,6 +4474,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // === pick_calls_dune_query unit tests ===
+    //
+    // The cold-cache calls path resolves a deploy floor through up to four
+    // sources (deploy_info → class_history → pf → Voyager) before deciding
+    // which Dune query variant to issue. Regressions back to the legacy
+    // unwindowed `block_date >= '2024-01-01'` query are silent (just slow,
+    // not wrong), so we test the decision exhaustively.
+
+    /// 2025-04-21 00:00:00 UTC — a representative deploy timestamp used
+    /// across these tests.
+    const DEPLOY_TS: u64 = 1_745_193_600;
+    /// 2025-04-21 minus the 1-day cushion `pick_calls_dune_query` applies.
+    fn deploy_min_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2025, 4, 20).unwrap()
+    }
+
+    #[test]
+    fn warm_cache_uses_top_delta_with_date_hint() {
+        let plan = pick_calls_dune_query(Some((9_148_000, DEPLOY_TS)), None, None);
+        assert_eq!(
+            plan,
+            CallsDuneQuery::TopDelta {
+                from_block: 9_148_001,
+                min_date: Some(deploy_min_date()),
+            }
+        );
+    }
+
+    #[test]
+    fn warm_cache_with_zero_timestamp_drops_date_hint() {
+        // A cached row with `timestamp == 0` (e.g. enrichment never landed)
+        // must not produce `min_date = 1969-12-31`.
+        let plan = pick_calls_dune_query(Some((9_148_000, 0)), Some(9_013_975), Some(DEPLOY_TS));
+        assert_eq!(
+            plan,
+            CallsDuneQuery::TopDelta {
+                from_block: 9_148_001,
+                min_date: None,
+            }
+        );
+    }
+
+    #[test]
+    fn warm_cache_ignores_deploy_floor() {
+        // TopDelta wins over DeployScoped: if we already have cached rows
+        // there's no need to scan all the way back to deploy.
+        let plan = pick_calls_dune_query(
+            Some((9_148_000, DEPLOY_TS)),
+            Some(9_013_975),
+            Some(DEPLOY_TS),
+        );
+        match plan {
+            CallsDuneQuery::TopDelta { from_block, .. } => assert_eq!(from_block, 9_148_001),
+            other => panic!("expected TopDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cold_cache_with_deploy_info_uses_deploy_scoped() {
+        let plan = pick_calls_dune_query(None, Some(9_013_975), Some(DEPLOY_TS));
+        assert_eq!(
+            plan,
+            CallsDuneQuery::DeployScoped {
+                from_block: 9_013_975,
+                min_date: deploy_min_date(),
+            }
+        );
+    }
+
+    #[test]
+    fn cold_cache_without_deploy_floor_falls_back_to_unwindowed() {
+        let plan = pick_calls_dune_query(None, None, None);
+        assert_eq!(plan, CallsDuneQuery::Unwindowed);
+    }
+
+    #[test]
+    fn cold_cache_with_floor_but_no_timestamp_falls_back() {
+        // Voyager gave us deploy_block but ds.get_block failed (or returned
+        // a sentinel `0` timestamp). Without a real date we can't prune
+        // partitions, so the windowed query is no better than unwindowed —
+        // emit the unwindowed query, which is what the comment on
+        // `query_contract_calls_windowed` says is required to avoid
+        // QUERY_STATE_FAILED on dense contracts.
+        let plan = pick_calls_dune_query(None, Some(9_013_975), None);
+        assert_eq!(plan, CallsDuneQuery::Unwindowed);
+
+        let plan_zero_ts = pick_calls_dune_query(None, Some(9_013_975), Some(0));
+        assert_eq!(plan_zero_ts, CallsDuneQuery::Unwindowed);
     }
 
     /// Smoke test that `batch_call_contracts` matches individual `call_contract`

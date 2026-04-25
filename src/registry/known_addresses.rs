@@ -112,6 +112,7 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 # Infrastructure
 "0x01176a1bd84444c89232ec27754698e5d2e7e1a7f1539f12027f28b23ec9f3d8" = { name = "Starknet Sequencer", type = "Sequencer", verified = true, source = "bundled" }
 "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf" = { name = "UDC", type = "Infrastructure", verified = true, source = "bundled" }
+"0x02ceed65a4bd731034c01113685c831b01c15d7d432f71afb1cf1634b53a2125" = { name = "UDC v2", type = "Infrastructure", verified = true, source = "bundled" }
 "0x0243eed6e2b2b02a24e249f2b39ef9e5bc8bc32b252174d1c0961a458640ed8a" = { name = "Pragma Oracle", type = "Oracle", verified = true, source = "bundled" }
 
 # Known exchanges/wallets

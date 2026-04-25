@@ -1,13 +1,13 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use starknet::core::types::Felt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::data::types::VoyagerLabelInfo;
@@ -36,10 +36,12 @@ pub struct VoyagerClient {
     /// Caps simultaneous outbound HTTP calls. Acquired only after a cache miss
     /// and after dedup, so cache-only paths stay free.
     sem: Semaphore,
-    /// Addresses currently being fetched. A second concurrent caller for the
-    /// same address returns an empty label immediately; the next render after
-    /// the in-flight call lands will hit the cache.
-    in_flight: Mutex<HashSet<Felt>>,
+    /// Per-address mutex for deduplicating concurrent fetches. The first
+    /// caller to acquire the inner async lock performs the fetch; concurrent
+    /// callers wait for it and then read from cache. Lets a downstream caller
+    /// (e.g. the cold-cache contract-calls path) get the real result instead
+    /// of an empty placeholder when another task is already mid-flight.
+    in_flight: Mutex<HashMap<Felt, Arc<AsyncMutex<()>>>>,
     /// Unix-secs gate. While `now < backoff_until`, outbound calls are skipped.
     /// Tripped on any non-cacheable Voyager error (429/5xx, transport error).
     backoff_until: AtomicU64,
@@ -105,29 +107,33 @@ fn empty_label() -> VoyagerLabelInfo {
     }
 }
 
-/// RAII guard for an in-flight address slot. Removes the entry on drop so a
-/// failure path can't wedge an address as "permanently in flight".
-struct InFlightGuard<'a> {
-    set: &'a Mutex<HashSet<Felt>>,
+/// Acquire (or create) the per-address async lock used to serialise
+/// concurrent fetches. The returned `Arc` is held until the caller drops it,
+/// keeping the entry alive for the duration of the fetch.
+fn acquire_addr_lock(
+    map: &Mutex<HashMap<Felt, Arc<AsyncMutex<()>>>>,
     addr: Felt,
+) -> Option<Arc<AsyncMutex<()>>> {
+    let mut g = map.lock().ok()?;
+    Some(
+        g.entry(addr)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone(),
+    )
 }
 
-impl<'a> InFlightGuard<'a> {
-    fn try_acquire(set: &'a Mutex<HashSet<Felt>>, addr: Felt) -> Option<Self> {
-        let mut g = set.lock().ok()?;
-        if g.insert(addr) {
-            Some(InFlightGuard { set, addr })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut g) = self.set.lock() {
-            g.remove(&self.addr);
-        }
+/// Drop the per-address slot from the map *only* if we're the last holder.
+/// `addr_lock` is the local clone the caller is about to drop, so a strong
+/// count of 2 means "the map and us" — safe to remove.
+fn release_addr_lock(
+    map: &Mutex<HashMap<Felt, Arc<AsyncMutex<()>>>>,
+    addr: Felt,
+    addr_lock: &Arc<AsyncMutex<()>>,
+) {
+    if let Ok(mut g) = map.lock()
+        && Arc::strong_count(addr_lock) <= 2
+    {
+        g.remove(&addr);
     }
 }
 
@@ -157,7 +163,7 @@ impl VoyagerClient {
             api_key,
             db: Mutex::new(db),
             sem: Semaphore::new(MAX_CONCURRENT_FETCHES),
-            in_flight: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             backoff_until: AtomicU64::new(0),
         })
     }
@@ -169,7 +175,12 @@ impl VoyagerClient {
     ///   1. Error backoff: if Voyager recently errored, return an empty label
     ///      without firing a request.
     ///   2. In-flight dedup: if another task is already fetching this address,
-    ///      return an empty label and let the in-flight call populate the cache.
+    ///      wait for it to finish and read the result from cache. Avoids
+    ///      duplicate API calls while still letting concurrent callers see
+    ///      the real label (the previous behaviour returned empty here, which
+    ///      forced downstream callers — e.g. the cold-cache contract-calls
+    ///      path that needs `deploy_block` to scope a Dune query — to fall
+    ///      back to a much more expensive query).
     ///   3. Concurrency cap: only `MAX_CONCURRENT_FETCHES` requests run at once.
     ///
     /// "Empty label" means `VoyagerLabelInfo` with all `None` fields; callers
@@ -188,20 +199,33 @@ impl VoyagerClient {
             return Ok(empty_label());
         }
 
-        // Reserve the in-flight slot. If another task is already fetching this
-        // address, bail — we don't want N tasks racing to fetch the same key.
-        let _guard = match InFlightGuard::try_acquire(&self.in_flight, address) {
-            Some(g) => g,
-            None => {
-                debug!(address = %addr_hex, "Voyager fetch already in flight, skipping");
-                return Ok(empty_label());
-            }
+        // Acquire the per-address lock. If another task holds it, we wait
+        // here until they release — at which point either the cache is
+        // populated (cache check below short-circuits) or their fetch failed
+        // and we'll try ourselves.
+        let Some(addr_lock) = acquire_addr_lock(&self.in_flight, address) else {
+            return Ok(empty_label());
         };
+        let _held = addr_lock.lock().await;
+
+        // Re-check cache: a previous holder of the lock may have just written.
+        if let Some(cached) = self.get_cached(&addr_hex) {
+            debug!(address = %addr_hex, "Voyager label cache hit after dedup wait");
+            release_addr_lock(&self.in_flight, address, &addr_lock);
+            return Ok(cached);
+        }
+        // Re-check backoff too: a prior in-flight caller may have errored
+        // and tripped it while we were waiting. Avoids piling onto a
+        // failing endpoint.
+        if self.in_backoff() {
+            release_addr_lock(&self.in_flight, address, &addr_lock);
+            return Ok(empty_label());
+        }
 
         // `acquire` only fails if the semaphore is closed, which we never do.
         let _permit = self.sem.acquire().await.map_err(|e| e.to_string())?;
 
-        match self.fetch_from_api(&addr_hex).await {
+        let result = match self.fetch_from_api(&addr_hex).await {
             Ok(label) => {
                 self.store_cached(&addr_hex, &label);
                 Ok(label)
@@ -210,7 +234,9 @@ impl VoyagerClient {
                 self.trip_backoff();
                 Err(e)
             }
-        }
+        };
+        release_addr_lock(&self.in_flight, address, &addr_lock);
+        result
     }
 
     fn in_backoff(&self) -> bool {
@@ -628,33 +654,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_flight_guard_dedups_concurrent_callers() {
+    async fn in_flight_dedup_waits_and_reads_cache() {
         let (client, _f) = tmp_client();
+        let client = std::sync::Arc::new(client);
         let address =
             Felt::from_hex("0x0000000000000000000000000000000000000000000000000000000000000bbb")
                 .unwrap();
-        // Manually claim the in-flight slot to simulate an ongoing fetch by another task.
-        let _held = InFlightGuard::try_acquire(&client.in_flight, address)
-            .expect("first acquire must succeed");
+        let addr_hex = format!("{:#066x}", address);
 
-        // A second concurrent caller must NOT hit the network — short-circuit to empty.
-        // (No cache entry, no backoff: the only way `get_label` can return Ok here is
-        // via the in-flight short-circuit.)
-        let label = client.get_label(address).await.expect("must not error");
-        assert!(label.name.is_none(), "in-flight dedup must yield empty");
+        // Take the per-address lock to simulate an in-flight fetch by another
+        // task. While we hold it, populate the cache as that fetch would.
+        let addr_lock =
+            acquire_addr_lock(&client.in_flight, address).expect("acquire_addr_lock must succeed");
+        let held = addr_lock.lock().await;
+
+        let label = VoyagerLabelInfo {
+            name: Some("InFlightWriter".to_string()),
+            class_alias: None,
+            deploy_block: Some(42),
+        };
+        client.store_cached(&addr_hex, &label);
+
+        // A second caller racing with the in-flight fetch should block until
+        // we release, then read the freshly cached entry instead of bailing
+        // to empty.
+        let client_c = std::sync::Arc::clone(&client);
+        let waiter = tokio::spawn(async move { client_c.get_label(address).await });
+
+        // Give the waiter a chance to enter the lock acquisition.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+
+        let result = waiter.await.expect("task must not panic").expect("ok");
+        assert_eq!(result.name.as_deref(), Some("InFlightWriter"));
+        assert_eq!(result.deploy_block, Some(42));
     }
 
-    #[test]
-    fn in_flight_guard_releases_on_drop() {
-        let set: Mutex<HashSet<Felt>> = Mutex::new(HashSet::new());
+    #[tokio::test]
+    async fn addr_lock_entry_cleaned_up_after_release() {
+        let map: Mutex<HashMap<Felt, Arc<AsyncMutex<()>>>> = Mutex::new(HashMap::new());
         let addr = Felt::from_hex("0x1").unwrap();
         {
-            let _g = InFlightGuard::try_acquire(&set, addr).unwrap();
-            assert_eq!(set.lock().unwrap().len(), 1);
+            let lock = acquire_addr_lock(&map, addr).unwrap();
+            assert_eq!(map.lock().unwrap().len(), 1);
+            release_addr_lock(&map, addr, &lock);
         }
         assert!(
-            set.lock().unwrap().is_empty(),
-            "guard must remove its entry on drop"
+            map.lock().unwrap().is_empty(),
+            "release must remove the entry when no other holder remains"
         );
     }
 }
