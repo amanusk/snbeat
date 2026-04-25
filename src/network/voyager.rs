@@ -1,10 +1,13 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use starknet::core::types::Felt;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::data::types::VoyagerLabelInfo;
@@ -12,13 +15,34 @@ use crate::data::types::VoyagerLabelInfo;
 const VOYAGER_API_BASE: &str = "https://api.voyager.online/beta";
 /// Cache TTL: 24 hours (labels rarely change)
 const CACHE_TTL_SECS: u64 = 86_400;
+/// Max concurrent outbound Voyager API requests. Voyager is a nice-to-have
+/// (labels for sender/contract tags) so we keep this small to avoid rate-limit
+/// errors when a busy page (e.g. a block with hundreds of unique senders)
+/// triggers a burst of prefetches. Cache hits bypass this limit entirely.
+const MAX_CONCURRENT_FETCHES: usize = 4;
+/// After a Voyager error, suppress new outbound calls for this window.
+/// The error is usually a 429/5xx — burning more requests at it during the
+/// window just compounds the problem and spams the UI status bar.
+const ERROR_BACKOFF_SECS: u64 = 30;
 
 /// Voyager API client for fetching contract metadata (labels, types).
-/// Wraps a SQLite cache to avoid redundant API calls across restarts.
+/// Wraps a SQLite cache to avoid redundant API calls across restarts, plus
+/// in-process throttling (concurrency cap, in-flight dedup, error backoff)
+/// so a single busy page can't hammer the Voyager API.
 pub struct VoyagerClient {
     client: reqwest::Client,
     api_key: String,
     db: Mutex<Connection>,
+    /// Caps simultaneous outbound HTTP calls. Acquired only after a cache miss
+    /// and after dedup, so cache-only paths stay free.
+    sem: Semaphore,
+    /// Addresses currently being fetched. A second concurrent caller for the
+    /// same address returns an empty label immediately; the next render after
+    /// the in-flight call lands will hit the cache.
+    in_flight: Mutex<HashSet<Felt>>,
+    /// Unix-secs gate. While `now < backoff_until`, outbound calls are skipped.
+    /// Tripped on any non-cacheable Voyager error (429/5xx, transport error).
+    backoff_until: AtomicU64,
 }
 
 /// Raw API response shape — all fields optional to be robust to schema changes.
@@ -66,6 +90,47 @@ impl VoyagerContractResponse {
     }
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn empty_label() -> VoyagerLabelInfo {
+    VoyagerLabelInfo {
+        name: None,
+        class_alias: None,
+        deploy_block: None,
+    }
+}
+
+/// RAII guard for an in-flight address slot. Removes the entry on drop so a
+/// failure path can't wedge an address as "permanently in flight".
+struct InFlightGuard<'a> {
+    set: &'a Mutex<HashSet<Felt>>,
+    addr: Felt,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn try_acquire(set: &'a Mutex<HashSet<Felt>>, addr: Felt) -> Option<Self> {
+        let mut g = set.lock().ok()?;
+        if g.insert(addr) {
+            Some(InFlightGuard { set, addr })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.set.lock() {
+            g.remove(&self.addr);
+        }
+    }
+}
+
 impl VoyagerClient {
     /// Create a new client. Opens (or creates) the voyager_labels table in `cache_db_path`.
     pub fn new(api_key: String, cache_db_path: &Path) -> Result<Self, String> {
@@ -91,11 +156,25 @@ impl VoyagerClient {
             client: reqwest::Client::new(),
             api_key,
             db: Mutex::new(db),
+            sem: Semaphore::new(MAX_CONCURRENT_FETCHES),
+            in_flight: Mutex::new(HashSet::new()),
+            backoff_until: AtomicU64::new(0),
         })
     }
 
     /// Get the label for an address, reading from cache when available.
-    /// On cache miss, fetches from the Voyager API and persists the result.
+    ///
+    /// Cache hits return immediately. On a cache miss this enforces three
+    /// guards before issuing an API call:
+    ///   1. Error backoff: if Voyager recently errored, return an empty label
+    ///      without firing a request.
+    ///   2. In-flight dedup: if another task is already fetching this address,
+    ///      return an empty label and let the in-flight call populate the cache.
+    ///   3. Concurrency cap: only `MAX_CONCURRENT_FETCHES` requests run at once.
+    ///
+    /// "Empty label" means `VoyagerLabelInfo` with all `None` fields; callers
+    /// (e.g. `fetch_and_send_label`) treat it as "no tag available" and don't
+    /// emit anything to the UI, so the throttle is invisible to the user.
     pub async fn get_label(&self, address: Felt) -> Result<VoyagerLabelInfo, String> {
         let addr_hex = format!("{:#066x}", address);
 
@@ -104,9 +183,48 @@ impl VoyagerClient {
             return Ok(cached);
         }
 
-        let label = self.fetch_from_api(&addr_hex).await?;
-        self.store_cached(&addr_hex, &label);
-        Ok(label)
+        if self.in_backoff() {
+            debug!(address = %addr_hex, "Voyager backoff active, skipping fetch");
+            return Ok(empty_label());
+        }
+
+        // Reserve the in-flight slot. If another task is already fetching this
+        // address, bail — we don't want N tasks racing to fetch the same key.
+        let _guard = match InFlightGuard::try_acquire(&self.in_flight, address) {
+            Some(g) => g,
+            None => {
+                debug!(address = %addr_hex, "Voyager fetch already in flight, skipping");
+                return Ok(empty_label());
+            }
+        };
+
+        // `acquire` only fails if the semaphore is closed, which we never do.
+        let _permit = self.sem.acquire().await.map_err(|e| e.to_string())?;
+
+        match self.fetch_from_api(&addr_hex).await {
+            Ok(label) => {
+                self.store_cached(&addr_hex, &label);
+                Ok(label)
+            }
+            Err(e) => {
+                self.trip_backoff();
+                Err(e)
+            }
+        }
+    }
+
+    fn in_backoff(&self) -> bool {
+        let now = now_secs();
+        self.backoff_until.load(Ordering::Acquire) > now
+    }
+
+    fn trip_backoff(&self) {
+        let until = now_secs().saturating_add(ERROR_BACKOFF_SECS);
+        self.backoff_until.store(until, Ordering::Release);
+        warn!(
+            secs = ERROR_BACKOFF_SECS,
+            "Voyager error — pausing outbound fetches"
+        );
     }
 
     /// Probe connectivity — fetches a known contract (ETH token) to verify the key works.
@@ -165,8 +283,7 @@ impl VoyagerClient {
 
     fn get_cached(&self, addr_hex: &str) -> Option<VoyagerLabelInfo> {
         let db = self.db.lock().ok()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-        let cutoff = now.saturating_sub(CACHE_TTL_SECS) as i64;
+        let cutoff = now_secs().saturating_sub(CACHE_TTL_SECS) as i64;
 
         let mut stmt = db
             .prepare(
@@ -188,10 +305,7 @@ impl VoyagerClient {
 
     fn store_cached(&self, addr_hex: &str, label: &VoyagerLabelInfo) {
         let Ok(db) = self.db.lock() else { return };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_secs() as i64;
         let deploy_block = label.deploy_block.map(|b| b as i64);
         let _ = db.execute(
             "INSERT OR REPLACE INTO voyager_labels (address, name, contract_type, fetched_at, deploy_block) \
@@ -491,6 +605,56 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "Should emit nothing when name is null"
+        );
+    }
+
+    // --- throttle: backoff & in-flight dedup ---
+
+    #[tokio::test]
+    async fn get_label_skips_outbound_during_backoff() {
+        let (client, _f) = tmp_client();
+        // Trip the backoff manually to a future time. With a bogus api_key
+        // and no cached entry, a real fetch would error against api.voyager.online;
+        // backoff must short-circuit before any HTTP call.
+        let until = (now_secs() as u64).saturating_add(60);
+        client.backoff_until.store(until, Ordering::Release);
+
+        let address =
+            Felt::from_hex("0x0000000000000000000000000000000000000000000000000000000000000aaa")
+                .unwrap();
+        let label = client.get_label(address).await.expect("must not error");
+        assert!(label.name.is_none(), "backoff must yield empty label");
+        assert!(label.class_alias.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_flight_guard_dedups_concurrent_callers() {
+        let (client, _f) = tmp_client();
+        let address =
+            Felt::from_hex("0x0000000000000000000000000000000000000000000000000000000000000bbb")
+                .unwrap();
+        // Manually claim the in-flight slot to simulate an ongoing fetch by another task.
+        let _held = InFlightGuard::try_acquire(&client.in_flight, address)
+            .expect("first acquire must succeed");
+
+        // A second concurrent caller must NOT hit the network — short-circuit to empty.
+        // (No cache entry, no backoff: the only way `get_label` can return Ok here is
+        // via the in-flight short-circuit.)
+        let label = client.get_label(address).await.expect("must not error");
+        assert!(label.name.is_none(), "in-flight dedup must yield empty");
+    }
+
+    #[test]
+    fn in_flight_guard_releases_on_drop() {
+        let set: Mutex<HashSet<Felt>> = Mutex::new(HashSet::new());
+        let addr = Felt::from_hex("0x1").unwrap();
+        {
+            let _g = InFlightGuard::try_acquire(&set, addr).unwrap();
+            assert_eq!(set.lock().unwrap().len(), 1);
+        }
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "guard must remove its entry on drop"
         );
     }
 }
