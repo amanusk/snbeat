@@ -2155,6 +2155,7 @@ pub(super) async fn run_endpoint_enrichment(
         &known_txs,
         ds,
         dune,
+        pf,
         abi_reg,
         action_tx,
     )
@@ -2221,12 +2222,12 @@ pub(super) async fn run_nonce_gap_fill(
         gap.missing_count
     )));
 
-    let found = fill_specific_large_gap(address, &known_txs, &gap, dune, action_tx).await;
+    let found = fill_specific_large_gap(address, &known_txs, &gap, dune, pf, action_tx).await;
 
     if !found.is_empty() {
         info!(
             found = found.len(),
-            "Gap fill: Dune returned {} new txs, enriching endpoints",
+            "Gap fill: backend returned {} new txs, enriching endpoints",
             found.len()
         );
         let _ = action_tx.send(Action::AddressTxsEnriched {
@@ -2234,8 +2235,9 @@ pub(super) async fn run_nonce_gap_fill(
             updates: found.clone(),
         });
 
-        // Enrich endpoints for the newly discovered txs (they usually arrive from
-        // Dune without endpoint names decoded).
+        // Enrich endpoints for the newly discovered txs (Dune txs arrive
+        // without endpoints; PF txs already carry hash/fee/status but still
+        // need ABI-driven endpoint name resolution).
         let mut combined = known_txs;
         for t in &found {
             if !combined.iter().any(|k| k.hash == t.hash) {
@@ -2244,7 +2246,7 @@ pub(super) async fn run_nonce_gap_fill(
         }
         enrich_all_empty_endpoints(address, &combined, ds, pf.as_ref(), abi_reg, action_tx).await;
     } else {
-        info!("Gap fill: no txs returned from Dune for this range");
+        info!("Gap fill: no txs returned for this range");
         let _ = action_tx.send(Action::LoadingStatus(String::new()));
     }
 
@@ -2266,6 +2268,7 @@ async fn fill_small_nonce_gaps_phase(
     known_txs: &[crate::data::types::AddressTxSummary],
     ds: &Arc<dyn DataSource>,
     _dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::AddressTxSummary> {
@@ -2362,68 +2365,161 @@ async fn fill_small_nonce_gaps_phase(
 
     let mut found_txs = Vec::new();
 
-    // Small gaps only: RPC block scan. Large gaps are left for on-demand fill.
-    if !small_gaps.is_empty() {
-        let mut blocks_to_scan: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for (_, from, to) in &small_gaps {
-            for b in *from..=*to {
-                blocks_to_scan.insert(b);
+    if small_gaps.is_empty() {
+        return found_txs;
+    }
+
+    // Pathfinder primary path: a single ranged `/sender-txs` call covers the
+    // bounding window across all small gaps. nonce_updates is indexed by
+    // address, so the range size is irrelevant — only the matching tx count
+    // (capped at our limit). This collapses the previous N-block RPC fan-out
+    // into one round-trip.
+    let bounding_from = small_gaps.iter().map(|(_, f, _)| *f).min().unwrap_or(0);
+    let bounding_to = small_gaps.iter().map(|(_, _, t)| *t).max().unwrap_or(0);
+    if let Some(pf_c) = pf.as_ref()
+        && bounding_to >= bounding_from
+    {
+        info!(
+            small = small_count,
+            from = bounding_from,
+            to = bounding_to,
+            "Sanity gap-fill: querying PF for blocks {}..{}",
+            bounding_from,
+            bounding_to
+        );
+        match pf_c
+            .get_sender_txs(
+                address,
+                1000,
+                Some(bounding_to.saturating_add(1)),
+                Some(bounding_from),
+            )
+            .await
+        {
+            Ok(entries) => {
+                let summaries = pf_txs_to_summaries(entries);
+                let new: Vec<_> = summaries
+                    .into_iter()
+                    .filter(|t| !known_txs.iter().any(|k| k.hash == t.hash))
+                    .collect();
+                info!(
+                    found = new.len(),
+                    "Sanity gap-fill: PF returned {} new txs", new.len()
+                );
+                return new;
+            }
+            Err(e) => {
+                warn!(error = %e, "Sanity gap-fill: PF query failed, falling back to RPC scan");
+                // Fall through to RPC.
             }
         }
-        // Cap RPC block scan to 200 blocks
-        if blocks_to_scan.len() <= 200 {
-            let blocks_vec: Vec<u64> = blocks_to_scan.into_iter().collect();
-            info!(
-                blocks = blocks_vec.len(),
-                "Sanity gap-fill: scanning {} blocks via RPC for small gaps",
-                blocks_vec.len()
-            );
-            let rpc_found =
-                fetch_txs_from_blocks(address, &blocks_vec, known_txs, ds, abi_reg, action_tx)
-                    .await;
-            info!(
-                found = rpc_found.len(),
-                "Sanity gap-fill: RPC scan found {} txs",
-                rpc_found.len()
-            );
-            found_txs.extend(rpc_found);
-        } else {
-            info!(
-                blocks = blocks_to_scan.len(),
-                "Sanity gap-fill: too many small-gap blocks ({}), skipping RPC scan",
-                blocks_to_scan.len()
-            );
+    }
+
+    // RPC fallback: union the gap windows into a flat block list and scan.
+    let mut blocks_to_scan: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (_, from, to) in &small_gaps {
+        for b in *from..=*to {
+            blocks_to_scan.insert(b);
         }
+    }
+    // Cap RPC block scan to 200 blocks
+    if blocks_to_scan.len() <= 200 {
+        let blocks_vec: Vec<u64> = blocks_to_scan.into_iter().collect();
+        info!(
+            blocks = blocks_vec.len(),
+            "Sanity gap-fill: scanning {} blocks via RPC for small gaps",
+            blocks_vec.len()
+        );
+        let rpc_found =
+            fetch_txs_from_blocks(address, &blocks_vec, known_txs, ds, abi_reg, action_tx).await;
+        info!(
+            found = rpc_found.len(),
+            "Sanity gap-fill: RPC scan found {} txs",
+            rpc_found.len()
+        );
+        found_txs.extend(rpc_found);
+    } else {
+        info!(
+            blocks = blocks_to_scan.len(),
+            "Sanity gap-fill: too many small-gap blocks ({}), skipping RPC scan",
+            blocks_to_scan.len()
+        );
     }
 
     found_txs
 }
 
-/// On-demand Dune query for a single large nonce gap (issue #10).
+/// On-demand range query for a single large nonce gap (issue #10).
 ///
-/// Caller supplies the known lo/hi block bounds of the gap; we query Dune's
-/// windowed account-tx endpoint for that range, deduplicate against known
-/// hashes, and return the new entries.
+/// Prefers Pathfinder's `/sender-txs` (sub-second on indexed nonce_updates)
+/// when available; falls back to Dune's windowed account-tx query when PF
+/// isn't configured. Returns only entries the caller doesn't already know.
 async fn fill_specific_large_gap(
     address: starknet::core::types::Felt,
     known_txs: &[crate::data::types::AddressTxSummary],
     gap: &crate::app::views::address_info::UnfilledGap,
     dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::AddressTxSummary> {
+    let from = gap.lo_block;
+    let to = gap.hi_block;
+    let known_hashes: std::collections::HashSet<_> = known_txs.iter().map(|t| t.hash).collect();
+
+    // Pathfinder primary. `before_block` is exclusive in the pf-query API,
+    // so pass `to + 1` to keep the gap's upper bound inclusive — matching
+    // the Dune BETWEEN semantics this used to use.
+    if let Some(pf_c) = pf.as_ref() {
+        info!(
+            from,
+            to,
+            span = to.saturating_sub(from),
+            "Gap fill: querying Pathfinder for blocks {}..{}",
+            from,
+            to
+        );
+        match pf_c
+            .get_sender_txs(address, 1000, Some(to.saturating_add(1)), Some(from))
+            .await
+        {
+            Ok(entries) => {
+                let summaries = pf_txs_to_summaries(entries);
+                let total_returned = summaries.len();
+                let new: Vec<_> = summaries
+                    .into_iter()
+                    .filter(|t| !known_hashes.contains(&t.hash))
+                    .collect();
+                info!(
+                    returned = total_returned,
+                    new = new.len(),
+                    from,
+                    to,
+                    "Gap fill: PF returned {} txs, {} new for blocks {}..{}",
+                    total_returned,
+                    new.len(),
+                    from,
+                    to
+                );
+                return new;
+            }
+            Err(e) => {
+                warn!(error = %e, from, to, "Gap fill: PF query failed, falling back to Dune");
+                // Fall through to Dune.
+            }
+        }
+    }
+
     let Some(dune_c) = dune.as_ref() else {
         warn!(
-            "Gap fill: Dune client unavailable, cannot fill gap {}..{}",
+            "Gap fill: neither Pathfinder nor Dune available, cannot fill gap {}..{}",
             gap.lo_block, gap.hi_block
         );
         let _ = action_tx.send(Action::LoadingStatus(
-            "Gap fill unavailable (Dune not configured)".to_string(),
+            "Gap fill unavailable (no backend configured)".to_string(),
         ));
         return Vec::new();
     };
 
-    let from = gap.lo_block;
-    let to = gap.hi_block;
     info!(
         from,
         to,
@@ -2432,8 +2528,6 @@ async fn fill_specific_large_gap(
         from,
         to
     );
-
-    let known_hashes: std::collections::HashSet<_> = known_txs.iter().map(|t| t.hash).collect();
 
     match dune_c
         .query_account_txs_windowed(address, from, to, 1000)
