@@ -32,6 +32,7 @@ fn tx_summary(hash: u64, nonce: u64, sender: Felt) -> AddressTxSummary {
         tx_type: "INVOKE".to_string(),
         status: "OK".to_string(),
         sender: Some(sender),
+        called_contracts: Vec::new(),
     }
 }
 

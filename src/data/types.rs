@@ -275,6 +275,11 @@ pub struct AddressTxSummary {
     /// The actual sender of this transaction (may differ from the viewed address for deployment txs).
     #[serde(default)]
     pub sender: Option<Felt>,
+    /// Top-level contracts directly invoked by this tx's multicall, in order
+    /// (deduplicated). Populated by the same path that fills `endpoint_names`;
+    /// remains empty for non-INVOKE txs and pre-enrichment stubs.
+    #[serde(default)]
+    pub called_contracts: Vec<Felt>,
 }
 
 /// A meta-transaction (SNIP-9 outside execution) summary for the MetaTxs tab on

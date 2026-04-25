@@ -484,6 +484,7 @@ fn pf_txs_to_summaries(
             tx_type,
             status: pt.status,
             sender,
+            called_contracts: Vec::new(), // populated later via enrich
         });
     }
     summaries
@@ -3118,6 +3119,7 @@ pub(super) async fn find_deploy_tx(
             tx_type: "DEPLOY".into(),
             status: "OK".into(),
             sender: cached_deployer,
+            called_contracts: Vec::new(),
         };
         let _ = tx.send(Action::AddressTxsStreamed {
             address: addr,
@@ -3162,6 +3164,7 @@ pub(super) async fn find_deploy_tx(
                 tx_type: t.type_name().to_string(),
                 status: "OK".into(),
                 sender,
+                called_contracts: Vec::new(),
             };
             let _ = tx.send(Action::AddressTxsStreamed {
                 address: addr,
@@ -3218,6 +3221,7 @@ pub(super) async fn find_deploy_tx(
                     tx_type: "DEPLOY (UDC)".into(),
                     status: "OK".into(),
                     sender: deployer,
+                    called_contracts: Vec::new(),
                 };
                 let _ = tx.send(Action::AddressTxsStreamed {
                     address: addr,

@@ -656,6 +656,7 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
                 tx_type,
                 status,
                 sender,
+                called_contracts: Vec::new(), // Populated later from cached calldata
             })
         })
         .collect()

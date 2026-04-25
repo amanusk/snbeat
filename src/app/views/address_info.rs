@@ -464,6 +464,11 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     if existing.endpoint_names.is_empty() && !incoming.endpoint_names.is_empty() {
         existing.endpoint_names.clone_from(&incoming.endpoint_names);
     }
+    if existing.called_contracts.is_empty() && !incoming.called_contracts.is_empty() {
+        existing
+            .called_contracts
+            .clone_from(&incoming.called_contracts);
+    }
     if existing.sender.is_none() && incoming.sender.is_some() {
         existing.sender = incoming.sender;
     }
@@ -490,6 +495,7 @@ mod tests {
             tx_type: "INVOKE".into(),
             status: "OK".into(),
             sender: None,
+            called_contracts: Vec::new(),
         }
     }
 

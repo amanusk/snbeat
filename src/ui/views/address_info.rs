@@ -457,6 +457,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("   Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
+        Span::styled("Contracts             ", theme::SUGGESTION_STYLE),
         Span::styled("Endpoint(s)                    ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
@@ -513,6 +514,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 tx.endpoint_names.clone()
             };
+            let contracts_display = format_called_contracts(app, &tx.called_contracts);
 
             let status_style = match tx.status.as_str() {
                 "OK" => theme::STATUS_OK,
@@ -535,6 +537,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{:<14}", short_hash(&tx.hash)),
                     theme::TX_HASH_STYLE,
                 ),
+                Span::styled(format!("{:<22}", contracts_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -598,6 +601,30 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, list_area, &mut app.address.txs.state);
+}
+
+/// Render the contracts-called column: first contract's label (or short hex)
+/// followed by `+N` for any extras. Truncates to fit the 22-char column.
+/// Mirrors the MetaTxs protocol-column formatting for visual consistency.
+fn format_called_contracts(app: &App, contracts: &[Felt]) -> String {
+    let Some(first) = contracts.first() else {
+        return String::new();
+    };
+    let base = app.format_address(first);
+    let extra = contracts.len().saturating_sub(1);
+    let suffix = if extra > 0 {
+        format!(" +{extra}")
+    } else {
+        String::new()
+    };
+    let budget = 21usize.saturating_sub(suffix.chars().count());
+    let trimmed = if base.chars().count() > budget {
+        let head: String = base.chars().take(budget.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        base
+    };
+    format!("{trimmed}{suffix}")
 }
 
 fn format_age(timestamp: u64) -> String {

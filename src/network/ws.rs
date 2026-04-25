@@ -743,6 +743,7 @@ fn tx_to_summary(tx: &Transaction) -> Option<AddressTxSummary> {
         tx_type: tx_type.to_string(),
         status: "?".to_string(), // Pending — enrichment will update
         sender,
+        called_contracts: Vec::new(),
     })
 }
 
@@ -770,6 +771,7 @@ fn tx_from_raw(v: &Value) -> Option<AddressTxSummary> {
         tx_type,
         status: "?".to_string(),
         sender,
+        called_contracts: Vec::new(),
     })
 }
 

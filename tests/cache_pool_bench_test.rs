@@ -140,6 +140,7 @@ fn mk_tx_summary(addr: Felt, idx: u64) -> AddressTxSummary {
         tx_type: "INVOKE".to_string(),
         status: "OK".to_string(),
         sender: Some(addr),
+        called_contracts: Vec::new(),
     }
 }
 
