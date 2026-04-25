@@ -102,13 +102,23 @@ pub async fn resolve_class_hash_at(
     // 1. cached class_history (desc-ordered).
     let mut history = ds.load_cached_class_history(&address);
 
-    // The cache is "complete" when the oldest entry's block <= our target —
-    // we can find the right class. If the target is older than anything we
-    // know about, refetch.
-    let cache_covers = history
+    // The cache "covers" the target block only if BOTH:
+    //   * the oldest cached entry is at/before `block` (cache reaches back
+    //     far enough to find the right class), AND
+    //   * pf-query has validated the cache forward through at least `block`
+    //     (no unobserved `replace_class` could sit between the newest cached
+    //     entry and `block`).
+    // Skipping the forward check would let a stale cache satisfy a newer
+    // target block and return the wrong class hash.
+    let reaches_back = history
         .last()
         .map(|e| e.block_number <= block)
         .unwrap_or(false);
+    let validated_through_target = ds
+        .load_class_history_max_block(&address)
+        .map(|max_block| max_block >= block)
+        .unwrap_or(false);
+    let cache_covers = reaches_back && validated_through_target;
     if !cache_covers && let Some(pf) = pf {
         match pf.get_class_history(address).await {
             Ok(entries) => {
@@ -167,9 +177,12 @@ pub async fn prewarm_abis_at(
     let addrs: Vec<Felt> = addresses.into_iter().collect();
 
     // Resolve all (address → class_hash @ block) in parallel.
-    let resolutions = futures::future::join_all(addrs.iter().copied().map(|a| async move {
-        (a, resolve_class_hash_at(a, block, ds, pf).await)
-    }))
+    let resolutions = futures::future::join_all(
+        addrs
+            .iter()
+            .copied()
+            .map(|a| async move { (a, resolve_class_hash_at(a, block, ds, pf).await) }),
+    )
     .await;
 
     let mut addr_to_class: HashMap<Felt, Felt> = HashMap::new();

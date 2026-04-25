@@ -119,7 +119,10 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
         Span::styled("Sender               ", theme::SUGGESTION_STYLE),
         Span::styled("Intender             ", theme::SUGGESTION_STYLE),
-        Span::styled("Endpoint(s)                            ", theme::SUGGESTION_STYLE),
+        Span::styled(
+            "Endpoint(s)                            ",
+            theme::SUGGESTION_STYLE,
+        ),
         Span::styled("Nonce      ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
         Span::styled("Tip             ", theme::SUGGESTION_STYLE),

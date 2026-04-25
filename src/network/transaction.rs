@@ -58,8 +58,15 @@ pub(super) async fn resolve_call_abis(
         if let Some(name) = abi_reg.get_selector_name(&call.selector) {
             call.function_name = Some(name);
         }
-        if let Some(abi) =
-            abi_at_block(&call.contract_address, block, addr_to_class, ds, pf, abi_reg).await
+        if let Some(abi) = abi_at_block(
+            &call.contract_address,
+            block,
+            addr_to_class,
+            ds,
+            pf,
+            abi_reg,
+        )
+        .await
         {
             if let Some(func) = abi.get_function(&call.selector) {
                 if call.function_name.is_none() {
@@ -115,9 +122,15 @@ pub(super) async fn decode_and_send_transaction(
         decoded_events.push(decode_event(event, abi.as_deref()));
     }
     resolve_call_abis(&mut decoded_calls, block, &addr_to_class, ds, pf, abi_reg).await;
-    let outside_executions =
-        detect_and_resolve_outside_executions(&decoded_calls, block, &addr_to_class, ds, pf, abi_reg)
-            .await;
+    let outside_executions = detect_and_resolve_outside_executions(
+        &decoded_calls,
+        block,
+        &addr_to_class,
+        ds,
+        pf,
+        abi_reg,
+    )
+    .await;
 
     // Fetch block timestamp (used for age display and price lookups on tracked tokens).
     // Block fetches are cached, so repeat calls for the same block are cheap.

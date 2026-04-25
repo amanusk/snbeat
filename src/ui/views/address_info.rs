@@ -728,7 +728,10 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Paymaster            ", theme::SUGGESTION_STYLE),
         Span::styled("Ver   ", theme::SUGGESTION_STYLE),
         Span::styled("Protocol(s)          ", theme::SUGGESTION_STYLE),
-        Span::styled("Endpoint(s)                        ", theme::SUGGESTION_STYLE),
+        Span::styled(
+            "Endpoint(s)                        ",
+            theme::SUGGESTION_STYLE,
+        ),
         Span::styled("Fee(STRK)      ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
     ]));
