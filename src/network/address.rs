@@ -791,52 +791,113 @@ pub(super) async fn fetch_and_send_address_info(
         u64::MAX // unknown — do full search
     };
     let cached_nonce_block = cached_nonce_info.map(|(_, b)| b).unwrap_or(0);
+
+    // Hoisted: needed both for the nonce save below and as the watermark for
+    // class-history re-validation further down. One RPC round-trip either way.
+    let latest_block = ds.get_latest_block_number().await.unwrap_or(0);
+
     // Save current nonce for next visit — but only if non-zero.
     // A nonce=0 contract might gain account functionality later, so we must
     // always re-check rather than locking in "no txs" from a cached zero.
     if nonce != starknet::core::types::Felt::ZERO {
-        let latest = ds.get_latest_block_number().await.unwrap_or(0);
-        ds.save_cached_nonce(&address, &nonce, latest);
+        ds.save_cached_nonce(&address, &nonce, latest_block);
     }
 
-    // Fire-and-forget: fetch class history from PF if available
-    if let Some(pf_client) = pf {
-        let pf_c = Arc::clone(pf_client);
+    // Replay cached deployment data BEFORE the pf branch so that visiting an
+    // address without pf-query still shows the same "Deployed at / Deployed by"
+    // header and class-history list as the first (pf-backed) visit. The deploy
+    // tx itself is immutable; the class-history cache may be stale (a
+    // replace_class can land between visits) but we always show what we have
+    // and let the pf branch below detect divergence and fix it up.
+    let cached_class_history = ds.load_cached_class_history(&address);
+    if !cached_class_history.is_empty() {
+        let _ = tx.send(Action::ClassHistoryLoaded {
+            address,
+            entries: cached_class_history.clone(),
+        });
+    }
+    let cached_deploy = ds.load_cached_deploy_info(&address);
+    if let Some((_, cached_deploy_block, _)) = cached_deploy {
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
-        let addr = address;
-        let cancel_c = cancel.clone();
         spawn_cancellable(cancel.clone(), async move {
-            match pf_c.get_class_history(addr).await {
-                Ok(entries) => {
-                    // Use earliest entry (deployment block) to find the deploy tx
-                    if let Some(deploy_entry) = entries.last() {
-                        let deploy_block = deploy_entry.block_number;
-                        let tx_c2 = tx_c.clone();
-                        let ds_c2 = Arc::clone(&ds_c);
-                        spawn_cancellable(cancel_c.clone(), async move {
-                            find_deploy_tx(addr, deploy_block, &ds_c2, &tx_c2).await;
+            // find_deploy_tx hits the deploy_info cache first and returns
+            // immediately on hit, so no network work runs here.
+            find_deploy_tx(address, cached_deploy_block, &ds_c, &tx_c).await;
+        });
+    }
+    let had_cached_deploy = cached_deploy.is_some();
+
+    // Decide whether the cached class-history is still authoritative. If the
+    // live class_hash matches the latest cached entry, no replace_class can
+    // have landed since the last write, so a pf round trip is wasted work.
+    // The cache is sorted DESC by block, so `.first()` is the most recent entry.
+    let cache_is_fresh = match (
+        cached_class_history
+            .first()
+            .and_then(|e| starknet::core::types::Felt::from_hex(&e.class_hash).ok()),
+        class_hash,
+    ) {
+        (Some(top), Some(live)) => top == live,
+        _ => false,
+    };
+
+    // Class-history reconciliation against pf-query.
+    //
+    // Three cases:
+    //   1. pf available + cache fresh → skip the network fetch and just
+    //      advance the watermark; we just re-validated up to `latest_block`.
+    //   2. pf available + cache stale (or empty) → full re-fetch (cheap;
+    //      pf-query class-history is a PK lookup in `contract_updates`),
+    //      overwrite, advance the watermark.
+    //   3. pf unavailable → leave cache and watermark untouched. The cached
+    //      list keeps showing even if a replace_class has landed since; the
+    //      next pf-enabled visit will detect the divergence and fill the gap.
+    if let Some(pf_client) = pf {
+        if cache_is_fresh {
+            ds.save_class_history_max_block(&address, latest_block);
+        } else {
+            let pf_c = Arc::clone(pf_client);
+            let ds_c = Arc::clone(ds);
+            let tx_c = tx.clone();
+            let addr = address;
+            let cancel_c = cancel.clone();
+            spawn_cancellable(cancel.clone(), async move {
+                match pf_c.get_class_history(addr).await {
+                    Ok(entries) => {
+                        ds_c.save_class_history(&addr, &entries);
+                        ds_c.save_class_history_max_block(&addr, latest_block);
+                        // Skip the deploy-tx lookup if the cached fast-path
+                        // already emitted the deploy summary above. Avoids a
+                        // duplicate AddressTxsStreamed for the same hash.
+                        if !had_cached_deploy && let Some(deploy_entry) = entries.last() {
+                            let deploy_block = deploy_entry.block_number;
+                            let tx_c2 = tx_c.clone();
+                            let ds_c2 = Arc::clone(&ds_c);
+                            spawn_cancellable(cancel_c.clone(), async move {
+                                find_deploy_tx(addr, deploy_block, &ds_c2, &tx_c2).await;
+                            });
+                        }
+                        debug!(
+                            address = %format!("{:#x}", addr),
+                            entries = entries.len(),
+                            "PF class history fetched"
+                        );
+                        let _ = tx_c.send(Action::ClassHistoryLoaded {
+                            address: addr,
+                            entries,
                         });
                     }
-                    debug!(
-                        address = %format!("{:#x}", addr),
-                        entries = entries.len(),
-                        "PF class history fetched"
-                    );
-                    let _ = tx_c.send(Action::ClassHistoryLoaded {
-                        address: addr,
-                        entries,
-                    });
+                    Err(e) => {
+                        warn!(error = %e, "PF class history fetch failed");
+                        let _ = tx_c.send(Action::SourceUpdate {
+                            source: Source::Pathfinder,
+                            status: crate::app::state::SourceStatus::FetchError(e.to_string()),
+                        });
+                    }
                 }
-                Err(e) => {
-                    warn!(error = %e, "PF class history fetch failed");
-                    let _ = tx_c.send(Action::SourceUpdate {
-                        source: Source::Pathfinder,
-                        status: crate::app::state::SourceStatus::FetchError(e.to_string()),
-                    });
-                }
-            }
-        });
+            });
+        }
     }
 
     // --- Determine which sources to fire and tell the UI ---

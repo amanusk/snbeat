@@ -142,6 +142,18 @@ impl CachingDataSource {
                 deploy_block INTEGER NOT NULL,
                 deployer TEXT
             );
+            CREATE TABLE IF NOT EXISTS class_history (
+                address TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                class_hash TEXT NOT NULL,
+                PRIMARY KEY (address, block_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_class_history_addr
+                ON class_history(address, block_number DESC);
+            CREATE TABLE IF NOT EXISTS class_history_meta (
+                address TEXT PRIMARY KEY,
+                last_known_block INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cached_nonces (
                 address TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
@@ -262,6 +274,30 @@ impl CachingDataSource {
             )
             .map_err(|e| SnbeatError::Config(format!("Migration v6 failed: {e}")))?;
             debug!("Migration v6: split address_search_progress by filter_kind");
+        }
+
+        if version < 7 {
+            // v7: introduce class_history. The DDL is in the CREATE block above;
+            // existing DBs just need the version bump. On revisit without
+            // pf-query the cached rows replay deployment + class-upgrade info
+            // so the address view doesn't regress.
+            db.execute("PRAGMA user_version = 7", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v7 version bump failed: {e}"))
+            })?;
+            debug!("Migration v7: added class_history table");
+        }
+
+        if version < 8 {
+            // v8: introduce class_history_meta. Tracks the highest block at
+            // which a pf-query response confirmed the cached class history was
+            // complete. Only advanced on pf-validated reads — when pf is
+            // unavailable we keep showing the cached list but leave the
+            // watermark alone, so the next pf-enabled visit can detect (via
+            // class-hash divergence) that gaps may exist and refetch.
+            db.execute("PRAGMA user_version = 8", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v8 version bump failed: {e}"))
+            })?;
+            debug!("Migration v8: added class_history_meta table");
         }
 
         drop(db);
@@ -650,6 +686,100 @@ impl CachingDataSource {
             let _ = db.execute(
                 "INSERT OR REPLACE INTO deploy_info (address, deploy_tx_hash, deploy_block, deployer) VALUES (?1, ?2, ?3, ?4)",
                 params![addr_hex, tx_hex, block as i64, deployer_hex],
+            );
+        }
+    }
+
+    // --- class history cache ---
+
+    fn get_cached_class_history(
+        &self,
+        address: &Felt,
+    ) -> Vec<crate::data::pathfinder::ClassHashEntry> {
+        let db = match self.db.get() {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = match db.prepare(
+            "SELECT block_number, class_hash FROM class_history \
+             WHERE address = ?1 ORDER BY block_number DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![addr_hex], |row| {
+            let block: i64 = row.get(0)?;
+            let class_hash: String = row.get(1)?;
+            Ok(crate::data::pathfinder::ClassHashEntry {
+                block_number: block as u64,
+                class_hash,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn cache_class_history(
+        &self,
+        address: &Felt,
+        entries: &[crate::data::pathfinder::ClassHashEntry],
+    ) {
+        let mut db = match self.db.get() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let addr_hex = format!("{:#x}", address);
+        let tx = match db.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if tx
+            .execute(
+                "DELETE FROM class_history WHERE address = ?1",
+                params![addr_hex],
+            )
+            .is_err()
+        {
+            return;
+        }
+        for entry in entries {
+            if tx
+                .execute(
+                    "INSERT OR REPLACE INTO class_history (address, block_number, class_hash) \
+                     VALUES (?1, ?2, ?3)",
+                    params![addr_hex, entry.block_number as i64, entry.class_hash],
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    fn get_cached_class_history_max_block(&self, address: &Felt) -> Option<u64> {
+        let db = self.db.get().ok()?;
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = db
+            .prepare("SELECT last_known_block FROM class_history_meta WHERE address = ?1")
+            .ok()?;
+        stmt.query_row(params![addr_hex], |row| {
+            let block: i64 = row.get(0)?;
+            Ok(block as u64)
+        })
+        .ok()
+    }
+
+    fn cache_class_history_max_block(&self, address: &Felt, block: u64) {
+        if let Ok(db) = self.db.get() {
+            let addr_hex = format!("{:#x}", address);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO class_history_meta (address, last_known_block) \
+                 VALUES (?1, ?2)",
+                params![addr_hex, block as i64],
             );
         }
     }
@@ -1370,6 +1500,29 @@ impl DataSource for CachingDataSource {
         deployer: Option<&Felt>,
     ) {
         self.cache_deploy_info(address, tx_hash, block, deployer);
+    }
+
+    fn load_cached_class_history(
+        &self,
+        address: &Felt,
+    ) -> Vec<crate::data::pathfinder::ClassHashEntry> {
+        self.get_cached_class_history(address)
+    }
+
+    fn save_class_history(
+        &self,
+        address: &Felt,
+        entries: &[crate::data::pathfinder::ClassHashEntry],
+    ) {
+        self.cache_class_history(address, entries);
+    }
+
+    fn load_class_history_max_block(&self, address: &Felt) -> Option<u64> {
+        self.get_cached_class_history_max_block(address)
+    }
+
+    fn save_class_history_max_block(&self, address: &Felt, block: u64) {
+        self.cache_class_history_max_block(address, block);
     }
 
     fn load_cached_nonce(&self, address: &Felt) -> Option<(Felt, u64)> {
