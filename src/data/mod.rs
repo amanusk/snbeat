@@ -14,6 +14,8 @@ use types::{
     MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt, SnTransaction,
 };
 
+use pathfinder::ClassHashEntry;
+
 /// What kind of event filter a scan applied. Used as a secondary key in
 /// `address_search_progress` so that a narrower (keyed) scan doesn't
 /// falsely mark the broader (unkeyed) region as "covered". Scans record
@@ -179,6 +181,17 @@ pub trait DataSource: Send + Sync {
         _deployer: Option<&Felt>,
     ) {
     }
+
+    // --- Class history cache ---
+    /// Load the cached pf-query class-hash history for an address, ordered
+    /// from latest to oldest (matches the pf-query response shape so the UI
+    /// can treat cached and live results identically).
+    fn load_cached_class_history(&self, _address: &Felt) -> Vec<ClassHashEntry> {
+        Vec::new()
+    }
+    /// Persist the full class-hash history for an address. Replaces any
+    /// existing rows so a refreshed pf-query response is the source of truth.
+    fn save_class_history(&self, _address: &Felt, _entries: &[ClassHashEntry]) {}
 
     // --- Nonce cache ---
     /// Load cached nonce + block number for an address.

@@ -799,6 +799,29 @@ pub(super) async fn fetch_and_send_address_info(
         ds.save_cached_nonce(&address, &nonce, latest);
     }
 
+    // Replay cached deployment data BEFORE the pf branch so that visiting an
+    // address without pf-query still shows the same "Deployed at / Deployed by"
+    // header and class-history list as the first (pf-backed) visit. Both
+    // facts are immutable once set, so the cache never goes stale.
+    let cached_class_history = ds.load_cached_class_history(&address);
+    if !cached_class_history.is_empty() {
+        let _ = tx.send(Action::ClassHistoryLoaded {
+            address,
+            entries: cached_class_history.clone(),
+        });
+    }
+    let cached_deploy = ds.load_cached_deploy_info(&address);
+    if let Some((_, cached_deploy_block, _)) = cached_deploy {
+        let ds_c = Arc::clone(ds);
+        let tx_c = tx.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            // find_deploy_tx hits the deploy_info cache first and returns
+            // immediately on hit, so no network work runs here.
+            find_deploy_tx(address, cached_deploy_block, &ds_c, &tx_c).await;
+        });
+    }
+    let had_cached_deploy = cached_deploy.is_some();
+
     // Fire-and-forget: fetch class history from PF if available
     if let Some(pf_client) = pf {
         let pf_c = Arc::clone(pf_client);
@@ -809,8 +832,11 @@ pub(super) async fn fetch_and_send_address_info(
         spawn_cancellable(cancel.clone(), async move {
             match pf_c.get_class_history(addr).await {
                 Ok(entries) => {
-                    // Use earliest entry (deployment block) to find the deploy tx
-                    if let Some(deploy_entry) = entries.last() {
+                    ds_c.save_class_history(&addr, &entries);
+                    // Skip the deploy-tx lookup if the cached fast-path already
+                    // emitted the deploy summary above. Avoids a duplicate
+                    // AddressTxsStreamed for the same hash.
+                    if !had_cached_deploy && let Some(deploy_entry) = entries.last() {
                         let deploy_block = deploy_entry.block_number;
                         let tx_c2 = tx_c.clone();
                         let ds_c2 = Arc::clone(&ds_c);
