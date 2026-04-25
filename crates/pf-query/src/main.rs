@@ -1772,8 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn handler_class_history_smoke() {
         let (_dir, state) = setup_test_db();
-        let result =
-            handler_class_history(AxumPath(TEST_ADDR.to_string()), AxumState(state)).await;
+        let result = handler_class_history(AxumPath(TEST_ADDR.to_string()), AxumState(state)).await;
         let json = result.expect("handler returned error");
         assert!(json.0.is_empty());
     }

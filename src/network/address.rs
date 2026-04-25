@@ -2404,7 +2404,8 @@ async fn fill_small_nonce_gaps_phase(
                     .collect();
                 info!(
                     found = new.len(),
-                    "Sanity gap-fill: PF returned {} new txs", new.len()
+                    "Sanity gap-fill: PF returned {} new txs",
+                    new.len()
                 );
                 return new;
             }
