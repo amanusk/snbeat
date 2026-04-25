@@ -80,6 +80,120 @@ pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &A
     futures::future::join_all(futs).await;
 }
 
+/// Resolve the class hash that was active for `address` at `block`.
+///
+/// Tries in order:
+/// 1. Cached class_history (populated by address-view visits or earlier
+///    tx-decode calls). Pick the latest entry with `block_number <= block`.
+/// 2. pf-query `/class-history/{address}`, then save full history to cache.
+/// 3. RPC `starknet_getClassHashAt(BlockId::Number(block), address)`.
+///    Result is intentionally NOT written into class_history — that table
+///    is a list of class-hash *changes*, and a single point lookup would
+///    falsely indicate "this is the only class this address ever had".
+///
+/// Returns `None` if all three fail; callers should fall back to the
+/// latest-ABI path.
+pub async fn resolve_class_hash_at(
+    address: Felt,
+    block: u64,
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
+) -> Option<Felt> {
+    // 1. cached class_history (desc-ordered).
+    let mut history = ds.load_cached_class_history(&address);
+
+    // The cache is "complete" when the oldest entry's block <= our target —
+    // we can find the right class. If the target is older than anything we
+    // know about, refetch.
+    let cache_covers = history
+        .last()
+        .map(|e| e.block_number <= block)
+        .unwrap_or(false);
+    if !cache_covers && let Some(pf) = pf {
+        match pf.get_class_history(address).await {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    let latest = ds.get_latest_block_number().await.unwrap_or(0);
+                    ds.save_class_history(&address, &entries);
+                    if latest > 0 {
+                        ds.save_class_history_max_block(&address, latest);
+                    }
+                    history = entries;
+                }
+            }
+            Err(e) => {
+                debug!(address = %format!("{:#x}", address), error = %e, "pf-query class-history fetch failed");
+            }
+        }
+    }
+
+    // 2. scan desc-ordered history for first entry with block_number <= target
+    for entry in &history {
+        if entry.block_number <= block {
+            if let Ok(felt) = Felt::from_hex(&entry.class_hash) {
+                return Some(felt);
+            }
+            warn!(class_hash = %entry.class_hash, "Bad class_hash hex in class_history");
+            break;
+        }
+    }
+
+    // 3. RPC fallback (don't cache — see doc comment).
+    match ds.get_class_hash_at(address, block).await {
+        Ok(ch) => Some(ch),
+        Err(e) => {
+            debug!(address = %format!("{:#x}", address), block, error = %e, "RPC get_class_hash_at failed");
+            None
+        }
+    }
+}
+
+/// Pre-warm ABIs for every address used in a tx, resolving each one's
+/// class hash *as of `block`* (not latest). Returns the address → class_hash
+/// map so callers can decode events / calls against the correct ABI by
+/// passing the resolved class to `AbiRegistry::get_abi_for_class` (which
+/// will be a cache hit after this prewarm).
+///
+/// Addresses that fail to resolve are simply omitted from the returned
+/// map; callers should fall back to `AbiRegistry::get_abi_for_address`
+/// (latest) for those.
+pub async fn prewarm_abis_at(
+    addresses: impl IntoIterator<Item = Felt>,
+    block: u64,
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
+    abi_reg: &AbiRegistry,
+) -> HashMap<Felt, Felt> {
+    let addrs: Vec<Felt> = addresses.into_iter().collect();
+
+    // Resolve all (address → class_hash @ block) in parallel.
+    let resolutions = futures::future::join_all(addrs.iter().copied().map(|a| async move {
+        (a, resolve_class_hash_at(a, block, ds, pf).await)
+    }))
+    .await;
+
+    let mut addr_to_class: HashMap<Felt, Felt> = HashMap::new();
+    let mut unique_classes: HashSet<Felt> = HashSet::new();
+    for (addr, class_opt) in resolutions {
+        if let Some(ch) = class_opt {
+            addr_to_class.insert(addr, ch);
+            unique_classes.insert(ch);
+        }
+    }
+
+    // Prewarm ABIs for each unique class_hash in parallel.
+    let class_futs: Vec<_> = unique_classes
+        .iter()
+        .copied()
+        .map(|ch| async move {
+            let _ = abi_reg.get_abi_for_class(&ch).await;
+        })
+        .collect();
+    futures::future::join_all(class_futs).await;
+
+    addr_to_class
+}
+
 /// Extract execution status string from a receipt.
 pub fn receipt_status(receipt: Option<&SnReceipt>) -> String {
     receipt

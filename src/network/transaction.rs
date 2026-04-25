@@ -1,14 +1,18 @@
 //! Transaction-related network functions: fetching, decoding, and resolving call ABIs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use starknet::core::types::Felt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::app::actions::Action;
 use crate::data::DataSource;
+use crate::data::pathfinder::PathfinderClient;
 use crate::data::types::SnTransaction;
 use crate::decode::AbiRegistry;
+use crate::decode::abi::ParsedAbi;
 use crate::decode::events::decode_event;
 use crate::decode::functions::parse_multicall;
 use crate::decode::outside_execution::{
@@ -16,17 +20,47 @@ use crate::decode::outside_execution::{
     looks_like_outside_execution, parse_forwarder_call, parse_outside_execution,
 };
 
+/// Resolve the ABI for `addr` as of `block`. Prefers the prewarmed
+/// `addr_to_class` map; on miss, falls back to a synchronous resolve via
+/// `class_history` (cached or fetched). If that also fails, falls through
+/// to the latest-ABI path (same behaviour as pre-issue-#24 code) so any
+/// degradation is graceful.
+async fn abi_at_block(
+    addr: &Felt,
+    block: u64,
+    addr_to_class: &HashMap<Felt, Felt>,
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
+    abi_reg: &AbiRegistry,
+) -> Option<Arc<ParsedAbi>> {
+    if let Some(class_hash) = addr_to_class.get(addr) {
+        return abi_reg.get_abi_for_class(class_hash).await;
+    }
+    if block > 0
+        && let Some(class_hash) = super::helpers::resolve_class_hash_at(*addr, block, ds, pf).await
+    {
+        return abi_reg.get_abi_for_class(&class_hash).await;
+    }
+    abi_reg.get_abi_for_address(addr).await
+}
+
 /// Resolve selector names, function definitions, and contract ABIs for a list of calls.
 /// Shared by all code paths that produce a `TransactionLoaded` action.
 pub(super) async fn resolve_call_abis(
     calls: &mut [crate::decode::functions::RawCall],
+    block: u64,
+    addr_to_class: &HashMap<Felt, Felt>,
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) {
     for call in calls.iter_mut() {
         if let Some(name) = abi_reg.get_selector_name(&call.selector) {
             call.function_name = Some(name);
         }
-        if let Some(abi) = abi_reg.get_abi_for_address(&call.contract_address).await {
+        if let Some(abi) =
+            abi_at_block(&call.contract_address, block, addr_to_class, ds, pf, abi_reg).await
+        {
             if let Some(func) = abi.get_function(&call.selector) {
                 if call.function_name.is_none() {
                     call.function_name = Some(func.name.clone());
@@ -43,18 +77,23 @@ pub(super) async fn decode_and_send_transaction(
     transaction: SnTransaction,
     receipt: crate::data::types::SnReceipt,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
+    let block = receipt.block_number;
+
     // Parse multicall up front so we can prewarm the ABI cache for every
     // unique address referenced by this tx (event sources + call targets)
-    // in a single parallel round-trip. Every subsequent per-event /
-    // per-call `get_abi_for_address` call then hits warm cache.
+    // in a single parallel round-trip — resolving each address's class
+    // hash *as of `block`* so post-upgrade contracts decode pre-upgrade
+    // events correctly (issue #24). Subsequent per-event / per-call ABI
+    // lookups consult the resolved (address → class_hash) map first.
     let mut decoded_calls = match &transaction {
         SnTransaction::Invoke(invoke) => parse_multicall(&invoke.calldata),
         _ => Vec::new(),
     };
-    let mut prewarm_targets: std::collections::HashSet<starknet::core::types::Felt> =
+    let mut prewarm_targets: std::collections::HashSet<Felt> =
         std::collections::HashSet::with_capacity(receipt.events.len() + decoded_calls.len());
     for event in &receipt.events {
         prewarm_targets.insert(event.from_address);
@@ -62,23 +101,27 @@ pub(super) async fn decode_and_send_transaction(
     for call in &decoded_calls {
         prewarm_targets.insert(call.contract_address);
     }
-    super::helpers::prewarm_abis(prewarm_targets, abi_reg).await;
+    let addr_to_class = if block > 0 {
+        super::helpers::prewarm_abis_at(prewarm_targets, block, ds, pf, abi_reg).await
+    } else {
+        // Pending tx (no block yet). Use latest-ABI prewarm.
+        super::helpers::prewarm_abis(prewarm_targets, abi_reg).await;
+        HashMap::new()
+    };
 
     let mut decoded_events = Vec::with_capacity(receipt.events.len());
     for event in &receipt.events {
-        let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+        let abi = abi_at_block(&event.from_address, block, &addr_to_class, ds, pf, abi_reg).await;
         decoded_events.push(decode_event(event, abi.as_deref()));
     }
-    resolve_call_abis(&mut decoded_calls, abi_reg).await;
-    let outside_executions = detect_and_resolve_outside_executions(&decoded_calls, abi_reg).await;
+    resolve_call_abis(&mut decoded_calls, block, &addr_to_class, ds, pf, abi_reg).await;
+    let outside_executions =
+        detect_and_resolve_outside_executions(&decoded_calls, block, &addr_to_class, ds, pf, abi_reg)
+            .await;
 
     // Fetch block timestamp (used for age display and price lookups on tracked tokens).
     // Block fetches are cached, so repeat calls for the same block are cheap.
-    let block_timestamp = ds
-        .get_block(receipt.block_number)
-        .await
-        .ok()
-        .map(|b| b.timestamp);
+    let block_timestamp = ds.get_block(block).await.ok().map(|b| b.timestamp);
 
     let _ = action_tx.send(Action::TransactionLoaded {
         transaction,
@@ -98,6 +141,10 @@ pub(super) async fn decode_and_send_transaction(
 /// 3. By known forwarder address (AVNU paymaster wraps outside execution in execute/execute_sponsored)
 async fn detect_and_resolve_outside_executions(
     calls: &[crate::decode::functions::RawCall],
+    block: u64,
+    addr_to_class: &HashMap<Felt, Felt>,
+    ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<(usize, OutsideExecutionInfo)> {
     let mut results = Vec::new();
@@ -120,7 +167,7 @@ async fn detect_and_resolve_outside_executions(
         }
 
         if let Some(mut oe) = oe {
-            resolve_call_abis(&mut oe.inner_calls, abi_reg).await;
+            resolve_call_abis(&mut oe.inner_calls, block, addr_to_class, ds, pf, abi_reg).await;
             results.push((i, oe));
         }
     }
@@ -132,6 +179,7 @@ async fn detect_and_resolve_outside_executions(
 pub(super) async fn fetch_and_send_transaction(
     hash: starknet::core::types::Felt,
     ds: &Arc<dyn DataSource>,
+    pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
     tx: &mpsc::UnboundedSender<Action>,
 ) {
@@ -145,7 +193,7 @@ pub(super) async fn fetch_and_send_transaction(
     match (tx_result, receipt_result) {
         (Ok(transaction), Ok(receipt)) => {
             info!(tx_hash = %hash_short, elapsed_ms = start.elapsed().as_millis(), "Transaction fetched, decoding");
-            decode_and_send_transaction(transaction, receipt, ds, abi_reg, tx).await;
+            decode_and_send_transaction(transaction, receipt, ds, pf, abi_reg, tx).await;
         }
         (Err(e), _) | (_, Err(e)) => {
             error!(tx_hash = %hash_short, elapsed_ms = start.elapsed().as_millis(), error = %e, "Failed to fetch transaction");

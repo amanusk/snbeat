@@ -1102,6 +1102,16 @@ impl DataSource for CachingDataSource {
         Ok(class_hash)
     }
 
+    async fn get_class_hash_at(&self, address: Felt, block: u64) -> Result<Felt> {
+        // The (address, block) → class_hash mapping is immutable, but the
+        // class_history table already caches it at coarser granularity for
+        // the addresses tx decoding cares about. Pass through here; the
+        // helper that wraps this (`resolve_class_hash_at`) consults
+        // class_history first and only hits this fallback when the cached
+        // history is incomplete.
+        self.upstream.get_class_hash_at(address, block).await
+    }
+
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass> {
         // Classes are large — pass through to upstream.
         // Parsed ABIs are cached separately via the decode layer's class_cache.
