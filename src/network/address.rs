@@ -825,8 +825,25 @@ pub(super) async fn fetch_and_send_address_info(
             // immediately on hit, so no network work runs here.
             find_deploy_tx(address, cached_deploy_block, &ds_c, &tx_c).await;
         });
+    } else if let Some(earliest) = cached_class_history.last() {
+        // No deploy_info cached, but class history is — meaning a previous
+        // flow (tx-detail decode, class info view) warmed class history but
+        // never triggered the deploy-tx scan. Kick it off here using the
+        // earliest cached entry as the deploy block. Without this, the pf
+        // re-fetch branch below only fires the lookup when the cache is
+        // *stale*, so a fresh-but-deploy-info-less cache would never show
+        // the deployment tx.
+        let deploy_block = earliest.block_number;
+        let ds_c = Arc::clone(ds);
+        let tx_c = tx.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            find_deploy_tx(address, deploy_block, &ds_c, &tx_c).await;
+        });
     }
     let had_cached_deploy = cached_deploy.is_some();
+    // Whether the cached fast-path above already kicked off a find_deploy_tx
+    // run. Used to suppress a duplicate launch from the pf re-fetch branch.
+    let kicked_deploy_lookup = had_cached_deploy || !cached_class_history.is_empty();
 
     // Decide whether the cached class-history is still authoritative. If the
     // live class_hash matches the latest cached entry, no replace_class can
@@ -868,9 +885,12 @@ pub(super) async fn fetch_and_send_address_info(
                         ds_c.save_class_history(&addr, &entries);
                         ds_c.save_class_history_max_block(&addr, latest_block);
                         // Skip the deploy-tx lookup if the cached fast-path
-                        // already emitted the deploy summary above. Avoids a
-                        // duplicate AddressTxsStreamed for the same hash.
-                        if !had_cached_deploy && let Some(deploy_entry) = entries.last() {
+                        // (or the cached-class-history fallback) already
+                        // kicked one off. find_deploy_tx itself is cache-first,
+                        // but launching it twice causes duplicate
+                        // AddressTxsStreamed emits when both runs miss cache
+                        // and race the same block scan.
+                        if !kicked_deploy_lookup && let Some(deploy_entry) = entries.last() {
                             let deploy_block = deploy_entry.block_number;
                             let tx_c2 = tx_c.clone();
                             let ds_c2 = Arc::clone(&ds_c);
@@ -1231,6 +1251,7 @@ pub(super) async fn fetch_and_send_address_info(
         let abi_b = Arc::clone(abi_reg);
         let dune_b = dune.as_ref().map(Arc::clone);
         let pf_b = pf.as_ref().map(Arc::clone);
+        let voyager_b = voyager_c.as_ref().map(Arc::clone);
         spawn_cancellable(cancel.clone(), async move {
             let _ = tx_b.send(Action::LoadingStatus("Calls: fetching from Dune...".into()));
             fetch_address_contract_calls(
@@ -1238,6 +1259,7 @@ pub(super) async fn fetch_and_send_address_info(
                 &ds_b,
                 dune_b.as_ref(),
                 pf_b.as_ref(),
+                voyager_b.as_ref(),
                 &abi_b,
                 &tx_b,
                 nonce,
@@ -3418,6 +3440,7 @@ pub(super) async fn fetch_address_contract_calls(
     ds: &Arc<dyn crate::data::DataSource>,
     dune: Option<&Arc<dune::DuneClient>>,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    voyager_c: Option<&Arc<voyager::VoyagerClient>>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
     nonce: starknet::core::types::Felt,
@@ -3475,9 +3498,105 @@ pub(super) async fn fetch_address_contract_calls(
                 .await
         }
         None => {
-            dune_client
-                .query_contract_calls(address, CONTRACT_CALL_LIMIT)
-                .await
+            // Cold cache: scope the query to the contract's deploy block (and
+            // its date) so Dune doesn't scan every partition since 2024-01-01.
+            // For a contract deployed yesterday this turns a 2-minute query
+            // into a ~5-second one.
+            //
+            // Wait for the deploy block before dispatching Dune. Sources, in
+            // order:
+            //   1. cached deploy_info / class_history (instant)
+            //   2. pf class-history (~500ms, when pf is wired up)
+            //   3. Voyager label (~600ms, works without pf)
+            //
+            // The block timestamp comes from `ds.get_block`, which serves
+            // from cache or falls back to RPC — so this whole path works
+            // with just RPC + Voyager when pf is unavailable.
+            //
+            // `min_block_date` is a partition hint; without it the windowed
+            // query is no better than the unwindowed one (see comment on
+            // `query_contract_calls_windowed`). If we can't resolve either a
+            // floor block or a date, fall back to the unwindowed path.
+            let mut deploy_floor = ds
+                .load_cached_deploy_info(&address)
+                .map(|(_, block, _)| block)
+                .or_else(|| {
+                    ds.load_cached_class_history(&address)
+                        .iter()
+                        .map(|e| e.block_number)
+                        .min()
+                });
+
+            if deploy_floor.is_none()
+                && let Some(pf_client) = pf
+            {
+                match pf_client.get_class_history(address).await {
+                    Ok(entries) => {
+                        if !entries.is_empty() {
+                            ds.save_class_history(&address, &entries);
+                        }
+                        deploy_floor = entries.iter().map(|e| e.block_number).min();
+                    }
+                    Err(e) => {
+                        debug!(
+                            addr = %format!("{:#x}", address),
+                            error = %e,
+                            "Calls: pf class-history fetch failed; trying Voyager"
+                        );
+                    }
+                }
+            }
+
+            if deploy_floor.is_none()
+                && let Some(vc) = voyager_c
+            {
+                match vc.get_label(address).await {
+                    Ok(label) => {
+                        deploy_floor = label.deploy_block;
+                    }
+                    Err(e) => {
+                        debug!(
+                            addr = %format!("{:#x}", address),
+                            error = %e,
+                            "Calls: Voyager label fetch failed"
+                        );
+                    }
+                }
+            }
+
+            let hinted = if let Some(from_block) = deploy_floor {
+                let ts = ds.get_block(from_block).await.ok().map(|b| b.timestamp);
+                ts.and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
+                    .map(|dt| dt.date_naive() - chrono::Duration::days(1))
+                    .map(|min_date| (from_block, min_date))
+            } else {
+                None
+            };
+
+            match hinted {
+                Some((from_block, min_date)) => {
+                    debug!(
+                        addr = %format!("{:#x}", address),
+                        from_block,
+                        ?min_date,
+                        "Calls: cold-cache windowed Dune query (deploy-scoped)"
+                    );
+                    dune_client
+                        .query_contract_calls_windowed(
+                            address,
+                            from_block,
+                            u64::MAX,
+                            CONTRACT_CALL_LIMIT,
+                            Some(min_date),
+                        )
+                        .await
+                }
+                None => {
+                    dune_client
+                        .query_contract_calls(address, CONTRACT_CALL_LIMIT)
+                        .await
+                }
+            }
         }
     };
 
