@@ -2984,7 +2984,14 @@ pub(super) async fn fetch_more_address_txs(
         .min()
         .unwrap_or(from_block);
 
-    let at_deploy_floor = deploy_block.is_some_and(|db| from_block <= db);
+    // We've truly exhausted the deploy-block floor only when the *oldest
+    // returned tx* is at or below the deploy block. The previous shortcut
+    // — `from_block <= deploy_block ⇒ at_deploy_floor` — was wrong: PF can
+    // return `limit` rows entirely within [from_block, before_block) without
+    // walking the bottom of that range. Declaring has_more=false there
+    // stranded the user mid-history (regression seen on a 1500-nonce account
+    // where pagination stopped at nonce 503 with deploy at the floor).
+    let at_deploy_floor = deploy_block.is_some_and(|db| oldest_block <= db);
     let has_more = from_block > 0
         && !at_deploy_floor
         && (summaries.len() >= 50
