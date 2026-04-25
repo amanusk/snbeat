@@ -755,8 +755,15 @@ async fn handler_sender_txs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<SenderTxEntry>> {
     let limit = params.limit.unwrap_or(500).min(2000);
-    let before_block = params.before_block.unwrap_or(u64::MAX);
-    let from_block = params.from_block.unwrap_or(0);
+    // SQLite INTEGER is i64. rusqlite refuses to bind u64 values above
+    // `i64::MAX`, so cap the unbounded sentinel at i64::MAX — far above any
+    // realistic block number. `from_block` defaults to 0 so the lower bound
+    // is a no-op when the client doesn't paginate.
+    let before_block = params
+        .before_block
+        .unwrap_or(i64::MAX as u64)
+        .min(i64::MAX as u64) as i64;
+    let from_block = params.from_block.unwrap_or(0).min(i64::MAX as u64) as i64;
     let addr_bytes = parse_address(&address)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid address: {e}")))?;
     let db_path = Arc::clone(&state.db_path);
