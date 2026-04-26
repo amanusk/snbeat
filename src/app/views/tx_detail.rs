@@ -175,19 +175,20 @@ impl TxDetailState {
             }
         }
 
-        // === Calls tab ===
-        // Deployed contract addresses (via UDC) — surfaced via the calls tree.
+        // Deployed contract addresses (via UDC) — rendered in the header's
+        // "Contracts Deployed" section, so they're navigable from there.
         for addr in crate::decode::events::extract_deployed_addresses(&self.decoded_events) {
             if seen.insert(addr) {
                 push(
                     TxNavItem::Address(addr),
-                    NavSection::Calls,
+                    NavSection::Header,
                     &mut items,
                     &mut sections,
                 );
             }
         }
 
+        // === Calls tab ===
         // Call contract addresses
         for call in &self.decoded_calls {
             if seen.insert(call.contract_address) {
@@ -200,12 +201,14 @@ impl TxDetailState {
             }
         }
 
-        // Outside execution intender + inner-call addresses
+        // Outside execution: the intender is shown in the header's META line
+        // (always visible), so it's a Header-section nav item. Inner calls are
+        // only revealed when the Calls tab toggles `o`, so they belong there.
         for (_, oe) in &self.outside_executions {
             if seen.insert(oe.intender) {
                 push(
                     TxNavItem::Address(oe.intender),
-                    NavSection::Calls,
+                    NavSection::Header,
                     &mut items,
                     &mut sections,
                 );

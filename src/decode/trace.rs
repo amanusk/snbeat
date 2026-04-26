@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures::stream::StreamExt;
 use starknet::core::types::{
     CallType, EntryPointType, ExecuteInvocation, Felt, FunctionInvocation, OrderedEvent,
     OrderedMessage, TransactionTrace,
@@ -52,6 +53,10 @@ pub struct DecodedTrace {
     pub fee_transfer: Option<DecodedTraceCall>,
     pub l1_handler: Option<DecodedTraceCall>,
     pub revert_reason: Option<String>,
+    /// Total nodes in the tree (validate + execute + fee_transfer + nested),
+    /// computed once at decode time so the tabs bar doesn't walk the whole
+    /// tree on every frame just to render the count.
+    pub total_nodes: usize,
 }
 
 impl DecodedTrace {
@@ -140,23 +145,30 @@ fn root_invocations(trace: &TransactionTrace) -> Vec<&FunctionInvocation> {
     out
 }
 
-/// Pre-warm parsed ABIs for every class hash in the trace, in parallel.
+/// Pre-warm parsed ABIs for every class hash in the trace, with bounded
+/// concurrency so a pathological tx (e.g. cross-protocol, many novel
+/// classes) doesn't issue dozens of parallel `getClass` RPCs at once and
+/// trip provider rate limits or jitter.
 async fn prewarm_trace_abis(trace: &TransactionTrace, abi_reg: &Arc<AbiRegistry>) {
+    /// Cap on parallel ABI fetches. ~8 covers typical traces (which dedupe
+    /// to a handful of unique classes anyway, and most are cache hits) while
+    /// staying well below provider per-second limits.
+    const PREWARM_CONCURRENCY: usize = 8;
+
     let mut classes: HashSet<Felt> = HashSet::new();
     for root in root_invocations(trace) {
         collect_class_hashes(root, &mut classes);
     }
 
-    let futs: Vec<_> = classes
-        .into_iter()
-        .map(|ch| {
-            let abi_reg = Arc::clone(abi_reg);
-            async move {
-                let _ = abi_reg.get_abi_for_class(&ch).await;
-            }
-        })
-        .collect();
-    futures::future::join_all(futs).await;
+    futures::stream::iter(classes.into_iter().map(|ch| {
+        let abi_reg = Arc::clone(abi_reg);
+        async move {
+            let _ = abi_reg.get_abi_for_class(&ch).await;
+        }
+    }))
+    .buffer_unordered(PREWARM_CONCURRENCY)
+    .for_each(|_| async {})
+    .await;
 }
 
 /// Decode one invocation node by looking up its class's ABI and decoding events.
@@ -289,5 +301,9 @@ pub async fn decode_trace(
             }
         },
     }
+    // Cache the total node count once so the UI doesn't walk the tree per frame.
+    let mut n = 0usize;
+    out.for_each_call(|_| n += 1);
+    out.total_nodes = n;
     out
 }

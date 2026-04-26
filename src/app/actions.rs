@@ -178,10 +178,11 @@ pub enum Action {
     },
     /// Decoded execution trace for a transaction (recursive call tree).
     /// Sent after TransactionLoaded so the user sees the rest of the view
-    /// immediately while the trace populates lazily.
+    /// immediately while the trace populates lazily. `trace = None` signals
+    /// a fetch/decode failure so the UI can clear the "loading…" state.
     TransactionTraceLoaded {
         tx_hash: Felt,
-        trace: crate::decode::trace::DecodedTrace,
+        trace: Option<crate::decode::trace::DecodedTrace>,
     },
     /// Address info loaded.
     AddressInfoLoaded {

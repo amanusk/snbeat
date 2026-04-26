@@ -242,14 +242,19 @@ pub(super) async fn fetch_and_send_trace(
             );
             let _ = tx.send(Action::TransactionTraceLoaded {
                 tx_hash: hash,
-                trace: decoded,
+                trace: Some(decoded),
             });
         }
         Err(e) => {
             error!(tx_hash = %hash_short, error = %e, "Failed to fetch trace");
-            // Non-fatal: the rest of the tx view is already populated. We
-            // surface the failure as a low-priority error instead of an
-            // empty Trace tab so the user knows it didn't silently succeed.
+            // Non-fatal: the rest of the tx view is already populated. Send
+            // a TransactionTraceLoaded with `trace: None` so the UI can clear
+            // the "loading…" state and render an "unavailable" message,
+            // and surface the error itself separately.
+            let _ = tx.send(Action::TransactionTraceLoaded {
+                tx_hash: hash,
+                trace: None,
+            });
             let _ = tx.send(Action::Error(format!("Fetch trace: {e}")));
         }
     }

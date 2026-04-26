@@ -7,7 +7,7 @@ use starknet::core::types::{CallType, EntryPointType, Felt};
 
 use crate::app::App;
 use crate::app::state::TxNavItem;
-use crate::app::views::tx_detail::TxTab;
+use crate::app::views::tx_detail::{NavSection, TxTab};
 use crate::data::types::{ExecutionStatus, SnTransaction};
 use crate::decode::calldata::{self, DecodedValue};
 use crate::decode::events::{DecodedEvent, DecodedParam};
@@ -54,14 +54,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let color_map = build_color_map(app);
     let mut line_map: Vec<Option<u16>> = vec![None; app.tx_detail.nav_items.len()];
 
-    // Build line buffers for header + every tab body up front. Header always
-    // renders; bodies are computed for all three tabs every frame so visual-mode
-    // tab-switches see up-to-date line offsets for the destination tab — without
-    // this, the first `j` after a tab switch would scroll to a stale offset.
+    // Header always renders, so it's always rebuilt. Tab bodies are computed
+    // for all three tabs only in visual mode — that's when cross-tab cursor
+    // navigation needs up-to-date line offsets for every tab. Outside visual
+    // mode only the active tab is visible, so we skip building the others to
+    // avoid recomputing large traces on every frame.
     let header_lines = build_header_lines(app, &color_map, selected.as_ref(), &mut line_map);
-    let events_lines = build_events_lines(app, &color_map, selected.as_ref(), &mut line_map);
-    let calls_lines = build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map);
-    let trace_lines = build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map);
+    let (events_lines, calls_lines, trace_lines) = if app.tx_detail.visual_mode {
+        (
+            build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
+        )
+    } else {
+        match app.tx_detail.active_tab {
+            TxTab::Events => (
+                build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
+                Vec::new(),
+            ),
+            TxTab::Calls => (
+                Vec::new(),
+                build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
+            ),
+            TxTab::Trace => (
+                Vec::new(),
+                Vec::new(),
+                build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            ),
+        }
+    };
 
     let header_height = (header_lines.len() as u16).saturating_add(2); // borders
     // Header is fixed-content; clamp to ~60% of screen so tab body always
@@ -108,11 +131,7 @@ fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
         .tx_detail
         .trace
         .as_ref()
-        .map(|t| {
-            let mut n = 0usize;
-            t.for_each_call(|_| n += 1);
-            n
-        })
+        .map(|t| t.total_nodes)
         .unwrap_or(0);
     let trace_label = if app.tx_detail.trace.is_some() {
         format!("Trace ({trace_count})")
@@ -256,9 +275,23 @@ fn push_revert_lines(reason: &str, expand: bool, lines: &mut Vec<Line<'static>>)
     ]));
 }
 
-/// Record `item`'s first-occurrence line position into `map` (if not already set).
-fn record(item: &TxNavItem, cur_line: usize, map: &mut [Option<u16>], nav: &[TxNavItem]) {
-    if let Some(idx) = nav.iter().position(|x| x == item) {
+/// Record `item`'s first-occurrence line position into `map`, but only when
+/// the item belongs to `section`. The caller passes the section currently
+/// being rendered; items rendered as part of another section's pre-rollup
+/// (e.g. a call-target shown in the header's top-level Calls preview but
+/// owned by `NavSection::Calls`) are skipped here so the per-tab line index
+/// isn't clobbered by a header line position.
+fn record(
+    item: &TxNavItem,
+    cur_line: usize,
+    map: &mut [Option<u16>],
+    nav: &[TxNavItem],
+    sections: &[NavSection],
+    section: NavSection,
+) {
+    if let Some(idx) = nav.iter().position(|x| x == item)
+        && sections.get(idx).copied() == Some(section)
+    {
         map[idx].get_or_insert(cur_line as u16);
     }
 }
@@ -329,6 +362,8 @@ fn build_header_lines(
         lines.len(),
         line_map,
         &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Header,
     );
     lines.push(Line::from(vec![
         block_marker(blk_num, selected),
@@ -362,6 +397,8 @@ fn build_header_lines(
                 lines.len(),
                 line_map,
                 &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Header,
             );
             lines.push(Line::from(vec![
                 addr_marker(&oe.intender, selected),
@@ -396,6 +433,8 @@ fn build_header_lines(
         lines.len(),
         line_map,
         &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Header,
     );
     lines.push(Line::from(vec![
         addr_marker(&sender, selected),
@@ -416,7 +455,14 @@ fn build_header_lines(
         } else {
             theme::TX_HASH_STYLE
         };
-        record(&ch_item, lines.len(), line_map, &app.tx_detail.nav_items);
+        record(
+            &ch_item,
+            lines.len(),
+            line_map,
+            &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Header,
+        );
         let ch_marker = if selected == Some(&ch_item) {
             Span::styled("►", theme::VISUAL_SELECTED_STYLE)
         } else {
@@ -437,7 +483,14 @@ fn build_header_lines(
         } else {
             theme::TX_HASH_STYLE
         };
-        record(&ch_item, lines.len(), line_map, &app.tx_detail.nav_items);
+        record(
+            &ch_item,
+            lines.len(),
+            line_map,
+            &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Header,
+        );
         let ch_marker = if selected == Some(&ch_item) {
             Span::styled("►", theme::VISUAL_SELECTED_STYLE)
         } else {
@@ -482,6 +535,8 @@ fn build_header_lines(
                 lines.len(),
                 line_map,
                 &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Header,
             );
             lines.push(Line::from(vec![
                 addr_marker(addr, selected),
@@ -527,6 +582,8 @@ fn build_header_lines(
                 lines.len(),
                 line_map,
                 &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Header,
             );
             lines.push(Line::from(vec![
                 addr_marker(&call.contract_address, selected),
@@ -674,6 +731,8 @@ fn build_events_lines(
             lines.len(),
             line_map,
             &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Events,
         );
         lines.push(Line::from(vec![
             addr_marker(&group.contract_address, selected),
@@ -701,6 +760,8 @@ fn build_events_lines(
                 selected,
                 line_map,
                 &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Events,
                 &mut lines,
             );
         }
@@ -776,6 +837,8 @@ fn build_calls_lines(
             lines.len(),
             line_map,
             &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Calls,
         );
         lines.push(Line::from(vec![
             addr_marker(&call.contract_address, selected),
@@ -879,6 +942,8 @@ fn build_calls_lines(
                     lines.len(),
                     line_map,
                     &app.tx_detail.nav_items,
+                    &app.tx_detail.nav_sections,
+                    NavSection::Calls,
                 );
                 lines.push(Line::from(vec![
                     addr_marker(&inner_call.contract_address, selected),
@@ -960,6 +1025,7 @@ fn build_trace_lines(
             selected,
             line_map,
             &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
             &mut lines,
         );
         lines.push(Line::from(""));
@@ -979,6 +1045,7 @@ fn render_trace_call(
     selected: Option<&TxNavItem>,
     line_map: &mut [Option<u16>],
     nav_items: &[TxNavItem],
+    nav_sections: &[NavSection],
     lines: &mut Vec<Line<'static>>,
 ) {
     let branch = if is_last { "└─" } else { "├─" };
@@ -997,6 +1064,8 @@ fn render_trace_call(
         lines.len(),
         line_map,
         nav_items,
+        nav_sections,
+        NavSection::Trace,
     );
     let mut spans: Vec<Span<'static>> = vec![
         addr_marker(&call.contract_address, selected),
@@ -1105,6 +1174,8 @@ fn render_trace_call(
             selected,
             line_map,
             nav_items,
+            nav_sections,
+            NavSection::Trace,
             lines,
         );
         child_idx += 1;
@@ -1122,6 +1193,7 @@ fn render_trace_call(
             selected,
             line_map,
             nav_items,
+            nav_sections,
             lines,
         );
         child_idx += 1;
@@ -1139,6 +1211,8 @@ fn push_event_line(
     selected: Option<&TxNavItem>,
     line_map: &mut [Option<u16>],
     nav_items: &[TxNavItem],
+    nav_sections: &[NavSection],
+    section: NavSection,
     lines: &mut Vec<Line<'static>>,
 ) {
     let name = event.event_name.as_deref().unwrap_or("Unknown");
@@ -1165,6 +1239,8 @@ fn push_event_line(
                     lines.len(),
                     line_map,
                     nav_items,
+                    nav_sections,
+                    section,
                 );
             }
             let mut param_spans = param_display::format_param_styled(

@@ -902,7 +902,9 @@ impl App {
                 // away from (or replaced via a re-fetch).
                 let current_hash = self.tx_detail.transaction.as_ref().map(|t| t.hash());
                 if current_hash == Some(tx_hash) {
-                    self.tx_detail.trace = Some(trace);
+                    self.tx_detail.trace = trace;
+                    // Always clear the loading flag, even on failure (None) —
+                    // otherwise the Trace tab gets stuck on "loading…".
                     self.tx_detail.trace_loading = false;
                     // Rebuild nav so trace addresses become reachable in `v` mode.
                     self.build_tx_nav_items();

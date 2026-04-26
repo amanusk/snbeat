@@ -29,19 +29,23 @@ type SharedTxFut =
     Shared<Pin<Box<dyn Future<Output = std::result::Result<SnTransaction, String>> + Send>>>;
 type SharedRxFut =
     Shared<Pin<Box<dyn Future<Output = std::result::Result<SnReceipt, String>> + Send>>>;
+type SharedTraceFut =
+    Shared<Pin<Box<dyn Future<Output = std::result::Result<TransactionTrace, String>> + Send>>>;
 
 /// Persistent cache backed by SQLite + in-memory LRU.
 /// Wraps any DataSource: checks cache first, fetches from upstream on miss,
 /// writes through to cache on fetch. Persists across restarts.
 ///
-/// Also deduplicates concurrent in-flight `get_transaction` / `get_receipt`
-/// fetches so that N parallel callers for the same hash produce one RPC round
-/// trip, not N. Prevents the user-click-races-background-enrichment storm.
+/// Also deduplicates concurrent in-flight `get_transaction` / `get_receipt` /
+/// `get_trace` fetches so that N parallel callers for the same hash produce
+/// one RPC round trip, not N. Prevents the user-click-races-background-
+/// enrichment storm.
 pub struct CachingDataSource {
     upstream: Arc<dyn DataSource>,
     db: DbPool,
     pending_txs: Mutex<HashMap<Felt, SharedTxFut>>,
     pending_receipts: Mutex<HashMap<Felt, SharedRxFut>>,
+    pending_traces: Mutex<HashMap<Felt, SharedTraceFut>>,
 }
 
 impl CachingDataSource {
@@ -310,6 +314,7 @@ impl CachingDataSource {
             db: pool,
             pending_txs: Mutex::new(HashMap::new()),
             pending_receipts: Mutex::new(HashMap::new()),
+            pending_traces: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1154,10 +1159,44 @@ impl DataSource for CachingDataSource {
             trace!(tx_hash = %format!("{:#x}", hash), "cache hit: trace");
             return Ok(cached);
         }
-        debug!(tx_hash = %format!("{:#x}", hash), "cache miss: trace, fetching from RPC");
-        let fetched = self.upstream.get_trace(hash).await?;
-        self.cache_trace(hash, &fetched);
-        Ok(fetched)
+
+        // Coalesce concurrent misses on the same hash into one RPC, mirroring
+        // the get_transaction / get_receipt pattern. Trace fetches are
+        // expensive (recursive call tree, hundreds of ms), so a re-fetch race
+        // would otherwise issue several full traces before the first lands.
+        let fut = {
+            let mut pending = self.pending_traces.lock().unwrap();
+            if let Some(existing) = pending.get(&hash) {
+                trace!(tx_hash = %format!("{:#x}", hash), "dedup: joining in-flight trace fetch");
+                existing.clone()
+            } else {
+                debug!(tx_hash = %format!("{:#x}", hash), "cache miss: trace, fetching from RPC");
+                let upstream = Arc::clone(&self.upstream);
+                let fut: Pin<
+                    Box<dyn Future<Output = std::result::Result<TransactionTrace, String>> + Send>,
+                > = Box::pin(
+                    async move { upstream.get_trace(hash).await.map_err(|e| e.to_string()) },
+                );
+                let shared = fut.shared();
+                pending.insert(hash, shared.clone());
+                shared
+            }
+        };
+
+        let result = fut.await;
+
+        {
+            let mut pending = self.pending_traces.lock().unwrap();
+            pending.remove(&hash);
+        }
+
+        match result {
+            Ok(fetched) => {
+                self.cache_trace(hash, &fetched);
+                Ok(fetched)
+            }
+            Err(e) => Err(SnbeatError::Rpc(e)),
+        }
     }
 
     async fn get_events_for_address(
