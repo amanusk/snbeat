@@ -457,6 +457,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("   Nonce     ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
+        Span::styled("Contracts                     ", theme::SUGGESTION_STYLE),
         Span::styled("Endpoint(s)                    ", theme::SUGGESTION_STYLE),
         Span::styled("Fee(STRK)        ", theme::SUGGESTION_STYLE),
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
@@ -513,6 +514,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 tx.endpoint_names.clone()
             };
+            let contracts_display = format_called_contracts(app, &tx.called_contracts);
 
             let status_style = match tx.status.as_str() {
                 "OK" => theme::STATUS_OK,
@@ -535,6 +537,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{:<14}", short_hash(&tx.hash)),
                     theme::TX_HASH_STYLE,
                 ),
+                Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -598,6 +601,48 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, list_area, &mut app.address.txs.state);
+}
+
+/// Render the contracts-called column: up to the first two contract labels
+/// (registry/Voyager-resolved or short hex), followed by ` +N` for any
+/// remaining. Each label is truncated to share the 29-char content budget;
+/// any slack left by a short first label spills over to the second.
+fn format_called_contracts(app: &App, contracts: &[Felt]) -> String {
+    const BUDGET: usize = 29;
+    if contracts.is_empty() {
+        return String::new();
+    }
+    let labels: Vec<String> = contracts.iter().map(|c| app.format_address(c)).collect();
+    if labels.len() == 1 {
+        return truncate_to(&labels[0], BUDGET);
+    }
+    let extra = labels.len().saturating_sub(2);
+    let suffix = if extra > 0 {
+        format!(" +{extra}")
+    } else {
+        String::new()
+    };
+    const SEP: &str = ", ";
+    let usable = BUDGET.saturating_sub(suffix.chars().count() + SEP.len());
+    let a_budget = usable / 2;
+    let a = truncate_to(&labels[0], a_budget);
+    let b_budget = usable.saturating_sub(a.chars().count());
+    let b = truncate_to(&labels[1], b_budget);
+    format!("{a}{SEP}{b}{suffix}")
+}
+
+/// Truncate a label to fit `max` chars, appending `…` when shortened. Returns
+/// an empty string if `max` is 0 (caller is responsible for not asking for
+/// space it doesn't have).
+fn truncate_to(label: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let head: String = label.chars().take(max - 1).collect();
+    format!("{head}…")
 }
 
 fn format_age(timestamp: u64) -> String {

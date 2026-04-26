@@ -21,6 +21,7 @@ fn make_summary(
         tx_type: "INVOKE".to_string(),
         status: status.to_string(),
         sender: Some(Felt::from(0x1u64)),
+        called_contracts: Vec::new(),
     }
 }
 
@@ -151,6 +152,7 @@ fn filter_deployment_txs_separates_deploy() {
             tx_type: "DEPLOY_ACCOUNT".to_string(),
             status: "OK".to_string(),
             sender: Some(addr),
+            called_contracts: Vec::new(),
         },
         make_summary(0xaaa, 1, "OK", 100, "transfer"),
     ];

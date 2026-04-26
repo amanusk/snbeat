@@ -32,6 +32,28 @@ pub fn format_endpoint_names(tx: &SnTransaction, abi_reg: &AbiRegistry) -> Strin
     format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
 }
 
+/// Top-level contracts directly invoked by `tx`'s multicall, in first-seen
+/// order with duplicates removed. Empty for non-Invoke txs.
+pub fn tx_called_contracts(tx: &SnTransaction) -> Vec<Felt> {
+    let calls = match tx {
+        SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
+        _ => return Vec::new(),
+    };
+    dedupe_preserve_order(calls.into_iter().map(|c| c.contract_address))
+}
+
+/// Deduplicate while preserving first-seen order. Cheap O(n²) is fine for the
+/// handful of calls a typical multicall carries.
+fn dedupe_preserve_order(items: impl IntoIterator<Item = Felt>) -> Vec<Felt> {
+    let mut out: Vec<Felt> = Vec::new();
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// Resolve a selector to its ABI name, or a short hex fallback if unknown.
 /// Shared across per-call formatters so the fallback shape stays consistent.
 pub fn format_selector_name_or_hex(selector: &Felt, abi_reg: &AbiRegistry) -> String {
@@ -245,6 +267,7 @@ pub fn build_tx_summary(
     let status = receipt_status(receipt);
     let (nonce, tip) = extract_nonce_tip(tx);
     let endpoint_names = format_endpoint_names(tx, abi_reg);
+    let called_contracts = tx_called_contracts(tx);
 
     AddressTxSummary {
         hash,
@@ -257,6 +280,7 @@ pub fn build_tx_summary(
         tx_type: tx.type_name().to_string(),
         status,
         sender: Some(tx.sender()),
+        called_contracts,
     }
 }
 
@@ -291,16 +315,18 @@ pub fn build_tx_summary_from_pf_data(
     let tx_type = normalize_pf_tx_type(&pf_tx.tx_type);
 
     // Only INVOKE transactions have multicall calldata to decode.
-    let endpoint_names = if tx_type == "INVOKE" {
+    let (endpoint_names, called_contracts) = if tx_type == "INVOKE" {
         let calldata: Vec<Felt> = pf_tx
             .calldata
             .iter()
             .filter_map(|h| Felt::from_hex(h).ok())
             .collect();
         let calls = parse_multicall(&calldata);
-        format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
+        let names = format_selector_names(calls.iter().map(|c| c.selector), abi_reg);
+        let contracts = dedupe_preserve_order(calls.into_iter().map(|c| c.contract_address));
+        (names, contracts)
     } else {
-        String::new()
+        (String::new(), Vec::new())
     };
 
     Some(AddressTxSummary {
@@ -314,12 +340,13 @@ pub fn build_tx_summary_from_pf_data(
         tx_type,
         status: pf_tx.status.clone(),
         sender: Some(sender),
+        called_contracts,
     })
 }
 
 /// Collect the set of target contract addresses referenced by a pf tx's
 /// multicall calldata. Used to pre-warm the ABI registry before building
-/// summaries in bulk.
+/// summaries in bulk. Order-preserving and deduplicated.
 pub fn pf_tx_target_addresses(pf_tx: &TxByHashData) -> Vec<Felt> {
     if normalize_pf_tx_type(&pf_tx.tx_type) != "INVOKE" {
         return Vec::new();
@@ -329,10 +356,11 @@ pub fn pf_tx_target_addresses(pf_tx: &TxByHashData) -> Vec<Felt> {
         .iter()
         .filter_map(|h| Felt::from_hex(h).ok())
         .collect();
-    parse_multicall(&calldata)
-        .into_iter()
-        .map(|c| c.contract_address)
-        .collect()
+    dedupe_preserve_order(
+        parse_multicall(&calldata)
+            .into_iter()
+            .map(|c| c.contract_address),
+    )
 }
 
 /// Backfill timestamps on address tx summaries by fetching block data.

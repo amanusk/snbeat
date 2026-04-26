@@ -1284,6 +1284,7 @@ impl App {
                             tx_type: "DEPLOY".into(),
                             status: "OK".into(),
                             sender: None,
+                            called_contracts: Vec::new(),
                         });
                         self.build_address_nav_items();
                     }
