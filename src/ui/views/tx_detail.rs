@@ -1094,30 +1094,20 @@ fn render_trace_call(
         Span::styled(format!("{body_prefix}fn "), theme::BORDER_STYLE),
         Span::styled(fn_label, theme::TX_HASH_STYLE),
     ];
+    let prices = price::token_prices(app, &call.contract_address, app.tx_detail.block_timestamp);
     if let (Some(func_def), Some(abi)) = (&call.function_def, &call.contract_abi) {
         let decoded = calldata::decode_calldata(&call.calldata, &func_def.inputs, abi);
-        let prices =
-            price::token_prices(app, &call.contract_address, app.tx_detail.block_timestamp);
         fn_spans.push(Span::raw("("));
-        for (pi, p) in decoded.iter().enumerate() {
-            if pi > 0 {
-                fn_spans.push(Span::raw(", "));
-            }
-            if let Some(name) = &p.name {
-                fn_spans.push(Span::styled(format!("{name}: "), theme::SUGGESTION_STYLE));
-            }
-            render_value_spans(&p.value, app, color_map, selected, &mut fn_spans);
-            // USD pair if param matches a tracked token's u256 amount.
-            if let Some((amount, _)) =
-                decoded_value_token_amount(&p.value, &call.contract_address, registry)
-                && (prices.0.is_some() || prices.1.is_some())
-            {
-                fn_spans.push(Span::styled(
-                    format_usd_pair(amount, prices.0, prices.1),
-                    theme::SUGGESTION_STYLE,
-                ));
-            }
-        }
+        push_decoded_params_spans(
+            &decoded,
+            &call.contract_address,
+            app,
+            color_map,
+            registry,
+            selected,
+            prices,
+            &mut fn_spans,
+        );
         fn_spans.push(Span::raw(")"));
     } else {
         fn_spans.push(Span::styled(
@@ -1127,38 +1117,62 @@ fn render_trace_call(
     }
     lines.push(Line::from(fn_spans));
 
-    // Result line(s): raw felts (return-value decoding is a follow-up).
+    // Result line(s): decoded via ABI outputs when available, raw felts otherwise.
     if !call.result.is_empty() {
-        let limit = if app.tx_detail.expand_all {
-            call.result.len()
-        } else {
-            4
+        let mut result_spans: Vec<Span<'static>> = vec![Span::styled(
+            format!("{body_prefix}→ "),
+            theme::BORDER_STYLE,
+        )];
+
+        let decoded_results = match (&call.function_def, &call.contract_abi) {
+            (Some(func_def), Some(abi)) if !func_def.outputs.is_empty() => Some(
+                calldata::decode_results(&call.result, &func_def.outputs, abi),
+            ),
+            _ => None,
         };
-        let preview: Vec<String> = call
-            .result
-            .iter()
-            .take(limit)
-            .map(|f| format!("{:#x}", f))
-            .collect();
-        let extra = call.result.len().saturating_sub(preview.len());
-        let suffix = if extra > 0 {
-            format!(", … +{extra}")
+
+        if let Some(decoded) = decoded_results {
+            push_decoded_params_spans(
+                &decoded,
+                &call.contract_address,
+                app,
+                color_map,
+                registry,
+                selected,
+                prices,
+                &mut result_spans,
+            );
         } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{body_prefix}→ "), theme::BORDER_STYLE),
-            Span::styled(
+            // Fallback: raw felt preview (no ABI / void function with leftover felts).
+            let limit = if app.tx_detail.expand_all {
+                call.result.len()
+            } else {
+                4
+            };
+            let preview: Vec<String> = call
+                .result
+                .iter()
+                .take(limit)
+                .map(|f| format!("{:#x}", f))
+                .collect();
+            let extra = call.result.len().saturating_sub(preview.len());
+            let suffix = if extra > 0 {
+                format!(", … +{extra}")
+            } else {
+                String::new()
+            };
+            result_spans.push(Span::styled(
                 format!("[{}]{suffix}", preview.join(", ")),
                 theme::SUGGESTION_STYLE,
-            ),
-        ]));
+            ));
+        }
+
+        lines.push(Line::from(result_spans));
     }
 
     // Events + inner calls share the same child-list under this node, so
     // their tree branches share a column. Treat them as one combined list
     // when picking ├─ vs └─ so only the very last entry gets └─.
-    let prices = price::token_prices(app, &call.contract_address, app.tx_detail.block_timestamp);
     let total_children = call.events.len() + call.inner.len();
     let mut child_idx = 0usize;
     for event in call.events.iter() {
@@ -1292,6 +1306,40 @@ fn entry_type_str(t: EntryPointType) -> &'static str {
         EntryPointType::External => "EXTERNAL",
         EntryPointType::L1Handler => "L1_HANDLER",
         EntryPointType::Constructor => "CONSTRUCTOR",
+    }
+}
+
+/// Render a list of decoded params (calldata or return values) inline as
+/// comma-separated `name: value` (or just `value` when nameless), appending a
+/// USD pair to any u256 amount that resolves against the contract's tracked
+/// token. Shared by the fn-args and result lines so they format identically.
+#[allow(clippy::too_many_arguments)]
+fn push_decoded_params_spans(
+    decoded: &[calldata::DecodedCallParam],
+    contract_address: &Felt,
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    prices: (Option<f64>, Option<f64>),
+    spans: &mut Vec<Span<'static>>,
+) {
+    for (pi, p) in decoded.iter().enumerate() {
+        if pi > 0 {
+            spans.push(Span::raw(", "));
+        }
+        if let Some(name) = &p.name {
+            spans.push(Span::styled(format!("{name}: "), theme::SUGGESTION_STYLE));
+        }
+        render_value_spans(&p.value, app, color_map, selected, spans);
+        if let Some((amount, _)) = decoded_value_token_amount(&p.value, contract_address, registry)
+            && (prices.0.is_some() || prices.1.is_some())
+        {
+            spans.push(Span::styled(
+                format_usd_pair(amount, prices.0, prices.1),
+                theme::SUGGESTION_STYLE,
+            ));
+        }
     }
 }
 

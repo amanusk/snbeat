@@ -206,6 +206,41 @@ pub fn decode_calldata(
     result
 }
 
+/// Decode return-value felts using a function's ABI output types.
+///
+/// Outputs are stored as types only (Cairo functions don't name their return
+/// values), so each `DecodedCallParam` comes back with `name = None`. Trailing
+/// felts that the ABI didn't account for are returned as raw entries, mirroring
+/// `decode_calldata` so the UI can still surface them.
+pub fn decode_results(data: &[Felt], outputs: &[String], abi: &ParsedAbi) -> Vec<DecodedCallParam> {
+    let mut reader = BufferReader::new(data);
+    let mut result = Vec::with_capacity(outputs.len());
+
+    for type_name in outputs {
+        if reader.remaining() == 0 {
+            break;
+        }
+        let value = decode_type(type_name, abi, &mut reader);
+        result.push(DecodedCallParam {
+            name: None,
+            type_name: Some(type_name.clone()),
+            value,
+        });
+    }
+
+    while reader.remaining() > 0 {
+        if let Some(f) = reader.read_felt() {
+            result.push(DecodedCallParam {
+                name: None,
+                type_name: None,
+                value: DecodedValue::Raw(f),
+            });
+        }
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Recursive type decoder
 // ---------------------------------------------------------------------------
@@ -2168,5 +2203,65 @@ mod tests {
                 result[1].value
             ),
         }
+    }
+
+    // ===== RESULT (RETURN-VALUE) DECODING =====
+
+    fn decode_res(felts: &[Felt], outputs: &[&str], abi: &ParsedAbi) -> Vec<DecodedCallParam> {
+        let outputs: Vec<String> = outputs.iter().map(|s| s.to_string()).collect();
+        decode_results(felts, &outputs, abi)
+    }
+
+    #[test]
+    fn test_results_single_bool() {
+        // ERC20::transfer returns bool
+        let felts = [Felt::from(1u64)];
+        let result = decode_res(&felts, &["core::bool"], &empty_abi());
+        assert_eq!(result.len(), 1);
+        assert!(result[0].name.is_none());
+        assert_eq!(result[0].type_name.as_deref(), Some("core::bool"));
+        assert!(matches!(&result[0].value, DecodedValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_results_single_u256() {
+        // ERC20::balanceOf returns u256
+        let felts = [Felt::from(1_000u64), Felt::ZERO];
+        let result = decode_res(&felts, &["core::integer::u256"], &empty_abi());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            &result[0].value,
+            DecodedValue::U256 { low: 1000, high: 0 }
+        ));
+    }
+
+    #[test]
+    fn test_results_multiple_outputs() {
+        // Two scalar outputs
+        let felts = [Felt::from(7u64), Felt::from(42u64)];
+        let result = decode_res(
+            &felts,
+            &["core::integer::u64", "core::integer::u64"],
+            &empty_abi(),
+        );
+        assert_eq!(result.len(), 2);
+        assert!(matches!(&result[0].value, DecodedValue::Uint(7)));
+        assert!(matches!(&result[1].value, DecodedValue::Uint(42)));
+    }
+
+    #[test]
+    fn test_results_empty_outputs_falls_back_to_raw() {
+        // No declared outputs but result felts present — preserve them as raw entries
+        let felts = [Felt::from(0xabcu64), Felt::from(0xdefu64)];
+        let result = decode_res(&felts, &[], &empty_abi());
+        assert_eq!(result.len(), 2);
+        assert!(matches!(&result[0].value, DecodedValue::Raw(_)));
+        assert!(matches!(&result[1].value, DecodedValue::Raw(_)));
+    }
+
+    #[test]
+    fn test_results_no_outputs_no_data() {
+        let result = decode_res(&[], &[], &empty_abi());
+        assert!(result.is_empty());
     }
 }
