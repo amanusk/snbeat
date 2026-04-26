@@ -38,10 +38,12 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
         height: area.height.saturating_sub(1),
         ..area
     };
+    // Headers must offset by 4 chars to align under list content:
+    // 1 char for the block's left border + 3 chars reserved for highlight_symbol.
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" Block     ", theme::SUGGESTION_STYLE),
-        Span::styled("Hash          ", theme::SUGGESTION_STYLE),
-        Span::styled("Txs  ", theme::SUGGESTION_STYLE),
+        Span::styled("     Block    ", theme::SUGGESTION_STYLE),
+        Span::styled(" Hash         ", theme::SUGGESTION_STYLE),
+        Span::styled("Txs     ", theme::SUGGESTION_STYLE),
         Span::styled("Age       ", theme::SUGGESTION_STYLE),
         Span::styled("L2 Gas Price      ", theme::SUGGESTION_STYLE),
         Span::styled("L1 Gas Price      ", theme::SUGGESTION_STYLE),
