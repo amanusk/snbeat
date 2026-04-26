@@ -1,30 +1,30 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use starknet::core::types::Felt;
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
+use starknet::core::types::{CallType, EntryPointType, Felt};
 
 use crate::app::App;
 use crate::app::state::TxNavItem;
+use crate::app::views::tx_detail::TxTab;
 use crate::data::types::{ExecutionStatus, SnTransaction};
 use crate::decode::calldata::{self, DecodedValue};
-use crate::decode::events::DecodedParam;
+use crate::decode::events::{DecodedEvent, DecodedParam};
 use crate::decode::functions::RawCall;
 use crate::decode::outside_execution;
+use crate::decode::trace::DecodedTraceCall;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
 use crate::ui::widgets::{param_display, price, search_bar, status_bar};
 use crate::utils::felt_to_u128;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1), // search bar
-        Constraint::Min(3),    // scrollable tx detail + events
-        Constraint::Length(1), // status bar
-    ])
-    .split(f.area());
+/// Cap of top-level multicall entries shown in the fixed header before
+/// collapsing the rest into a "... and N more" line.
+const HEADER_CALLS_PREVIEW: usize = 4;
 
+pub fn draw(f: &mut Frame, app: &mut App) {
     let selected: Option<TxNavItem> = if app.tx_detail.visual_mode {
         app.tx_detail
             .nav_items
@@ -33,48 +33,213 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         None
     };
-    search_bar::draw_input(f, app, chunks[0]);
-    let nav_line_map = draw_scrollable_detail(f, app, chunks[1], selected.as_ref());
-    app.tx_detail.nav_item_lines = nav_line_map;
-    status_bar::draw(f, app, chunks[2]);
 
+    if app.tx_detail.transaction.is_none() {
+        let chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+        search_bar::draw_input(f, app, chunks[0]);
+        f.render_widget(
+            Paragraph::new(" Loading transaction...").style(theme::STATUS_LOADING),
+            chunks[1],
+        );
+        status_bar::draw(f, app, chunks[2]);
+        search_bar::draw_dropdown(f, app, chunks[0]);
+        return;
+    }
+
+    let color_map = build_color_map(app);
+    let mut line_map: Vec<Option<u16>> = vec![None; app.tx_detail.nav_items.len()];
+
+    // Build line buffers for header + every tab body up front. Header always
+    // renders; bodies are computed for all three tabs every frame so visual-mode
+    // tab-switches see up-to-date line offsets for the destination tab — without
+    // this, the first `j` after a tab switch would scroll to a stale offset.
+    let header_lines = build_header_lines(app, &color_map, selected.as_ref(), &mut line_map);
+    let events_lines = build_events_lines(app, &color_map, selected.as_ref(), &mut line_map);
+    let calls_lines = build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map);
+    let trace_lines = build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map);
+
+    let header_height = (header_lines.len() as u16).saturating_add(2); // borders
+    // Header is fixed-content; clamp to ~60% of screen so tab body always
+    // gets at least a few rows on small terminals. The tab body Min(5) below
+    // works in tandem with this clamp.
+    let max_header = (f.area().height.saturating_sub(4) * 6 / 10).max(5);
+    let header_height = header_height.min(max_header);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),             // search bar
+        Constraint::Length(header_height), // fixed header
+        Constraint::Length(1),             // tabs bar
+        Constraint::Min(5),                // tab body (scrollable)
+        Constraint::Length(1),             // status bar
+    ])
+    .split(f.area());
+
+    search_bar::draw_input(f, app, chunks[0]);
+    draw_header_panel(f, header_lines, chunks[1]);
+    draw_tabs_bar(f, app, chunks[2]);
+    draw_active_tab_body(f, app, chunks[3], events_lines, calls_lines, trace_lines);
+    status_bar::draw(f, app, chunks[4]);
+
+    app.tx_detail.nav_item_lines = line_map.into_iter().map(|o| o.unwrap_or(0)).collect();
     search_bar::draw_dropdown(f, app, chunks[0]);
 }
 
-/// Returns the first-line index for each nav item in `app.tx_detail.nav_items` (same order).
-fn draw_scrollable_detail(
+fn draw_header_panel(f: &mut Frame, lines: Vec<Line<'static>>, area: Rect) {
+    let widget = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::BORDER_FOCUSED_STYLE)
+                .title(Span::styled(" Transaction ", theme::TITLE_STYLE)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(widget, area);
+}
+
+fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
+    let events_count = app.tx_detail.decoded_events.len();
+    let calls_count = app.tx_detail.decoded_calls.len();
+    let trace_count = app
+        .tx_detail
+        .trace
+        .as_ref()
+        .map(|t| {
+            let mut n = 0usize;
+            t.for_each_call(|_| n += 1);
+            n
+        })
+        .unwrap_or(0);
+    let trace_label = if app.tx_detail.trace.is_some() {
+        format!("Trace ({trace_count})")
+    } else if app.tx_detail.trace_loading {
+        "Trace (loading…)".to_string()
+    } else {
+        "Trace".to_string()
+    };
+    let titles = vec![
+        Span::raw(format!(" Events ({events_count}) ")),
+        Span::raw(format!(" Calls ({calls_count}) ")),
+        Span::raw(format!(" {trace_label} ")),
+    ];
+    let selected = match app.tx_detail.active_tab {
+        TxTab::Events => 0,
+        TxTab::Calls => 1,
+        TxTab::Trace => 2,
+    };
+    // Active tab uses a filled background for high contrast — much more
+    // visible than the default underline at-a-glance.
+    let highlight = ratatui::style::Style::new()
+        .fg(ratatui::style::Color::Black)
+        .bg(ratatui::style::Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .style(theme::SUGGESTION_STYLE)
+        .highlight_style(highlight)
+        .divider(Span::styled("·", theme::BORDER_STYLE))
+        .padding("", "");
+    f.render_widget(tabs, area);
+}
+
+fn draw_active_tab_body(
     f: &mut Frame,
     app: &App,
-    area: ratatui::layout::Rect,
+    area: Rect,
+    events_lines: Vec<Line<'static>>,
+    calls_lines: Vec<Line<'static>>,
+    trace_lines: Vec<Line<'static>>,
+) {
+    let (lines, scroll, title) = match app.tx_detail.active_tab {
+        TxTab::Events => (
+            events_lines,
+            app.tx_detail.events_scroll,
+            " Events (j/k: scroll · v: visual · Tab: next) ",
+        ),
+        TxTab::Calls => (
+            calls_lines,
+            app.tx_detail.calls_scroll,
+            " Calls (c: raw · d: decode · o: intent · e: expand · Tab: next) ",
+        ),
+        TxTab::Trace => (
+            trace_lines,
+            app.tx_detail.trace_scroll,
+            " Trace (j/k: scroll · v: visual · e: expand · Tab: next) ",
+        ),
+    };
+    let widget = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::BORDER_FOCUSED_STYLE)
+                .title(Span::styled(title, theme::TITLE_STYLE)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(widget, area);
+}
+
+/// Address formatting that honours the `e` (expand_all) toggle.
+/// When expand_all is on we always show the full hex; if the address has a
+/// label (registry or Voyager-sourced), we append `(label)` after the hex
+/// so the tag is still visible — the user gets both pieces of info on one
+/// line and can copy the full hex without losing the human-readable name.
+fn format_addr_expanded(app: &App, felt: &Felt) -> String {
+    let full = format!("{:#x}", felt);
+    if let Some(engine) = &app.search_engine
+        && let Some(name) = engine.registry().resolve(felt)
+    {
+        return format!("{full} ({name})");
+    }
+    if let Some(label) = app.voyager_labels.get(felt)
+        && let Some(name) = &label.name
+    {
+        return format!("{full} ({name})");
+    }
+    full
+}
+
+/// `format_address` with expand-all override.
+fn fmt_addr(app: &App, felt: &Felt) -> String {
+    if app.tx_detail.expand_all {
+        format_addr_expanded(app, felt)
+    } else {
+        app.format_address(felt)
+    }
+}
+
+/// `format_address_full` with expand-all override.
+fn fmt_addr_full(app: &App, felt: &Felt) -> String {
+    if app.tx_detail.expand_all {
+        format_addr_expanded(app, felt)
+    } else {
+        app.format_address_full(felt)
+    }
+}
+
+/// Record `item`'s first-occurrence line position into `map` (if not already set).
+fn record(item: &TxNavItem, cur_line: usize, map: &mut [Option<u16>], nav: &[TxNavItem]) {
+    if let Some(idx) = nav.iter().position(|x| x == item) {
+        map[idx].get_or_insert(cur_line as u16);
+    }
+}
+
+/// Build the fixed header lines (tx metadata, status, top-level calls preview, fee).
+fn build_header_lines(
+    app: &App,
+    color_map: &AddressColorMap,
     selected: Option<&TxNavItem>,
-) -> Vec<u16> {
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let tx = match &app.tx_detail.transaction {
         Some(t) => t,
-        None => {
-            f.render_widget(
-                Paragraph::new(" Loading transaction...").style(theme::STATUS_LOADING),
-                area,
-            );
-            return vec![];
-        }
+        None => return lines,
     };
-
-    // Build the address color map for this tx view.
-    // Registration order determines slot (= color). Sender is always slot 0.
-    let color_map = build_color_map(app);
-    let registry = app.search_engine.as_ref().map(|e| e.registry());
-
-    let mut lines: Vec<Line> = Vec::new();
-    // Tracks the first line index where each TxNavItem appears (same order as app.tx_detail.nav_items).
-    let mut line_map: Vec<Option<u16>> = vec![None; app.tx_detail.nav_items.len()];
-
-    // Record the current line count as the first occurrence of `item` (if not already recorded).
-    let record =
-        |item: &TxNavItem, lines: &Vec<Line>, map: &mut Vec<Option<u16>>, nav: &[TxNavItem]| {
-            if let Some(idx) = nav.iter().position(|x| x == item) {
-                map[idx].get_or_insert(lines.len() as u16);
-            }
-        };
 
     // === TX HEADER ===
     lines.push(Line::from(vec![
@@ -126,8 +291,8 @@ fn draw_scrollable_detail(
         .unwrap_or_default();
     record(
         &TxNavItem::Block(blk_num),
-        &lines,
-        &mut line_map,
+        lines.len(),
+        line_map,
         &app.tx_detail.nav_items,
     );
     lines.push(Line::from(vec![
@@ -156,11 +321,11 @@ fn draw_scrollable_detail(
     // META TX indicator for outside executions
     if !app.tx_detail.outside_executions.is_empty() {
         for (_, oe) in &app.tx_detail.outside_executions {
-            let intender_style = addr_style(&oe.intender, &color_map, selected);
+            let intender_style = addr_style(&oe.intender, color_map, selected);
             record(
                 &TxNavItem::Address(oe.intender),
-                &lines,
-                &mut line_map,
+                lines.len(),
+                line_map,
                 &app.tx_detail.nav_items,
             );
             lines.push(Line::from(vec![
@@ -168,7 +333,7 @@ fn draw_scrollable_detail(
                 Span::styled("Meta:   ", theme::NORMAL_STYLE),
                 Span::styled(format!("META TX ({})", oe.version), theme::META_TX_STYLE),
                 Span::styled("  Intender: ", theme::NORMAL_STYLE),
-                Span::styled(app.format_address_full(&oe.intender), intender_style),
+                Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
                 Span::styled(format!("  Nonce: {:#x}", oe.nonce), theme::SUGGESTION_STYLE),
             ]));
             lines.push(Line::from(vec![
@@ -190,17 +355,17 @@ fn draw_scrollable_detail(
             )
         })
         .unwrap_or_else(|| "N/A".into());
-    let sender_style = addr_style(&sender, &color_map, selected);
+    let sender_style = addr_style(&sender, color_map, selected);
     record(
         &TxNavItem::Address(sender),
-        &lines,
-        &mut line_map,
+        lines.len(),
+        line_map,
         &app.tx_detail.nav_items,
     );
     lines.push(Line::from(vec![
         addr_marker(&sender, selected),
         Span::styled("Sender: ", theme::NORMAL_STYLE),
-        Span::styled(app.format_address_full(&sender), sender_style),
+        Span::styled(fmt_addr_full(app, &sender), sender_style),
         Span::styled(format!("  Nonce: {}", nonce_str), theme::NORMAL_STYLE),
     ]));
     lines.push(Line::from(vec![
@@ -216,7 +381,7 @@ fn draw_scrollable_detail(
         } else {
             theme::TX_HASH_STYLE
         };
-        record(&ch_item, &lines, &mut line_map, &app.tx_detail.nav_items);
+        record(&ch_item, lines.len(), line_map, &app.tx_detail.nav_items);
         let ch_marker = if selected == Some(&ch_item) {
             Span::styled("►", theme::VISUAL_SELECTED_STYLE)
         } else {
@@ -237,7 +402,7 @@ fn draw_scrollable_detail(
         } else {
             theme::TX_HASH_STYLE
         };
-        record(&ch_item, &lines, &mut line_map, &app.tx_detail.nav_items);
+        record(&ch_item, lines.len(), line_map, &app.tx_detail.nav_items);
         let ch_marker = if selected == Some(&ch_item) {
             Span::styled("►", theme::VISUAL_SELECTED_STYLE)
         } else {
@@ -279,17 +444,17 @@ fn draw_scrollable_detail(
             theme::TITLE_STYLE,
         )));
         for addr in &deployed_addrs {
-            let style = addr_style(addr, &color_map, selected);
+            let style = addr_style(addr, color_map, selected);
             record(
                 &TxNavItem::Address(*addr),
-                &lines,
-                &mut line_map,
+                lines.len(),
+                line_map,
                 &app.tx_detail.nav_items,
             );
             lines.push(Line::from(vec![
                 addr_marker(addr, selected),
                 Span::styled("  ", theme::NORMAL_STYLE),
-                Span::styled(app.format_address_full(addr), style),
+                Span::styled(fmt_addr_full(app, addr), style),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("   "),
@@ -298,34 +463,23 @@ fn draw_scrollable_detail(
         }
     }
 
-    // === DECODED CALLS ===
+    // === TOP-LEVEL CALLS PREVIEW (compact) ===
+    // Show up to HEADER_CALLS_PREVIEW top-level multicall entries as a quick
+    // glance; the full list with c/d/o toggles lives in the Calls tab.
     if !app.tx_detail.decoded_calls.is_empty() {
         lines.push(Line::from(""));
-        let has_oe = !app.tx_detail.outside_executions.is_empty();
-        let oe_hint = if has_oe {
-            if app.tx_detail.show_outside_execution {
-                " [o: hide intent]"
-            } else {
-                " [o: intent]"
-            }
-        } else {
-            ""
-        };
-        let calldata_hint = if app.tx_detail.show_decoded_calldata {
-            format!(" [d: hide decoded] [c: raw]{oe_hint}")
-        } else if app.tx_detail.show_calldata {
-            format!(" [c: hide calldata] [d: decode]{oe_hint}")
-        } else {
-            format!(" [c: raw calldata] [d: decode]{oe_hint}")
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" Calls ({})", app.tx_detail.decoded_calls.len()),
-                theme::TITLE_STYLE,
-            ),
-            Span::styled(calldata_hint, theme::SUGGESTION_STYLE),
-        ]));
-        for (i, call) in app.tx_detail.decoded_calls.iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!(" Calls ({})", app.tx_detail.decoded_calls.len()),
+            theme::TITLE_STYLE,
+        )));
+        let preview_n = app.tx_detail.decoded_calls.len().min(HEADER_CALLS_PREVIEW);
+        for (i, call) in app
+            .tx_detail
+            .decoded_calls
+            .iter()
+            .take(preview_n)
+            .enumerate()
+        {
             let display_name = call.function_name.clone().unwrap_or_else(|| {
                 let hex = format!("{:#x}", call.selector);
                 if hex.len() > 18 {
@@ -334,12 +488,12 @@ fn draw_scrollable_detail(
                     hex
                 }
             });
-            let target = app.format_address(&call.contract_address);
-            let contract_style = addr_style(&call.contract_address, &color_map, selected);
+            let target = fmt_addr(app, &call.contract_address);
+            let contract_style = addr_style(&call.contract_address, color_map, selected);
             record(
                 &TxNavItem::Address(call.contract_address),
-                &lines,
-                &mut line_map,
+                lines.len(),
+                line_map,
                 &app.tx_detail.nav_items,
             );
             lines.push(Line::from(vec![
@@ -353,121 +507,13 @@ fn draw_scrollable_detail(
                     theme::SUGGESTION_STYLE,
                 ),
             ]));
-            // Inline annotation for outside execution calls
-            if let Some((_, oe)) = app
-                .tx_detail
-                .outside_executions
-                .iter()
-                .find(|(idx, _)| *idx == i)
-            {
-                let caller_str = outside_execution::format_caller(&oe.caller);
-                lines.push(Line::from(vec![
-                    Span::raw("        "),
-                    Span::styled(
-                        format!("Outside Execution ({})", oe.version),
-                        theme::META_TX_STYLE,
-                    ),
-                    Span::styled(
-                        format!(
-                            "  nonce: {:#x}  caller: {}  inner calls: {}",
-                            oe.nonce,
-                            caller_str,
-                            oe.inner_calls.len()
-                        ),
-                        theme::SUGGESTION_STYLE,
-                    ),
-                ]));
-            }
-            if app.tx_detail.show_decoded_calldata {
-                render_decoded_calldata(call, app, &color_map, selected, &mut lines);
-            } else if app.tx_detail.show_calldata {
-                for (di, felt) in call.data.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::raw("        "),
-                        Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
-                    ]));
-                }
-            }
         }
-    }
-
-    // === OUTSIDE EXECUTION INTENT (toggled with `o`) ===
-    if app.tx_detail.show_outside_execution && !app.tx_detail.outside_executions.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(" Outside Execution Intent", theme::TITLE_STYLE),
-            Span::styled(" [o: hide]", theme::SUGGESTION_STYLE),
-        ]));
-        for (_, oe) in &app.tx_detail.outside_executions {
-            let intender_style = addr_style(&oe.intender, &color_map, selected);
-            let caller_str = outside_execution::format_caller(&oe.caller);
-            lines.push(Line::from(vec![
-                Span::styled("   Intender: ", theme::NORMAL_STYLE),
-                Span::styled(app.format_address_full(&oe.intender), intender_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("             "),
-                Span::styled(format!("{:#x}", oe.intender), intender_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Caller:   ", theme::NORMAL_STYLE),
-                Span::raw(caller_str),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
-                Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Window:   ", theme::NORMAL_STYLE),
-                Span::raw(format!(
-                    "after: {}  before: {}",
-                    oe.execute_after, oe.execute_before
-                )),
-            ]));
-            lines.push(Line::from(""));
+        let remaining = app.tx_detail.decoded_calls.len().saturating_sub(preview_n);
+        if remaining > 0 {
             lines.push(Line::from(Span::styled(
-                format!("   Inner Calls ({})", oe.inner_calls.len()),
-                theme::TITLE_STYLE,
+                format!("    … and {remaining} more (Calls tab)"),
+                theme::SUGGESTION_STYLE,
             )));
-            for (ci, inner_call) in oe.inner_calls.iter().enumerate() {
-                let inner_name = inner_call.function_name.clone().unwrap_or_else(|| {
-                    let hex = format!("{:#x}", inner_call.selector);
-                    if hex.len() > 18 {
-                        format!("{}…", &hex[..18])
-                    } else {
-                        hex
-                    }
-                });
-                let inner_target = app.format_address(&inner_call.contract_address);
-                let inner_style = addr_style(&inner_call.contract_address, &color_map, selected);
-                record(
-                    &TxNavItem::Address(inner_call.contract_address),
-                    &lines,
-                    &mut line_map,
-                    &app.tx_detail.nav_items,
-                );
-                lines.push(Line::from(vec![
-                    addr_marker(&inner_call.contract_address, selected),
-                    Span::styled(format!("    {ci}: "), theme::NORMAL_STYLE),
-                    Span::styled(format!("{:<20}", inner_target), inner_style),
-                    Span::raw(" → "),
-                    Span::styled(inner_name, theme::TX_HASH_STYLE),
-                    Span::styled(
-                        format!(" ({} args)", inner_call.data.len()),
-                        theme::SUGGESTION_STYLE,
-                    ),
-                ]));
-                if app.tx_detail.show_decoded_calldata {
-                    render_decoded_calldata(inner_call, app, &color_map, selected, &mut lines);
-                } else if app.tx_detail.show_calldata {
-                    for (di, felt) in inner_call.data.iter().enumerate() {
-                        lines.push(Line::from(vec![
-                            Span::raw("          "),
-                            Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
-                        ]));
-                    }
-                }
-            }
         }
     }
 
@@ -562,27 +608,39 @@ fn draw_scrollable_detail(
         ))]));
     }
 
-    // === EVENTS ===
-    lines.push(Line::from(""));
-    let event_count = app.tx_detail.decoded_events.len();
-    lines.push(Line::from(Span::styled(
-        format!(" Events ({event_count})"),
-        theme::TITLE_STYLE,
-    )));
+    lines
+}
 
-    // Group events by contract
+/// Build the Events tab body: group decoded events by contract and render
+/// each event with its decoded params + USD pricing where applicable.
+fn build_events_lines(
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+
     let groups = crate::decode::events::group_events_by_contract(&app.tx_detail.decoded_events);
+    if groups.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no events)",
+            theme::SUGGESTION_STYLE,
+        )));
+        return lines;
+    }
     for (gi, group) in groups.iter().enumerate() {
         let is_last_group = gi == groups.len() - 1;
         let branch = if is_last_group { "└─" } else { "├─" };
         let continuation = if is_last_group { "   " } else { "│  " };
 
-        let contract_label = app.format_address_full(&group.contract_address);
-        let contract_style = addr_style(&group.contract_address, &color_map, selected);
+        let contract_label = fmt_addr_full(app, &group.contract_address);
+        let contract_style = addr_style(&group.contract_address, color_map, selected);
         record(
             &TxNavItem::Address(group.contract_address),
-            &lines,
-            &mut line_map,
+            lines.len(),
+            line_map,
             &app.tx_detail.nav_items,
         );
         lines.push(Line::from(vec![
@@ -595,100 +653,565 @@ fn draw_scrollable_detail(
             ),
         ]));
 
-        // One price lookup per event contract — params share the same address.
         let event_prices =
             price::token_prices(app, &group.contract_address, app.tx_detail.block_timestamp);
 
         for (ei, event) in group.events.iter().enumerate() {
             let is_last = ei == group.events.len() - 1;
             let eb = if is_last { "└─" } else { "├─" };
-            let name = event.event_name.as_deref().unwrap_or("Unknown");
+            push_event_line(
+                event,
+                &format!(" {continuation}{eb} "),
+                event_prices,
+                app,
+                color_map,
+                registry,
+                selected,
+                line_map,
+                &app.tx_detail.nav_items,
+                &mut lines,
+            );
+        }
+    }
+    lines
+}
 
-            let all_params: Vec<&DecodedParam> = event
-                .decoded_keys
-                .iter()
-                .chain(event.decoded_data.iter())
-                .collect();
+/// Build the Calls tab body: full multicall list with c/d/o toggles, plus
+/// the Outside Execution Intent expansion when toggled on.
+fn build_calls_lines(
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-            let mut event_spans: Vec<Span<'static>> = vec![Span::styled(
-                format!(" {continuation}{eb} "),
-                theme::BORDER_STYLE,
-            )];
+    if app.tx_detail.decoded_calls.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no calls)",
+            theme::SUGGESTION_STYLE,
+        )));
+        return lines;
+    }
 
-            if all_params.is_empty() {
-                event_spans.push(Span::raw(name.to_string()));
+    let has_oe = !app.tx_detail.outside_executions.is_empty();
+    // `e` is a master switch: when on, it forces decoded calldata and
+    // outside-exec intent on regardless of `d`/`o`.
+    let effective_decoded = app.tx_detail.show_decoded_calldata || app.tx_detail.expand_all;
+    let effective_outside = app.tx_detail.show_outside_execution || app.tx_detail.expand_all;
+    let oe_hint = if has_oe {
+        if effective_outside {
+            " [o: hide intent]"
+        } else {
+            " [o: intent]"
+        }
+    } else {
+        ""
+    };
+    let expand_hint = if app.tx_detail.expand_all {
+        " [e: collapse]"
+    } else {
+        " [e: expand]"
+    };
+    let calldata_hint = if effective_decoded {
+        format!(" [d: hide decoded] [c: raw]{oe_hint}{expand_hint}")
+    } else if app.tx_detail.show_calldata {
+        format!(" [c: hide calldata] [d: decode]{oe_hint}{expand_hint}")
+    } else {
+        format!(" [c: raw calldata] [d: decode]{oe_hint}{expand_hint}")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" Calls ({})", app.tx_detail.decoded_calls.len()),
+            theme::TITLE_STYLE,
+        ),
+        Span::styled(calldata_hint, theme::SUGGESTION_STYLE),
+    ]));
+
+    for (i, call) in app.tx_detail.decoded_calls.iter().enumerate() {
+        let display_name = call.function_name.clone().unwrap_or_else(|| {
+            let hex = format!("{:#x}", call.selector);
+            if !app.tx_detail.expand_all && hex.len() > 18 {
+                format!("{}…", &hex[..18])
             } else {
-                event_spans.push(Span::raw(format!("{name}(")));
-                for (pi, p) in all_params.iter().enumerate() {
-                    // Record address-typed params before the event line is pushed.
-                    if p.type_name
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("ContractAddress")
-                    {
-                        record(
-                            &TxNavItem::Address(p.value),
-                            &lines,
-                            &mut line_map,
-                            &app.tx_detail.nav_items,
-                        );
-                    }
-                    let mut param_spans = param_display::format_param_styled(
-                        p,
-                        &event.contract_address,
-                        registry,
-                        &color_map,
-                        selected,
-                        &|a| app.format_address(a),
-                    );
-                    event_spans.append(&mut param_spans);
-                    let (today, historic) = event_prices;
-                    if (today.is_some() || historic.is_some())
-                        && let Some((amount, _)) =
-                            price::token_amount_from_param(p, &event.contract_address, registry)
-                    {
-                        event_spans.push(Span::styled(
-                            format_usd_pair(amount, today, historic),
-                            theme::SUGGESTION_STYLE,
-                        ));
-                    }
-                    if pi < all_params.len() - 1 {
-                        event_spans.push(Span::raw(", "));
-                    }
-                }
-                event_spans.push(Span::raw(")"));
+                hex
             }
-
-            lines.push(Line::from(event_spans));
+        });
+        let target = fmt_addr(app, &call.contract_address);
+        let contract_style = addr_style(&call.contract_address, color_map, selected);
+        record(
+            &TxNavItem::Address(call.contract_address),
+            lines.len(),
+            line_map,
+            &app.tx_detail.nav_items,
+        );
+        lines.push(Line::from(vec![
+            addr_marker(&call.contract_address, selected),
+            Span::styled(format!("  {i}: "), theme::NORMAL_STYLE),
+            Span::styled(format!("{:<20}", target), contract_style),
+            Span::raw(" → "),
+            Span::styled(display_name, theme::TX_HASH_STYLE),
+            Span::styled(
+                format!(" ({} args)", call.data.len()),
+                theme::SUGGESTION_STYLE,
+            ),
+        ]));
+        // Inline annotation for outside execution calls
+        if let Some((_, oe)) = app
+            .tx_detail
+            .outside_executions
+            .iter()
+            .find(|(idx, _)| *idx == i)
+        {
+            let caller_str = outside_execution::format_caller(&oe.caller);
+            lines.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!("Outside Execution ({})", oe.version),
+                    theme::META_TX_STYLE,
+                ),
+                Span::styled(
+                    format!(
+                        "  nonce: {:#x}  caller: {}  inner calls: {}",
+                        oe.nonce,
+                        caller_str,
+                        oe.inner_calls.len()
+                    ),
+                    theme::SUGGESTION_STYLE,
+                ),
+            ]));
+        }
+        if effective_decoded {
+            render_decoded_calldata(call, app, color_map, selected, &mut lines);
+        } else if app.tx_detail.show_calldata {
+            for (di, felt) in call.data.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
+                ]));
+            }
         }
     }
 
-    if app.tx_detail.decoded_events.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   (no events)",
-            theme::SUGGESTION_STYLE,
-        )));
+    // === OUTSIDE EXECUTION INTENT (toggled with `o`, or forced by `e`) ===
+    if effective_outside && !app.tx_detail.outside_executions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" Outside Execution Intent", theme::TITLE_STYLE),
+            Span::styled(" [o: hide]", theme::SUGGESTION_STYLE),
+        ]));
+        for (_, oe) in &app.tx_detail.outside_executions {
+            let intender_style = addr_style(&oe.intender, color_map, selected);
+            let caller_str = outside_execution::format_caller(&oe.caller);
+            lines.push(Line::from(vec![
+                Span::styled("   Intender: ", theme::NORMAL_STYLE),
+                Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("             "),
+                Span::styled(format!("{:#x}", oe.intender), intender_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Caller:   ", theme::NORMAL_STYLE),
+                Span::raw(caller_str),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
+                Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   Window:   ", theme::NORMAL_STYLE),
+                Span::raw(format!(
+                    "after: {}  before: {}",
+                    oe.execute_after, oe.execute_before
+                )),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("   Inner Calls ({})", oe.inner_calls.len()),
+                theme::TITLE_STYLE,
+            )));
+            for (ci, inner_call) in oe.inner_calls.iter().enumerate() {
+                let inner_name = inner_call.function_name.clone().unwrap_or_else(|| {
+                    let hex = format!("{:#x}", inner_call.selector);
+                    if !app.tx_detail.expand_all && hex.len() > 18 {
+                        format!("{}…", &hex[..18])
+                    } else {
+                        hex
+                    }
+                });
+                let inner_target = fmt_addr(app, &inner_call.contract_address);
+                let inner_style = addr_style(&inner_call.contract_address, color_map, selected);
+                record(
+                    &TxNavItem::Address(inner_call.contract_address),
+                    lines.len(),
+                    line_map,
+                    &app.tx_detail.nav_items,
+                );
+                lines.push(Line::from(vec![
+                    addr_marker(&inner_call.contract_address, selected),
+                    Span::styled(format!("    {ci}: "), theme::NORMAL_STYLE),
+                    Span::styled(format!("{:<20}", inner_target), inner_style),
+                    Span::raw(" → "),
+                    Span::styled(inner_name, theme::TX_HASH_STYLE),
+                    Span::styled(
+                        format!(" ({} args)", inner_call.data.len()),
+                        theme::SUGGESTION_STYLE,
+                    ),
+                ]));
+                if effective_decoded {
+                    render_decoded_calldata(inner_call, app, color_map, selected, &mut lines);
+                } else if app.tx_detail.show_calldata {
+                    for (di, felt) in inner_call.data.iter().enumerate() {
+                        lines.push(Line::from(vec![
+                            Span::raw("          "),
+                            Span::styled(format!("[{di}] {:#x}", felt), theme::SUGGESTION_STYLE),
+                        ]));
+                    }
+                }
+            }
+        }
     }
 
-    // Render as scrollable paragraph
-    let title = if app.tx_detail.visual_mode {
-        " Transaction Detail [VISUAL] (j/k: cycle · Enter: open · Esc: exit) "
-    } else {
-        " Transaction Detail (j/k: scroll · v: visual · c: calldata) "
+    lines
+}
+
+/// Build the Trace tab body: recursive call tree with ABI-decoded function
+/// names, decoded params (incl. token amounts + USD), per-node events, and
+/// raw result felts.
+fn build_trace_lines(
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+
+    let trace = match &app.tx_detail.trace {
+        Some(t) => t,
+        None => {
+            let msg = if app.tx_detail.trace_loading {
+                "   (trace loading…)"
+            } else {
+                "   (trace unavailable)"
+            };
+            lines.push(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)));
+            return lines;
+        }
     };
-    let widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::BORDER_FOCUSED_STYLE)
-                .title(Span::styled(title, theme::TITLE_STYLE)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.tx_detail.scroll, 0));
+    if let Some(reason) = &trace.revert_reason {
+        lines.push(Line::from(vec![
+            Span::styled(" Revert: ", theme::STATUS_ERROR),
+            Span::raw(reason.clone()),
+        ]));
+        lines.push(Line::from(""));
+    }
 
-    f.render_widget(widget, area);
+    let roots = trace.roots();
+    if roots.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no invocations)",
+            theme::SUGGESTION_STYLE,
+        )));
+        return lines;
+    }
+    for (label, root) in roots {
+        lines.push(Line::from(Span::styled(
+            format!(" {label}"),
+            theme::TITLE_STYLE,
+        )));
+        render_trace_call(
+            root,
+            "",
+            true,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &app.tx_detail.nav_items,
+            &mut lines,
+        );
+        lines.push(Line::from(""));
+    }
+    lines
+}
 
-    line_map.into_iter().map(|o| o.unwrap_or(0)).collect()
+/// Render a single trace node and its descendants.
+#[allow(clippy::too_many_arguments)]
+fn render_trace_call(
+    call: &DecodedTraceCall,
+    prefix: &str,
+    is_last: bool,
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    nav_items: &[TxNavItem],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let branch = if is_last { "└─" } else { "├─" };
+    let next_prefix = format!("{prefix}{}", if is_last { "   " } else { "│  " });
+    // Body lines (fn / → / events) get a leading space so they line up under
+    // the header's content column — the header reserves column 1 for the
+    // visual-mode marker (`►` or space), and body lines match that offset.
+    let body_prefix = format!(" {next_prefix}");
+
+    // Header line: branch + contract label + optional kind tag (only when
+    // non-default; the default CALL/EXTERNAL combo is just visual noise).
+    let label = fmt_addr_full(app, &call.contract_address);
+    let style = addr_style(&call.contract_address, color_map, selected);
+    record(
+        &TxNavItem::Address(call.contract_address),
+        lines.len(),
+        line_map,
+        nav_items,
+    );
+    let mut spans: Vec<Span<'static>> = vec![
+        addr_marker(&call.contract_address, selected),
+        Span::styled(format!("{prefix}{branch} "), theme::BORDER_STYLE),
+        Span::styled(label, style),
+    ];
+    if let Some(kind) = call_kind_tag(call.call_type, call.entry_point_type) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(kind, theme::SUGGESTION_STYLE));
+    }
+    if call.is_reverted {
+        spans.push(Span::styled("  REVERTED", theme::STATUS_REVERTED));
+    }
+    lines.push(Line::from(spans));
+
+    // Function call line: fn_name(decoded args)
+    let fn_label = call.function_name.clone().unwrap_or_else(|| {
+        let hex = format!("{:#x}", call.entry_point_selector);
+        if !app.tx_detail.expand_all && hex.len() > 18 {
+            format!("{}…", &hex[..18])
+        } else {
+            hex
+        }
+    });
+    let mut fn_spans: Vec<Span<'static>> = vec![
+        Span::styled(format!("{body_prefix}fn "), theme::BORDER_STYLE),
+        Span::styled(fn_label, theme::TX_HASH_STYLE),
+    ];
+    if let (Some(func_def), Some(abi)) = (&call.function_def, &call.contract_abi) {
+        let decoded = calldata::decode_calldata(&call.calldata, &func_def.inputs, abi);
+        let prices =
+            price::token_prices(app, &call.contract_address, app.tx_detail.block_timestamp);
+        fn_spans.push(Span::raw("("));
+        for (pi, p) in decoded.iter().enumerate() {
+            if pi > 0 {
+                fn_spans.push(Span::raw(", "));
+            }
+            if let Some(name) = &p.name {
+                fn_spans.push(Span::styled(format!("{name}: "), theme::SUGGESTION_STYLE));
+            }
+            render_value_spans(&p.value, app, color_map, selected, &mut fn_spans);
+            // USD pair if param matches a tracked token's u256 amount.
+            if let Some((amount, _)) =
+                decoded_value_token_amount(&p.value, &call.contract_address, registry)
+                && (prices.0.is_some() || prices.1.is_some())
+            {
+                fn_spans.push(Span::styled(
+                    format_usd_pair(amount, prices.0, prices.1),
+                    theme::SUGGESTION_STYLE,
+                ));
+            }
+        }
+        fn_spans.push(Span::raw(")"));
+    } else {
+        fn_spans.push(Span::styled(
+            format!("({} felts)", call.calldata.len()),
+            theme::SUGGESTION_STYLE,
+        ));
+    }
+    lines.push(Line::from(fn_spans));
+
+    // Result line(s): raw felts (return-value decoding is a follow-up).
+    if !call.result.is_empty() {
+        let limit = if app.tx_detail.expand_all {
+            call.result.len()
+        } else {
+            4
+        };
+        let preview: Vec<String> = call
+            .result
+            .iter()
+            .take(limit)
+            .map(|f| format!("{:#x}", f))
+            .collect();
+        let extra = call.result.len().saturating_sub(preview.len());
+        let suffix = if extra > 0 {
+            format!(", … +{extra}")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{body_prefix}→ "), theme::BORDER_STYLE),
+            Span::styled(
+                format!("[{}]{suffix}", preview.join(", ")),
+                theme::SUGGESTION_STYLE,
+            ),
+        ]));
+    }
+
+    // Events + inner calls share the same child-list under this node, so
+    // their tree branches share a column. Treat them as one combined list
+    // when picking ├─ vs └─ so only the very last entry gets └─.
+    let prices = price::token_prices(app, &call.contract_address, app.tx_detail.block_timestamp);
+    let total_children = call.events.len() + call.inner.len();
+    let mut child_idx = 0usize;
+    for event in call.events.iter() {
+        let is_last_child = child_idx == total_children - 1;
+        let eb = if is_last_child { "└─" } else { "├─" };
+        push_event_line(
+            event,
+            &format!("{body_prefix}{eb} "),
+            prices,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            nav_items,
+            lines,
+        );
+        child_idx += 1;
+    }
+
+    for child in call.inner.iter() {
+        let is_last_child = child_idx == total_children - 1;
+        render_trace_call(
+            child,
+            &next_prefix,
+            is_last_child,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            nav_items,
+            lines,
+        );
+        child_idx += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_event_line(
+    event: &DecodedEvent,
+    prefix: &str,
+    prices: (Option<f64>, Option<f64>),
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    nav_items: &[TxNavItem],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let name = event.event_name.as_deref().unwrap_or("Unknown");
+    let all_params: Vec<&DecodedParam> = event
+        .decoded_keys
+        .iter()
+        .chain(event.decoded_data.iter())
+        .collect();
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix.to_string(), theme::BORDER_STYLE)];
+
+    if all_params.is_empty() {
+        spans.push(Span::raw(name.to_string()));
+    } else {
+        spans.push(Span::raw(format!("{name}(")));
+        for (pi, p) in all_params.iter().enumerate() {
+            if p.type_name
+                .as_deref()
+                .unwrap_or("")
+                .contains("ContractAddress")
+            {
+                record(
+                    &TxNavItem::Address(p.value),
+                    lines.len(),
+                    line_map,
+                    nav_items,
+                );
+            }
+            let mut param_spans = param_display::format_param_styled(
+                p,
+                &event.contract_address,
+                registry,
+                color_map,
+                selected,
+                &|a| fmt_addr(app, a),
+                app.tx_detail.expand_all,
+            );
+            spans.append(&mut param_spans);
+            let (today, historic) = prices;
+            if (today.is_some() || historic.is_some())
+                && let Some((amount, _)) =
+                    price::token_amount_from_param(p, &event.contract_address, registry)
+            {
+                spans.push(Span::styled(
+                    format_usd_pair(amount, today, historic),
+                    theme::SUGGESTION_STYLE,
+                ));
+            }
+            if pi < all_params.len() - 1 {
+                spans.push(Span::raw(", "));
+            }
+        }
+        spans.push(Span::raw(")"));
+    }
+
+    lines.push(Line::from(spans));
+}
+
+/// Compact tag like "(LIBRARY_CALL)", "(CONSTRUCTOR)", or "(L1_HANDLER)".
+/// Returns None for the common case `(CALL, EXTERNAL)` so the trace stays
+/// uncluttered — that's the default for ~every node and adds no signal.
+fn call_kind_tag(c: CallType, t: EntryPointType) -> Option<String> {
+    match (c, t) {
+        (CallType::Call, EntryPointType::External) => None,
+        (CallType::Call, EntryPointType::L1Handler) => Some("(L1_HANDLER)".into()),
+        (CallType::Call, EntryPointType::Constructor) => Some("(CONSTRUCTOR)".into()),
+        (CallType::LibraryCall, EntryPointType::External) => Some("(LIBRARY_CALL)".into()),
+        (CallType::LibraryCall, t) => Some(format!("(LIBRARY_CALL {})", entry_type_str(t))),
+        (CallType::Delegate, t) => Some(format!("(DELEGATE {})", entry_type_str(t))),
+    }
+}
+
+fn entry_type_str(t: EntryPointType) -> &'static str {
+    match t {
+        EntryPointType::External => "EXTERNAL",
+        EntryPointType::L1Handler => "L1_HANDLER",
+        EntryPointType::Constructor => "CONSTRUCTOR",
+    }
+}
+
+/// If `value` is a u256 amount on a tracked token, return `(amount_f64, decimals)`.
+/// Mirrors `price::token_amount_from_param` but accepts a `DecodedValue` so the
+/// trace tab can use the same USD-pair formatting as events without needing to
+/// re-shape the trace's calldata as `DecodedParam`.
+fn decoded_value_token_amount(
+    value: &DecodedValue,
+    contract_address: &Felt,
+    registry: Option<&crate::registry::AddressRegistry>,
+) -> Option<(f64, u8)> {
+    // Re-pack a u256 DecodedValue into the (low, Some(high)) shape that the
+    // existing helper consumes (which expects Felt-encoded halves).
+    let (low, high) = match value {
+        DecodedValue::U256 { low, high } => (*low, *high),
+        _ => return None,
+    };
+    let synth = DecodedParam {
+        name: None,
+        type_name: Some("u256".into()),
+        value: Felt::from(low),
+        value_high: Some(Felt::from(high)),
+    };
+    price::token_amount_from_param(&synth, contract_address, registry)
 }
 
 /// Returns the style to use for an address span, applying visual-mode highlight when selected.
@@ -835,9 +1358,10 @@ fn render_value_spans(
     selected: Option<&TxNavItem>,
     spans: &mut Vec<Span<'static>>,
 ) {
+    let expand = app.tx_detail.expand_all;
     match value {
         DecodedValue::Address(felt) => {
-            let label = app.format_address(felt);
+            let label = fmt_addr(app, felt);
             let style = if matches!(selected, Some(TxNavItem::Address(a)) if *a == *felt) {
                 theme::VISUAL_SELECTED_STYLE
             } else {
@@ -846,7 +1370,7 @@ fn render_value_spans(
             spans.push(Span::styled(label, style));
         }
         DecodedValue::String(s) => {
-            let display = if s.len() > 60 {
+            let display = if !expand && s.len() > 60 {
                 format!("\"{}...\"", &s[..57])
             } else {
                 format!("\"{s}\"")
@@ -858,10 +1382,22 @@ fn render_value_spans(
         }
         DecodedValue::Struct { name, fields } => {
             let short = name.rsplit("::").next().unwrap_or(name);
-            spans.push(Span::styled(
-                format!("{short} {{ {} fields }}", fields.len()),
-                theme::TX_HASH_STYLE,
-            ));
+            if expand {
+                spans.push(Span::styled(format!("{short} {{ "), theme::TX_HASH_STYLE));
+                for (i, (fname, fval)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(", "));
+                    }
+                    spans.push(Span::styled(format!("{fname}: "), theme::SUGGESTION_STYLE));
+                    render_value_spans(fval, app, color_map, selected, spans);
+                }
+                spans.push(Span::styled(" }", theme::TX_HASH_STYLE));
+            } else {
+                spans.push(Span::styled(
+                    format!("{short} {{ {} fields }}", fields.len()),
+                    theme::TX_HASH_STYLE,
+                ));
+            }
         }
         DecodedValue::Enum {
             name,
@@ -869,23 +1405,57 @@ fn render_value_spans(
             value: inner,
         } => {
             let short = name.rsplit("::").next().unwrap_or(name);
-            let suffix = if inner.is_some() { "(...)" } else { "" };
-            spans.push(Span::styled(
-                format!("{short}::{variant}{suffix}"),
-                theme::TX_HASH_STYLE,
-            ));
+            if expand {
+                spans.push(Span::styled(
+                    format!("{short}::{variant}"),
+                    theme::TX_HASH_STYLE,
+                ));
+                if let Some(inner) = inner {
+                    spans.push(Span::raw("("));
+                    render_value_spans(inner, app, color_map, selected, spans);
+                    spans.push(Span::raw(")"));
+                }
+            } else {
+                let suffix = if inner.is_some() { "(...)" } else { "" };
+                spans.push(Span::styled(
+                    format!("{short}::{variant}{suffix}"),
+                    theme::TX_HASH_STYLE,
+                ));
+            }
         }
         DecodedValue::Array(items) => {
-            spans.push(Span::styled(
-                format!("[{} items]", items.len()),
-                theme::TX_HASH_STYLE,
-            ));
+            if expand {
+                spans.push(Span::styled("[", theme::TX_HASH_STYLE));
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(", "));
+                    }
+                    render_value_spans(item, app, color_map, selected, spans);
+                }
+                spans.push(Span::styled("]", theme::TX_HASH_STYLE));
+            } else {
+                spans.push(Span::styled(
+                    format!("[{} items]", items.len()),
+                    theme::TX_HASH_STYLE,
+                ));
+            }
         }
         DecodedValue::Tuple(items) => {
-            spans.push(Span::styled(
-                format!("({} items)", items.len()),
-                theme::TX_HASH_STYLE,
-            ));
+            if expand {
+                spans.push(Span::styled("(", theme::TX_HASH_STYLE));
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(", "));
+                    }
+                    render_value_spans(item, app, color_map, selected, spans);
+                }
+                spans.push(Span::styled(")", theme::TX_HASH_STYLE));
+            } else {
+                spans.push(Span::styled(
+                    format!("({} items)", items.len()),
+                    theme::TX_HASH_STYLE,
+                ));
+            }
         }
         // Simple values: use Display
         other => {

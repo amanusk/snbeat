@@ -457,7 +457,8 @@ impl App {
             }
             View::BlockDetail => self.block_detail.txs.next(),
             View::TxDetail => {
-                self.tx_detail.scroll = self.tx_detail.scroll.saturating_add(1);
+                let s = self.tx_detail.active_scroll_mut();
+                *s = s.saturating_add(1);
             }
             View::ClassInfo => {
                 self.class.scroll = self.class.scroll.saturating_add(1);
@@ -494,7 +495,8 @@ impl App {
             View::Blocks => self.blocks.previous(),
             View::BlockDetail => self.block_detail.txs.previous(),
             View::TxDetail => {
-                self.tx_detail.scroll = self.tx_detail.scroll.saturating_sub(1);
+                let s = self.tx_detail.active_scroll_mut();
+                *s = s.saturating_sub(1);
             }
             View::ClassInfo => {
                 self.class.scroll = self.class.scroll.saturating_sub(1);
@@ -521,7 +523,7 @@ impl App {
             View::Blocks => self.blocks.select_first(),
             View::BlockDetail => self.block_detail.txs.select_first(),
             View::TxDetail => {
-                self.tx_detail.scroll = 0;
+                *self.tx_detail.active_scroll_mut() = 0;
             }
             View::ClassInfo => {
                 self.class.scroll = 0;
@@ -557,7 +559,7 @@ impl App {
             }
             View::BlockDetail => self.block_detail.txs.select_last(),
             View::TxDetail => {
-                self.tx_detail.scroll = 999;
+                *self.tx_detail.active_scroll_mut() = 999;
             } // will be clamped by Paragraph
             View::ClassInfo => {
                 self.class.scroll = 999;
@@ -880,7 +882,12 @@ impl App {
                 self.tx_detail.decoded_calls = decoded_calls;
                 self.tx_detail.outside_executions = outside_executions;
                 self.tx_detail.block_timestamp = block_timestamp;
-                self.tx_detail.scroll = 0;
+                self.tx_detail.events_scroll = 0;
+                self.tx_detail.calls_scroll = 0;
+                self.tx_detail.trace_scroll = 0;
+                self.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::default();
+                self.tx_detail.trace = None;
+                self.tx_detail.trace_loading = true;
                 self.tx_detail.visual_mode = false;
                 self.build_tx_nav_items();
                 self.is_loading = false;
@@ -889,6 +896,17 @@ impl App {
                     self.push_view(View::TxDetail);
                 }
                 self.dispatch_tx_price_fetch();
+            }
+            Action::TransactionTraceLoaded { tx_hash, trace } => {
+                // Drop late-arriving traces for a tx the user has navigated
+                // away from (or replaced via a re-fetch).
+                let current_hash = self.tx_detail.transaction.as_ref().map(|t| t.hash());
+                if current_hash == Some(tx_hash) {
+                    self.tx_detail.trace = Some(trace);
+                    self.tx_detail.trace_loading = false;
+                    // Rebuild nav so trace addresses become reachable in `v` mode.
+                    self.build_tx_nav_items();
+                }
             }
             Action::NavigateToAddress { address } => {
                 // Push view immediately — show cached data while fresh data loads

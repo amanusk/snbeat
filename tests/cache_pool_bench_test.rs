@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use starknet::core::types::{ContractClass, Felt};
+use starknet::core::types::{ContractClass, Felt, TransactionTrace};
 use tokio::sync::Notify;
 
 use snbeat::data::cache::CachingDataSource;
@@ -85,6 +85,9 @@ impl DataSource for NullUpstream {
         unimplemented!()
     }
     async fn get_class(&self, _class_hash: Felt) -> Result<ContractClass> {
+        unimplemented!()
+    }
+    async fn get_trace(&self, _hash: Felt) -> Result<TransactionTrace> {
         unimplemented!()
     }
     async fn get_recent_blocks(&self, _count: usize) -> Result<Vec<SnBlock>> {

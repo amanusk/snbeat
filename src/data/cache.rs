@@ -10,7 +10,7 @@ use futures::future::Shared;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{TransactionBehavior, params};
-use starknet::core::types::{ContractClass, Felt};
+use starknet::core::types::{ContractClass, Felt, TransactionTrace};
 use tracing::{debug, trace, warn};
 
 /// Alias so call sites read cleanly. r2d2 reuses the same `rusqlite::Connection`
@@ -83,6 +83,10 @@ impl CachingDataSource {
                 data TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS receipts (
+                tx_hash TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tx_traces (
                 tx_hash TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
@@ -590,6 +594,32 @@ impl CachingDataSource {
             let hash_hex = format!("{:#x}", receipt.transaction_hash);
             let _ = db.execute(
                 "INSERT OR REPLACE INTO receipts (tx_hash, data) VALUES (?1, ?2)",
+                params![hash_hex, json],
+            );
+        }
+    }
+
+    // --- tx_trace cache ---
+    // Traces are deterministic for finalized txs and the RPC call is expensive
+    // (recursive call tree, hundreds of ms). Stash the JSON-serialized trace
+    // keyed by tx hash so revisits are instant.
+    fn get_cached_trace(&self, hash: Felt) -> Option<TransactionTrace> {
+        let db = self.db.get().ok()?;
+        let hash_hex = format!("{:#x}", hash);
+        let mut stmt = db
+            .prepare("SELECT data FROM tx_traces WHERE tx_hash = ?1")
+            .ok()?;
+        let json: String = stmt.query_row(params![hash_hex], |row| row.get(0)).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    fn cache_trace(&self, hash: Felt, trace: &TransactionTrace) {
+        if let Ok(json) = serde_json::to_string(trace)
+            && let Ok(db) = self.db.get()
+        {
+            let hash_hex = format!("{:#x}", hash);
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO tx_traces (tx_hash, data) VALUES (?1, ?2)",
                 params![hash_hex, json],
             );
         }
@@ -1117,6 +1147,17 @@ impl DataSource for CachingDataSource {
         // Parsed ABIs are cached separately via the decode layer's class_cache.
         debug!(class_hash = %format!("{:#x}", class_hash), "Fetching class from RPC (not cached — parsed ABI cached separately)");
         self.upstream.get_class(class_hash).await
+    }
+
+    async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace> {
+        if let Some(cached) = self.get_cached_trace(hash) {
+            trace!(tx_hash = %format!("{:#x}", hash), "cache hit: trace");
+            return Ok(cached);
+        }
+        debug!(tx_hash = %format!("{:#x}", hash), "cache miss: trace, fetching from RPC");
+        let fetched = self.upstream.get_trace(hash).await?;
+        self.cache_trace(hash, &fetched);
+        Ok(fetched)
     }
 
     async fn get_events_for_address(
@@ -1719,7 +1760,7 @@ impl DataSource for CachingDataSource {
 mod tests {
     use super::*;
     use crate::data::DataSource;
-    use starknet::core::types::ContractClass;
+    use starknet::core::types::{ContractClass, TransactionTrace};
 
     /// Minimal upstream stub — the search_progress / activity_total tests only
     /// touch sync cache-local SQL, so the async upstream methods never fire.
@@ -1752,6 +1793,9 @@ mod tests {
             unimplemented!()
         }
         async fn get_class(&self, _class_hash: Felt) -> Result<ContractClass> {
+            unimplemented!()
+        }
+        async fn get_trace(&self, _hash: Felt) -> Result<TransactionTrace> {
             unimplemented!()
         }
         async fn get_recent_blocks(&self, _count: usize) -> Result<Vec<SnBlock>> {

@@ -862,6 +862,12 @@ mod tests {
         async fn get_class(&self, _class_hash: Felt) -> crate::error::Result<ContractClass> {
             unimplemented!()
         }
+        async fn get_trace(
+            &self,
+            _hash: Felt,
+        ) -> crate::error::Result<starknet::core::types::TransactionTrace> {
+            unimplemented!()
+        }
         async fn get_recent_blocks(&self, _count: usize) -> crate::error::Result<Vec<SnBlock>> {
             unimplemented!()
         }

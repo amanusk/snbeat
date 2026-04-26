@@ -136,6 +136,7 @@ pub(super) async fn decode_and_send_transaction(
     // Block fetches are cached, so repeat calls for the same block are cheap.
     let block_timestamp = ds.get_block(block).await.ok().map(|b| b.timestamp);
 
+    let tx_hash = transaction.hash();
     let _ = action_tx.send(Action::TransactionLoaded {
         transaction,
         receipt,
@@ -144,6 +145,10 @@ pub(super) async fn decode_and_send_transaction(
         outside_executions,
         block_timestamp,
     });
+
+    // Fire-and-forget trace fetch. Sent as a separate Action so the rest of
+    // the tx view paints immediately while the recursive trace decodes.
+    spawn_trace_fetch(tx_hash, block, ds, abi_reg, action_tx);
 }
 
 /// Detect outside execution calls, parse their inner calls, and resolve inner call ABIs.
@@ -213,4 +218,55 @@ pub(super) async fn fetch_and_send_transaction(
             let _ = tx.send(Action::Error(format!("Fetch tx: {e}")));
         }
     }
+}
+
+/// Fetch + decode the trace for `hash` and send `TransactionTraceLoaded`.
+pub(super) async fn fetch_and_send_trace(
+    hash: starknet::core::types::Felt,
+    block: u64,
+    ds: Arc<dyn DataSource>,
+    abi_reg: Arc<AbiRegistry>,
+    tx: mpsc::UnboundedSender<Action>,
+) {
+    let start = std::time::Instant::now();
+    let hash_short = format!("{:#x}", hash);
+    debug!(tx_hash = %hash_short, "Fetching transaction trace");
+
+    match ds.get_trace(hash).await {
+        Ok(trace) => {
+            let decoded = crate::decode::trace::decode_trace(&trace, hash, block, &abi_reg).await;
+            info!(
+                tx_hash = %hash_short,
+                elapsed_ms = start.elapsed().as_millis(),
+                "Trace fetched + decoded"
+            );
+            let _ = tx.send(Action::TransactionTraceLoaded {
+                tx_hash: hash,
+                trace: decoded,
+            });
+        }
+        Err(e) => {
+            error!(tx_hash = %hash_short, error = %e, "Failed to fetch trace");
+            // Non-fatal: the rest of the tx view is already populated. We
+            // surface the failure as a low-priority error instead of an
+            // empty Trace tab so the user knows it didn't silently succeed.
+            let _ = tx.send(Action::Error(format!("Fetch trace: {e}")));
+        }
+    }
+}
+
+/// Helper that spawns `fetch_and_send_trace` as a detached tokio task.
+pub(super) fn spawn_trace_fetch(
+    hash: starknet::core::types::Felt,
+    block: u64,
+    ds: &Arc<dyn DataSource>,
+    abi_reg: &Arc<AbiRegistry>,
+    tx: &mpsc::UnboundedSender<Action>,
+) {
+    let ds = Arc::clone(ds);
+    let abi_reg = Arc::clone(abi_reg);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        fetch_and_send_trace(hash, block, ds, abi_reg, tx).await;
+    });
 }
