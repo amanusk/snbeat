@@ -221,6 +221,41 @@ fn fmt_addr_full(app: &App, felt: &Felt) -> String {
     }
 }
 
+/// Render a revert reason. By default we collapse to a single ellipsised
+/// preview so the fixed-height header doesn't get pushed off-screen by a
+/// wrapped multi-line cairo panic. With `expand` on, we split on `\n` and
+/// push each segment as its own line so the header layout still accounts
+/// for the row count.
+fn push_revert_lines(reason: &str, expand: bool, lines: &mut Vec<Line<'static>>) {
+    /// Single-line ellipsis cutoff. Picked to leave room for terminal padding
+    /// and the " Revert: " label on a typical 120-col terminal.
+    const REVERT_PREVIEW_CHARS: usize = 100;
+
+    if expand {
+        let segments: Vec<&str> = reason.split('\n').collect();
+        for (i, seg) in segments.iter().enumerate() {
+            let prefix = if i == 0 { " Revert: " } else { "         " };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme::STATUS_ERROR),
+                Span::raw(seg.to_string()),
+            ]));
+        }
+        return;
+    }
+
+    let single_line = reason.replace('\n', " ");
+    let display = if single_line.chars().count() > REVERT_PREVIEW_CHARS {
+        let truncated: String = single_line.chars().take(REVERT_PREVIEW_CHARS).collect();
+        format!("{truncated}… (e: full)")
+    } else {
+        single_line
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Revert: ", theme::STATUS_ERROR),
+        Span::raw(display),
+    ]));
+}
+
 /// Record `item`'s first-occurrence line position into `map` (if not already set).
 fn record(item: &TxNavItem, cur_line: usize, map: &mut [Option<u16>], nav: &[TxNavItem]) {
     if let Some(idx) = nav.iter().position(|x| x == item) {
@@ -427,10 +462,7 @@ fn build_header_lines(
             Span::styled(status_text, style),
         ]));
         if let ExecutionStatus::Reverted(reason) = &receipt.execution_status {
-            lines.push(Line::from(vec![
-                Span::styled(" Revert: ", theme::STATUS_ERROR),
-                Span::raw(reason.clone()),
-            ]));
+            push_revert_lines(reason, app.tx_detail.expand_all, &mut lines);
         }
     }
 
@@ -901,10 +933,7 @@ fn build_trace_lines(
         }
     };
     if let Some(reason) = &trace.revert_reason {
-        lines.push(Line::from(vec![
-            Span::styled(" Revert: ", theme::STATUS_ERROR),
-            Span::raw(reason.clone()),
-        ]));
+        push_revert_lines(reason, app.tx_detail.expand_all, &mut lines);
         lines.push(Line::from(""));
     }
 
