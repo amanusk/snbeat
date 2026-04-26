@@ -87,6 +87,7 @@ fn format_event(event: &DecodedEvent, app: &App) -> String {
             &event.contract_address,
             registry,
             &format_addr,
+            false,
         ));
     }
     for p in &event.decoded_data {
@@ -95,6 +96,7 @@ fn format_event(event: &DecodedEvent, app: &App) -> String {
             &event.contract_address,
             registry,
             &format_addr,
+            false,
         ));
     }
 

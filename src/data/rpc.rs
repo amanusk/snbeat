@@ -3,7 +3,7 @@ use starknet::core::types::requests::CallRequest;
 use starknet::core::types::{
     AddressFilter, BlockId, BlockTag, BlockWithTxs, ContractClass, DeclareTransaction,
     DeployAccountTransaction, EventFilter, ExecutionResult, Felt, FunctionCall, InvokeTransaction,
-    MaybePreConfirmedBlockWithTxs, Transaction, TransactionReceipt,
+    MaybePreConfirmedBlockWithTxs, Transaction, TransactionReceipt, TransactionTrace,
 };
 use starknet::core::utils::get_contract_address;
 use starknet::providers::{
@@ -286,6 +286,13 @@ impl DataSource for RpcDataSource {
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass> {
         self.provider
             .get_class(BlockId::Tag(BlockTag::Latest), class_hash)
+            .await
+            .map_err(|e| SnbeatError::Provider(e.to_string()))
+    }
+
+    async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace> {
+        self.provider
+            .trace_transaction(hash)
             .await
             .map_err(|e| SnbeatError::Provider(e.to_string()))
     }

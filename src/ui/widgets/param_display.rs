@@ -17,8 +17,9 @@ pub fn format_param(
     contract_address: &Felt,
     registry: Option<&AddressRegistry>,
     format_addr: &dyn Fn(&Felt) -> String,
+    expand: bool,
 ) -> String {
-    let value_str = format_param_value(p, contract_address, registry, format_addr);
+    let value_str = format_param_value(p, contract_address, registry, format_addr, expand);
     match &p.name {
         Some(name) => format!("{name}: {value_str}"),
         None => value_str,
@@ -36,6 +37,7 @@ pub fn format_param_styled(
     color_map: &AddressColorMap,
     selected: Option<&TxNavItem>,
     format_addr: &dyn Fn(&Felt) -> String,
+    expand: bool,
 ) -> Vec<Span<'static>> {
     let type_name = p.type_name.as_deref().unwrap_or("");
     let name_prefix = p
@@ -62,7 +64,7 @@ pub fn format_param_styled(
     }
 
     // All other types: compute the string value and return unstyled
-    let value_str = format_param_value(p, contract_address, registry, format_addr);
+    let value_str = format_param_value(p, contract_address, registry, format_addr, expand);
     vec![Span::raw(format!("{name_prefix}{value_str}"))]
 }
 
@@ -71,6 +73,7 @@ fn format_param_value(
     contract_address: &Felt,
     registry: Option<&AddressRegistry>,
     format_addr: &dyn Fn(&Felt) -> String,
+    expand: bool,
 ) -> String {
     let type_name = p.type_name.as_deref().unwrap_or("");
 
@@ -101,7 +104,11 @@ fn format_param_value(
         }
     }
 
-    format_felt_short(&p.value)
+    if expand {
+        format!("{:#x}", p.value)
+    } else {
+        format_felt_short(&p.value)
+    }
 }
 
 /// Format a u256 value as a human-readable token amount with the given decimals.

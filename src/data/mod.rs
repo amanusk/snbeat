@@ -6,7 +6,7 @@ pub mod types;
 use async_trait::async_trait;
 use starknet::core::types::Felt;
 
-use starknet::core::types::ContractClass;
+use starknet::core::types::{ContractClass, TransactionTrace};
 
 use crate::error::Result;
 use types::{
@@ -66,6 +66,9 @@ pub trait DataSource: Send + Sync {
         self.get_class_hash(address).await
     }
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass>;
+    /// Fetch the execution trace of a transaction (recursive call tree with
+    /// nested events, calldata, and results). Used by the tx-detail Trace tab.
+    async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace>;
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>>;
     /// Fetch recent events emitted by or targeting an address.
     ///

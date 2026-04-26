@@ -107,7 +107,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
         KeyCode::PageDown => handle_cycle(app, -1),
 
-        // Tab / Shift+Tab: cycle address tabs forward/backward (AddressInfo only).
+        // Tab / Shift+Tab: cycle tabs forward/backward.
         KeyCode::Tab => {
             if app.current_view() == View::AddressInfo {
                 app.address.tab = match app.address.tab {
@@ -119,6 +119,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                     crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Transactions,
                 };
                 return maybe_dispatch_meta_txs_on_entry(app);
+            }
+            if app.current_view() == View::TxDetail {
+                app.tx_detail.active_tab = app.tx_detail.active_tab.next();
             }
             None
         }
@@ -133,6 +136,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                     crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Events,
                 };
                 return maybe_dispatch_meta_txs_on_entry(app);
+            }
+            if app.current_view() == View::TxDetail {
+                app.tx_detail.active_tab = app.tx_detail.active_tab.prev();
             }
             None
         }
@@ -219,23 +225,35 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
-        // c: toggle calldata display in TxDetail
+        // c: toggle calldata display in TxDetail. The toggle only takes effect
+        // in the Calls tab, so jump there if the user pressed it elsewhere.
         KeyCode::Char('c') if app.current_view() == View::TxDetail => {
+            app.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::Calls;
             app.tx_detail.show_calldata = !app.tx_detail.show_calldata;
             None
         }
 
-        // d: toggle decoded calldata display in TxDetail
+        // d: toggle decoded calldata display in TxDetail (Calls tab).
         KeyCode::Char('d') if app.current_view() == View::TxDetail => {
+            app.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::Calls;
             app.tx_detail.show_decoded_calldata = !app.tx_detail.show_decoded_calldata;
             None
         }
 
-        // o: toggle outside execution intent view in TxDetail
+        // o: toggle outside execution intent view in TxDetail (Calls tab).
         KeyCode::Char('o') if app.current_view() == View::TxDetail => {
             if !app.tx_detail.outside_executions.is_empty() {
+                app.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::Calls;
                 app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
             }
+            None
+        }
+
+        // e: toggle "expand everything" in TxDetail (Calls + Trace tabs).
+        // Master switch — un-truncates hashes, expands structs/arrays inline,
+        // and forces decoded-calldata + outside-exec intent on.
+        KeyCode::Char('e') if app.current_view() == View::TxDetail => {
+            app.tx_detail.expand_all = !app.tx_detail.expand_all;
             None
         }
 

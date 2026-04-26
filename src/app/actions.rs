@@ -176,6 +176,14 @@ pub enum Action {
         outside_executions: Vec<(usize, OutsideExecutionInfo)>,
         block_timestamp: Option<u64>,
     },
+    /// Decoded execution trace for a transaction (recursive call tree).
+    /// Sent after TransactionLoaded so the user sees the rest of the view
+    /// immediately while the trace populates lazily. `trace = None` signals
+    /// a fetch/decode failure so the UI can clear the "loading…" state.
+    TransactionTraceLoaded {
+        tx_hash: Felt,
+        trace: Option<crate::decode::trace::DecodedTrace>,
+    },
     /// Address info loaded.
     AddressInfoLoaded {
         info: SnAddressInfo,

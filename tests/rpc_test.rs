@@ -117,3 +117,46 @@ async fn test_balance_of_call() {
     );
     println!("Sequencer ETH balance (raw): {:#x}", result[0]);
 }
+
+#[tokio::test]
+#[ignore = "requires APP_RPC_URL"]
+async fn test_trace_transaction_decode() {
+    use snbeat::data::DataSource;
+    use snbeat::data::rpc::RpcDataSource;
+    use snbeat::decode::AbiRegistry;
+    use snbeat::decode::class_cache::ClassCache;
+    use std::sync::Arc;
+
+    dotenvy::dotenv().ok();
+    let rpc_url = std::env::var("APP_RPC_URL").expect("APP_RPC_URL");
+
+    // Reference tx from issue #29.
+    let hash = Felt::from_hex("0x3175dc5e465e3cd02a144a29e287031f6cbf477a4c009ad171efdef55a5250f")
+        .unwrap();
+
+    let ds: Arc<dyn DataSource> = Arc::new(RpcDataSource::new(&rpc_url));
+    let trace = ds.get_trace(hash).await.expect("get_trace failed");
+
+    // In-memory ABI cache (no SQLite needed for this smoke test).
+    let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+    let class_cache = ClassCache::new(conn, 256);
+    let abi_reg = Arc::new(AbiRegistry::new(Arc::clone(&ds), class_cache));
+
+    let receipt = ds.get_receipt(hash).await.expect("receipt failed");
+    let block = receipt.block_number;
+    let decoded = snbeat::decode::trace::decode_trace(&trace, hash, block, &abi_reg).await;
+
+    let mut total = 0usize;
+    decoded.for_each_call(|_| total += 1);
+    assert!(total >= 5, "expected ≥5 nodes in trace tree, got {total}");
+    assert!(
+        decoded.execute.is_some(),
+        "INVOKE tx should have an execute root"
+    );
+    println!(
+        "Decoded trace: {total} total nodes, validate={}, execute={}, fee_transfer={}",
+        decoded.validate.is_some(),
+        decoded.execute.is_some(),
+        decoded.fee_transfer.is_some()
+    );
+}
