@@ -2249,8 +2249,11 @@ pub(super) async fn run_nonce_gap_fill(
         enrich_all_empty_endpoints(address, &combined, ds, pf.as_ref(), abi_reg, action_tx).await;
     } else {
         info!("Gap fill: no txs returned for this range");
-        let _ = action_tx.send(Action::LoadingStatus(String::new()));
     }
+    // Always clear the loading status so the "Filling gap…" line doesn't
+    // linger after the response (it used to only clear on the empty-result
+    // branch — successful fills left it hanging until the next status push).
+    let _ = action_tx.send(Action::LoadingStatus(String::new()));
 
     debug!(
         address = %format!("{:#x}", address),

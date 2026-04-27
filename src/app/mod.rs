@@ -677,6 +677,49 @@ impl App {
         true
     }
 
+    /// Refresh the address's nonce-gap list, then auto-dispatch fills for any
+    /// "tiny" gaps (≤ `AUTO_FILL_MAX_MISSING` missing nonces). Tiny gaps
+    /// shouldn't require user action — a 1-nonce hole in a sparse account is
+    /// trivial to fill and surfacing it as a "press Enter" row would just be
+    /// noise. Capped at `MAX_AUTO_FILLS_PER_REFRESH` per call to avoid
+    /// flooding the backends on accounts with many scattered holes;
+    /// remaining tiny gaps fire on the next refresh.
+    fn refresh_address_gaps_and_auto_fill(&mut self) {
+        use crate::app::views::address_info::{AUTO_FILL_MAX_MISSING, MAX_AUTO_FILLS_PER_REFRESH};
+        self.address.refresh_unfilled_gaps();
+        let Some(address) = self.address.context else {
+            return;
+        };
+        let to_fill: Vec<_> = self
+            .address
+            .unfilled_gaps
+            .iter()
+            .filter(|g| !g.fill_dispatched && g.missing_count <= AUTO_FILL_MAX_MISSING)
+            .take(MAX_AUTO_FILLS_PER_REFRESH)
+            .cloned()
+            .collect();
+        if to_fill.is_empty() {
+            return;
+        }
+        let known_txs = self.address.txs.items.clone();
+        for gap in to_fill {
+            if let Some(g) = self
+                .address
+                .unfilled_gaps
+                .iter_mut()
+                .find(|g| g.lo_nonce == gap.lo_nonce)
+            {
+                g.fill_dispatched = true;
+            }
+            self.address.fetching_more_txs = true;
+            let _ = self.action_tx.send(Action::FillAddressNonceGaps {
+                address,
+                known_txs: known_txs.clone(),
+                gap,
+            });
+        }
+    }
+
     pub fn clear_block_detail(&mut self) {
         self.block_detail.clear();
     }
@@ -1127,7 +1170,7 @@ impl App {
                     {
                         let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                         if current_nonce > 0 {
-                            self.address.refresh_unfilled_gaps();
+                            self.refresh_address_gaps_and_auto_fill();
                             self.address.sanity_check_dispatched = true;
                             let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                 address,
@@ -1340,7 +1383,7 @@ impl App {
                 // batch lands above the cached set). `refresh_unfilled_gaps`
                 // preserves `fill_dispatched` per `lo_nonce`, so any in-flight
                 // fill keeps its state.
-                self.address.refresh_unfilled_gaps();
+                self.refresh_address_gaps_and_auto_fill();
                 if any_gap_fill_inflight {
                     self.address.fetching_more_txs = false;
                 }
@@ -1503,7 +1546,7 @@ impl App {
                             && let Some(info) = &self.address.info
                         {
                             let current_nonce = crate::utils::felt_to_u64(&info.nonce);
-                            self.address.refresh_unfilled_gaps();
+                            self.refresh_address_gaps_and_auto_fill();
                             self.address.sanity_check_dispatched = true;
                             let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                 address,

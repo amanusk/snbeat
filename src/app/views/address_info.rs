@@ -29,6 +29,22 @@ pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
 /// Enter, which is exactly the behavior we want to avoid.
 pub const LARGE_GAP_FILL_CHUNK_TXS: u32 = 50;
 
+/// Detected gaps with no more than this many missing nonces are filled
+/// automatically (no Enter required). They still go through the deferred-fill
+/// machinery — we just dispatch the fill on the user's behalf so a 1-tx hole
+/// in a sparse account never surfaces as a "press Enter" row. Larger gaps
+/// stay deferred so we don't burn Dune/Pathfinder queries on multi-thousand
+/// tx ranges the user might not care about.
+pub const AUTO_FILL_MAX_MISSING: u64 = 1;
+
+/// Cap on the number of tiny gaps auto-dispatched per refresh. A very-active
+/// address can have dozens of 1-nonce holes scattered across its history;
+/// firing every one at once would saturate Pathfinder and (on the Dune
+/// fallback) blow through quota. Remaining tiny gaps still appear as
+/// deferred rows, and the next refresh picks them up after the dispatched
+/// chunk lands.
+pub const MAX_AUTO_FILLS_PER_REFRESH: usize = 5;
+
 /// Passive UI hint derived from the event-window helper's last fetch.
 /// Shared across the Calls / Events / MetaTxs tabs because all three
 /// project from the same `address_events` + `address_search_progress`
@@ -840,5 +856,172 @@ mod tests {
         state.refresh_unfilled_gaps();
         assert!(state.unfilled_gaps.is_empty());
         assert!(state.gap_selected.is_none());
+    }
+
+    /// Build a state with a single deferred gap between hi/lo nonces. Tx list
+    /// is sorted nonce-descending, matching the live-render layout.
+    fn state_one_gap() -> AddressInfoState {
+        // Nonces 100, 99, 30, 29 — gap between 30 and 99 (block span 4790).
+        let mut state = state_with(vec![
+            summary(100, 5000),
+            summary(99, 4990),
+            summary(30, 200),
+            summary(29, 190),
+        ]);
+        state.refresh_unfilled_gaps();
+        assert_eq!(state.unfilled_gaps.len(), 1);
+        state.txs.state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn next_lands_on_gap_when_crossing_forward() {
+        let mut state = state_one_gap();
+        // Start at nonce 99 (tx idx 1), the tx just above the gap.
+        state.txs.state.select(Some(1));
+        state.tx_list_next();
+        assert_eq!(state.gap_selected, Some(30));
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn next_off_gap_lands_on_lo_nonce_tx_no_dispatch() {
+        let mut state = state_one_gap();
+        state.gap_selected = Some(30);
+        state.tx_list_next();
+        // Cleared gap selection, landed on the lo_nonce tx (nonce 30, idx 2).
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(2));
+        // Crucially, no fill_dispatched — Enter alone triggers fills.
+        assert!(!state.unfilled_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn previous_lands_on_gap_when_crossing_backward() {
+        let mut state = state_one_gap();
+        // Start at nonce 30 (tx idx 2), the tx just below the gap.
+        state.txs.state.select(Some(2));
+        state.tx_list_previous();
+        assert_eq!(state.gap_selected, Some(30));
+        assert_eq!(state.txs.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn previous_off_gap_lands_on_hi_nonce_tx() {
+        let mut state = state_one_gap();
+        state.gap_selected = Some(30);
+        state.tx_list_previous();
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_gap_forward() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(0));
+        state.tx_list_scroll_by(10);
+        // Should clamp on the gap row, not jump past it.
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_gap_backward() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(3));
+        state.tx_list_scroll_by(-10);
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn select_first_clamps_on_gap_from_below() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(3));
+        state.tx_list_select_first();
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn select_last_clamps_on_gap_from_above() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(0));
+        state.tx_list_select_last();
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn navigation_is_a_noop_with_no_gap() {
+        let mut state = state_with(vec![summary(10, 100), summary(11, 102)]);
+        state.refresh_unfilled_gaps();
+        assert!(state.unfilled_gaps.is_empty());
+        state.txs.state.select(Some(0));
+        state.tx_list_next();
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    /// Two deferred gaps — single-step navigation should pause at each.
+    fn state_two_gaps() -> AddressInfoState {
+        // Nonces 200, 199, 100, 99, 30, 29 — gaps between 100..199 and 30..99.
+        let mut state = state_with(vec![
+            summary(200, 9010),
+            summary(199, 9000),
+            summary(100, 5000),
+            summary(99, 4990),
+            summary(30, 200),
+            summary(29, 190),
+        ]);
+        state.refresh_unfilled_gaps();
+        assert_eq!(state.unfilled_gaps.len(), 2);
+        state.txs.state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_first_of_multiple_gaps_forward() {
+        let mut state = state_two_gaps();
+        state.tx_list_scroll_by(20);
+        // First gap encountered going down from the top is the upper one.
+        assert_eq!(state.gap_selected, Some(100));
+    }
+
+    #[test]
+    fn scroll_by_from_first_gap_clamps_on_second() {
+        let mut state = state_two_gaps();
+        state.gap_selected = Some(100);
+        state.tx_list_scroll_by(20);
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn step_walks_through_each_gap() {
+        let mut state = state_two_gaps();
+        // Start on the tx just above the upper gap (nonce 199, idx 1).
+        state.txs.state.select(Some(1));
+        state.tx_list_next(); // lands on upper gap
+        assert_eq!(state.gap_selected, Some(100));
+        state.tx_list_next(); // off gap → tx with nonce 100 (idx 2)
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(2));
+        state.tx_list_next(); // tx idx 3 (nonce 99) — just above lower gap
+        assert_eq!(state.txs.state.selected(), Some(3));
+        state.tx_list_next(); // lands on lower gap
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn rendered_selected_tracks_gap_and_tx_state() {
+        let mut state = state_two_gaps();
+        // Tx idx 0 (nonce 200) → rendered 0.
+        state.txs.state.select(Some(0));
+        assert_eq!(state.tx_list_rendered_selected(), Some(0));
+        // Tx idx 3 (nonce 99) → rendered 4 (one upper-gap row in front of it).
+        state.txs.state.select(Some(3));
+        assert_eq!(state.tx_list_rendered_selected(), Some(4));
+        // Selecting the upper gap → rendered 2.
+        state.gap_selected = Some(100);
+        assert_eq!(state.tx_list_rendered_selected(), Some(2));
+        // Selecting the lower gap → rendered 5.
+        state.gap_selected = Some(30);
+        assert_eq!(state.tx_list_rendered_selected(), Some(5));
     }
 }
