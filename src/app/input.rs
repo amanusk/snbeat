@@ -639,7 +639,7 @@ fn handle_enter(app: &mut App) -> Option<Action> {
         View::AddressInfo => {
             match app.address.tab {
                 crate::app::AddressTab::Transactions => {
-                    if app.address.gap_selected {
+                    if app.address.gap_selected.is_some() {
                         app.dispatch_address_gap_fill();
                         return None;
                     }

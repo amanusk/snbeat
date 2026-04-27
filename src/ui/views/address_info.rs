@@ -484,31 +484,36 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Position (in `txs.items`) where the gap row should be rendered just
-    // above. `None` when no deferred gap is showing, or the lo-nonce tx isn't
-    // in the loaded list yet.
-    let gap_pos = app.address.gap_pos();
-    let gap_info: Option<(u64, bool)> = app
-        .address
-        .unfilled_gap
-        .as_ref()
-        .map(|g| (g.missing_count, g.fill_dispatched));
+    // (tx_idx, lo_nonce) for each gap, sorted by tx_idx ascending. Each gap
+    // renders as its own ListItem above the lo_nonce tx.
+    let gap_positions = app.address.gap_render_positions();
+    let mut next_gap = gap_positions.iter().peekable();
+    let gap_info_for_lo = |lo: u64| -> Option<(u64, bool)> {
+        app.address
+            .unfilled_gaps
+            .iter()
+            .find(|g| g.lo_nonce == lo)
+            .map(|g| (g.missing_count, g.fill_dispatched))
+    };
 
     let mut items: Vec<ListItem> =
-        Vec::with_capacity(app.address.txs.items.len() + if gap_pos.is_some() { 1 } else { 0 });
+        Vec::with_capacity(app.address.txs.items.len() + gap_positions.len());
     for (idx, tx) in app.address.txs.items.iter().enumerate() {
-        if Some(idx) == gap_pos
-            && let Some((missing, dispatched)) = gap_info
+        while let Some(&&(p, lo)) = next_gap.peek()
+            && p == idx
         {
-            let msg = if dispatched {
-                format!(" ── gap of {missing} txs — loading / press r to retry ──")
-            } else {
-                format!(" ── {missing} txs hidden — press Enter to load ──")
-            };
-            items.push(ListItem::new(Line::from(Span::styled(
-                msg,
-                theme::SUGGESTION_STYLE,
-            ))));
+            if let Some((missing, dispatched)) = gap_info_for_lo(lo) {
+                let msg = if dispatched {
+                    format!(" ── gap of {missing} txs — loading / press r to retry ──")
+                } else {
+                    format!(" ── {missing} txs hidden — press Enter to load ──")
+                };
+                items.push(ListItem::new(Line::from(Span::styled(
+                    msg,
+                    theme::SUGGESTION_STYLE,
+                ))));
+            }
+            next_gap.next();
         }
 
         let fee_str = format_strk_u128(tx.total_fee_fri)
@@ -563,15 +568,28 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         items.push(ListItem::new(main_line));
     }
 
-    let gap_suffix = match &app.address.unfilled_gap {
-        Some(g) if !g.fill_dispatched => {
+    let gap_suffix = if app.address.unfilled_gaps.is_empty() {
+        String::new()
+    } else {
+        let total_missing: u64 = app
+            .address
+            .unfilled_gaps
+            .iter()
+            .map(|g| g.missing_count)
+            .sum();
+        let n = app.address.unfilled_gaps.len();
+        let any_pending = app.address.unfilled_gaps.iter().any(|g| !g.fill_dispatched);
+        if any_pending {
             format!(
-                " — {} older txs deferred (Enter on gap row to load) ",
-                g.missing_count
+                " — {n} gap{plural} ({total_missing} txs deferred, Enter on a gap row to load) ",
+                plural = if n == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                " — {n} gap{plural} ({total_missing} txs, press r to retry) ",
+                plural = if n == 1 { "" } else { "s" }
             )
         }
-        Some(g) => format!(" — gap of {} txs (press r to retry) ", g.missing_count),
-        None => String::new(),
     };
     let count = tx_count_fragment(app);
     let title = if app.is_loading {

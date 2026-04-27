@@ -646,22 +646,28 @@ impl App {
 
     /// Dispatch an on-demand nonce-gap fill for the currently selected gap row
     /// in the address Transactions tab. Returns `true` if a fill was sent.
-    /// No-op if there's no current gap, no current address, or a fill is
-    /// already in flight for this gap.
+    /// No-op if no gap is selected, no fill is in flight already, or there
+    /// is no current address.
     pub fn dispatch_address_gap_fill(&mut self) -> bool {
         let Some(address) = self.address.context else {
             return false;
         };
-        let Some(gap) = self.address.unfilled_gap.as_ref() else {
+        let Some(sel_lo) = self.address.gap_selected else {
+            return false;
+        };
+        let Some(gap) = self
+            .address
+            .unfilled_gaps
+            .iter_mut()
+            .find(|g| g.lo_nonce == sel_lo)
+        else {
             return false;
         };
         if gap.fill_dispatched {
             return false;
         }
         let gap_clone = gap.clone();
-        if let Some(g) = self.address.unfilled_gap.as_mut() {
-            g.fill_dispatched = true;
-        }
+        gap.fill_dispatched = true;
         self.address.fetching_more_txs = true;
         let _ = self.action_tx.send(Action::FillAddressNonceGaps {
             address,
@@ -1111,9 +1117,9 @@ impl App {
                             .send(Action::EnrichAddressTxs { address, hashes });
                     }
 
-                    // Detect any large nonce gap in cached data and defer it to
-                    // on-demand fill (issue #10). Endpoint enrichment + small gap
-                    // fill still run immediately from cache.
+                    // Detect any large nonce gaps in cached data and defer
+                    // them to on-demand fill (issue #10). Endpoint enrichment
+                    // + small gap fill still run immediately from cache.
                     if !self.address.is_contract
                         && !self.address.txs.items.is_empty()
                         && !self.address.sanity_check_dispatched
@@ -1121,7 +1127,7 @@ impl App {
                     {
                         let current_nonce = crate::utils::felt_to_u64(&info.nonce);
                         if current_nonce > 0 {
-                            self.address.unfilled_gap = self.address.detect_unfilled_gap();
+                            self.address.refresh_unfilled_gaps();
                             self.address.sanity_check_dispatched = true;
                             let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                 address,
@@ -1326,24 +1332,16 @@ impl App {
                 if self.address.context != Some(address) {
                     return;
                 }
-                // If a deferred gap-fill was in-flight, unblock the pagination
-                // trigger now that results have landed.
-                let was_gap_fill = self
-                    .address
-                    .unfilled_gap
-                    .as_ref()
-                    .is_some_and(|g| g.fill_dispatched);
-                // Merge enrichment data (upgrades existing entries)
+                let any_gap_fill_inflight =
+                    self.address.unfilled_gaps.iter().any(|g| g.fill_dispatched);
                 self.address.merge_tx_summaries(updates);
-                // If a gap fill was in flight, re-run detection so we either
-                // clear the gap (filled) or update it to the residual gap.
-                if was_gap_fill {
-                    self.address.unfilled_gap = self.address.detect_unfilled_gap().map(|mut g| {
-                        // Preserve dispatched state so we don't re-fire for the
-                        // same (or similar) gap; require refresh ('r') to retry.
-                        g.fill_dispatched = true;
-                        g
-                    });
+                // Re-run detection so newly-arrived txs can both close existing
+                // gaps and surface new ones (e.g. when a fresh top-of-list
+                // batch lands above the cached set). `refresh_unfilled_gaps`
+                // preserves `fill_dispatched` per `lo_nonce`, so any in-flight
+                // fill keeps its state.
+                self.address.refresh_unfilled_gaps();
+                if any_gap_fill_inflight {
                     self.address.fetching_more_txs = false;
                 }
                 // Persist enriched txs to cache so they survive restarts
@@ -1498,14 +1496,14 @@ impl App {
                         self.is_loading = false;
                         self.loading_detail = None;
 
-                        // Post-display: detect any large nonce gap and defer it for
-                        // on-demand fill (issue #10). Small gaps + endpoint
-                        // enrichment still run automatically.
+                        // Post-display: detect any large nonce gaps and defer
+                        // them for on-demand fill (issue #10). Small gaps +
+                        // endpoint enrichment still run automatically.
                         if !self.address.is_contract
                             && let Some(info) = &self.address.info
                         {
                             let current_nonce = crate::utils::felt_to_u64(&info.nonce);
-                            self.address.unfilled_gap = self.address.detect_unfilled_gap();
+                            self.address.refresh_unfilled_gaps();
                             self.address.sanity_check_dispatched = true;
                             let _ = self.action_tx.send(Action::EnrichAddressEndpoints {
                                 address,
