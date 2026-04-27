@@ -21,6 +21,14 @@ use crate::ui::widgets::stateful_list::StatefulList;
 /// they stay aligned — drift between the two causes silent data loss.
 pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
 
+/// Maximum number of txs an on-demand fill pulls per Enter press. Keeping
+/// this small (matching the chronological pagination chunk in `app/mod.rs`)
+/// makes large-gap fills lazy: each Enter shrinks the gap from its newer
+/// edge, leaving a residual gap row that the user can fill again. Without
+/// this cap, a 33k-tx gap would fire one giant Dune/Pathfinder query per
+/// Enter, which is exactly the behavior we want to avoid.
+pub const LARGE_GAP_FILL_CHUNK_TXS: u32 = 50;
+
 /// Passive UI hint derived from the event-window helper's last fetch.
 /// Shared across the Calls / Events / MetaTxs tabs because all three
 /// project from the same `address_events` + `address_search_progress`
@@ -454,19 +462,24 @@ impl AddressInfoState {
         out
     }
 
-    /// Re-detect gaps and store them, preserving `fill_dispatched` for any
-    /// gap whose `lo_nonce` already had a fill in flight. Drops the gap
-    /// selection if the previously-selected gap no longer exists.
+    /// Re-detect gaps and store them. `fill_dispatched` is preserved only for
+    /// gaps whose `(lo_nonce, hi_nonce)` is unchanged from the previous list —
+    /// a shifted `hi_nonce` is evidence the fill response just landed
+    /// (lazy fills always shrink the gap from the newer edge), so we clear
+    /// the flag and let the user press Enter again for the next chunk.
+    /// Drops the gap selection if the previously-selected gap no longer exists.
     pub fn refresh_unfilled_gaps(&mut self) {
-        let dispatched_los: std::collections::HashSet<u64> = self
+        let prev_inflight: std::collections::HashMap<u64, u64> = self
             .unfilled_gaps
             .iter()
             .filter(|g| g.fill_dispatched)
-            .map(|g| g.lo_nonce)
+            .map(|g| (g.lo_nonce, g.hi_nonce))
             .collect();
         let mut next = self.detect_unfilled_gaps();
         for g in next.iter_mut() {
-            if dispatched_los.contains(&g.lo_nonce) {
+            if let Some(prev_hi) = prev_inflight.get(&g.lo_nonce)
+                && *prev_hi == g.hi_nonce
+            {
                 g.fill_dispatched = true;
             }
         }
@@ -784,13 +797,37 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_dispatched_flag() {
+    fn refresh_preserves_dispatched_flag_when_gap_unchanged() {
         let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
         state.unfilled_gaps = state.detect_unfilled_gaps();
         state.unfilled_gaps[0].fill_dispatched = true;
         state.refresh_unfilled_gaps();
         assert_eq!(state.unfilled_gaps.len(), 1);
         assert!(state.unfilled_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn refresh_clears_dispatched_flag_when_gap_shrinks() {
+        // Mimics a lazy fill landing: the chunk arrived from the top of the
+        // gap (nonces just below `hi_nonce`), shrinking the gap from its
+        // newer edge. Same `lo_nonce`, lower `hi_nonce` → flag should clear
+        // so the user can Enter on the residual to load the next chunk.
+        let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        state.unfilled_gaps = state.detect_unfilled_gaps();
+        state.unfilled_gaps[0].fill_dispatched = true;
+
+        // Add a contiguous chunk at the top of the gap (nonces 18, 19, 20).
+        // Their blocks are close to 2000 (top edge) but the older boundary
+        // gap (10..18) still has a wide block span → still deferred.
+        state.txs.items.push(summary(18, 1980));
+        state.txs.items.push(summary(19, 1990));
+        state.txs.items.push(summary(20, 1995));
+        state.refresh_unfilled_gaps();
+
+        assert_eq!(state.unfilled_gaps.len(), 1);
+        assert_eq!(state.unfilled_gaps[0].lo_nonce, 10);
+        assert_eq!(state.unfilled_gaps[0].hi_nonce, 18);
+        assert!(!state.unfilled_gaps[0].fill_dispatched);
     }
 
     #[test]

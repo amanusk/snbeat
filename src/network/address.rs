@@ -2218,9 +2218,10 @@ pub(super) async fn run_nonce_gap_fill(
         "Gap fill: filling large nonce gap on demand"
     );
 
+    let chunk = crate::app::views::address_info::LARGE_GAP_FILL_CHUNK_TXS;
     let _ = action_tx.send(Action::LoadingStatus(format!(
-        "Filling gap of {} txs...",
-        gap.missing_count
+        "Filling gap (up to {} txs of {})...",
+        chunk, gap.missing_count
     )));
 
     let found = fill_specific_large_gap(address, &known_txs, &gap, dune, pf, action_tx).await;
@@ -2466,22 +2467,28 @@ async fn fill_specific_large_gap(
 ) -> Vec<crate::data::types::AddressTxSummary> {
     let from = gap.lo_block;
     let to = gap.hi_block;
+    let chunk = crate::app::views::address_info::LARGE_GAP_FILL_CHUNK_TXS;
     let known_hashes: std::collections::HashSet<_> = known_txs.iter().map(|t| t.hash).collect();
 
     // Pathfinder primary. `before_block` is exclusive in the pf-query API,
     // so pass `to + 1` to keep the gap's upper bound inclusive — matching
-    // the Dune BETWEEN semantics this used to use.
+    // the Dune BETWEEN semantics this used to use. We cap at
+    // `LARGE_GAP_FILL_CHUNK_TXS` so multi-thousand-tx gaps fill lazily,
+    // one Enter at a time; pf-query orders results `block_number DESC`,
+    // so each chunk shrinks the gap from its newer edge.
     if let Some(pf_c) = pf.as_ref() {
         info!(
             from,
             to,
             span = to.saturating_sub(from),
-            "Gap fill: querying Pathfinder for blocks {}..{}",
+            chunk,
+            "Gap fill: querying Pathfinder for blocks {}..{} (limit {})",
             from,
-            to
+            to,
+            chunk
         );
         match pf_c
-            .get_sender_txs(address, 1000, Some(to.saturating_add(1)), Some(from))
+            .get_sender_txs(address, chunk, Some(to.saturating_add(1)), Some(from))
             .await
         {
             Ok(entries) => {
@@ -2526,13 +2533,15 @@ async fn fill_specific_large_gap(
         from,
         to,
         span = to.saturating_sub(from),
-        "Gap fill: querying Dune for blocks {}..{}",
+        chunk,
+        "Gap fill: querying Dune for blocks {}..{} (limit {})",
         from,
-        to
+        to,
+        chunk
     );
 
     match dune_c
-        .query_account_txs_windowed(address, from, to, 1000)
+        .query_account_txs_windowed(address, from, to, chunk)
         .await
     {
         Ok(dune_txs) => {
