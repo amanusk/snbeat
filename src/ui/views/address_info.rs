@@ -484,102 +484,92 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // If a large nonce gap is deferred, remember its (hi_nonce → lo_nonce)
-    // boundary so we can render a divider above the row where the jump occurs.
-    let gap_boundary: Option<(u64, u64, u64, bool)> = app
+    // Position (in `txs.items`) where the gap row should be rendered just
+    // above. `None` when no deferred gap is showing, or the lo-nonce tx isn't
+    // in the loaded list yet.
+    let gap_pos = app.address.gap_pos();
+    let gap_info: Option<(u64, bool)> = app
         .address
         .unfilled_gap
         .as_ref()
-        .map(|g| (g.hi_nonce, g.lo_nonce, g.missing_count, g.fill_dispatched));
+        .map(|g| (g.missing_count, g.fill_dispatched));
 
-    let mut prev_nonce: Option<u64> = None;
-    let items: Vec<ListItem> = app
-        .address
-        .txs
-        .items
-        .iter()
-        .map(|tx| {
-            let fee_str = format_strk_u128(tx.total_fee_fri)
-                .trim_end_matches(" STRK")
-                .to_string();
-            let tip_str = if tx.tip > 0 {
-                format_fri(tx.tip as u128)
+    let mut items: Vec<ListItem> =
+        Vec::with_capacity(app.address.txs.items.len() + if gap_pos.is_some() { 1 } else { 0 });
+    for (idx, tx) in app.address.txs.items.iter().enumerate() {
+        if Some(idx) == gap_pos
+            && let Some((missing, dispatched)) = gap_info
+        {
+            let msg = if dispatched {
+                format!(" ── gap of {missing} txs — loading / press r to retry ──")
             } else {
-                "0".to_string()
+                format!(" ── {missing} txs hidden — press Enter to load ──")
             };
-            let age = format_age(tx.timestamp);
-            let endpoint = if tx.endpoint_names.chars().count() > 30 {
-                let truncated: String = tx.endpoint_names.chars().take(29).collect();
-                format!("{truncated}…")
-            } else {
-                tx.endpoint_names.clone()
-            };
-            let contracts_display = format_called_contracts(app, &tx.called_contracts);
+            items.push(ListItem::new(Line::from(Span::styled(
+                msg,
+                theme::SUGGESTION_STYLE,
+            ))));
+        }
 
-            let status_style = match tx.status.as_str() {
-                "OK" => theme::STATUS_OK,
-                "REV" => theme::STATUS_REVERTED,
-                _ => theme::SUGGESTION_STYLE,
-            };
+        let fee_str = format_strk_u128(tx.total_fee_fri)
+            .trim_end_matches(" STRK")
+            .to_string();
+        let tip_str = if tx.tip > 0 {
+            format_fri(tx.tip as u128)
+        } else {
+            "0".to_string()
+        };
+        let age = format_age(tx.timestamp);
+        let endpoint = if tx.endpoint_names.chars().count() > 30 {
+            let truncated: String = tx.endpoint_names.chars().take(29).collect();
+            format!("{truncated}…")
+        } else {
+            tx.endpoint_names.clone()
+        };
+        let contracts_display = format_called_contracts(app, &tx.called_contracts);
 
-            let type_style = match tx.tx_type.as_str() {
-                "INVOKE" => theme::TX_TYPE_INVOKE,
-                "DECLARE" => theme::TX_TYPE_DECLARE,
-                "DEPLOY_ACCOUNT" | "DEPLOY" => theme::TX_TYPE_DEPLOY,
-                "L1_HANDLER" => theme::TX_TYPE_L1HANDLER,
-                _ => theme::NORMAL_STYLE,
-            };
+        let status_style = match tx.status.as_str() {
+            "OK" => theme::STATUS_OK,
+            "REV" => theme::STATUS_REVERTED,
+            _ => theme::SUGGESTION_STYLE,
+        };
 
-            let main_line = Line::from(vec![
-                Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
-                Span::styled(format!("{:<15}", tx.tx_type), type_style),
-                Span::styled(
-                    format!("{:<14}", short_hash(&tx.hash)),
-                    theme::TX_HASH_STYLE,
-                ),
-                Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
-                Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
-                Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
-                Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
-                Span::styled(
-                    format!("#{:<9}", tx.block_number),
-                    theme::BLOCK_NUMBER_STYLE,
-                ),
-                Span::styled(format!("{:<4}", &tx.status), status_style),
-                Span::styled(age, theme::BLOCK_AGE_STYLE),
-            ]);
+        let type_style = match tx.tx_type.as_str() {
+            "INVOKE" => theme::TX_TYPE_INVOKE,
+            "DECLARE" => theme::TX_TYPE_DECLARE,
+            "DEPLOY_ACCOUNT" | "DEPLOY" => theme::TX_TYPE_DEPLOY,
+            "L1_HANDLER" => theme::TX_TYPE_L1HANDLER,
+            _ => theme::NORMAL_STYLE,
+        };
 
-            // Insert a dimmed divider above the row that sits on the far side
-            // of the unfilled gap (i.e. when we're about to step from hi_nonce
-            // down to lo_nonce in the descending list).
-            let separator: Option<Line> = match (prev_nonce, gap_boundary) {
-                (Some(prev), Some((hi, lo, missing, dispatched)))
-                    if prev == hi && tx.nonce == lo =>
-                {
-                    let msg = if dispatched {
-                        format!(" ── gap of {missing} txs — loading / retry with 'r' ──")
-                    } else {
-                        format!(" ── {missing} txs hidden — scroll down to load ──")
-                    };
-                    Some(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)))
-                }
-                _ => None,
-            };
-            prev_nonce = Some(tx.nonce);
-
-            let lines = match separator {
-                Some(sep) => vec![sep, main_line],
-                None => vec![main_line],
-            };
-            ListItem::new(lines)
-        })
-        .collect();
+        let main_line = Line::from(vec![
+            Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
+            Span::styled(format!("{:<15}", tx.tx_type), type_style),
+            Span::styled(
+                format!("{:<14}", short_hash(&tx.hash)),
+                theme::TX_HASH_STYLE,
+            ),
+            Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
+            Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
+            Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+            Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
+            Span::styled(
+                format!("#{:<9}", tx.block_number),
+                theme::BLOCK_NUMBER_STYLE,
+            ),
+            Span::styled(format!("{:<4}", &tx.status), status_style),
+            Span::styled(age, theme::BLOCK_AGE_STYLE),
+        ]);
+        items.push(ListItem::new(main_line));
+    }
 
     let gap_suffix = match &app.address.unfilled_gap {
-        Some(g) if !g.fill_dispatched => format!(
-            " — {} older txs deferred (scroll down to load) ",
-            g.missing_count
-        ),
+        Some(g) if !g.fill_dispatched => {
+            format!(
+                " — {} older txs deferred (Enter on gap row to load) ",
+                g.missing_count
+            )
+        }
         Some(g) => format!(" — gap of {} txs (press r to retry) ", g.missing_count),
         None => String::new(),
     };
@@ -600,7 +590,11 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
         .highlight_symbol(">> ");
 
-    f.render_stateful_widget(list, list_area, &mut app.address.txs.state);
+    // Sync rendered selection (gap-aware) into the persistent render state.
+    app.address
+        .txs_render_state
+        .select(app.address.tx_list_rendered_selected());
+    f.render_stateful_widget(list, list_area, &mut app.address.txs_render_state);
 }
 
 /// Render the contracts-called column: up to the first two contract labels

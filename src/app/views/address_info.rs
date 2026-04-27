@@ -113,8 +113,17 @@ pub struct AddressInfoState {
     pub sanity_check_dispatched: bool,
     /// Detected large nonce gap that has NOT been auto-filled (issue #10).
     /// Set after the initial load settles; filled on-demand when the user
-    /// scrolls near the bottom of the list.
+    /// presses Enter on the gap row.
     pub unfilled_gap: Option<UnfilledGap>,
+    /// True when the rendered gap row (rather than any tx) is currently selected.
+    /// The gap row is a synthetic, standalone entry in the rendered list; the
+    /// underlying `txs.state.selected()` does not move while this flag is set.
+    pub gap_selected: bool,
+    /// ListState fed to ratatui for the Transactions tab. Indexed against the
+    /// rendered list (txs + optional gap row), so it diverges from `txs.state`
+    /// whenever a gap is showing. Persisted across frames to keep the viewport
+    /// offset stable.
+    pub txs_render_state: ratatui::widgets::ListState,
     /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
     pub meta_txs: StatefulList<MetaTxIntenderSummary>,
     /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
@@ -185,6 +194,8 @@ impl Default for AddressInfoState {
             ws_subscribed: false,
             sanity_check_dispatched: false,
             unfilled_gap: None,
+            gap_selected: false,
+            txs_render_state: ratatui::widgets::ListState::default(),
             meta_txs: StatefulList::new(),
             fetching_meta_txs: false,
             meta_tx_cursor_block: None,
@@ -222,6 +233,8 @@ impl AddressInfoState {
         self.ws_subscribed = false;
         self.sanity_check_dispatched = false;
         self.unfilled_gap = None;
+        self.gap_selected = false;
+        self.txs_render_state = ratatui::widgets::ListState::default();
         self.meta_txs = StatefulList::new();
         self.fetching_meta_txs = false;
         self.meta_tx_cursor_block = None;
@@ -444,6 +457,154 @@ impl AddressInfoState {
             return None;
         }
         Some(gap)
+    }
+
+    /// Index in `txs.items` of the tx that sits just below the rendered gap
+    /// row (i.e. the one with `nonce == gap.lo_nonce`). Returns `None` when
+    /// there is no detected gap or the lo-nonce tx isn't in the visible list.
+    pub fn gap_pos(&self) -> Option<usize> {
+        let gap = self.unfilled_gap.as_ref()?;
+        self.txs.items.iter().position(|t| t.nonce == gap.lo_nonce)
+    }
+
+    /// Rendered (gap-aware) selection index for the Transactions list — the
+    /// position the gap row + tx rows occupy in the rendered viewport.
+    pub fn tx_list_rendered_selected(&self) -> Option<usize> {
+        let gap = self.gap_pos();
+        if self.gap_selected {
+            return gap;
+        }
+        let tx_idx = self.txs.state.selected()?;
+        Some(match gap {
+            Some(g) if tx_idx >= g => tx_idx + 1,
+            _ => tx_idx,
+        })
+    }
+
+    /// Step the tx-list selection down. If the next step would cross the gap
+    /// row, selection lands on the gap row instead. From the gap row, advances
+    /// to the tx below it (no fill is dispatched — Enter is the only trigger).
+    pub fn tx_list_next(&mut self) {
+        if self.txs.items.is_empty() {
+            return;
+        }
+        let gap = self.gap_pos();
+        if self.gap_selected {
+            self.gap_selected = false;
+            if let Some(g) = gap {
+                let target = g.min(self.txs.items.len() - 1);
+                self.txs.state.select(Some(target));
+            } else {
+                self.txs.next();
+            }
+            return;
+        }
+        if let Some(g) = gap {
+            let cur = self.txs.state.selected().unwrap_or(0);
+            if cur + 1 == g {
+                self.gap_selected = true;
+                return;
+            }
+        }
+        self.txs.next();
+    }
+
+    /// Step the tx-list selection up. Symmetric to `tx_list_next` w.r.t. the
+    /// gap row.
+    pub fn tx_list_previous(&mut self) {
+        if self.txs.items.is_empty() {
+            return;
+        }
+        let gap = self.gap_pos();
+        if self.gap_selected {
+            self.gap_selected = false;
+            if let Some(g) = gap {
+                let target = g.saturating_sub(1);
+                self.txs.state.select(Some(target));
+            } else {
+                self.txs.previous();
+            }
+            return;
+        }
+        if let Some(g) = gap {
+            let cur = self.txs.state.selected().unwrap_or(0);
+            if cur == g {
+                self.gap_selected = true;
+                return;
+            }
+        }
+        self.txs.previous();
+    }
+
+    pub fn tx_list_select_first(&mut self) {
+        self.gap_selected = false;
+        self.txs.select_first();
+    }
+
+    /// Jump to the last tx. If the cursor is currently above the gap row, the
+    /// jump clamps on the gap so the user can decide whether to load it or
+    /// step past with another keypress.
+    pub fn tx_list_select_last(&mut self) {
+        if self.txs.items.is_empty() {
+            return;
+        }
+        if let Some(g) = self.gap_pos() {
+            let above_gap =
+                !self.gap_selected && self.txs.state.selected().is_none_or(|cur| cur < g);
+            if above_gap {
+                self.gap_selected = true;
+                return;
+            }
+        }
+        self.gap_selected = false;
+        self.txs.select_last();
+    }
+
+    /// Scroll the tx-list selection by `delta`. If the gap row sits between
+    /// the current selection and the target, selection clamps on the gap row.
+    pub fn tx_list_scroll_by(&mut self, delta: i64) {
+        if self.txs.items.is_empty() || delta == 0 {
+            return;
+        }
+        let gap = self.gap_pos();
+        let last_tx = self.txs.items.len() as i64 - 1;
+        let cur_tx = self.txs.state.selected().unwrap_or(0) as i64;
+        let cur_rendered = match (self.gap_selected, gap) {
+            (true, Some(g)) => g as i64,
+            (false, Some(g)) if cur_tx >= g as i64 => cur_tx + 1,
+            _ => cur_tx,
+        };
+        let rendered_last = last_tx + if gap.is_some() { 1 } else { 0 };
+        let target_rendered = (cur_rendered + delta).clamp(0, rendered_last);
+        let final_rendered = match gap {
+            Some(g) => {
+                let g = g as i64;
+                if cur_rendered != g && (cur_rendered < g) != (target_rendered < g) {
+                    g
+                } else {
+                    target_rendered
+                }
+            }
+            None => target_rendered,
+        };
+        match gap {
+            Some(g) if final_rendered == g as i64 => {
+                self.gap_selected = true;
+            }
+            Some(g) => {
+                self.gap_selected = false;
+                let tx_idx = if final_rendered < g as i64 {
+                    final_rendered as usize
+                } else {
+                    (final_rendered - 1) as usize
+                };
+                self.txs.state.select(Some(tx_idx));
+            }
+            None => {
+                self.gap_selected = false;
+                self.txs.state.select(Some(final_rendered as usize));
+            }
+        }
     }
 }
 
