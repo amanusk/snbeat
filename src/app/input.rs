@@ -97,15 +97,24 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
-        // Ctrl+U / PgUp: cycle to next block or tx
+        // Ctrl+U / PgUp: page-scroll the active list (in TxDetail: cycle tab back)
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => handle_cycle(app, 1),
         KeyCode::PageUp => handle_cycle(app, 1),
 
-        // Ctrl+D / PgDn: cycle to prev block or tx
+        // Ctrl+D / PgDn: page-scroll the active list (in TxDetail: cycle tab forward)
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             handle_cycle(app, -1)
         }
         KeyCode::PageDown => handle_cycle(app, -1),
+
+        // Ctrl+P: scroll UP the primary axis. BlockDetail: block N+1.
+        // TxDetail: higher tx idx, wrapping at the top to tx idx 0 of block N+1.
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => handle_axis(app, -1),
+
+        // Ctrl+N: scroll DOWN the primary axis. BlockDetail: block N-1.
+        // TxDetail: lower tx idx, wrapping at the bottom (tx idx 0) to the
+        // highest tx idx of block N-1.
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => handle_axis(app, 1),
 
         // Tab / Shift+Tab: cycle tabs forward/backward.
         KeyCode::Tab => {
@@ -146,9 +155,10 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         // ]: jump forward in history (replaces Ctrl+i which terminals map to Tab)
         KeyCode::Char(']') => app.navigate_forward(),
 
-        // n/N: nonce-based tx cycling (in TxDetail, navigate to next/prev tx by same sender)
-        KeyCode::Char('n') => handle_nonce_cycle(app, 1),
-        KeyCode::Char('N') => handle_nonce_cycle(app, -1),
+        // n/N: nonce-based tx cycling (TxDetail; matches visual scroll
+        // direction — n goes down to the older tx, N goes up to the newer).
+        KeyCode::Char('n') => handle_nonce_cycle(app, -1),
+        KeyCode::Char('N') => handle_nonce_cycle(app, 1),
 
         // Refresh
         KeyCode::Char('r') => match app.current_view() {
@@ -527,7 +537,10 @@ fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
     })
 }
 
-/// Cycle to the next/previous block or transaction depending on active view.
+/// Page-scroll the active list. Ctrl+U / Ctrl+D / PageUp / PageDown share this
+/// dispatcher. In TxDetail (which has no list under the cursor) it cycles the
+/// body tab instead. Axis navigation (next/prev block, next/prev tx) lives in
+/// `handle_axis` (Ctrl+P / Ctrl+N).
 fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
     match app.current_view() {
         View::Blocks => {
@@ -541,35 +554,24 @@ fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
             None
         }
         View::BlockDetail => {
-            let current = app.block_detail.block.as_ref()?.number;
-            let target = (current as i64 + direction).max(0) as u64;
-            if target == current {
-                return None;
-            }
-            // Stay in same view -- clear and refetch without pushing
-            app.is_loading = true;
-            app.clear_block_detail();
-            Some(Action::FetchBlockDetail { number: target })
+            // Page-scroll the per-block tx list (newest tx first, so direction
+            // signs match Blocks above).
+            const CHUNK: i64 = 20;
+            let delta = -direction * CHUNK;
+            app.block_detail_txs_scroll_by(delta);
+            None
         }
         View::TxDetail => {
-            let current_hash = app.tx_detail.transaction.as_ref()?.hash();
-            let idx = app
-                .block_detail
-                .txs
-                .items
-                .iter()
-                .position(|tx| tx.hash() == current_hash)?;
-            let new_idx = (idx as i64 + direction).max(0) as usize;
-            let new_idx = new_idx.min(app.block_detail.txs.items.len().saturating_sub(1));
-            if new_idx == idx {
-                return None;
-            }
-            let hash = app.block_detail.txs.items[new_idx].hash();
-            app.block_detail.txs.state.select(Some(new_idx));
-            // Stay in same view -- clear and refetch without pushing
-            app.is_loading = true;
-            app.clear_tx_detail();
-            Some(Action::FetchTransaction { hash })
+            // Page-scroll the active tab's body. Tab/Shift+Tab switch tabs.
+            // direction: +1 = Ctrl+U / PageUp (up), -1 = Ctrl+D / PageDown (down).
+            const CHUNK: u16 = 10;
+            let s = app.tx_detail.active_scroll_mut();
+            *s = if direction > 0 {
+                s.saturating_sub(CHUNK)
+            } else {
+                s.saturating_add(CHUNK)
+            };
+            None
         }
         View::AddressInfo => {
             // Half-page-ish scroll inside the active address tab.
@@ -579,6 +581,91 @@ fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
             let delta = -direction * CHUNK;
             app.address_list_scroll_by(delta);
             None
+        }
+        _ => None,
+    }
+}
+
+/// Axis navigation in display order.
+///
+/// `dir`: +1 = scroll DOWN visually (Ctrl+N), -1 = scroll UP visually (Ctrl+P).
+///
+/// Display order in the TUI:
+/// - Blocks list shows newest first → block N+1 is above block N → scrolling
+///   down visually means moving to a *lower* block number.
+/// - Per-block tx list is reversed at load time (`transactions.reverse()` in
+///   `BlockDetailLoaded`) so highest tx idx is at the top → scrolling down
+///   visually means moving to a *lower* tx idx (i.e., a higher *position*
+///   in the items list).
+///
+/// Wrapping in TxDetail:
+/// - Down past tx idx 0 (bottom of current block) → highest tx idx of block
+///   N-1 (top of the next block down). That's `TxBoundary::First` (position
+///   0 in the items list of block N-1, which is the highest tx idx after
+///   the load-time reverse).
+/// - Up past the highest tx idx (top of current block) → tx idx 0 of block
+///   N+1 (bottom of the previous block up). That's `TxBoundary::Last`
+///   (last position in the items list = tx idx 0 after the reverse).
+fn handle_axis(app: &mut App, dir: i64) -> Option<Action> {
+    match app.current_view() {
+        View::BlockDetail => {
+            let current = app.block_detail.block.as_ref()?.number;
+            // Higher block number = visually up, so target = current - dir.
+            let target = if dir > 0 {
+                current.checked_sub(1)?
+            } else {
+                current + 1
+            };
+            // Stay in same view -- clear and refetch without pushing.
+            app.is_loading = true;
+            app.clear_block_detail();
+            Some(Action::FetchBlockDetail { number: target })
+        }
+        View::TxDetail => {
+            let current_hash = app.tx_detail.transaction.as_ref()?.hash();
+            let len = app.block_detail.txs.items.len();
+            let idx = app
+                .block_detail
+                .txs
+                .items
+                .iter()
+                .position(|tx| tx.hash() == current_hash)?;
+            // Higher position in items list = visually down (because the list
+            // is reversed at load time), so new_position = current_position + dir.
+            let new_idx = idx as i64 + dir;
+            if new_idx >= 0 && (new_idx as usize) < len {
+                // Within-block step.
+                let new_idx = new_idx as usize;
+                let hash = app.block_detail.txs.items[new_idx].hash();
+                app.block_detail.txs.state.select(Some(new_idx));
+                app.is_loading = true;
+                app.clear_tx_detail();
+                Some(Action::FetchTransaction { hash })
+            } else {
+                // Out of bounds — wrap to neighbor block.
+                let current_block = app.block_detail.block.as_ref()?.number;
+                let target_block = if dir > 0 {
+                    // Down past tx idx 0 → next block (N-1) at its top
+                    // (highest tx idx = position 0 in items = First).
+                    current_block.checked_sub(1)?
+                } else {
+                    // Up past highest tx idx → prev block (N+1) at its bottom
+                    // (tx idx 0 = last position in items = Last).
+                    current_block + 1
+                };
+                let boundary = if dir > 0 {
+                    crate::app::TxBoundary::First
+                } else {
+                    crate::app::TxBoundary::Last
+                };
+                app.pending_tx_boundary = Some(boundary);
+                app.is_loading = true;
+                app.clear_tx_detail();
+                app.clear_block_detail();
+                Some(Action::FetchBlockDetail {
+                    number: target_block,
+                })
+            }
         }
         _ => None,
     }

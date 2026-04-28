@@ -46,6 +46,15 @@ pub enum NavEntry {
     ClassHash(starknet::core::types::Felt),
 }
 
+/// Pending follow-up after a `BlockDetailLoaded` lands: jump to the first or
+/// last tx of the freshly fetched block. Used by Ctrl+P / Ctrl+N in TxDetail
+/// to wrap across block boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxBoundary {
+    First,
+    Last,
+}
+
 /// Tabs in the address info view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressTab {
@@ -99,6 +108,12 @@ pub struct App {
     /// item (without this, `G` stops 30 blocks short of the true bottom).
     pub pending_bottom_jump: bool,
 
+    /// Set when Ctrl+P/Ctrl+N at a block boundary in TxDetail triggers a
+    /// neighbor-block fetch. Once the BlockDetail data lands, we honor this
+    /// by dispatching a follow-up FetchTransaction for that block's first or
+    /// last tx and staying in TxDetail.
+    pub pending_tx_boundary: Option<TxBoundary>,
+
     /// Labels fetched from Voyager API at runtime (address → label info).
     /// Used as a fallback when neither user labels nor known addresses have an entry.
     pub voyager_labels: HashMap<starknet::core::types::Felt, VoyagerLabelInfo>,
@@ -148,6 +163,7 @@ impl App {
 
             fetching_older_blocks: false,
             pending_bottom_jump: false,
+            pending_tx_boundary: None,
 
             voyager_labels: HashMap::new(),
 
@@ -308,6 +324,9 @@ impl App {
         self.class.visual_mode = false;
         self.address.visual_mode = false;
 
+        // Any explicit nav cancels a pending wrap-to-boundary.
+        self.pending_tx_boundary = None;
+
         self.is_loading = true;
 
         match target {
@@ -407,6 +426,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Scroll the tx list inside the BlockDetail view by a delta. Mirrors
+    /// `address_list_scroll_by` but for the per-block tx list — used by
+    /// Ctrl+U / Ctrl+D on the BlockDetail view.
+    pub fn block_detail_txs_scroll_by(&mut self, delta: i64) {
+        if self.block_detail.txs.items.is_empty() {
+            return;
+        }
+        self.block_detail.txs.scroll_by(delta);
     }
 
     /// Scroll the main blocks list by a delta, triggering older-block
@@ -917,6 +946,38 @@ impl App {
                 self.block_detail.endpoint_names = endpoint_names;
                 self.block_detail.tx_statuses = tx_statuses;
                 self.block_detail.meta_tx_info = meta_tx_info;
+
+                // If a wrap-to-boundary is pending (Ctrl+P/N at the first/last
+                // tx of the prior block), pick the corresponding tx and stay
+                // in TxDetail by dispatching a follow-up FetchTransaction
+                // instead of pushing BlockDetail.
+                if let Some(boundary) = self.pending_tx_boundary.take() {
+                    let hash = match boundary {
+                        TxBoundary::First => {
+                            if !self.block_detail.txs.items.is_empty() {
+                                self.block_detail.txs.select_first();
+                            }
+                            self.block_detail.txs.items.first().map(|t| t.hash())
+                        }
+                        TxBoundary::Last => {
+                            if !self.block_detail.txs.items.is_empty() {
+                                self.block_detail.txs.select_last();
+                            }
+                            self.block_detail.txs.items.last().map(|t| t.hash())
+                        }
+                    };
+                    if let Some(hash) = hash {
+                        // Keep is_loading true — the tx fetch will clear it.
+                        let _ = self.action_tx.send(Action::FetchTransaction { hash });
+                        return;
+                    }
+                    // Empty block on the other side — clear loading and stay
+                    // wherever the user was. Rare in practice.
+                    self.is_loading = false;
+                    self.loading_detail = None;
+                    return;
+                }
+
                 if !self.block_detail.txs.items.is_empty() {
                     self.block_detail.txs.select_first();
                 }

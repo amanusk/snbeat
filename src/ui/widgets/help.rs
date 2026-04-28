@@ -31,9 +31,13 @@ pub fn draw_help_overlay(f: &mut Frame, app: &App) {
         Line::from("   Enter            Submit search"),
         Line::from(""),
         Line::from(Span::styled(" Block/Tx Navigation", theme::TITLE_STYLE)),
-        Line::from("   PgUp/Ctrl+U      Next block (or next tx in TxDetail)"),
-        Line::from("   PgDn/Ctrl+D      Prev block (or prev tx in TxDetail)"),
-        Line::from("   n/N              Next/prev tx by nonce (same sender)"),
+        Line::from("   PgUp/Ctrl+U      Page-scroll up (list or active TxDetail tab body)"),
+        Line::from("   PgDn/Ctrl+D      Page-scroll down (list or active TxDetail tab body)"),
+        Line::from(
+            "   Ctrl+P / Ctrl+N  Up/down on the axis (block in BlockDetail, tx in TxDetail; wraps blocks)",
+        ),
+        Line::from("   n / N            Down/up tx by nonce (same sender)"),
+        Line::from("   Tab / Shift+Tab  Cycle tabs (TxDetail / AddressInfo)"),
         Line::from("   c/d              Raw calldata / decoded calldata"),
         Line::from("   o                Outside execution intent (meta tx)"),
         Line::from("   Ctrl+o / h / Esc  Go back one view"),
@@ -68,10 +72,10 @@ pub fn hint_for_view(app: &App) -> String {
             " /search  j/k scroll  Enter open  r refresh  ? help".into()
         }
         crate::app::state::View::BlockDetail => {
-            " /search  j/k scroll  Enter open  h back  PgUp/PgDn blocks  ? help".into()
+            " /search  j/k scroll  PgUp/PgDn page txs  Ctrl+P/N block up/down  Enter open  h back  ? help".into()
         }
         crate::app::state::View::TxDetail => {
-            " /search  h back  PgUp/PgDn txs  n/N nonce  v visual  c/d calldata  o intent  ? help"
+            " /search  h back  j/k scroll  PgUp/PgDn page  Tab switch  Ctrl+P/N tx up/down  n/N nonce down/up  v visual  c/d calldata  ? help"
                 .into()
         }
         crate::app::state::View::AddressInfo => {
