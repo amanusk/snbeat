@@ -17,9 +17,33 @@ use crate::ui::widgets::stateful_list::StatefulList;
 /// Maximum block span a nonce gap can cover before we stop auto-filling it
 /// via RPC block scans. Gaps wider than this are deferred to on-demand Dune
 /// queries (`run_nonce_gap_fill`). Shared between the detector
-/// (`detect_unfilled_gap`) and the filler (`fill_small_nonce_gaps_phase`) so
+/// (`detect_unfilled_gaps`) and the filler (`fill_small_nonce_gaps_phase`) so
 /// they stay aligned — drift between the two causes silent data loss.
 pub const SMALL_GAP_SPAN_BLOCKS: u64 = 50;
+
+/// Maximum number of txs an on-demand fill pulls per Enter press. Keeping
+/// this small (matching the chronological pagination chunk in `app/mod.rs`)
+/// makes large-gap fills lazy: each Enter shrinks the gap from its newer
+/// edge, leaving a residual gap row that the user can fill again. Without
+/// this cap, a 33k-tx gap would fire one giant Dune/Pathfinder query per
+/// Enter, which is exactly the behavior we want to avoid.
+pub const LARGE_GAP_FILL_CHUNK_TXS: u32 = 50;
+
+/// Detected gaps with no more than this many missing nonces are filled
+/// automatically (no Enter required). They still go through the deferred-fill
+/// machinery — we just dispatch the fill on the user's behalf so a 1-tx hole
+/// in a sparse account never surfaces as a "press Enter" row. Larger gaps
+/// stay deferred so we don't burn Dune/Pathfinder queries on multi-thousand
+/// tx ranges the user might not care about.
+pub const AUTO_FILL_MAX_MISSING: u64 = 1;
+
+/// Cap on the number of tiny gaps auto-dispatched per refresh. A very-active
+/// address can have dozens of 1-nonce holes scattered across its history;
+/// firing every one at once would saturate Pathfinder and (on the Dune
+/// fallback) blow through quota. Remaining tiny gaps still appear as
+/// deferred rows, and the next refresh picks them up after the dispatched
+/// chunk lands.
+pub const MAX_AUTO_FILLS_PER_REFRESH: usize = 5;
 
 /// Passive UI hint derived from the event-window helper's last fetch.
 /// Shared across the Calls / Events / MetaTxs tabs because all three
@@ -111,10 +135,22 @@ pub struct AddressInfoState {
     pub ws_subscribed: bool,
     /// Whether the post-display sanity check has already been dispatched.
     pub sanity_check_dispatched: bool,
-    /// Detected large nonce gap that has NOT been auto-filled (issue #10).
-    /// Set after the initial load settles; filled on-demand when the user
-    /// scrolls near the bottom of the list.
-    pub unfilled_gap: Option<UnfilledGap>,
+    /// Detected large nonce gaps that have NOT been auto-filled (issue #10).
+    /// Each gap renders as its own row between the bordering txs; the user
+    /// presses Enter on a gap row to dispatch its fill.
+    pub unfilled_gaps: Vec<UnfilledGap>,
+    /// `Some(lo_nonce)` when the rendered gap row whose `lo_nonce` matches is
+    /// currently selected. The gap row is a synthetic, standalone entry in the
+    /// rendered list; the underlying `txs.state.selected()` does not move
+    /// while this is set. Identifying by `lo_nonce` (instead of vec index)
+    /// keeps the selection stable across re-detection passes that reorder the
+    /// gap list.
+    pub gap_selected: Option<u64>,
+    /// ListState fed to ratatui for the Transactions tab. Indexed against the
+    /// rendered list (txs + optional gap row), so it diverges from `txs.state`
+    /// whenever a gap is showing. Persisted across frames to keep the viewport
+    /// offset stable.
+    pub txs_render_state: ratatui::widgets::ListState,
     /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
     pub meta_txs: StatefulList<MetaTxIntenderSummary>,
     /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
@@ -184,7 +220,9 @@ impl Default for AddressInfoState {
             rpc_has_more: false,
             ws_subscribed: false,
             sanity_check_dispatched: false,
-            unfilled_gap: None,
+            unfilled_gaps: Vec::new(),
+            gap_selected: None,
+            txs_render_state: ratatui::widgets::ListState::default(),
             meta_txs: StatefulList::new(),
             fetching_meta_txs: false,
             meta_tx_cursor_block: None,
@@ -221,7 +259,9 @@ impl AddressInfoState {
         self.rpc_has_more = false;
         self.ws_subscribed = false;
         self.sanity_check_dispatched = false;
-        self.unfilled_gap = None;
+        self.unfilled_gaps.clear();
+        self.gap_selected = None;
+        self.txs_render_state = ratatui::widgets::ListState::default();
         self.meta_txs = StatefulList::new();
         self.fetching_meta_txs = false;
         self.meta_tx_cursor_block = None;
@@ -388,19 +428,17 @@ impl AddressInfoState {
             .sort_by(|a, b| b.block_number.cmp(&a.block_number));
     }
 
-    /// Scan the current tx list for a "large" nonce gap that we want to defer
-    /// filling until the user asks for it.
+    /// Scan the current tx list for *all* large nonce gaps that should be
+    /// deferred until the user asks for them.
     ///
-    /// Returns `Some(gap)` when the biggest contiguous missing-nonce run is large
-    /// enough to justify deferring (either many missing entries, or a wide block
-    /// span). Small gaps are left to the normal enrichment path and return `None`
-    /// so the caller can auto-fill them.
-    pub fn detect_unfilled_gap(&self) -> Option<UnfilledGap> {
-        // Only meaningful for account txs (contracts don't have sequential nonces).
+    /// Each returned gap has at least one missing nonce *and* a block span
+    /// wider than `SMALL_GAP_SPAN_BLOCKS` (the RPC small-gap path's reach —
+    /// narrower gaps stay on the auto-fill path). Sorted by `lo_nonce`
+    /// ascending so renderers/tests have a stable order.
+    pub fn detect_unfilled_gaps(&self) -> Vec<UnfilledGap> {
         if self.is_contract {
-            return None;
+            return Vec::new();
         }
-        // Build sorted (nonce, block) pairs for txs that have landed in a block.
         let mut pairs: Vec<(u64, u64)> = self
             .txs
             .items
@@ -409,12 +447,11 @@ impl AddressInfoState {
             .map(|t| (t.nonce, t.block_number))
             .collect();
         if pairs.len() < 2 {
-            return None;
+            return Vec::new();
         }
         pairs.sort_by_key(|(n, _)| *n);
 
-        // Find the biggest missing-nonce run.
-        let mut best: Option<UnfilledGap> = None;
+        let mut out = Vec::new();
         for w in pairs.windows(2) {
             let (lo_nonce, lo_block) = w[0];
             let (hi_nonce, hi_block) = w[1];
@@ -422,28 +459,203 @@ impl AddressInfoState {
             if missing == 0 {
                 continue;
             }
-            let keep = best.as_ref().is_none_or(|b| missing > b.missing_count);
-            if keep {
-                best = Some(UnfilledGap {
-                    lo_nonce,
-                    hi_nonce,
-                    lo_block,
-                    hi_block,
-                    missing_count: missing,
-                    fill_dispatched: false,
-                });
+            // `fill_small_nonce_gaps_phase` only covers spans ≤ SMALL_GAP_SPAN_BLOCKS
+            // via RPC scans; anything wider must be filled via Dune on demand
+            // or it would be silently dropped.
+            let span = hi_block.saturating_sub(lo_block);
+            if span <= SMALL_GAP_SPAN_BLOCKS {
+                continue;
+            }
+            out.push(UnfilledGap {
+                lo_nonce,
+                hi_nonce,
+                lo_block,
+                hi_block,
+                missing_count: missing,
+                fill_dispatched: false,
+            });
+        }
+        out
+    }
+
+    /// Re-detect gaps and store them. `fill_dispatched` is preserved only for
+    /// gaps whose `(lo_nonce, hi_nonce)` is unchanged from the previous list —
+    /// a shifted `hi_nonce` is evidence the fill response just landed
+    /// (lazy fills always shrink the gap from the newer edge), so we clear
+    /// the flag and let the user press Enter again for the next chunk.
+    /// Drops the gap selection if the previously-selected gap no longer exists.
+    pub fn refresh_unfilled_gaps(&mut self) {
+        let prev_inflight: std::collections::HashMap<u64, u64> = self
+            .unfilled_gaps
+            .iter()
+            .filter(|g| g.fill_dispatched)
+            .map(|g| (g.lo_nonce, g.hi_nonce))
+            .collect();
+        let mut next = self.detect_unfilled_gaps();
+        for g in next.iter_mut() {
+            if let Some(prev_hi) = prev_inflight.get(&g.lo_nonce)
+                && *prev_hi == g.hi_nonce
+            {
+                g.fill_dispatched = true;
             }
         }
-        let gap = best?;
+        self.unfilled_gaps = next;
+        if let Some(sel) = self.gap_selected
+            && !self.unfilled_gaps.iter().any(|g| g.lo_nonce == sel)
+        {
+            self.gap_selected = None;
+        }
+    }
 
-        // Defer any gap the RPC small-gap path can't handle. `fill_small_nonce_gaps_phase`
-        // only scans spans ≤ `SMALL_GAP_SPAN_BLOCKS` — anything wider must be
-        // filled via Dune on-demand or it would otherwise be dropped silently.
-        let span = gap.hi_block.saturating_sub(gap.lo_block);
-        if span <= SMALL_GAP_SPAN_BLOCKS {
+    /// Render-order positions for the gap rows: pairs of `(tx_idx, lo_nonce)`
+    /// sorted by `tx_idx` ascending. Each gap renders immediately above the
+    /// tx whose nonce equals `lo_nonce`. Gaps whose `lo_nonce` tx isn't in
+    /// `txs.items` are filtered out (defensive — usually all match).
+    pub fn gap_render_positions(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = self
+            .unfilled_gaps
+            .iter()
+            .filter_map(|g| {
+                self.txs
+                    .items
+                    .iter()
+                    .position(|t| t.nonce == g.lo_nonce)
+                    .map(|p| (p, g.lo_nonce))
+            })
+            .collect();
+        out.sort_by_key(|(p, _)| *p);
+        out
+    }
+
+    fn rendered_len(&self, gaps: &[(usize, u64)]) -> usize {
+        self.txs.items.len() + gaps.len()
+    }
+
+    fn tx_pos_to_rendered(tx_pos: usize, gaps: &[(usize, u64)]) -> usize {
+        tx_pos + gaps.iter().filter(|(p, _)| *p <= tx_pos).count()
+    }
+
+    fn gap_rendered_idx(gaps: &[(usize, u64)], idx_in_gaps: usize) -> usize {
+        gaps[idx_in_gaps].0 + idx_in_gaps
+    }
+
+    fn rendered_to_tx_pos(r: usize, gaps: &[(usize, u64)]) -> usize {
+        let gaps_before = gaps
+            .iter()
+            .enumerate()
+            .filter(|(g_idx, (p, _))| p + g_idx < r)
+            .count();
+        r - gaps_before
+    }
+
+    /// Rendered (gap-aware) selection index for the Transactions list.
+    pub fn tx_list_rendered_selected(&self) -> Option<usize> {
+        let gaps = self.gap_render_positions();
+        if let Some(sel_lo) = self.gap_selected
+            && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
+        {
+            return Some(Self::gap_rendered_idx(&gaps, g_idx));
+        }
+        let tx_idx = self.txs.state.selected()?;
+        Some(Self::tx_pos_to_rendered(tx_idx, &gaps))
+    }
+
+    /// Currently-selected gap, if the gap row is the active selection.
+    pub fn selected_gap(&self) -> Option<&UnfilledGap> {
+        let lo = self.gap_selected?;
+        self.unfilled_gaps.iter().find(|g| g.lo_nonce == lo)
+    }
+
+    fn current_rendered(&self, gaps: &[(usize, u64)]) -> usize {
+        if let Some(sel_lo) = self.gap_selected
+            && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
+        {
+            return Self::gap_rendered_idx(gaps, g_idx);
+        }
+        let t = self.txs.state.selected().unwrap_or(0);
+        Self::tx_pos_to_rendered(t, gaps)
+    }
+
+    /// First gap rendered idx that lies strictly between `cur` and `target`
+    /// (target inclusive). Returns `None` if no gap is crossed.
+    fn first_gap_crossed(gaps: &[(usize, u64)], cur: usize, target: usize) -> Option<usize> {
+        if cur == target {
             return None;
         }
-        Some(gap)
+        if target > cur {
+            gaps.iter().enumerate().find_map(|(g_idx, (p, _))| {
+                let r = p + g_idx;
+                (r > cur && r <= target).then_some(r)
+            })
+        } else {
+            gaps.iter().enumerate().rev().find_map(|(g_idx, (p, _))| {
+                let r = p + g_idx;
+                (r < cur && r >= target).then_some(r)
+            })
+        }
+    }
+
+    /// Apply a target rendered index to state — selects the gap row when the
+    /// index lands on one, otherwise selects the corresponding tx.
+    fn apply_rendered(&mut self, r: usize, gaps: &[(usize, u64)]) {
+        for (g_idx, (p, lo)) in gaps.iter().enumerate() {
+            if p + g_idx == r {
+                self.gap_selected = Some(*lo);
+                return;
+            }
+        }
+        self.gap_selected = None;
+        let t = Self::rendered_to_tx_pos(r, gaps);
+        self.txs.state.select(Some(t));
+    }
+
+    /// Move selection by `delta` rows in the rendered list, clamping on the
+    /// first gap row crossed.
+    fn tx_list_step(&mut self, delta: i64) {
+        if self.txs.items.is_empty() || delta == 0 {
+            return;
+        }
+        let gaps = self.gap_render_positions();
+        let rendered_max = self.rendered_len(&gaps).saturating_sub(1);
+        let cur = self.current_rendered(&gaps);
+        let target = ((cur as i64) + delta).clamp(0, rendered_max as i64) as usize;
+        let final_r = Self::first_gap_crossed(&gaps, cur, target).unwrap_or(target);
+        self.apply_rendered(final_r, &gaps);
+    }
+
+    pub fn tx_list_next(&mut self) {
+        self.tx_list_step(1);
+    }
+
+    pub fn tx_list_previous(&mut self) {
+        self.tx_list_step(-1);
+    }
+
+    /// Jump toward the first row, clamping on the first gap row crossed.
+    pub fn tx_list_select_first(&mut self) {
+        if self.txs.items.is_empty() {
+            return;
+        }
+        let gaps = self.gap_render_positions();
+        let cur = self.current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, 0).unwrap_or(0);
+        self.apply_rendered(final_r, &gaps);
+    }
+
+    /// Jump toward the last row, clamping on the first gap row crossed.
+    pub fn tx_list_select_last(&mut self) {
+        if self.txs.items.is_empty() {
+            return;
+        }
+        let gaps = self.gap_render_positions();
+        let rendered_max = self.rendered_len(&gaps).saturating_sub(1);
+        let cur = self.current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, rendered_max).unwrap_or(rendered_max);
+        self.apply_rendered(final_r, &gaps);
+    }
+
+    pub fn tx_list_scroll_by(&mut self, delta: i64) {
+        self.tx_list_step(delta);
     }
 }
 
@@ -508,14 +720,14 @@ mod tests {
     #[test]
     fn no_gap_when_contiguous() {
         let state = state_with(vec![summary(10, 100), summary(11, 102), summary(12, 104)]);
-        assert!(state.detect_unfilled_gap().is_none());
+        assert!(state.detect_unfilled_gaps().is_empty());
     }
 
     #[test]
     fn no_gap_for_small_span() {
         // Gap spans only 30 blocks — RPC small-gap path handles this.
         let state = state_with(vec![summary(10, 100), summary(16, 130)]);
-        assert!(state.detect_unfilled_gap().is_none());
+        assert!(state.detect_unfilled_gaps().is_empty());
     }
 
     #[test]
@@ -523,7 +735,9 @@ mod tests {
         // Only 2 missing nonces but span = 100 blocks > SMALL_GAP_SPAN_BLOCKS.
         // This is the medium-gap case that would otherwise be silently dropped.
         let state = state_with(vec![summary(10, 100), summary(13, 200)]);
-        let g = state.detect_unfilled_gap().expect("wide-span gap expected");
+        let gaps = state.detect_unfilled_gaps();
+        assert_eq!(gaps.len(), 1);
+        let g = &gaps[0];
         assert_eq!(g.lo_nonce, 10);
         assert_eq!(g.hi_nonce, 13);
         assert_eq!(g.missing_count, 2);
@@ -532,45 +746,44 @@ mod tests {
 
     #[test]
     fn detects_gap_by_block_span() {
-        // Large block span well above the RPC small-gap limit.
         let state = state_with(vec![summary(10, 100), summary(21, 2000)]);
-        let g = state.detect_unfilled_gap().expect("wide-span gap expected");
-        assert_eq!(g.lo_nonce, 10);
-        assert_eq!(g.hi_nonce, 21);
-        assert_eq!(g.missing_count, 10);
+        let gaps = state.detect_unfilled_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].lo_nonce, 10);
+        assert_eq!(gaps[0].hi_nonce, 21);
+        assert_eq!(gaps[0].missing_count, 10);
     }
 
     #[test]
     fn gap_threshold_boundary() {
-        // Exactly at the threshold: span == SMALL_GAP_SPAN_BLOCKS → no defer.
+        // Exactly at the threshold: span == SMALL_GAP_SPAN_BLOCKS → not deferred.
         let state = state_with(vec![
             summary(10, 100),
             summary(12, 100 + SMALL_GAP_SPAN_BLOCKS),
         ]);
-        assert!(state.detect_unfilled_gap().is_none());
+        assert!(state.detect_unfilled_gaps().is_empty());
 
-        // One over: span == SMALL_GAP_SPAN_BLOCKS + 1 → deferred.
+        // One over → deferred.
         let state = state_with(vec![
             summary(10, 100),
             summary(12, 100 + SMALL_GAP_SPAN_BLOCKS + 1),
         ]);
-        assert!(state.detect_unfilled_gap().is_some());
+        assert_eq!(state.detect_unfilled_gaps().len(), 1);
     }
 
     #[test]
     fn contract_addresses_never_report_gap() {
         let mut state = state_with(vec![summary(10, 100), summary(200, 500)]);
         state.is_contract = true;
-        assert!(state.detect_unfilled_gap().is_none());
+        assert!(state.detect_unfilled_gaps().is_empty());
     }
 
     #[test]
-    fn reset_clears_unfilled_gap() {
-        // Guards the 'r'-refresh path: `NavigateToAddress` calls `reset()`, and
-        // the UI hint "retry with 'r'" only works if this wipes
-        // `unfilled_gap` + `fill_dispatched` so the next load re-detects.
+    fn reset_clears_unfilled_gaps() {
+        // Guards the 'r'-refresh path: `NavigateToAddress` calls `reset()`,
+        // and the next load re-detects from scratch.
         let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
-        state.unfilled_gap = Some(UnfilledGap {
+        state.unfilled_gaps.push(UnfilledGap {
             lo_nonce: 10,
             hi_nonce: 21,
             lo_block: 100,
@@ -580,23 +793,235 @@ mod tests {
         });
         state.sanity_check_dispatched = true;
         state.clear();
-        assert!(state.unfilled_gap.is_none());
+        assert!(state.unfilled_gaps.is_empty());
         assert!(!state.sanity_check_dispatched);
     }
 
     #[test]
-    fn biggest_gap_wins_when_multiple() {
+    fn detects_every_qualifying_gap() {
         let state = state_with(vec![
             summary(10, 100),
-            summary(20, 110),   // 9 missing
-            summary(200, 5000), // 179 missing — winner
+            summary(20, 1100),  // 9 missing, span 1000 → deferred
+            summary(22, 1110),  // 1 missing, span 10 → small (skipped)
+            summary(200, 5000), // 177 missing, span 3890 → deferred
             summary(201, 5001),
         ]);
-        let g = state
-            .detect_unfilled_gap()
-            .expect("should pick biggest gap");
-        assert_eq!(g.lo_nonce, 20);
-        assert_eq!(g.hi_nonce, 200);
-        assert_eq!(g.missing_count, 179);
+        let gaps = state.detect_unfilled_gaps();
+        assert_eq!(gaps.len(), 2);
+        let los: Vec<u64> = gaps.iter().map(|g| g.lo_nonce).collect();
+        assert_eq!(los, vec![10, 22]);
+    }
+
+    #[test]
+    fn refresh_preserves_dispatched_flag_when_gap_unchanged() {
+        let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        state.unfilled_gaps = state.detect_unfilled_gaps();
+        state.unfilled_gaps[0].fill_dispatched = true;
+        state.refresh_unfilled_gaps();
+        assert_eq!(state.unfilled_gaps.len(), 1);
+        assert!(state.unfilled_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn refresh_clears_dispatched_flag_when_gap_shrinks() {
+        // Mimics a lazy fill landing: the chunk arrived from the top of the
+        // gap (nonces just below `hi_nonce`), shrinking the gap from its
+        // newer edge. Same `lo_nonce`, lower `hi_nonce` → flag should clear
+        // so the user can Enter on the residual to load the next chunk.
+        let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        state.unfilled_gaps = state.detect_unfilled_gaps();
+        state.unfilled_gaps[0].fill_dispatched = true;
+
+        // Add a contiguous chunk at the top of the gap (nonces 18, 19, 20).
+        // Their blocks are close to 2000 (top edge) but the older boundary
+        // gap (10..18) still has a wide block span → still deferred.
+        state.txs.items.push(summary(18, 1980));
+        state.txs.items.push(summary(19, 1990));
+        state.txs.items.push(summary(20, 1995));
+        state.refresh_unfilled_gaps();
+
+        assert_eq!(state.unfilled_gaps.len(), 1);
+        assert_eq!(state.unfilled_gaps[0].lo_nonce, 10);
+        assert_eq!(state.unfilled_gaps[0].hi_nonce, 18);
+        assert!(!state.unfilled_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn refresh_drops_stale_gap_selection() {
+        let mut state = state_with(vec![summary(10, 100), summary(21, 2000)]);
+        state.unfilled_gaps = state.detect_unfilled_gaps();
+        state.gap_selected = Some(10);
+        // Replace tx data so the gap closes.
+        state.txs.items = (10..=21).map(|n| summary(n, 100 + n)).collect();
+        state.refresh_unfilled_gaps();
+        assert!(state.unfilled_gaps.is_empty());
+        assert!(state.gap_selected.is_none());
+    }
+
+    /// Build a state with a single deferred gap between hi/lo nonces. Tx list
+    /// is sorted nonce-descending, matching the live-render layout.
+    fn state_one_gap() -> AddressInfoState {
+        // Nonces 100, 99, 30, 29 — gap between 30 and 99 (block span 4790).
+        let mut state = state_with(vec![
+            summary(100, 5000),
+            summary(99, 4990),
+            summary(30, 200),
+            summary(29, 190),
+        ]);
+        state.refresh_unfilled_gaps();
+        assert_eq!(state.unfilled_gaps.len(), 1);
+        state.txs.state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn next_lands_on_gap_when_crossing_forward() {
+        let mut state = state_one_gap();
+        // Start at nonce 99 (tx idx 1), the tx just above the gap.
+        state.txs.state.select(Some(1));
+        state.tx_list_next();
+        assert_eq!(state.gap_selected, Some(30));
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn next_off_gap_lands_on_lo_nonce_tx_no_dispatch() {
+        let mut state = state_one_gap();
+        state.gap_selected = Some(30);
+        state.tx_list_next();
+        // Cleared gap selection, landed on the lo_nonce tx (nonce 30, idx 2).
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(2));
+        // Crucially, no fill_dispatched — Enter alone triggers fills.
+        assert!(!state.unfilled_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn previous_lands_on_gap_when_crossing_backward() {
+        let mut state = state_one_gap();
+        // Start at nonce 30 (tx idx 2), the tx just below the gap.
+        state.txs.state.select(Some(2));
+        state.tx_list_previous();
+        assert_eq!(state.gap_selected, Some(30));
+        assert_eq!(state.txs.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn previous_off_gap_lands_on_hi_nonce_tx() {
+        let mut state = state_one_gap();
+        state.gap_selected = Some(30);
+        state.tx_list_previous();
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_gap_forward() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(0));
+        state.tx_list_scroll_by(10);
+        // Should clamp on the gap row, not jump past it.
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_gap_backward() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(3));
+        state.tx_list_scroll_by(-10);
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn select_first_clamps_on_gap_from_below() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(3));
+        state.tx_list_select_first();
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn select_last_clamps_on_gap_from_above() {
+        let mut state = state_one_gap();
+        state.txs.state.select(Some(0));
+        state.tx_list_select_last();
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn navigation_is_a_noop_with_no_gap() {
+        let mut state = state_with(vec![summary(10, 100), summary(11, 102)]);
+        state.refresh_unfilled_gaps();
+        assert!(state.unfilled_gaps.is_empty());
+        state.txs.state.select(Some(0));
+        state.tx_list_next();
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(1));
+    }
+
+    /// Two deferred gaps — single-step navigation should pause at each.
+    fn state_two_gaps() -> AddressInfoState {
+        // Nonces 200, 199, 100, 99, 30, 29 — gaps between 100..199 and 30..99.
+        let mut state = state_with(vec![
+            summary(200, 9010),
+            summary(199, 9000),
+            summary(100, 5000),
+            summary(99, 4990),
+            summary(30, 200),
+            summary(29, 190),
+        ]);
+        state.refresh_unfilled_gaps();
+        assert_eq!(state.unfilled_gaps.len(), 2);
+        state.txs.state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn scroll_by_clamps_on_first_of_multiple_gaps_forward() {
+        let mut state = state_two_gaps();
+        state.tx_list_scroll_by(20);
+        // First gap encountered going down from the top is the upper one.
+        assert_eq!(state.gap_selected, Some(100));
+    }
+
+    #[test]
+    fn scroll_by_from_first_gap_clamps_on_second() {
+        let mut state = state_two_gaps();
+        state.gap_selected = Some(100);
+        state.tx_list_scroll_by(20);
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn step_walks_through_each_gap() {
+        let mut state = state_two_gaps();
+        // Start on the tx just above the upper gap (nonce 199, idx 1).
+        state.txs.state.select(Some(1));
+        state.tx_list_next(); // lands on upper gap
+        assert_eq!(state.gap_selected, Some(100));
+        state.tx_list_next(); // off gap → tx with nonce 100 (idx 2)
+        assert_eq!(state.gap_selected, None);
+        assert_eq!(state.txs.state.selected(), Some(2));
+        state.tx_list_next(); // tx idx 3 (nonce 99) — just above lower gap
+        assert_eq!(state.txs.state.selected(), Some(3));
+        state.tx_list_next(); // lands on lower gap
+        assert_eq!(state.gap_selected, Some(30));
+    }
+
+    #[test]
+    fn rendered_selected_tracks_gap_and_tx_state() {
+        let mut state = state_two_gaps();
+        // Tx idx 0 (nonce 200) → rendered 0.
+        state.txs.state.select(Some(0));
+        assert_eq!(state.tx_list_rendered_selected(), Some(0));
+        // Tx idx 3 (nonce 99) → rendered 4 (one upper-gap row in front of it).
+        state.txs.state.select(Some(3));
+        assert_eq!(state.tx_list_rendered_selected(), Some(4));
+        // Selecting the upper gap → rendered 2.
+        state.gap_selected = Some(100);
+        assert_eq!(state.tx_list_rendered_selected(), Some(2));
+        // Selecting the lower gap → rendered 5.
+        state.gap_selected = Some(30);
+        assert_eq!(state.tx_list_rendered_selected(), Some(5));
     }
 }

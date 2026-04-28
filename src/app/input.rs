@@ -639,6 +639,10 @@ fn handle_enter(app: &mut App) -> Option<Action> {
         View::AddressInfo => {
             match app.address.tab {
                 crate::app::AddressTab::Transactions => {
+                    if app.address.gap_selected.is_some() {
+                        app.dispatch_address_gap_fill();
+                        return None;
+                    }
                     let hash = app.address.txs.selected_item()?.hash;
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }
