@@ -97,11 +97,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
-        // Ctrl+U / PgUp: page-scroll the active list (in TxDetail: cycle tab back)
+        // Ctrl+U / PgUp: page-scroll the active list (in TxDetail: scroll
+        // the active tab body up; Tab/Shift+Tab switches tabs).
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => handle_cycle(app, 1),
         KeyCode::PageUp => handle_cycle(app, 1),
 
-        // Ctrl+D / PgDn: page-scroll the active list (in TxDetail: cycle tab forward)
+        // Ctrl+D / PgDn: page-scroll the active list (in TxDetail: scroll
+        // the active tab body down).
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             handle_cycle(app, -1)
         }
@@ -537,10 +539,11 @@ fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
     })
 }
 
-/// Page-scroll the active list. Ctrl+U / Ctrl+D / PageUp / PageDown share this
-/// dispatcher. In TxDetail (which has no list under the cursor) it cycles the
-/// body tab instead. Axis navigation (next/prev block, next/prev tx) lives in
-/// `handle_axis` (Ctrl+P / Ctrl+N).
+/// Page-scroll the active list or pane. Ctrl+U / Ctrl+D / PageUp / PageDown
+/// share this dispatcher. In TxDetail (which has no list under the cursor) it
+/// page-scrolls the active tab's body; tab switching is on Tab / Shift+Tab.
+/// Axis navigation (next/prev block, next/prev tx) lives in `handle_axis`
+/// (Ctrl+P / Ctrl+N).
 fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
     match app.current_view() {
         View::Blocks => {

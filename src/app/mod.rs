@@ -951,7 +951,15 @@ impl App {
                 // tx of the prior block), pick the corresponding tx and stay
                 // in TxDetail by dispatching a follow-up FetchTransaction
                 // instead of pushing BlockDetail.
-                if let Some(boundary) = self.pending_tx_boundary.take() {
+                //
+                // Only honor the pending flag when the user is still in
+                // TxDetail. If they navigated away (Esc / h / q) while the
+                // neighbor block was loading, drop the flag and fall through
+                // to normal BlockDetail handling — otherwise we'd bounce them
+                // into an unexpected new tx.
+                if self.current_view() == View::TxDetail
+                    && let Some(boundary) = self.pending_tx_boundary.take()
+                {
                     let hash = match boundary {
                         TxBoundary::First => {
                             if !self.block_detail.txs.items.is_empty() {
@@ -971,12 +979,12 @@ impl App {
                         let _ = self.action_tx.send(Action::FetchTransaction { hash });
                         return;
                     }
-                    // Empty block on the other side — clear loading and stay
-                    // wherever the user was. Rare in practice.
-                    self.is_loading = false;
-                    self.loading_detail = None;
-                    return;
+                    // Empty block on the other side — fall through to the
+                    // normal BlockDetail push so the user lands on a sensible
+                    // empty BlockDetail view rather than a stuck TxDetail.
                 }
+                // Drop any stale pending flag that wasn't consumed above.
+                self.pending_tx_boundary = None;
 
                 if !self.block_detail.txs.items.is_empty() {
                     self.block_detail.txs.select_first();

@@ -203,22 +203,22 @@ fn draw_active_tab_body(
         TxTab::Events => (
             events_lines,
             app.tx_detail.events_scroll,
-            " Events (j/k · Ctrl+U/D: page · v: visual · Tab: switch · Ctrl+P/N: tx up/down) ",
+            " Events (j/k: scroll · Ctrl+U/D: page · v: visual · Tab: switch · Ctrl+P/N: tx up/down) ",
         ),
         TxTab::Calls => (
             calls_lines,
             app.tx_detail.calls_scroll,
-            " Calls (j/k · Ctrl+U/D: page · c: raw · d: decode · o: intent · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
+            " Calls (j/k: scroll · Ctrl+U/D: page · c: raw · d: decode · o: intent · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
         ),
         TxTab::Transfers => (
             transfers_lines,
             app.tx_detail.transfers_scroll,
-            " Transfers (j/k · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
+            " Transfers (j/k: scroll · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
         ),
         TxTab::Trace => (
             trace_lines,
             app.tx_detail.trace_scroll,
-            " Trace (j/k · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
+            " Trace (j/k: scroll · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
         ),
     };
     let widget = Paragraph::new(lines)

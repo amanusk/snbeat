@@ -75,7 +75,7 @@ pub fn hint_for_view(app: &App) -> String {
             " /search  j/k scroll  PgUp/PgDn page txs  Ctrl+P/N block up/down  Enter open  h back  ? help".into()
         }
         crate::app::state::View::TxDetail => {
-            " /search  h back  j/k scroll  PgUp/PgDn page  Tab switch  Ctrl+P/N tx up/down  n/N nonce down/up  v visual  c/d calldata  ? help"
+            " /search  h back  j/k scroll  PgUp/PgDn page  Tab switch  Ctrl+P/N tx up/down  n/N nonce down/up  v visual  c/d calldata  o intent  ? help"
                 .into()
         }
         crate::app::state::View::AddressInfo => {
