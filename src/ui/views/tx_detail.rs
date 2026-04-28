@@ -13,7 +13,7 @@ use crate::decode::calldata::{self, DecodedValue};
 use crate::decode::events::{DecodedEvent, DecodedParam};
 use crate::decode::functions::RawCall;
 use crate::decode::outside_execution;
-use crate::decode::trace::DecodedTraceCall;
+use crate::decode::trace::{DecodedTraceCall, MulticallGroup, TransferRow};
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
@@ -60,10 +60,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // mode only the active tab is visible, so we skip building the others to
     // avoid recomputing large traces on every frame.
     let header_lines = build_header_lines(app, &color_map, selected.as_ref(), &mut line_map);
-    let (events_lines, calls_lines, trace_lines) = if app.tx_detail.visual_mode {
+    let (events_lines, calls_lines, transfers_lines, trace_lines) = if app.tx_detail.visual_mode {
         (
             build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
             build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
             build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
         )
     } else {
@@ -72,13 +73,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ),
             TxTab::Calls => (
                 Vec::new(),
                 build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
                 Vec::new(),
+                Vec::new(),
+            ),
+            TxTab::Transfers => (
+                Vec::new(),
+                Vec::new(),
+                build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
             ),
             TxTab::Trace => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
@@ -105,7 +115,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     search_bar::draw_input(f, app, chunks[0]);
     draw_header_panel(f, header_lines, chunks[1]);
     draw_tabs_bar(f, app, chunks[2]);
-    draw_active_tab_body(f, app, chunks[3], events_lines, calls_lines, trace_lines);
+    draw_active_tab_body(
+        f,
+        app,
+        chunks[3],
+        events_lines,
+        calls_lines,
+        transfers_lines,
+        trace_lines,
+    );
     status_bar::draw(f, app, chunks[4]);
 
     app.tx_detail.nav_item_lines = line_map.into_iter().map(|o| o.unwrap_or(0)).collect();
@@ -140,15 +158,22 @@ fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Trace".to_string()
     };
+    let transfers_label = match app.tx_detail.trace.as_ref() {
+        Some(t) => format!("Transfers ({})", t.collect_transfers().total),
+        None if app.tx_detail.trace_loading => "Transfers (loading…)".to_string(),
+        None => "Transfers".to_string(),
+    };
     let titles = vec![
         Span::raw(format!(" Events ({events_count}) ")),
         Span::raw(format!(" Calls ({calls_count}) ")),
+        Span::raw(format!(" {transfers_label} ")),
         Span::raw(format!(" {trace_label} ")),
     ];
     let selected = match app.tx_detail.active_tab {
         TxTab::Events => 0,
         TxTab::Calls => 1,
-        TxTab::Trace => 2,
+        TxTab::Transfers => 2,
+        TxTab::Trace => 3,
     };
     // Active tab uses a filled background for high contrast — much more
     // visible than the default underline at-a-glance.
@@ -171,6 +196,7 @@ fn draw_active_tab_body(
     area: Rect,
     events_lines: Vec<Line<'static>>,
     calls_lines: Vec<Line<'static>>,
+    transfers_lines: Vec<Line<'static>>,
     trace_lines: Vec<Line<'static>>,
 ) {
     let (lines, scroll, title) = match app.tx_detail.active_tab {
@@ -183,6 +209,11 @@ fn draw_active_tab_body(
             calls_lines,
             app.tx_detail.calls_scroll,
             " Calls (c: raw · d: decode · o: intent · e: expand · Tab: next) ",
+        ),
+        TxTab::Transfers => (
+            transfers_lines,
+            app.tx_detail.transfers_scroll,
+            " Transfers (j/k: scroll · v: visual · e: expand · Tab: next) ",
         ),
         TxTab::Trace => (
             trace_lines,
@@ -1031,6 +1062,325 @@ fn build_trace_lines(
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Build the Transfers tab body: ERC20 Transfer events in execution order,
+/// grouped by multicall call, with the fee transfer separated at the bottom.
+fn build_transfers_lines(
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+
+    let trace = match &app.tx_detail.trace {
+        Some(t) => t,
+        None => {
+            let msg = if app.tx_detail.trace_loading {
+                "   (transfers loading…)"
+            } else {
+                "   (trace unavailable)"
+            };
+            lines.push(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)));
+            return lines;
+        }
+    };
+
+    let groups = trace.collect_transfers();
+    if groups.total == 0 {
+        lines.push(Line::from(Span::styled(
+            "   (no transfers)",
+            theme::SUGGESTION_STYLE,
+        )));
+        return lines;
+    }
+
+    let mut emitted = false;
+
+    if !groups.validate.is_empty() {
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        push_transfers_section(
+            " Validate",
+            theme::TITLE_STYLE,
+            &groups.validate,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+        emitted = true;
+    }
+
+    if !groups.constructor.is_empty() {
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        push_transfers_section(
+            " Constructor",
+            theme::TITLE_STYLE,
+            &groups.constructor,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+        emitted = true;
+    }
+
+    if !groups.execute_top.is_empty() {
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        push_transfers_section(
+            " Execute (account)",
+            theme::TITLE_STYLE,
+            &groups.execute_top,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+        emitted = true;
+    }
+
+    for group in &groups.execute_calls {
+        if group.transfers.is_empty() {
+            continue;
+        }
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        push_multicall_header(group, app, color_map, selected, line_map, &mut lines);
+        push_transfer_rows(
+            &group.transfers,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+        emitted = true;
+    }
+
+    if !groups.l1_handler.is_empty() {
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        push_transfers_section(
+            " L1 Handler",
+            theme::TITLE_STYLE,
+            &groups.l1_handler,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+        emitted = true;
+    }
+
+    if !groups.fee.is_empty() {
+        if emitted {
+            lines.push(Line::from(""));
+        }
+        // Fee transfer gets a distinct header style so it's visually separated
+        // from the user-intent transfers above.
+        push_transfers_section(
+            " Fee Transfer",
+            theme::STATUS_LOADING,
+            &groups.fee,
+            app,
+            color_map,
+            registry,
+            selected,
+            line_map,
+            &mut lines,
+        );
+    }
+
+    lines
+}
+
+/// Render a section with a static header (Validate / Constructor / Fee /…).
+#[allow(clippy::too_many_arguments)]
+fn push_transfers_section(
+    title: &str,
+    title_style: ratatui::style::Style,
+    transfers: &[TransferRow],
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    lines.push(Line::from(Span::styled(title.to_string(), title_style)));
+    push_transfer_rows(
+        transfers, app, color_map, registry, selected, line_map, lines,
+    );
+}
+
+/// Render the header line for one multicall call: "Call N — fn_name on contract".
+fn push_multicall_header(
+    group: &MulticallGroup,
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let contract_label = fmt_addr(app, &group.contract);
+    let contract_style = addr_style(&group.contract, color_map, selected);
+    let fn_label = group
+        .function_name
+        .clone()
+        .unwrap_or_else(|| "<unknown>".into());
+    record(
+        &TxNavItem::Address(group.contract),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+    lines.push(Line::from(vec![
+        addr_marker(&group.contract, selected),
+        Span::styled(format!("Call {}: ", group.index), theme::TITLE_STYLE),
+        Span::styled(contract_label, contract_style),
+        Span::raw(" → "),
+        Span::styled(fn_label, theme::TX_HASH_STYLE),
+    ]));
+}
+
+/// Push a row per transfer with branch tree characters.
+fn push_transfer_rows(
+    rows: &[TransferRow],
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    for (i, row) in rows.iter().enumerate() {
+        let is_last = i == rows.len() - 1;
+        let branch = if is_last { "└─" } else { "├─" };
+        push_transfer_row(
+            row, branch, app, color_map, registry, selected, line_map, lines,
+        );
+    }
+}
+
+/// Render one transfer row.
+#[allow(clippy::too_many_arguments)]
+fn push_transfer_row(
+    row: &TransferRow,
+    branch: &str,
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    // Token: prefer registry symbol; fall back to a truncated address. When
+    // expand_all is on, always show the full hex with label suffix.
+    let token_label = fmt_addr(app, &row.token);
+    let token_style = addr_style(&row.token, color_map, selected);
+
+    // Amount: format as a decimal token amount when decimals are known,
+    // otherwise show the raw u256 (best-effort) so we never silently drop data.
+    let low = felt_to_u128(&row.value_low);
+    let high = felt_to_u128(&row.value_high);
+    let decimals = registry.and_then(|r| r.get_decimals(&row.token));
+    let amount_str = match decimals {
+        Some(d) => crate::ui::widgets::param_display::format_token_amount(low, high, d),
+        None if high == 0 => low.to_string(),
+        None => format!("0x{high:x}{low:032x}"),
+    };
+
+    let from_label = fmt_addr(app, &row.from);
+    let from_style = addr_style(&row.from, color_map, selected);
+    let to_label = fmt_addr(app, &row.to);
+    let to_style = addr_style(&row.to, color_map, selected);
+
+    record(
+        &TxNavItem::Address(row.token),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+    record(
+        &TxNavItem::Address(row.from),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+    record(
+        &TxNavItem::Address(row.to),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+
+    let mut spans: Vec<Span<'static>> = vec![
+        addr_marker_any(&[&row.token, &row.from, &row.to], selected),
+        Span::styled(format!(" {branch} "), theme::BORDER_STYLE),
+        Span::styled(token_label, token_style),
+        Span::raw("  "),
+        Span::styled(from_label, from_style),
+        Span::styled(" → ", theme::BORDER_STYLE),
+        Span::styled(to_label, to_style),
+        Span::raw("  "),
+        Span::styled(amount_str.clone(), theme::TX_HASH_STYLE),
+    ];
+
+    // USD pair: only when we managed to compute a valid f64 amount AND prices
+    // are available. Skip silently otherwise (don't show $0.00 misleadingly).
+    if let Some(d) = decimals
+        && high == 0
+    {
+        let amount_f64 = low as f64 / 10f64.powi(d as i32);
+        let (today, historic) = price::token_prices(app, &row.token, app.tx_detail.block_timestamp);
+        if today.is_some() || historic.is_some() {
+            spans.push(Span::styled(
+                format_usd_pair(amount_f64, today, historic),
+                theme::SUGGESTION_STYLE,
+            ));
+        }
+    }
+
+    lines.push(Line::from(spans));
+}
+
+/// Like `addr_marker`, but flags the row when ANY of `addrs` is selected —
+/// so a transfer row's `►` lights up regardless of which address (token / from
+/// / to) the cursor is on.
+fn addr_marker_any(addrs: &[&Felt], selected: Option<&TxNavItem>) -> Span<'static> {
+    let any_selected = matches!(selected, Some(TxNavItem::Address(a)) if addrs.contains(&a));
+    if any_selected {
+        Span::styled("►", theme::VISUAL_SELECTED_STYLE)
+    } else {
+        Span::raw(" ")
+    }
 }
 
 /// Render a single trace node and its descendants.

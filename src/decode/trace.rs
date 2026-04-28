@@ -94,6 +94,144 @@ impl DecodedTrace {
             walk(root, &mut f);
         }
     }
+
+    /// Extract every ERC20 `Transfer` event from the trace, in execution order,
+    /// grouped by which top-level invocation produced them. Multicall execute
+    /// roots split their transfers per inner call so the UI can render
+    /// `Call 1`, `Call 2`, etc. The fee transfer lives in its own bucket.
+    pub fn collect_transfers(&self) -> TransferGroups {
+        let mut groups = TransferGroups::default();
+        if let Some(v) = &self.validate {
+            collect_transfers_subtree(v, &mut groups.validate);
+        }
+        if let Some(c) = &self.constructor {
+            collect_transfers_subtree(c, &mut groups.constructor);
+        }
+        if let Some(e) = &self.execute {
+            // Events emitted directly on the execute root (e.g. account-level
+            // events) go into `execute_top`; per-call subtrees become their own
+            // groups in `execute_calls`.
+            collect_transfers_local(e, &mut groups.execute_top);
+            for (idx, child) in e.inner.iter().enumerate() {
+                let mut transfers = Vec::new();
+                collect_transfers_subtree(child, &mut transfers);
+                groups.execute_calls.push(MulticallGroup {
+                    index: idx + 1,
+                    contract: child.contract_address,
+                    function_name: child.function_name.clone(),
+                    transfers,
+                });
+            }
+        }
+        if let Some(h) = &self.l1_handler {
+            collect_transfers_subtree(h, &mut groups.l1_handler);
+        }
+        if let Some(f) = &self.fee_transfer {
+            collect_transfers_subtree(f, &mut groups.fee);
+        }
+
+        groups.total = groups.validate.len()
+            + groups.constructor.len()
+            + groups.execute_top.len()
+            + groups
+                .execute_calls
+                .iter()
+                .map(|g| g.transfers.len())
+                .sum::<usize>()
+            + groups.l1_handler.len()
+            + groups.fee.len();
+        groups
+    }
+}
+
+/// Transfer-row breakdown of a decoded trace. Empty groups stay empty so the
+/// renderer can decide which sections to show.
+#[derive(Debug, Clone, Default)]
+pub struct TransferGroups {
+    pub validate: Vec<TransferRow>,
+    pub constructor: Vec<TransferRow>,
+    /// Transfers emitted directly on the execute root (not in any inner call).
+    pub execute_top: Vec<TransferRow>,
+    /// One entry per inner call of the execute root; mirrors the multicall layout.
+    pub execute_calls: Vec<MulticallGroup>,
+    pub l1_handler: Vec<TransferRow>,
+    pub fee: Vec<TransferRow>,
+    pub total: usize,
+}
+
+/// One inner call of the multicall and the transfers emitted under it.
+#[derive(Debug, Clone)]
+pub struct MulticallGroup {
+    /// 1-based index in the user's __execute__ array.
+    pub index: usize,
+    pub contract: Felt,
+    pub function_name: Option<String>,
+    pub transfers: Vec<TransferRow>,
+}
+
+/// One decoded ERC20 transfer.
+#[derive(Debug, Clone)]
+pub struct TransferRow {
+    /// Token contract that emitted the event.
+    pub token: Felt,
+    pub from: Felt,
+    pub to: Felt,
+    /// Low 128 bits of the u256 amount.
+    pub value_low: Felt,
+    /// High 128 bits of the u256 amount.
+    pub value_high: Felt,
+}
+
+/// Pre-order walk of one invocation's subtree, appending every Transfer event
+/// to `out`. Pre-order matches actual emission order (parent's events fire
+/// before children execute).
+fn collect_transfers_subtree(call: &DecodedTraceCall, out: &mut Vec<TransferRow>) {
+    collect_transfers_local(call, out);
+    for child in &call.inner {
+        collect_transfers_subtree(child, out);
+    }
+}
+
+/// Append the Transfer events emitted directly by `call` (no recursion).
+fn collect_transfers_local(call: &DecodedTraceCall, out: &mut Vec<TransferRow>) {
+    for ev in &call.events {
+        if let Some(row) = transfer_row_from_event(ev) {
+            out.push(row);
+        }
+    }
+}
+
+/// Repackage an already-decoded ERC20 `Transfer` event as a `TransferRow`.
+///
+/// The trace decoder ran each event through the historical class ABI, so
+/// `decoded_keys` and `decoded_data` already carry proper param names —
+/// regardless of whether the contract marked from/to as `#[key]` (modern
+/// OpenZeppelin) or stuffed everything into `data` (Cairo-0 and a few
+/// Cairo-1 contracts including STRK on mainnet). Looking up by name avoids
+/// duplicating that ABI knowledge here.
+///
+/// NFT-style `Transfer(from, to, token_id)` intentionally falls through:
+/// `token_id` carries no amount, so it would have nothing useful to show.
+fn transfer_row_from_event(ev: &DecodedEvent) -> Option<TransferRow> {
+    if ev.event_name.as_deref() != Some("Transfer") {
+        return None;
+    }
+    let by_name = |n: &str| {
+        ev.decoded_keys
+            .iter()
+            .chain(ev.decoded_data.iter())
+            .find(|p| p.name.as_deref() == Some(n))
+    };
+    let from = by_name("from")?;
+    let to = by_name("to")?;
+    let value = by_name("value").or_else(|| by_name("amount"))?;
+    Some(TransferRow {
+        token: ev.contract_address,
+        from: from.value,
+        to: to.value,
+        value_low: value.value,
+        value_high: value.value_high.unwrap_or(Felt::ZERO),
+    })
 }
 
 /// Collect every unique class hash referenced in the trace tree.
@@ -306,4 +444,281 @@ pub async fn decode_trace(
     out.for_each_call(|_| n += 1);
     out.total_nodes = n;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::types::SnEvent;
+    use crate::decode::events::{DecodedEvent, DecodedParam};
+
+    /// Public ETH token contract on Starknet mainnet — safe for fixtures.
+    const ETH: &str = "0x49d36570d4e46f48e99674bd3fcc8463d4dd6dad9d8d4e9b3eb38e3f4eba7e0";
+    /// Public AVNU exchange router — safe for fixtures.
+    const AVNU: &str = "0x04270219d365d6b017231b52e92b3fb5d7c8378b05e9abc97724537a80e93b0f";
+    /// Public Sequencer fee receiver placeholder for tests.
+    const SEQ: &str = "0x01176a1bd84444c89232ec27754698e5d2e7e1a7f1539f12027f28b23ec9f3d8";
+    /// Public sender placeholder (well-known EVM-style zero-suffix). Tests
+    /// must not use any address that could be linked to real activity.
+    const ALICE: &str = "0x00000000000000000000000000000000000000000000000000000000deadbeef";
+
+    fn felt(hex: &str) -> Felt {
+        Felt::from_hex(hex).unwrap()
+    }
+
+    fn transfer_event(token: Felt, from: Felt, to: Felt, value: u128) -> DecodedEvent {
+        DecodedEvent {
+            contract_address: token,
+            event_name: Some("Transfer".to_string()),
+            decoded_keys: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: from,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: to,
+                    value_high: None,
+                },
+            ],
+            decoded_data: vec![DecodedParam {
+                name: Some("value".into()),
+                type_name: Some("u256".into()),
+                value: Felt::from(value),
+                value_high: Some(Felt::ZERO),
+            }],
+            raw: SnEvent {
+                from_address: token,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        }
+    }
+
+    /// Transfer event with all params packed into `data` (no `#[key]` on
+    /// from/to). This is how STRK on Starknet mainnet — and Cairo-0 ERC20s —
+    /// emit Transfer.
+    fn transfer_event_data_only(
+        token: Felt,
+        from: Felt,
+        to: Felt,
+        value: u128,
+        type_tag: &str,
+    ) -> DecodedEvent {
+        DecodedEvent {
+            contract_address: token,
+            event_name: Some("Transfer".to_string()),
+            decoded_keys: vec![],
+            decoded_data: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: from,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: to,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("value".into()),
+                    type_name: Some(type_tag.into()),
+                    value: Felt::from(value),
+                    value_high: Some(Felt::ZERO),
+                },
+            ],
+            raw: SnEvent {
+                from_address: token,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        }
+    }
+
+    fn other_event(name: &str, contract: Felt) -> DecodedEvent {
+        DecodedEvent {
+            contract_address: contract,
+            event_name: Some(name.to_string()),
+            decoded_keys: vec![],
+            decoded_data: vec![],
+            raw: SnEvent {
+                from_address: contract,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        }
+    }
+
+    fn leaf_call(contract: Felt, fn_name: &str, events: Vec<DecodedEvent>) -> DecodedTraceCall {
+        DecodedTraceCall {
+            contract_address: contract,
+            class_hash: Felt::ZERO,
+            caller_address: Felt::ZERO,
+            entry_point_selector: Felt::ZERO,
+            entry_point_type: EntryPointType::External,
+            call_type: CallType::Call,
+            calldata: Vec::new(),
+            result: Vec::new(),
+            is_reverted: false,
+            function_name: Some(fn_name.into()),
+            function_def: None,
+            contract_abi: None,
+            events,
+            messages: Vec::new(),
+            inner: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn collect_transfers_groups_by_multicall_call_and_separates_fee() {
+        let eth = felt(ETH);
+        let avnu = felt(AVNU);
+        let alice = felt(ALICE);
+        let seq = felt(SEQ);
+
+        // Multicall with two execute children, each emitting one transfer.
+        // The second child has a nested inner call whose transfer should be
+        // attributed to call 2.
+        let leg_a_inner = leaf_call(eth, "_inner", vec![transfer_event(eth, alice, avnu, 1_000)]);
+        let leg_a = DecodedTraceCall {
+            inner: vec![leg_a_inner],
+            ..leaf_call(avnu, "swap_exact_in", Vec::new())
+        };
+        let leg_b = leaf_call(eth, "transfer", vec![transfer_event(eth, avnu, alice, 950)]);
+
+        // A non-Transfer event on the execute root should be ignored.
+        let execute = DecodedTraceCall {
+            inner: vec![leg_a, leg_b],
+            ..leaf_call(alice, "__execute__", vec![other_event("Approval", eth)])
+        };
+
+        let fee = leaf_call(eth, "transfer", vec![transfer_event(eth, alice, seq, 50)]);
+
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            fee_transfer: Some(fee),
+            ..DecodedTrace::default()
+        };
+
+        let groups = trace.collect_transfers();
+        assert_eq!(groups.execute_calls.len(), 2);
+        assert_eq!(groups.execute_calls[0].index, 1);
+        assert_eq!(groups.execute_calls[0].transfers.len(), 1);
+        assert_eq!(groups.execute_calls[0].transfers[0].from, alice);
+        assert_eq!(groups.execute_calls[0].transfers[0].to, avnu);
+        assert_eq!(groups.execute_calls[1].index, 2);
+        assert_eq!(groups.execute_calls[1].transfers.len(), 1);
+        assert_eq!(groups.execute_calls[1].transfers[0].to, alice);
+        assert!(groups.execute_top.is_empty());
+        assert_eq!(groups.fee.len(), 1);
+        assert_eq!(groups.fee[0].to, seq);
+        assert_eq!(groups.total, 3);
+    }
+
+    #[test]
+    fn collect_transfers_skips_nft_style_transfers_without_u256_data() {
+        let eth = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        // NFT-style Transfer: keys carry from/to, but data is a felt token_id —
+        // not a u256 amount. We can't render a meaningful amount, so skip it.
+        let nft_event = DecodedEvent {
+            contract_address: eth,
+            event_name: Some("Transfer".into()),
+            decoded_keys: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: alice,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: avnu,
+                    value_high: None,
+                },
+            ],
+            decoded_data: vec![DecodedParam {
+                name: Some("token_id".into()),
+                type_name: Some("felt252".into()),
+                value: Felt::from(7u32),
+                value_high: None,
+            }],
+            raw: SnEvent {
+                from_address: eth,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        };
+
+        let execute = leaf_call(alice, "__execute__", vec![nft_event]);
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let groups = trace.collect_transfers();
+        assert_eq!(groups.total, 0);
+    }
+
+    /// STRK and other tokens that emit Transfer with from/to in `data` (no
+    /// `#[key]`) must still be detected. Regression test for tx
+    /// 0x7d5543b0eb99a15ea173d3fe7ca389c60ec0c6b9a66054c0d3fce0fb04ac08
+    /// where 9 transfer events on STRK previously rendered as `Transfers (0)`.
+    #[test]
+    fn collect_transfers_handles_data_only_layout_strk_style() {
+        let strk = felt(SEQ); // any token contract; the layout is what's tested
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let ev = transfer_event_data_only(strk, alice, avnu, 1_000, "core::integer::u256");
+        let execute = leaf_call(alice, "__execute__", vec![ev]);
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let groups = trace.collect_transfers();
+        // Event is on the execute root itself (no inner call), so it lands in execute_top.
+        assert_eq!(groups.execute_top.len(), 1);
+        assert_eq!(groups.execute_top[0].from, alice);
+        assert_eq!(groups.execute_top[0].to, avnu);
+        assert_eq!(groups.total, 1);
+    }
+
+    /// Cairo-0 contracts use `Uint256` (capitalized) as the type tag — must
+    /// also be picked up.
+    #[test]
+    fn collect_transfers_handles_legacy_uint256_type_tag() {
+        let token = felt(SEQ);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let ev = transfer_event_data_only(token, alice, avnu, 42, "Uint256");
+        let execute = leaf_call(alice, "__execute__", vec![ev]);
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let groups = trace.collect_transfers();
+        assert_eq!(groups.execute_top.len(), 1);
+        assert_eq!(groups.total, 1);
+    }
 }

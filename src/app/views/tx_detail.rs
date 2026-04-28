@@ -15,6 +15,7 @@ pub enum TxTab {
     #[default]
     Events,
     Calls,
+    Transfers,
     Trace,
 }
 
@@ -22,7 +23,8 @@ impl TxTab {
     pub fn next(self) -> Self {
         match self {
             Self::Events => Self::Calls,
-            Self::Calls => Self::Trace,
+            Self::Calls => Self::Transfers,
+            Self::Transfers => Self::Trace,
             Self::Trace => Self::Events,
         }
     }
@@ -30,7 +32,8 @@ impl TxTab {
         match self {
             Self::Events => Self::Trace,
             Self::Calls => Self::Events,
-            Self::Trace => Self::Calls,
+            Self::Transfers => Self::Calls,
+            Self::Trace => Self::Transfers,
         }
     }
 }
@@ -42,6 +45,7 @@ pub enum NavSection {
     Header,
     Events,
     Calls,
+    Transfers,
     Trace,
 }
 
@@ -57,6 +61,7 @@ pub struct TxDetailState {
     /// Per-tab scroll offsets so switching tabs preserves scroll position.
     pub events_scroll: u16,
     pub calls_scroll: u16,
+    pub transfers_scroll: u16,
     pub trace_scroll: u16,
     /// Decoded recursive call tree (populated lazily after the main fetch).
     pub trace: Option<DecodedTrace>,
@@ -103,6 +108,7 @@ impl TxDetailState {
         self.active_tab = TxTab::default();
         self.events_scroll = 0;
         self.calls_scroll = 0;
+        self.transfers_scroll = 0;
         self.trace_scroll = 0;
         self.trace = None;
         self.trace_loading = false;
@@ -256,6 +262,41 @@ impl TxDetailState {
             }
         }
 
+        // === Transfers tab ===
+        // Add token / from / to addresses pulled from Transfer events. Most
+        // are dedup'd against earlier sections (sender is in Header, token
+        // contracts in Events), so this only adds genuinely transfer-unique
+        // addresses (e.g. final recipients).
+        if let Some(trace) = &self.trace {
+            let groups = trace.collect_transfers();
+            let add = |felt: starknet::core::types::Felt,
+                       items: &mut Vec<TxNavItem>,
+                       sections: &mut Vec<NavSection>,
+                       seen: &mut HashSet<starknet::core::types::Felt>| {
+                if seen.insert(felt) {
+                    push(
+                        TxNavItem::Address(felt),
+                        NavSection::Transfers,
+                        items,
+                        sections,
+                    );
+                }
+            };
+            for row in groups
+                .validate
+                .iter()
+                .chain(groups.constructor.iter())
+                .chain(groups.execute_top.iter())
+                .chain(groups.execute_calls.iter().flat_map(|g| g.transfers.iter()))
+                .chain(groups.l1_handler.iter())
+                .chain(groups.fee.iter())
+            {
+                add(row.token, &mut items, &mut sections, &mut seen);
+                add(row.from, &mut items, &mut sections, &mut seen);
+                add(row.to, &mut items, &mut sections, &mut seen);
+            }
+        }
+
         // === Trace tab ===
         if let Some(trace) = &self.trace {
             trace.for_each_call(|call| {
@@ -301,6 +342,7 @@ impl TxDetailState {
         match self.active_tab {
             TxTab::Events => self.events_scroll,
             TxTab::Calls => self.calls_scroll,
+            TxTab::Transfers => self.transfers_scroll,
             TxTab::Trace => self.trace_scroll,
         }
     }
@@ -311,6 +353,7 @@ impl TxDetailState {
         match self.active_tab {
             TxTab::Events => &mut self.events_scroll,
             TxTab::Calls => &mut self.calls_scroll,
+            TxTab::Transfers => &mut self.transfers_scroll,
             TxTab::Trace => &mut self.trace_scroll,
         }
     }
@@ -331,6 +374,7 @@ impl TxDetailState {
             match section {
                 NavSection::Events => self.active_tab = TxTab::Events,
                 NavSection::Calls => self.active_tab = TxTab::Calls,
+                NavSection::Transfers => self.active_tab = TxTab::Transfers,
                 NavSection::Trace => self.active_tab = TxTab::Trace,
                 NavSection::Header => {} // header is always visible — no tab switch
             }
@@ -343,6 +387,7 @@ impl TxDetailState {
             match self.nav_sections.get(next).copied() {
                 Some(NavSection::Events) => self.events_scroll = target,
                 Some(NavSection::Calls) => self.calls_scroll = target,
+                Some(NavSection::Transfers) => self.transfers_scroll = target,
                 Some(NavSection::Trace) => self.trace_scroll = target,
                 Some(NavSection::Header) | None => {}
             }
