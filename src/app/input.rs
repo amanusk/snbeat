@@ -585,7 +585,16 @@ fn handle_cycle(app: &mut App, direction: i64) -> Option<Action> {
             app.address_list_scroll_by(delta);
             None
         }
-        _ => None,
+        View::ClassInfo => {
+            // Page-scroll the class info pane (mirrors j/k stepping by 1).
+            const CHUNK: u16 = 10;
+            app.class.scroll = if direction > 0 {
+                app.class.scroll.saturating_sub(CHUNK)
+            } else {
+                app.class.scroll.saturating_add(CHUNK)
+            };
+            None
+        }
     }
 }
 
@@ -614,9 +623,15 @@ fn handle_axis(app: &mut App, dir: i64) -> Option<Action> {
         View::BlockDetail => {
             let current = app.block_detail.block.as_ref()?.number;
             // Higher block number = visually up, so target = current - dir.
+            // Genesis is the lower bound; `latest_block_number` (last known
+            // tip) is the upper bound — refusing to fetch past it avoids a
+            // miss that would clear the view.
             let target = if dir > 0 {
                 current.checked_sub(1)?
             } else {
+                if current >= app.latest_block_number {
+                    return None;
+                }
                 current + 1
             };
             // Stay in same view -- clear and refetch without pushing.
@@ -653,7 +668,11 @@ fn handle_axis(app: &mut App, dir: i64) -> Option<Action> {
                     current_block.checked_sub(1)?
                 } else {
                     // Up past highest tx idx → prev block (N+1) at its bottom
-                    // (tx idx 0 = last position in items = Last).
+                    // (tx idx 0 = last position in items = Last). Refuse to
+                    // step past the known chain tip.
+                    if current_block >= app.latest_block_number {
+                        return None;
+                    }
                     current_block + 1
                 };
                 let boundary = if dir > 0 {
