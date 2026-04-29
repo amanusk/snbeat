@@ -827,21 +827,10 @@ impl App {
         }
     }
 
-    /// Format a tx hash using the registry (user label if present, short hash otherwise).
-    pub fn format_tx_hash(&self, hash: &starknet::core::types::Felt) -> String {
-        if let Some(engine) = &self.search_engine {
-            engine.registry().format_tx_hash(hash)
-        } else {
-            crate::ui::widgets::hex_display::short_hash(hash)
-        }
-    }
-
-    /// Whether this tx hash has a user-supplied label.
-    pub fn is_known_tx(&self, hash: &starknet::core::types::Felt) -> bool {
-        self.search_engine
-            .as_ref()
-            .map(|e| e.registry().is_known_tx(hash))
-            .unwrap_or(false)
+    /// Resolve a tx hash to its user label, if any. Single registry lookup —
+    /// callers can derive both the displayed string and a style from the result.
+    pub fn resolve_tx(&self, hash: &starknet::core::types::Felt) -> Option<&str> {
+        self.search_engine.as_ref()?.registry().resolve_tx(hash)
     }
 
     /// Format an address showing both user and global labels (for detail views).

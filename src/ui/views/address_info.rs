@@ -10,7 +10,7 @@ use crate::app::state::TxNavItem;
 use crate::app::{AddressTab, App};
 use crate::data::types::TokenBalance;
 use crate::ui::theme;
-use crate::ui::widgets::hex_display::{format_fri, format_strk_u128};
+use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, tx_hash_cell};
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
@@ -547,14 +547,9 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             _ => theme::NORMAL_STYLE,
         };
 
-        let tx_hash_label = app.format_tx_hash(&tx.hash);
-        let tx_hash_display = if tx_hash_label.chars().count() > 14 {
-            let truncated: String = tx_hash_label.chars().take(13).collect();
-            format!("{truncated}…")
-        } else {
-            tx_hash_label
-        };
-        let tx_hash_style = if app.is_known_tx(&tx.hash) {
+        let tx_label = app.resolve_tx(&tx.hash);
+        let tx_hash_display = tx_hash_cell(tx_label, &tx.hash);
+        let tx_hash_style = if tx_label.is_some() {
             theme::LABEL_STYLE
         } else {
             theme::TX_HASH_STYLE
@@ -762,14 +757,9 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => theme::SUGGESTION_STYLE,
             };
 
-            let tx_hash_label = app.format_tx_hash(&call.tx_hash);
-            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
-                let truncated: String = tx_hash_label.chars().take(13).collect();
-                format!("{truncated}…")
-            } else {
-                tx_hash_label
-            };
-            let tx_hash_style = if app.is_known_tx(&call.tx_hash) {
+            let tx_label = app.resolve_tx(&call.tx_hash);
+            let tx_hash_display = tx_hash_cell(tx_label, &call.tx_hash);
+            let tx_hash_style = if tx_label.is_some() {
                 theme::LABEL_STYLE
             } else {
                 theme::TX_HASH_STYLE
@@ -913,14 +903,9 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => theme::SUGGESTION_STYLE,
             };
 
-            let tx_hash_label = app.format_tx_hash(&m.hash);
-            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
-                let truncated: String = tx_hash_label.chars().take(13).collect();
-                format!("{truncated}…")
-            } else {
-                tx_hash_label
-            };
-            let tx_hash_style = if app.is_known_tx(&m.hash) {
+            let tx_label = app.resolve_tx(&m.hash);
+            let tx_hash_display = tx_hash_cell(tx_label, &m.hash);
+            let tx_hash_style = if tx_label.is_some() {
                 theme::LABEL_STYLE
             } else {
                 theme::TX_HASH_STYLE
@@ -1079,14 +1064,9 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
             let contract = app.format_address(&event.contract_address);
             let name = event.event_name.as_deref().unwrap_or("?");
             let tx_hash = event.raw.transaction_hash;
-            let tx_label = app.format_tx_hash(&tx_hash);
-            let tx_display = if tx_label.chars().count() > 14 {
-                let truncated: String = tx_label.chars().take(13).collect();
-                format!("{truncated}…")
-            } else {
-                tx_label
-            };
-            let tx_style = if app.is_known_tx(&tx_hash) {
+            let tx_label = app.resolve_tx(&tx_hash);
+            let tx_display = tx_hash_cell(tx_label, &tx_hash);
+            let tx_style = if tx_label.is_some() {
                 theme::LABEL_STYLE
             } else {
                 theme::TX_HASH_STYLE

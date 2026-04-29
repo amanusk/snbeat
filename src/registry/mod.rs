@@ -255,7 +255,9 @@ impl AddressRegistry {
     }
 
     /// Look up an entry by exact label name (case-insensitive). Returns the
-    /// felt (address or tx hash) and its kind so callers can route navigation.
+    /// matched felt (address or tx hash). On a name collision between an
+    /// address label and a tx label, the address wins (insertion order is
+    /// preserved by the stable sort that builds the index).
     pub fn resolve_by_name(&self, name: &str) -> Option<Felt> {
         let lower = name.to_lowercase();
         let index = self.search_index.read().unwrap();
@@ -296,31 +298,12 @@ impl AddressRegistry {
         self.resolve(address).is_some()
     }
 
-    /// Check if a tx hash has a user label.
-    pub fn is_known_tx(&self, hash: &Felt) -> bool {
-        self.resolve_tx(hash).is_some()
-    }
-
     /// Format an address for display: label if known, truncated hex otherwise.
     pub fn format_address(&self, address: &Felt) -> String {
         if let Some(name) = self.resolve(address) {
             format!("[{}]", name)
         } else {
             let hex = format!("{:#x}", address);
-            if hex.len() > 14 {
-                format!("{}..{}", &hex[..6], &hex[hex.len() - 4..])
-            } else {
-                hex
-            }
-        }
-    }
-
-    /// Format a tx hash: user label if present, short hash otherwise.
-    pub fn format_tx_hash(&self, hash: &Felt) -> String {
-        if let Some(name) = self.resolve_tx(hash) {
-            format!("[{}]", name)
-        } else {
-            let hex = format!("{:#x}", hash);
             if hex.len() > 14 {
                 format!("{}..{}", &hex[..6], &hex[hex.len() - 4..])
             } else {
@@ -374,7 +357,9 @@ fn format_search_result(entry: &SearchEntry) -> String {
         EntryKind::Address => "",
         EntryKind::Transaction => " [tx]",
     };
-    format!("{}{} ({})", entry.display_name, kind_tag, short)
+    // The kind tag goes after the closing paren so `extract_name_from_display`
+    // (which splits on " (") still recovers the bare label name for Tab-complete.
+    format!("{} ({}){}", entry.display_name, short, kind_tag)
 }
 
 fn make_result(entry: &SearchEntry) -> SearchResult {

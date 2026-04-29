@@ -7,7 +7,8 @@ use crate::registry::AddressRegistry;
 pub enum SearchQuery {
     /// Pure decimal number → block number.
     BlockNumber(u64),
-    /// Resolved from a known label → address.
+    /// Resolved from a known label → address or tx hash. The label kind isn't
+    /// carried here; downstream `resolve_search` infers it by querying RPC.
     Label(String, Felt),
     /// Hex that could be a tx hash or address — needs RPC to disambiguate.
     Ambiguous(Felt),

@@ -65,6 +65,21 @@ pub fn short_hash(felt: &Felt) -> String {
     truncate_felt(felt, 4, 4)
 }
 
+/// Render a tx-hash table cell: `[label]` (truncated to 14 chars with `…` on overflow)
+/// when a user label is supplied, short hex otherwise.
+pub fn tx_hash_cell(label: Option<&str>, hash: &Felt) -> String {
+    let raw = match label {
+        Some(name) => format!("[{name}]"),
+        None => short_hash(hash),
+    };
+    if raw.chars().count() > 14 {
+        let truncated: String = raw.chars().take(13).collect();
+        format!("{truncated}…")
+    } else {
+        raw
+    }
+}
+
 /// Format a u128 fri value as STRK amount (5 decimal places).
 pub fn format_strk_u128(fri: u128) -> String {
     if fri == 0 {

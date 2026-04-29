@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
-use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash};
+use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash, tx_hash_cell};
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::felt_to_u64;
 
@@ -294,14 +294,9 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             };
 
             let tx_hash = tx.hash();
-            let tx_hash_label = app.format_tx_hash(&tx_hash);
-            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
-                let truncated: String = tx_hash_label.chars().take(13).collect();
-                format!("{truncated}…")
-            } else {
-                tx_hash_label
-            };
-            let tx_hash_style = if app.is_known_tx(&tx_hash) {
+            let tx_label = app.resolve_tx(&tx_hash);
+            let tx_hash_display = tx_hash_cell(tx_label, &tx_hash);
+            let tx_hash_style = if tx_label.is_some() {
                 theme::LABEL_STYLE
             } else {
                 theme::TX_HASH_STYLE
