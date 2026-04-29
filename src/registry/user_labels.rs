@@ -45,13 +45,19 @@ pub struct UserLabel {
     pub tags: Vec<String>,
 }
 
-/// Load user labels from a TOML file. Returns (labels, optional_warning).
+#[derive(Debug, Clone)]
+pub struct UserTxLabel {
+    pub hash: Felt,
+    pub name: String,
+}
+
+/// Load user labels from a TOML file. Returns (address_labels, tx_labels, optional_warning).
 /// On missing file: empty labels, no warning.
 /// On corrupt/malformed file: empty labels + warning string.
-pub fn load_user_labels(path: &Path) -> Result<(Vec<UserLabel>, Option<String>)> {
+pub fn load_user_labels(path: &Path) -> Result<(Vec<UserLabel>, Vec<UserTxLabel>, Option<String>)> {
     if !path.exists() {
         debug!(path = %path.display(), "User labels file not found, using empty");
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), Vec::new(), None));
     }
 
     let content = std::fs::read_to_string(path)
@@ -63,7 +69,7 @@ pub fn load_user_labels(path: &Path) -> Result<(Vec<UserLabel>, Option<String>)>
             let msg =
                 format!("labels.toml is corrupted (TOML parse error: {e}) — no user labels loaded");
             warn!("{}", msg);
-            return Ok((Vec::new(), Some(msg)));
+            return Ok((Vec::new(), Vec::new(), Some(msg)));
         }
     };
 
@@ -87,6 +93,25 @@ pub fn load_user_labels(path: &Path) -> Result<(Vec<UserLabel>, Option<String>)>
         });
     }
 
-    debug!(count = labels.len(), "Loaded user labels");
-    Ok((labels, None))
+    let mut tx_labels = Vec::new();
+    for (hex, name) in &file.transactions {
+        let felt = match Felt::from_hex(hex) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(tx = hex, error = %e, "Invalid tx hash in labels file, skipping");
+                continue;
+            }
+        };
+        tx_labels.push(UserTxLabel {
+            hash: felt,
+            name: name.clone(),
+        });
+    }
+
+    debug!(
+        addresses = labels.len(),
+        transactions = tx_labels.len(),
+        "Loaded user labels"
+    );
+    Ok((labels, tx_labels, None))
 }

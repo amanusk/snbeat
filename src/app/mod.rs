@@ -827,6 +827,23 @@ impl App {
         }
     }
 
+    /// Format a tx hash using the registry (user label if present, short hash otherwise).
+    pub fn format_tx_hash(&self, hash: &starknet::core::types::Felt) -> String {
+        if let Some(engine) = &self.search_engine {
+            engine.registry().format_tx_hash(hash)
+        } else {
+            crate::ui::widgets::hex_display::short_hash(hash)
+        }
+    }
+
+    /// Whether this tx hash has a user-supplied label.
+    pub fn is_known_tx(&self, hash: &starknet::core::types::Felt) -> bool {
+        self.search_engine
+            .as_ref()
+            .map(|e| e.registry().is_known_tx(hash))
+            .unwrap_or(false)
+    }
+
     /// Format an address showing both user and global labels (for detail views).
     /// Falls back to a Voyager-sourced label when the registry has no entry.
     pub fn format_address_full(&self, address: &starknet::core::types::Felt) -> String {

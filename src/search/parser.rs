@@ -43,7 +43,7 @@ pub fn classify(input: &str, registry: &AddressRegistry) -> Result<SearchQuery, 
         // Try as a partial name match — if exactly one result, use it
         let results = registry.search(trimmed, 2);
         if results.len() == 1 {
-            return Ok(SearchQuery::Label(trimmed.to_string(), results[0].address));
+            return Ok(SearchQuery::Label(trimmed.to_string(), results[0].felt));
         }
         return Err(format!("Cannot parse: {trimmed}"));
     };

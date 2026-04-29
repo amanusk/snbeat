@@ -10,7 +10,7 @@ use crate::app::state::TxNavItem;
 use crate::app::{AddressTab, App};
 use crate::data::types::TokenBalance;
 use crate::ui::theme;
-use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, short_hash};
+use crate::ui::widgets::hex_display::{format_fri, format_strk_u128};
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
@@ -547,13 +547,23 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             _ => theme::NORMAL_STYLE,
         };
 
+        let tx_hash_label = app.format_tx_hash(&tx.hash);
+        let tx_hash_display = if tx_hash_label.chars().count() > 14 {
+            let truncated: String = tx_hash_label.chars().take(13).collect();
+            format!("{truncated}…")
+        } else {
+            tx_hash_label
+        };
+        let tx_hash_style = if app.is_known_tx(&tx.hash) {
+            theme::LABEL_STYLE
+        } else {
+            theme::TX_HASH_STYLE
+        };
+
         let main_line = Line::from(vec![
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
-            Span::styled(
-                format!("{:<14}", short_hash(&tx.hash)),
-                theme::TX_HASH_STYLE,
-            ),
+            Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
             Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
             Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
             Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
@@ -752,13 +762,23 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => theme::SUGGESTION_STYLE,
             };
 
+            let tx_hash_label = app.format_tx_hash(&call.tx_hash);
+            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
+                let truncated: String = tx_hash_label.chars().take(13).collect();
+                format!("{truncated}…")
+            } else {
+                tx_hash_label
+            };
+            let tx_hash_style = if app.is_known_tx(&call.tx_hash) {
+                theme::LABEL_STYLE
+            } else {
+                theme::TX_HASH_STYLE
+            };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {:<25} ", sender_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
-                Span::styled(
-                    format!("{:<14}", short_hash(&call.tx_hash)),
-                    theme::TX_HASH_STYLE,
-                ),
+                Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
                 Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -893,9 +913,22 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => theme::SUGGESTION_STYLE,
             };
 
+            let tx_hash_label = app.format_tx_hash(&m.hash);
+            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
+                let truncated: String = tx_hash_label.chars().take(13).collect();
+                format!("{truncated}…")
+            } else {
+                tx_hash_label
+            };
+            let tx_hash_style = if app.is_known_tx(&m.hash) {
+                theme::LABEL_STYLE
+            } else {
+                theme::TX_HASH_STYLE
+            };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
-                Span::styled(format!("{:<14}", short_hash(&m.hash)), theme::TX_HASH_STYLE),
+                Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
                 Span::styled(
                     format!("#{:<10}", m.block_number),
                     theme::BLOCK_NUMBER_STYLE,
@@ -1045,12 +1078,24 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|event| {
             let contract = app.format_address(&event.contract_address);
             let name = event.event_name.as_deref().unwrap_or("?");
-            let tx_short = short_hash(&event.raw.transaction_hash);
+            let tx_hash = event.raw.transaction_hash;
+            let tx_label = app.format_tx_hash(&tx_hash);
+            let tx_display = if tx_label.chars().count() > 14 {
+                let truncated: String = tx_label.chars().take(13).collect();
+                format!("{truncated}…")
+            } else {
+                tx_label
+            };
+            let tx_style = if app.is_known_tx(&tx_hash) {
+                theme::LABEL_STYLE
+            } else {
+                theme::TX_HASH_STYLE
+            };
 
             let line = Line::from(vec![
                 Span::styled(format!(" {:<20}", name), theme::LABEL_STYLE),
                 Span::styled(format!("{:<17}", contract), theme::BLOCK_HASH_STYLE),
-                Span::styled(tx_short, theme::TX_HASH_STYLE),
+                Span::styled(tx_display, tx_style),
             ]);
             ListItem::new(line)
         })

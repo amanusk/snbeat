@@ -134,6 +134,66 @@ fn test_format_address() {
 }
 
 #[test]
+fn test_resolve_tx_label() {
+    let labels = make_user_labels(
+        r#"
+[transactions]
+"0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3" = "60M STRK deposit"
+"#,
+    );
+
+    let registry = snbeat::registry::AddressRegistry::load(labels.path())
+        .unwrap()
+        .0;
+
+    let tx_hash =
+        Felt::from_hex("0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3")
+            .unwrap();
+    assert_eq!(registry.resolve_tx(&tx_hash), Some("60M STRK deposit"));
+
+    let other = Felt::from_hex("0xdeadbeef").unwrap();
+    assert_eq!(registry.resolve_tx(&other), None);
+}
+
+#[test]
+fn test_tx_label_appears_in_search() {
+    let labels = make_user_labels(
+        r#"
+[transactions]
+"0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3" = "60M STRK deposit"
+"#,
+    );
+
+    let registry = snbeat::registry::AddressRegistry::load(labels.path())
+        .unwrap()
+        .0;
+
+    let results = registry.search("60M", 10);
+    assert!(!results.is_empty(), "tx label should be searchable by name");
+    assert!(results[0].is_user);
+    assert!(results[0].display.contains("60M STRK deposit"));
+    assert!(
+        matches!(results[0].kind, snbeat::registry::EntryKind::Transaction),
+        "result kind should be Transaction"
+    );
+
+    // resolve_by_name returns the tx hash so the network resolver can navigate
+    let felt = registry.resolve_by_name("60M STRK deposit").unwrap();
+    assert_eq!(
+        felt,
+        Felt::from_hex("0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3")
+            .unwrap()
+    );
+}
+
+#[test]
+fn test_corrupted_labels_returns_warning() {
+    let labels = make_user_labels("[transactions]\nthis is not toml = broken");
+    let (_reg, warning) = snbeat::registry::AddressRegistry::load(labels.path()).unwrap();
+    assert!(warning.is_some());
+}
+
+#[test]
 fn test_get_decimals() {
     let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
         .unwrap()

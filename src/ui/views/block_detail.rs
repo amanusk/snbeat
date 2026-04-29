@@ -293,16 +293,27 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 theme::NORMAL_STYLE
             };
 
+            let tx_hash = tx.hash();
+            let tx_hash_label = app.format_tx_hash(&tx_hash);
+            let tx_hash_display = if tx_hash_label.chars().count() > 14 {
+                let truncated: String = tx_hash_label.chars().take(13).collect();
+                format!("{truncated}…")
+            } else {
+                tx_hash_label
+            };
+            let tx_hash_style = if app.is_known_tx(&tx_hash) {
+                theme::LABEL_STYLE
+            } else {
+                theme::TX_HASH_STYLE
+            };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<4} ", tx.index()), theme::BLOCK_NUMBER_STYLE),
                 Span::styled(format!("{:<4}", status), status_style),
                 Span::styled(format!("{:<15}", tx.type_name()), type_style),
                 Span::styled(format!("{:<10}", meta_str), theme::META_TX_STYLE),
-                Span::styled(
-                    format!("{:<14}", short_hash(&tx.hash())),
-                    theme::TX_HASH_STYLE,
-                ),
+                Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
                 Span::styled(format!("{:<21}", sender_display), sender_style),
                 Span::styled(format!("{:<21}", intender_display), intender_style),
                 Span::styled(format!("{:<38} ", endpoint_display), theme::LABEL_STYLE),
