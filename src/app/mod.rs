@@ -827,6 +827,12 @@ impl App {
         }
     }
 
+    /// Resolve a tx hash to its user label, if any. Single registry lookup —
+    /// callers can derive both the displayed string and a style from the result.
+    pub fn resolve_tx(&self, hash: &starknet::core::types::Felt) -> Option<&str> {
+        self.search_engine.as_ref()?.registry().resolve_tx(hash)
+    }
+
     /// Format an address showing both user and global labels (for detail views).
     /// Falls back to a Voyager-sourced label when the registry has no entry.
     pub fn format_address_full(&self, address: &starknet::core::types::Felt) -> String {

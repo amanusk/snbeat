@@ -430,7 +430,7 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             let query = if !app.search_suggestions.is_empty()
                 && app.search_selected < app.search_suggestions.len()
             {
-                format!("{:#x}", app.search_suggestions[app.search_selected].address)
+                format!("{:#x}", app.search_suggestions[app.search_selected].felt)
             } else {
                 app.search_input.clone()
             };

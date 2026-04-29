@@ -341,10 +341,19 @@ fn build_header_lines(
     };
 
     // === TX HEADER ===
-    lines.push(Line::from(vec![
+    let tx_label = app
+        .search_engine
+        .as_ref()
+        .and_then(|e| e.registry().resolve_tx(&tx.hash()).map(|s| s.to_string()));
+    let mut hash_spans = vec![
         Span::styled(" Hash:   ", theme::NORMAL_STYLE),
         Span::styled(format!("{:#x}", tx.hash()), theme::TX_HASH_STYLE),
-    ]));
+    ];
+    if let Some(name) = &tx_label {
+        hash_spans.push(Span::raw("  "));
+        hash_spans.push(Span::styled(format!("[{}]", name), theme::LABEL_STYLE));
+    }
+    lines.push(Line::from(hash_spans));
 
     // Block + index from receipt
     let (blk_num, blk_hash_str, finality_str) = if let Some(receipt) = &app.tx_detail.receipt {

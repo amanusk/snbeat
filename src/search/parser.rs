@@ -7,7 +7,8 @@ use crate::registry::AddressRegistry;
 pub enum SearchQuery {
     /// Pure decimal number → block number.
     BlockNumber(u64),
-    /// Resolved from a known label → address.
+    /// Resolved from a known label → address or tx hash. The label kind isn't
+    /// carried here; downstream `resolve_search` infers it by querying RPC.
     Label(String, Felt),
     /// Hex that could be a tx hash or address — needs RPC to disambiguate.
     Ambiguous(Felt),
@@ -43,7 +44,7 @@ pub fn classify(input: &str, registry: &AddressRegistry) -> Result<SearchQuery, 
         // Try as a partial name match — if exactly one result, use it
         let results = registry.search(trimmed, 2);
         if results.len() == 1 {
-            return Ok(SearchQuery::Label(trimmed.to_string(), results[0].address));
+            return Ok(SearchQuery::Label(trimmed.to_string(), results[0].felt));
         }
         return Err(format!("Cannot parse: {trimmed}"));
     };

@@ -9,14 +9,24 @@ use tracing::info;
 
 use crate::error::Result;
 use known_addresses::{KnownAddress, load_known_addresses};
-use user_labels::{UserLabel, load_user_labels};
+use user_labels::{UserLabel, UserTxLabel, load_user_labels};
 
-/// Unified address registry over user labels + known addresses.
+/// What kind of on-chain entity a search entry/result points at. Drives
+/// downstream navigation (address view vs transaction detail view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Address,
+    Transaction,
+}
+
+/// Unified address + tx-hash registry over user labels + known addresses.
 /// User labels take priority over known addresses.
 /// Pre-builds a search index for fast prefix/substring matching.
 pub struct AddressRegistry {
-    /// User labels (highest priority)
+    /// User address labels (highest priority)
     user: Vec<UserLabel>,
+    /// User transaction labels
+    tx_labels: Vec<UserTxLabel>,
     /// Known addresses (curated)
     known: Vec<KnownAddress>,
     /// Search index: sorted entries for fast lookup.
@@ -28,19 +38,23 @@ pub struct AddressRegistry {
 struct SearchEntry {
     name_lower: String,
     display_name: String,
-    address: Felt,
+    /// Address or tx hash, depending on `kind`.
+    felt: Felt,
     hex_lower: String,
     is_user: bool,
     /// Lowercase tags for search matching (user labels only).
     tags_lower: Vec<String>,
+    kind: EntryKind,
 }
 
 /// A search result returned to the UI.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub display: String,
-    pub address: Felt,
+    /// Address or tx hash, depending on `kind`.
+    pub felt: Felt,
     pub is_user: bool,
+    pub kind: EntryKind,
 }
 
 /// Metadata for a resolved address.
@@ -56,10 +70,10 @@ impl AddressRegistry {
     /// Load from user labels file and bundled known addresses.
     /// Returns (registry, optional_warning) — warning is set when labels file is corrupt.
     pub fn load(user_labels_path: &Path) -> Result<(Self, Option<String>)> {
-        let (user, warning) = load_user_labels(user_labels_path)?;
+        let (user, tx_labels, warning) = load_user_labels(user_labels_path)?;
         let known = load_known_addresses()?;
 
-        let mut search_index = Vec::with_capacity(user.len() + known.len());
+        let mut search_index = Vec::with_capacity(user.len() + tx_labels.len() + known.len());
 
         // User labels first (higher priority in search results)
         for label in &user {
@@ -67,10 +81,25 @@ impl AddressRegistry {
             search_index.push(SearchEntry {
                 name_lower: label.name.to_lowercase(),
                 display_name: label.name.clone(),
-                address: label.address,
+                felt: label.address,
                 hex_lower: hex.to_lowercase(),
                 is_user: true,
                 tags_lower: label.tags.iter().map(|t| t.to_lowercase()).collect(),
+                kind: EntryKind::Address,
+            });
+        }
+
+        // User tx labels: same priority as address labels (the user added them)
+        for label in &tx_labels {
+            let hex = format!("{:#x}", label.hash);
+            search_index.push(SearchEntry {
+                name_lower: label.name.to_lowercase(),
+                display_name: label.name.clone(),
+                felt: label.hash,
+                hex_lower: hex.to_lowercase(),
+                is_user: true,
+                tags_lower: Vec::new(),
+                kind: EntryKind::Transaction,
             });
         }
 
@@ -84,10 +113,11 @@ impl AddressRegistry {
             search_index.push(SearchEntry {
                 name_lower: addr.name.to_lowercase(),
                 display_name: addr.name.clone(),
-                address: addr.address,
+                felt: addr.address,
                 hex_lower: hex.to_lowercase(),
                 is_user: false,
                 tags_lower: Vec::new(),
+                kind: EntryKind::Address,
             });
         }
 
@@ -96,6 +126,7 @@ impl AddressRegistry {
 
         info!(
             user = user.len(),
+            tx_labels = tx_labels.len(),
             known = known.len(),
             index = search_index.len(),
             "Address registry loaded"
@@ -104,6 +135,7 @@ impl AddressRegistry {
         Ok((
             Self {
                 user,
+                tx_labels,
                 known,
                 search_index: RwLock::new(search_index),
             },
@@ -122,6 +154,14 @@ impl AddressRegistry {
             return Some(&addr.name);
         }
         None
+    }
+
+    /// Resolve a transaction hash to its user-supplied display name.
+    pub fn resolve_tx(&self, hash: &Felt) -> Option<&str> {
+        self.tx_labels
+            .iter()
+            .find(|t| t.hash == *hash)
+            .map(|t| t.name.as_str())
     }
 
     /// Get metadata for an address.
@@ -167,11 +207,7 @@ impl AddressRegistry {
         // Prefix matches first (highest relevance)
         for entry in index.iter() {
             if entry.name_lower.starts_with(&query_lower) {
-                results.push(SearchResult {
-                    display: format_search_result(entry),
-                    address: entry.address,
-                    is_user: entry.is_user,
-                });
+                results.push(make_result(entry));
             }
             if results.len() >= limit {
                 return results;
@@ -180,7 +216,10 @@ impl AddressRegistry {
 
         // Then substring matches (name or tags)
         for entry in index.iter() {
-            if results.iter().any(|r| r.address == entry.address) {
+            if results
+                .iter()
+                .any(|r| r.felt == entry.felt && r.kind == entry.kind)
+            {
                 continue;
             }
             let name_match = entry.name_lower.contains(&query_lower);
@@ -189,11 +228,7 @@ impl AddressRegistry {
                 .iter()
                 .any(|t| t.starts_with(&query_lower) || t.contains(&query_lower));
             if name_match || tag_match {
-                results.push(SearchResult {
-                    display: format_search_result(entry),
-                    address: entry.address,
-                    is_user: entry.is_user,
-                });
+                results.push(make_result(entry));
             }
             if results.len() >= limit {
                 return results;
@@ -204,13 +239,11 @@ impl AddressRegistry {
         if query_lower.starts_with("0x") {
             for entry in index.iter() {
                 if entry.hex_lower.starts_with(&query_lower)
-                    && !results.iter().any(|r| r.address == entry.address)
+                    && !results
+                        .iter()
+                        .any(|r| r.felt == entry.felt && r.kind == entry.kind)
                 {
-                    results.push(SearchResult {
-                        display: format_search_result(entry),
-                        address: entry.address,
-                        is_user: entry.is_user,
-                    });
+                    results.push(make_result(entry));
                 }
                 if results.len() >= limit {
                     return results;
@@ -221,32 +254,37 @@ impl AddressRegistry {
         results
     }
 
-    /// Look up an address by exact label name (case-insensitive).
+    /// Look up an entry by exact label name (case-insensitive). Returns the
+    /// matched felt (address or tx hash). On a name collision between an
+    /// address label and a tx label, the address wins (insertion order is
+    /// preserved by the stable sort that builds the index).
     pub fn resolve_by_name(&self, name: &str) -> Option<Felt> {
         let lower = name.to_lowercase();
         let index = self.search_index.read().unwrap();
-        index
-            .iter()
-            .find(|e| e.name_lower == lower)
-            .map(|e| e.address)
+        index.iter().find(|e| e.name_lower == lower).map(|e| e.felt)
     }
 
     /// Add a Voyager-sourced label to the search index.
     /// Skips if the address already has an entry (user/known labels take priority).
     pub fn add_voyager_label(&self, address: Felt, name: &str) {
         let mut index = self.search_index.write().unwrap();
-        // Don't duplicate if address already indexed
-        if index.iter().any(|e| e.address == address) {
+        // Don't duplicate if address already indexed (only check Address-kind
+        // entries — a tx label sharing the same felt by accident is fine).
+        if index
+            .iter()
+            .any(|e| e.kind == EntryKind::Address && e.felt == address)
+        {
             return;
         }
         let hex = format!("{:#x}", address);
         let entry = SearchEntry {
             name_lower: name.to_lowercase(),
             display_name: name.to_string(),
-            address,
+            felt: address,
             hex_lower: hex.to_lowercase(),
             is_user: false,
             tags_lower: Vec::new(),
+            kind: EntryKind::Address,
         };
         // Insert sorted by name
         let pos = index
@@ -315,5 +353,20 @@ fn format_search_result(entry: &SearchEntry) -> String {
     } else {
         hex.clone()
     };
-    format!("{} ({})", entry.display_name, short)
+    let kind_tag = match entry.kind {
+        EntryKind::Address => "",
+        EntryKind::Transaction => " [tx]",
+    };
+    // The kind tag goes after the closing paren so `extract_name_from_display`
+    // (which splits on " (") still recovers the bare label name for Tab-complete.
+    format!("{} ({}){}", entry.display_name, short, kind_tag)
+}
+
+fn make_result(entry: &SearchEntry) -> SearchResult {
+    SearchResult {
+        display: format_search_result(entry),
+        felt: entry.felt,
+        is_user: entry.is_user,
+        kind: entry.kind,
+    }
 }

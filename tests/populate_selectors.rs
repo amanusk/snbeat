@@ -74,7 +74,7 @@ fn collect_all_addresses() -> Vec<(Felt, String)> {
     // Load from labels.toml
     let labels_path = Path::new("labels.toml");
     if labels_path.exists()
-        && let Ok((labels, _)) = snbeat::registry::user_labels::load_user_labels(labels_path)
+        && let Ok((labels, _, _)) = snbeat::registry::user_labels::load_user_labels(labels_path)
     {
         for label in labels {
             if seen.insert(label.address) {
