@@ -194,6 +194,28 @@ fn test_corrupted_labels_returns_warning() {
 }
 
 #[test]
+fn test_invalid_tx_hash_entry_is_skipped() {
+    let labels = make_user_labels(
+        r#"
+[transactions]
+"not-a-hex-string" = "garbage"
+"0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3" = "valid tx"
+"#,
+    );
+
+    let (registry, warning) = snbeat::registry::AddressRegistry::load(labels.path()).unwrap();
+    assert!(
+        warning.is_none(),
+        "per-entry skip must not surface a global warning"
+    );
+
+    let valid =
+        Felt::from_hex("0x05c8845db9ac7775e736853b456a8dddaf22367a81d35ae6951825c36e1a27c3")
+            .unwrap();
+    assert_eq!(registry.resolve_tx(&valid), Some("valid tx"));
+}
+
+#[test]
 fn test_get_decimals() {
     let registry = snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
         .unwrap()
