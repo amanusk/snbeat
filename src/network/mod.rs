@@ -177,37 +177,57 @@ pub async fn run_network_task(
                                     })
                                     .collect();
 
-                                // Find the tx with the target nonce
-                                // Check a batch of txs to find the right nonce
+                                // Find the tx with the target nonce. Fetch candidates in
+                                // parallel (buffer_unordered) and short-circuit on the first
+                                // sender+nonce match, so worst-case latency is ~1 RTT instead
+                                // of N. Nonces are unique per sender on a healthy chain, so
+                                // unordered traversal cannot pick a different "winner".
+                                use futures::stream::StreamExt;
                                 let target_felt = starknet::core::types::Felt::from(target_nonce);
-                                for hash in &tx_hashes {
-                                    if let Ok(fetched_tx) = ds.get_transaction(*hash).await
+                                let ds_for_stream = ds.clone();
+                                let mut stream = futures::stream::iter(tx_hashes.into_iter())
+                                    .map(|h| {
+                                        let ds = ds_for_stream.clone();
+                                        async move { (h, ds.get_transaction(h).await) }
+                                    })
+                                    .buffer_unordered(8);
+
+                                let mut found: Option<(
+                                    starknet::core::types::Felt,
+                                    crate::data::types::SnTransaction,
+                                )> = None;
+                                while let Some((hash, res)) = stream.next().await {
+                                    if let Ok(fetched_tx) = res
                                         && let crate::data::types::SnTransaction::Invoke(ref inv) =
                                             fetched_tx
                                         && inv.nonce == Some(target_felt)
                                         && inv.sender_address == sender
                                     {
-                                        // Found it — reuse fetched_tx, only fetch receipt
-                                        match ds.get_receipt(*hash).await {
-                                            Ok(receipt) => {
-                                                transaction::decode_and_send_transaction(
-                                                    fetched_tx,
-                                                    receipt,
-                                                    &ds,
-                                                    pf.as_ref(),
-                                                    &abi_reg,
-                                                    &tx,
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                let _ = tx.send(Action::Error(format!(
-                                                    "Fetch receipt: {e}"
-                                                )));
-                                            }
-                                        }
-                                        return;
+                                        found = Some((hash, fetched_tx));
+                                        break;
                                     }
+                                }
+                                drop(stream);
+
+                                if let Some((hash, fetched_tx)) = found {
+                                    match ds.get_receipt(hash).await {
+                                        Ok(receipt) => {
+                                            transaction::decode_and_send_transaction(
+                                                fetched_tx,
+                                                receipt,
+                                                &ds,
+                                                pf.as_ref(),
+                                                &abi_reg,
+                                                &tx,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx
+                                                .send(Action::Error(format!("Fetch receipt: {e}")));
+                                        }
+                                    }
+                                    return;
                                 }
                                 let _ = tx.send(Action::Error(format!(
                                     "No tx found with nonce {target_nonce} for this sender"

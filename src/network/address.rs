@@ -967,11 +967,19 @@ pub(super) async fn fetch_and_send_address_info(
         let abi_reg_c = Arc::clone(abi_reg);
         let tx_c = tx.clone();
         spawn_cancellable(cancel.clone(), async move {
-            let mut decoded = Vec::with_capacity(cached_events.len());
-            for event in &cached_events {
-                let abi = abi_reg_c.get_abi_for_address(&event.from_address).await;
-                decoded.push(decode_event(event, abi.as_deref()));
-            }
+            // Prewarm the ABI cache for the unique event sources in parallel
+            // so the per-event decode below is essentially CPU-only after a
+            // single concurrent fan-out, instead of N serial RPC round-trips.
+            let unique_addrs: std::collections::HashSet<starknet::core::types::Felt> =
+                cached_events.iter().map(|e| e.from_address).collect();
+            helpers::prewarm_abis(unique_addrs, &abi_reg_c).await;
+
+            let abi_reg = &abi_reg_c;
+            let event_futs = cached_events.iter().map(|event| async move {
+                let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+                decode_event(event, abi.as_deref())
+            });
+            let decoded: Vec<_> = futures::future::join_all(event_futs).await;
             let _ = tx_c.send(Action::AddressEventsCacheLoaded {
                 address,
                 decoded_events: decoded,

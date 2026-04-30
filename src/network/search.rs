@@ -36,65 +36,68 @@ pub(super) async fn resolve_search(
         return;
     }
 
-    // Try as hex — could be address or tx hash.
-    // Starknet addresses and tx hashes have the same format.
-    // Strategy: check class_hash first (fast) — if it exists, it's a contract/account.
-    // Otherwise try as tx hash.
+    // Try as hex — could be address, tx hash, block hash, or class hash.
+    // Starknet uses the same Felt encoding for all four, so we race the four
+    // backend probes in parallel and dispatch on results in priority order:
+    //   1. class_hash present → address (deployed contract / account)
+    //   2. transaction        → tx detail
+    //   3. block_by_hash      → block detail
+    //   4. class              → class info
+    // Cache writes are idempotent so the speculative parallel fetches are
+    // harmless on miss, and on hit they collapse what used to be up to four
+    // sequential RPCs into a single round-trip. The receipt is fetched in
+    // the same batch so a tx-hash search resolves in one RTT instead of two.
     let hex = query.strip_prefix("0x").unwrap_or(&query);
     if let Ok(felt) = starknet::core::types::Felt::from_hex(&format!("0x{hex}")) {
-        // Step 1: Check if it's a deployed contract/account (has class_hash)
-        let is_contract = ds.get_class_hash(felt).await.is_ok();
+        let (class_hash_res, tx_res, receipt_res, block_hash_res, class_res) = tokio::join!(
+            ds.get_class_hash(felt),
+            ds.get_transaction(felt),
+            ds.get_receipt(felt),
+            ds.get_block_by_hash(felt),
+            ds.get_class(felt),
+        );
 
-        if is_contract {
-            // It's an address — go to address view
+        if class_hash_res.is_ok() {
             let _ = tx.send(Action::NavigateToAddress { address: felt });
             address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx, cancel)
                 .await;
             return;
         }
 
-        // Step 2: Not a contract — try as tx hash
-        match ds.get_transaction(felt).await {
-            Ok(transaction) => {
-                // Reuse the fetched transaction, only fetch receipt
-                match ds.get_receipt(felt).await {
-                    Ok(receipt) => {
-                        transaction::decode_and_send_transaction(
-                            transaction,
-                            receipt,
-                            ds,
-                            pf.as_ref(),
-                            abi_reg,
-                            tx,
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Action::Error(format!(
-                            "Found tx {felt:#x} but failed to fetch receipt: {err}"
-                        )));
-                    }
+        if let Ok(transaction) = tx_res {
+            match receipt_res {
+                Ok(receipt) => {
+                    transaction::decode_and_send_transaction(
+                        transaction,
+                        receipt,
+                        ds,
+                        pf.as_ref(),
+                        abi_reg,
+                        tx,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    let _ = tx.send(Action::Error(format!(
+                        "Found tx {felt:#x} but failed to fetch receipt: {err}"
+                    )));
                 }
             }
-            Err(_) => {
-                // Step 3: Not a tx — try as block hash
-                match ds.get_block_by_hash(felt).await {
-                    Ok(number) => {
-                        block::fetch_and_send_block_detail(number, ds, abi_reg, voyager, tx).await;
-                    }
-                    Err(_) => {
-                        // Step 4: Try as class hash
-                        if ds.get_class(felt).await.is_ok() {
-                            class::fetch_class_info(felt, ds, abi_reg, dune, pf, tx).await;
-                        } else {
-                            let _ = tx.send(Action::Error(
-                                "Not found as address, transaction, block hash, or class hash"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
+            return;
         }
+
+        if let Ok(number) = block_hash_res {
+            block::fetch_and_send_block_detail(number, ds, abi_reg, voyager, tx).await;
+            return;
+        }
+
+        if class_res.is_ok() {
+            class::fetch_class_info(felt, ds, abi_reg, dune, pf, tx).await;
+            return;
+        }
+
+        let _ = tx.send(Action::Error(
+            "Not found as address, transaction, block hash, or class hash".to_string(),
+        ));
     }
 }

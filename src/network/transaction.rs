@@ -54,20 +54,29 @@ pub(super) async fn resolve_call_abis(
     pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) {
-    for call in calls.iter_mut() {
+    // Resolve ABIs concurrently — each `abi_at_block` is mostly cache-hit
+    // after the prewarm pass, but the long-tail miss (an address that wasn't
+    // in `prewarm_targets`) used to serialize the whole multicall behind a
+    // single RPC.
+    let abis: Vec<Option<Arc<ParsedAbi>>> =
+        futures::future::join_all(calls.iter().map(|call| async move {
+            abi_at_block(
+                &call.contract_address,
+                block,
+                addr_to_class,
+                ds,
+                pf,
+                abi_reg,
+            )
+            .await
+        }))
+        .await;
+
+    for (call, abi_opt) in calls.iter_mut().zip(abis.into_iter()) {
         if let Some(name) = abi_reg.get_selector_name(&call.selector) {
             call.function_name = Some(name);
         }
-        if let Some(abi) = abi_at_block(
-            &call.contract_address,
-            block,
-            addr_to_class,
-            ds,
-            pf,
-            abi_reg,
-        )
-        .await
-        {
+        if let Some(abi) = abi_opt {
             if let Some(func) = abi.get_function(&call.selector) {
                 if call.function_name.is_none() {
                     call.function_name = Some(func.name.clone());
@@ -116,11 +125,19 @@ pub(super) async fn decode_and_send_transaction(
         HashMap::new()
     };
 
-    let mut decoded_events = Vec::with_capacity(receipt.events.len());
-    for event in &receipt.events {
-        let abi = abi_at_block(&event.from_address, block, &addr_to_class, ds, pf, abi_reg).await;
-        decoded_events.push(decode_event(event, abi.as_deref()));
-    }
+    // Decode events concurrently. After prewarm, most ABI lookups are cache
+    // hits and complete synchronously; cache-miss tails (synthetic events
+    // whose `from_address` wasn't in `prewarm_targets`) overlap rather than
+    // serialize.
+    let decoded_events: Vec<_> = {
+        let addr_to_class = &addr_to_class;
+        let event_futs = receipt.events.iter().map(|event| async move {
+            let abi =
+                abi_at_block(&event.from_address, block, addr_to_class, ds, pf, abi_reg).await;
+            decode_event(event, abi.as_deref())
+        });
+        futures::future::join_all(event_futs).await
+    };
     resolve_call_abis(&mut decoded_calls, block, &addr_to_class, ds, pf, abi_reg).await;
     let outside_executions = detect_and_resolve_outside_executions(
         &decoded_calls,
@@ -165,7 +182,8 @@ async fn detect_and_resolve_outside_executions(
     pf: Option<&Arc<PathfinderClient>>,
     abi_reg: &Arc<AbiRegistry>,
 ) -> Vec<(usize, OutsideExecutionInfo)> {
-    let mut results = Vec::new();
+    // Pass 1 (sync): detect OEs.
+    let mut detected: Vec<(usize, OutsideExecutionInfo)> = Vec::new();
     for (i, call) in calls.iter().enumerate() {
         let fname = call.function_name.as_deref().unwrap_or("");
 
@@ -184,12 +202,19 @@ async fn detect_and_resolve_outside_executions(
             oe = parse_forwarder_call(call);
         }
 
-        if let Some(mut oe) = oe {
-            resolve_call_abis(&mut oe.inner_calls, block, addr_to_class, ds, pf, abi_reg).await;
-            results.push((i, oe));
+        if let Some(oe) = oe {
+            detected.push((i, oe));
         }
     }
-    results
+
+    // Pass 2 (concurrent): resolve every OE's inner_calls in parallel. Each
+    // future holds a disjoint `&mut Vec<RawCall>` so the borrows don't alias.
+    let resolve_futs = detected.iter_mut().map(|(_, oe)| {
+        resolve_call_abis(&mut oe.inner_calls, block, addr_to_class, ds, pf, abi_reg)
+    });
+    futures::future::join_all(resolve_futs).await;
+
+    detected
 }
 
 /// Fetch tx + receipt in parallel, decode, and send `TransactionLoaded`.
