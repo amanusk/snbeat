@@ -340,11 +340,16 @@ async fn decode_invocation(
         events.push(decode_event(&synth, abi.as_deref()));
     }
 
-    // Recurse for inner calls. Box::pin to break the recursion in async.
-    let mut inner = Vec::with_capacity(inv.calls.len());
-    for child in &inv.calls {
-        inner.push(Box::pin(decode_invocation(child, tx_hash, block, abi_reg)).await);
-    }
+    // Recurse for inner calls in parallel. Box::pin breaks the recursion in
+    // async, and `join_all` lets sibling subtrees decode concurrently — useful
+    // for wide call trees (e.g. router multicalls with many independent legs)
+    // where each branch has its own ABI fetches.
+    let inner: Vec<DecodedTraceCall> = futures::future::join_all(
+        inv.calls
+            .iter()
+            .map(|child| Box::pin(decode_invocation(child, tx_hash, block, abi_reg))),
+    )
+    .await;
 
     DecodedTraceCall {
         contract_address: inv.contract_address,

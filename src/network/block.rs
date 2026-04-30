@@ -34,27 +34,29 @@ pub(super) async fn fetch_and_send_block_detail(
             let (endpoint_names, meta_tx_info) =
                 resolve_endpoint_names(&transactions, abi_reg).await;
 
-            // Batch-fetch receipts for execution status + actual fee (chunks of 20)
+            // Batch-fetch receipts for execution status + actual fee. `buffered`
+            // keeps up to 20 in flight while letting later receipts start as soon
+            // as earlier ones land — the previous `step_by(20) + join_all` form
+            // gated each chunk's start on its predecessor's slowest receipt.
+            use futures::stream::StreamExt;
             let mut tx_statuses = vec!["?".to_string(); transactions.len()];
-            for chunk_start in (0..transactions.len()).step_by(20) {
-                let chunk_end = (chunk_start + 20).min(transactions.len());
-                let futs: Vec<_> = (chunk_start..chunk_end)
-                    .map(|idx| {
-                        let ds_r = Arc::clone(ds);
-                        let hash = transactions[idx].hash();
-                        async move { (idx, ds_r.get_receipt(hash).await) }
-                    })
-                    .collect();
-                let results = futures::future::join_all(futs).await;
-                for (idx, result) in results {
-                    if let Ok(receipt) = result {
-                        tx_statuses[idx] = match receipt.execution_status {
-                            crate::data::types::ExecutionStatus::Succeeded => "OK".into(),
-                            crate::data::types::ExecutionStatus::Reverted(_) => "REV".into(),
-                            _ => "?".into(),
-                        };
-                        transactions[idx].set_actual_fee(receipt.actual_fee);
-                    }
+            let receipt_results: Vec<_> = futures::stream::iter(0..transactions.len())
+                .map(|idx| {
+                    let ds_r = Arc::clone(ds);
+                    let hash = transactions[idx].hash();
+                    async move { (idx, ds_r.get_receipt(hash).await) }
+                })
+                .buffered(20)
+                .collect()
+                .await;
+            for (idx, result) in receipt_results {
+                if let Ok(receipt) = result {
+                    tx_statuses[idx] = match receipt.execution_status {
+                        crate::data::types::ExecutionStatus::Succeeded => "OK".into(),
+                        crate::data::types::ExecutionStatus::Reverted(_) => "REV".into(),
+                        _ => "?".into(),
+                    };
+                    transactions[idx].set_actual_fee(receipt.actual_fee);
                 }
             }
 

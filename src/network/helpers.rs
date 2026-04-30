@@ -266,8 +266,13 @@ pub fn build_tx_summary(
     let fee_fri = receipt.map(|r| felt_to_u128(&r.actual_fee)).unwrap_or(0);
     let status = receipt_status(receipt);
     let (nonce, tip) = extract_nonce_tip(tx);
-    let endpoint_names = format_endpoint_names(tx, abi_reg);
-    let called_contracts = tx_called_contracts(tx);
+    // Parse calldata once and feed both endpoint formatting and called-contracts.
+    let calls = match tx {
+        SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
+        _ => Vec::new(),
+    };
+    let endpoint_names = format_selector_names(calls.iter().map(|c| c.selector), abi_reg);
+    let called_contracts = dedupe_preserve_order(calls.iter().map(|c| c.contract_address));
 
     AddressTxSummary {
         hash,
