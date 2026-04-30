@@ -420,7 +420,19 @@ async fn run_loop(
                         MouseEventKind::ScrollDown => app.select_next(),
                         _ => {} // ignore clicks/motion — text selection works via Shift+drag
                     },
-                    _ => {}
+                    Some(Ok(_)) => {} // resize, focus, paste — ignored
+                    Some(Err(e)) => {
+                        // Terminal input errors are usually fatal (closed tty,
+                        // broken pipe). Log and quit cleanly so the select! arm
+                        // doesn't spin on persistent errors.
+                        warn!(error = %e, "Terminal event stream error, quitting");
+                        return Ok(());
+                    }
+                    None => {
+                        // Stream end (terminal closed). Quit.
+                        info!("Terminal event stream ended");
+                        return Ok(());
+                    }
                 }
             }
             // Handle responses from network task

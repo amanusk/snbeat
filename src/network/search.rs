@@ -37,12 +37,14 @@ pub(super) async fn resolve_search(
     }
 
     // Try as hex — could be address, tx hash, block hash, or class hash.
-    // Two-stage probe: address searches dominate, so check class_hash first
-    // (one RPC, mostly cache-served). On miss, race the remaining four probes
-    // in parallel — that collapses what used to be up to three sequential
-    // round-trips into one, while saving four wasted RPCs per hit on the
-    // common address-search path. The receipt is fetched alongside the tx
-    // probe so tx-hash searches still resolve in one RTT.
+    // Three-stage probe ordered by query frequency:
+    //   1. class_hash (most common: address searches) — single RPC, usually
+    //      cache-served.
+    //   2. tx + receipt joined (tx-hash searches) — both are needed to
+    //      dispatch a tx detail, so race them together.
+    //   3. block_hash + class joined (rare) — only probed if 1 and 2 miss.
+    // Staging avoids waiting for a slow class-fetch on every tx-hash search,
+    // which `tokio::join!` of all four would otherwise force.
     let hex = query.strip_prefix("0x").unwrap_or(&query);
     if let Ok(felt) = starknet::core::types::Felt::from_hex(&format!("0x{hex}")) {
         if ds.get_class_hash(felt).await.is_ok() {
@@ -52,12 +54,7 @@ pub(super) async fn resolve_search(
             return;
         }
 
-        let (tx_res, receipt_res, block_hash_res, class_res) = tokio::join!(
-            ds.get_transaction(felt),
-            ds.get_receipt(felt),
-            ds.get_block_by_hash(felt),
-            ds.get_class(felt),
-        );
+        let (tx_res, receipt_res) = tokio::join!(ds.get_transaction(felt), ds.get_receipt(felt));
 
         if let Ok(transaction) = tx_res {
             match receipt_res {
@@ -80,6 +77,9 @@ pub(super) async fn resolve_search(
             }
             return;
         }
+
+        let (block_hash_res, class_res) =
+            tokio::join!(ds.get_block_by_hash(felt), ds.get_class(felt));
 
         if let Ok(number) = block_hash_res {
             block::fetch_and_send_block_detail(number, ds, abi_reg, voyager, tx).await;
