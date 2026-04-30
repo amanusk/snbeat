@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -384,6 +386,14 @@ async fn run_loop(
     app: &mut App,
     response_rx: &mut mpsc::UnboundedReceiver<Action>,
 ) -> anyhow::Result<()> {
+    // EventStream is cancellation-safe: dropping its `.next()` future does NOT
+    // consume buffered events. The previous `spawn_blocking(event::read)` form
+    // was racy — when `tokio::select!` picked the network branch, the blocking
+    // task could finish reading a key but its result would be dropped, silently
+    // losing characters mid-paste under heavy background traffic.
+    use futures::StreamExt;
+    let mut event_stream = EventStream::new();
+
     loop {
         // Draw
         terminal.draw(|f| ui::draw(f, app))?;
@@ -393,18 +403,10 @@ async fn run_loop(
             return Ok(());
         }
 
-        // Use tokio::select to handle both terminal events and network responses
         tokio::select! {
-            // Check for terminal events (keyboard input)
-            result = tokio::task::spawn_blocking(|| {
-                if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                    Some(event::read())
-                } else {
-                    None
-                }
-            }) => {
-                match result {
-                    Ok(Some(Ok(Event::Key(key)))) => {
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => {
                         // Clear error on any keypress
                         app.error_message = None;
                         if let Some(action) = app::input::handle_key(app, key) {
@@ -413,7 +415,7 @@ async fn run_loop(
                             let _ = app.action_tx.send(action);
                         }
                     }
-                    Ok(Some(Ok(Event::Mouse(mouse)))) => match mouse.kind {
+                    Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
                         MouseEventKind::ScrollUp => app.select_previous(),
                         MouseEventKind::ScrollDown => app.select_next(),
                         _ => {} // ignore clicks/motion — text selection works via Shift+drag
