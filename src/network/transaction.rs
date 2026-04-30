@@ -57,9 +57,12 @@ pub(super) async fn resolve_call_abis(
     // Resolve ABIs concurrently — each `abi_at_block` is mostly cache-hit
     // after the prewarm pass, but the long-tail miss (an address that wasn't
     // in `prewarm_targets`) used to serialize the whole multicall behind a
-    // single RPC.
-    let abis: Vec<Option<Arc<ParsedAbi>>> =
-        futures::future::join_all(calls.iter().map(|call| async move {
+    // single RPC. `buffered(8)` caps fan-out so a multicall with hundreds of
+    // unique cold targets can't burst into hundreds of concurrent RPCs.
+    use futures::stream::StreamExt;
+    let abi_futs: Vec<_> = calls
+        .iter()
+        .map(|call| {
             abi_at_block(
                 &call.contract_address,
                 block,
@@ -68,9 +71,10 @@ pub(super) async fn resolve_call_abis(
                 pf,
                 abi_reg,
             )
-            .await
-        }))
-        .await;
+        })
+        .collect();
+    let abis: Vec<Option<Arc<ParsedAbi>>> =
+        futures::stream::iter(abi_futs).buffered(8).collect().await;
 
     for (call, abi_opt) in calls.iter_mut().zip(abis.into_iter()) {
         if let Some(name) = abi_reg.get_selector_name(&call.selector) {
@@ -125,18 +129,27 @@ pub(super) async fn decode_and_send_transaction(
         HashMap::new()
     };
 
-    // Decode events concurrently. After prewarm, most ABI lookups are cache
-    // hits and complete synchronously; cache-miss tails (synthetic events
-    // whose `from_address` wasn't in `prewarm_targets`) overlap rather than
-    // serialize.
+    // Decode events concurrently with bounded fan-out. After prewarm, most
+    // ABI lookups are cache hits and complete synchronously; cache-miss tails
+    // (synthetic events whose `from_address` wasn't in `prewarm_targets`)
+    // overlap rather than serialize. `buffered(8)` caps in-flight fetches so
+    // huge receipts can't burst hundreds of concurrent RPCs.
+    use futures::stream::StreamExt;
     let decoded_events: Vec<_> = {
         let addr_to_class = &addr_to_class;
-        let event_futs = receipt.events.iter().map(|event| async move {
-            let abi =
-                abi_at_block(&event.from_address, block, addr_to_class, ds, pf, abi_reg).await;
-            decode_event(event, abi.as_deref())
-        });
-        futures::future::join_all(event_futs).await
+        let event_futs: Vec<_> = receipt
+            .events
+            .iter()
+            .map(|event| async move {
+                let abi =
+                    abi_at_block(&event.from_address, block, addr_to_class, ds, pf, abi_reg).await;
+                decode_event(event, abi.as_deref())
+            })
+            .collect();
+        futures::stream::iter(event_futs)
+            .buffered(8)
+            .collect()
+            .await
     };
     resolve_call_abis(&mut decoded_calls, block, &addr_to_class, ds, pf, abi_reg).await;
     let outside_executions = detect_and_resolve_outside_executions(
@@ -209,6 +222,9 @@ async fn detect_and_resolve_outside_executions(
 
     // Pass 2 (concurrent): resolve every OE's inner_calls in parallel. Each
     // future holds a disjoint `&mut Vec<RawCall>` so the borrows don't alias.
+    // Concurrency is transitively bounded — `resolve_call_abis` itself caps
+    // in-flight ABI lookups at 8 per OE, so the global ceiling is
+    // `OE_count × 8` (typically ≤ 16 in practice).
     let resolve_futs = detected.iter_mut().map(|(_, oe)| {
         resolve_call_abis(&mut oe.inner_calls, block, addr_to_class, ds, pf, abi_reg)
     });

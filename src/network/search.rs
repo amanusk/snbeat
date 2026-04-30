@@ -37,32 +37,27 @@ pub(super) async fn resolve_search(
     }
 
     // Try as hex — could be address, tx hash, block hash, or class hash.
-    // Starknet uses the same Felt encoding for all four, so we race the four
-    // backend probes in parallel and dispatch on results in priority order:
-    //   1. class_hash present → address (deployed contract / account)
-    //   2. transaction        → tx detail
-    //   3. block_by_hash      → block detail
-    //   4. class              → class info
-    // Cache writes are idempotent so the speculative parallel fetches are
-    // harmless on miss, and on hit they collapse what used to be up to four
-    // sequential RPCs into a single round-trip. The receipt is fetched in
-    // the same batch so a tx-hash search resolves in one RTT instead of two.
+    // Two-stage probe: address searches dominate, so check class_hash first
+    // (one RPC, mostly cache-served). On miss, race the remaining four probes
+    // in parallel — that collapses what used to be up to three sequential
+    // round-trips into one, while saving four wasted RPCs per hit on the
+    // common address-search path. The receipt is fetched alongside the tx
+    // probe so tx-hash searches still resolve in one RTT.
     let hex = query.strip_prefix("0x").unwrap_or(&query);
     if let Ok(felt) = starknet::core::types::Felt::from_hex(&format!("0x{hex}")) {
-        let (class_hash_res, tx_res, receipt_res, block_hash_res, class_res) = tokio::join!(
-            ds.get_class_hash(felt),
-            ds.get_transaction(felt),
-            ds.get_receipt(felt),
-            ds.get_block_by_hash(felt),
-            ds.get_class(felt),
-        );
-
-        if class_hash_res.is_ok() {
+        if ds.get_class_hash(felt).await.is_ok() {
             let _ = tx.send(Action::NavigateToAddress { address: felt });
             address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx, cancel)
                 .await;
             return;
         }
+
+        let (tx_res, receipt_res, block_hash_res, class_res) = tokio::join!(
+            ds.get_transaction(felt),
+            ds.get_receipt(felt),
+            ds.get_block_by_hash(felt),
+            ds.get_class(felt),
+        );
 
         if let Ok(transaction) = tx_res {
             match receipt_res {

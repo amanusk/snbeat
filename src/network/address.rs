@@ -974,12 +974,22 @@ pub(super) async fn fetch_and_send_address_info(
                 cached_events.iter().map(|e| e.from_address).collect();
             helpers::prewarm_abis(unique_addrs, &abi_reg_c).await;
 
+            // `buffered(8)` caps in-flight `get_abi_for_address` calls so a
+            // huge cached-event list can't burst hundreds of concurrent lookups
+            // while the prewarm cache is still cold.
+            use futures::stream::StreamExt;
             let abi_reg = &abi_reg_c;
-            let event_futs = cached_events.iter().map(|event| async move {
-                let abi = abi_reg.get_abi_for_address(&event.from_address).await;
-                decode_event(event, abi.as_deref())
-            });
-            let decoded: Vec<_> = futures::future::join_all(event_futs).await;
+            let event_futs: Vec<_> = cached_events
+                .iter()
+                .map(|event| async move {
+                    let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+                    decode_event(event, abi.as_deref())
+                })
+                .collect();
+            let decoded: Vec<_> = futures::stream::iter(event_futs)
+                .buffered(8)
+                .collect()
+                .await;
             let _ = tx_c.send(Action::AddressEventsCacheLoaded {
                 address,
                 decoded_events: decoded,
