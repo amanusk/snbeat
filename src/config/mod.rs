@@ -28,6 +28,14 @@ pub struct AppConfig {
     #[arg(long, env = "DUNE_API_KEY")]
     pub dune_api_key: Option<String>,
 
+    /// Mark dynamic Dune queries as private. Default true preserves the
+    /// pre-existing behavior; set `DUNE_PRIVATE_QUERIES=false` to create
+    /// non-private queries, which can dodge the per-account private-query
+    /// quota when it's exhausted (the same archive-on-finish cleanup still
+    /// applies, so they stay temporary).
+    #[arg(long, env = "DUNE_PRIVATE_QUERIES", default_value_t = true)]
+    pub dune_private_queries: bool,
+
     /// Pathfinder query service URL (e.g. http://steak:8234)
     #[arg(long, env = "APP_PATHFINDER_SERVICE_URL")]
     pub pathfinder_service_url: Option<String>,

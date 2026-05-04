@@ -145,8 +145,11 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .filter(|k| !k.is_empty())
         .map(|key| {
-            info!("Dune API enabled");
-            Arc::new(network::dune::DuneClient::new(key.clone()))
+            info!(is_private = config.dune_private_queries, "Dune API enabled");
+            Arc::new(network::dune::DuneClient::new(
+                key.clone(),
+                config.dune_private_queries,
+            ))
         });
 
     // DefiLlama needs no API key, so the client is always created when the cache opens.
