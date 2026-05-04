@@ -2166,12 +2166,43 @@ pub(super) async fn run_endpoint_enrichment(
         min_nonce, max_nonce, known_txs.len(), empty_endpoints
     );
 
-    // --- Phase 1: Fill only small nonce gaps ---
+    // --- Phase 1: Always fetch newest sender txs when current_nonce is ahead
+    // of max_known. PF's initial address load did this implicitly via
+    // `get_sender_txs(limit=200, before=None, after=None)`; without PF, no
+    // path was fetching "newest N by nonce" — both RPC and Dune queries are
+    // block-range scoped. This phase closes that gap on the non-PF path and
+    // also handles the PF case where the user's app missed WS events while
+    // backgrounded.
+    let top_txs = fill_top_of_range_phase(address, current_nonce, &known_txs, ds, dune, pf).await;
+    if !top_txs.is_empty() {
+        let top_nonces: Vec<u64> = top_txs.iter().map(|t| t.nonce).collect();
+        info!(
+            found = top_txs.len(),
+            nonces = ?top_nonces,
+            "Endpoint enrich: filled {} top-of-range txs, sending to UI",
+            top_txs.len()
+        );
+        let _ = action_tx.send(Action::AddressTxsEnriched {
+            address,
+            updates: top_txs.clone(),
+        });
+    }
+
+    // Merge top-of-range fills before scanning for between-pairs gaps so
+    // small-gap heuristics see the new max_known nonce.
+    let mut known_after_top = known_txs.clone();
+    for t in &top_txs {
+        if !known_after_top.iter().any(|k| k.hash == t.hash) {
+            known_after_top.push(t.clone());
+        }
+    }
+
+    // --- Phase 2: Fill only small nonce gaps ---
     // Large gaps are left for on-demand fill via `run_nonce_gap_fill`.
     let gap_txs = fill_small_nonce_gaps_phase(
         address,
         current_nonce,
-        &known_txs,
+        &known_after_top,
         ds,
         dune,
         pf,
@@ -2196,8 +2227,8 @@ pub(super) async fn run_endpoint_enrichment(
         info!("Endpoint enrich: no small nonce gaps to fill");
     }
 
-    // --- Phase 2: Enrich all txs with missing endpoint names ---
-    let mut all_txs = known_txs;
+    // --- Phase 3: Enrich all txs with missing endpoint names ---
+    let mut all_txs = known_after_top;
     for gt in &gap_txs {
         if !all_txs.iter().any(|t| t.hash == gt.hash) {
             all_txs.push(gt.clone());
@@ -2277,6 +2308,125 @@ pub(super) async fn run_nonce_gap_fill(
         address = %format!("{:#x}", address),
         "Gap fill complete"
     );
+}
+
+/// Fill txs whose nonce is above the highest currently-known nonce.
+///
+/// PF's initial address load already covers this via
+/// `get_sender_txs(limit=200, before=None, after=None)`; this phase is the
+/// equivalent for the Dune fallback path, and also catches the PF case where
+/// new sender txs landed after the initial load (e.g. while the app was
+/// backgrounded and missed WS events).
+///
+/// Caps the fetch at `LARGE_GAP_FILL_CHUNK_TXS` newest sender txs. If the
+/// remaining gap exceeds the chunk, the residual hole becomes a normal
+/// between-pairs `UnfilledGap` row that the user can fill on demand.
+async fn fill_top_of_range_phase(
+    address: starknet::core::types::Felt,
+    current_nonce: u64,
+    known_txs: &[crate::data::types::AddressTxSummary],
+    ds: &Arc<dyn DataSource>,
+    dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
+) -> Vec<crate::data::types::AddressTxSummary> {
+    let max_known = known_txs.iter().map(|t| t.nonce).max().unwrap_or(0);
+    // current_nonce is the *next* nonce; the highest tx nonce should be
+    // current_nonce - 1. Anything below is a top-of-range gap.
+    if current_nonce <= max_known.saturating_add(1) {
+        return Vec::new();
+    }
+    let missing = current_nonce.saturating_sub(max_known).saturating_sub(1);
+    let chunk = crate::app::views::address_info::LARGE_GAP_FILL_CHUNK_TXS;
+    info!(
+        address = %format!("{:#x}", address),
+        max_known,
+        current_nonce,
+        missing,
+        chunk,
+        "Top-of-range fill: {} missing nonces above {}, fetching newest {} sender txs",
+        missing, max_known, chunk
+    );
+
+    let known_hashes: std::collections::HashSet<_> = known_txs.iter().map(|t| t.hash).collect();
+
+    if let Some(pf_c) = pf.as_ref() {
+        match pf_c.get_sender_txs(address, chunk, None, None).await {
+            Ok(entries) => {
+                let summaries = pf_txs_to_summaries(entries);
+                let new: Vec<_> = summaries
+                    .into_iter()
+                    .filter(|t| !known_hashes.contains(&t.hash))
+                    .collect();
+                info!(
+                    found = new.len(),
+                    "Top-of-range fill: PF returned {} new txs",
+                    new.len()
+                );
+                return new;
+            }
+            Err(e) => {
+                warn!(error = %e, "Top-of-range fill: PF query failed, falling back to Dune");
+            }
+        }
+    }
+
+    let Some(dune_c) = dune.as_ref() else {
+        warn!(
+            "Top-of-range fill: neither Pathfinder nor Dune available, cannot fill {} missing nonces",
+            missing
+        );
+        return Vec::new();
+    };
+
+    // Dune needs a real block range — anchor on the highest block we know
+    // about for this account and use the chain head as the upper bound.
+    let block_of_max_known = known_txs
+        .iter()
+        .filter(|t| t.nonce == max_known)
+        .map(|t| t.block_number)
+        .max()
+        .unwrap_or(0);
+    let head_block = match ds.get_latest_block_number().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "Top-of-range fill: get_latest_block_number failed");
+            return Vec::new();
+        }
+    };
+    if block_of_max_known == 0 || head_block <= block_of_max_known {
+        return Vec::new();
+    }
+
+    info!(
+        from = block_of_max_known,
+        to = head_block,
+        chunk,
+        "Top-of-range fill: querying Dune for blocks {}..{} (limit {})",
+        block_of_max_known,
+        head_block,
+        chunk
+    );
+    match dune_c
+        .query_account_txs_windowed(address, block_of_max_known, head_block, chunk)
+        .await
+    {
+        Ok(dune_txs) => {
+            let new: Vec<_> = dune_txs
+                .into_iter()
+                .filter(|t| !known_hashes.contains(&t.hash))
+                .collect();
+            info!(
+                found = new.len(),
+                "Top-of-range fill: Dune returned {} new txs",
+                new.len()
+            );
+            new
+        }
+        Err(e) => {
+            warn!(error = %e, "Top-of-range fill: Dune query failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Fill only the *small* nonce gaps (≤50 blocks each) via RPC block scans.
