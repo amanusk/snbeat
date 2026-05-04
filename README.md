@@ -108,6 +108,7 @@ All variables are optional except `APP_RPC_URL`.
 | `APP_PATHFINDER_SERVICE_URL` | -                       | URL of a running `pf-query` instance           |
 | `VOYAGER_API_KEY`            | -                       | Voyager API key for address metadata           |
 | `DUNE_API_KEY`               | -                       | Dune Analytics API key                         |
+| `DUNE_PRIVATE_QUERIES`       | `true`                  | Mark dynamic Dune queries private; set `false` to dodge private-query quota |
 | `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
 | `APP_LOG_LEVEL`              | `info`                  | `trace` / `debug` / `info` / `warn` / `error`  |
 | `APP_LOG_DIR`                | `~/.config/snbeat/logs` | Log file directory                             |
