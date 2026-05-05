@@ -12,6 +12,11 @@ const DUNE_API_BASE: &str = "https://api.dune.com/api/v1";
 pub struct DuneClient {
     client: reqwest::Client,
     api_key: String,
+    /// Whether dynamic queries created via `execute_sql` are flagged
+    /// `is_private`. Toggleable so callers can sidestep a per-account
+    /// private-query quota when it's exhausted; archive-on-finish still
+    /// runs either way, so the queries stay temporary.
+    is_private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +38,46 @@ struct ExecutionStatusResponse {
 #[derive(Debug, Deserialize)]
 struct ExecutionResult {
     rows: Vec<serde_json::Value>,
+}
+
+/// RAII archive trigger for ephemeral queries created by `execute_sql`.
+/// Dropping this fires a detached archive POST so the query doesn't leak on
+/// the Dune account when the awaiting future is cancelled mid-poll. Cleanup
+/// is best-effort: if the runtime is shutting down the spawned task may not
+/// run, but on regular cancellation it does.
+struct ArchiveGuard {
+    client: reqwest::Client,
+    api_key: String,
+    query_id: u64,
+}
+
+impl Drop for ArchiveGuard {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let api_key = std::mem::take(&mut self.api_key);
+        let query_id = self.query_id;
+        tokio::spawn(async move {
+            match client
+                .post(format!("{}/query/{}/archive", DUNE_API_BASE, query_id))
+                .header("X-Dune-API-Key", &api_key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        debug!(query_id, "Dune archive succeeded");
+                    } else {
+                        let body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(query_id, %status, body = %body, "Dune archive returned non-success");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(query_id, error = %e, "Dune archive request failed");
+                }
+            }
+        });
+    }
 }
 
 /// Result of a lightweight probe: block range + count of address activity.
@@ -86,10 +131,11 @@ impl AddressActivityProbe {
 }
 
 impl DuneClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, is_private: bool) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            is_private,
         }
     }
 
@@ -505,7 +551,7 @@ impl DuneClient {
         let create_body = serde_json::json!({
             "name": format!("snbeat_{}", chrono::Utc::now().timestamp()),
             "query_sql": sql,
-            "is_private": true
+            "is_private": self.is_private
         });
 
         let resp: CreateQueryResponse = self
@@ -523,6 +569,16 @@ impl DuneClient {
             .map_err(|e| format!("Dune create parse failed: {e}"))?;
 
         let query_id = resp.query_id;
+        // Arm the archive guard immediately after create. If the calling task
+        // is cancelled (or any later step short-circuits with `?`), the guard
+        // spawns a fire-and-forget archive request from Drop so we don't leak
+        // the query on the Dune account. Non-private queries make this matter
+        // more — they're visible org-wide until archived.
+        let _archive_guard = ArchiveGuard {
+            client: self.client.clone(),
+            api_key: self.api_key.clone(),
+            query_id,
+        };
 
         let exec_resp: ExecuteResponse = self
             .client
@@ -540,7 +596,10 @@ impl DuneClient {
 
         let execution_id = &exec_resp.execution_id;
         let mut attempts = 0;
-        let result = loop {
+        // Archive runs from `_archive_guard`'s Drop impl so the query is
+        // cleaned up on every exit path (success, polling failure, future
+        // cancellation, error early-return).
+        loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             attempts += 1;
 
@@ -573,17 +632,7 @@ impl DuneClient {
                     }
                 }
             }
-        };
-
-        // Archive the ephemeral query to avoid accumulating queries on the account.
-        let _ = self
-            .client
-            .post(format!("{}/query/{}/archive", DUNE_API_BASE, query_id))
-            .header("X-Dune-API-Key", &self.api_key)
-            .send()
-            .await;
-
-        result
+        }
     }
 }
 
@@ -697,7 +746,7 @@ mod tests {
         let dune_key = std::env::var("DUNE_API_KEY").expect("DUNE_API_KEY");
         let rpc_url = std::env::var("APP_RPC_URL").expect("APP_RPC_URL");
 
-        let dune = DuneClient::new(dune_key);
+        let dune = DuneClient::new(dune_key, true);
         let ds = RpcDataSource::new(&rpc_url);
         let address = Felt::from_hex(HYBRID_TEST_ADDR).unwrap();
 
