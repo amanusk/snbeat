@@ -48,4 +48,9 @@ impl AddressColorMap {
             .map(|&s| theme::ADDRESS_PALETTE[s % theme::ADDRESS_PALETTE.len()])
             .unwrap_or(theme::NORMAL_STYLE)
     }
+
+    /// Number of distinct addresses that have been assigned a slot.
+    pub fn slots_count(&self) -> usize {
+        self.slots.len()
+    }
 }
