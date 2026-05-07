@@ -1,6 +1,6 @@
 //! State for the address info view (tx history, balances, calls, events, class history).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use starknet::core::types::Felt;
 
@@ -12,6 +12,7 @@ use crate::data::types::{
 };
 use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
+use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::stateful_list::StatefulList;
 
 /// Maximum block span a nonce gap can cover before we stop auto-filling it
@@ -174,6 +175,18 @@ pub struct AddressInfoState {
     /// MetaTxs). Updated whenever `ensure_address_events_window` runs.
     /// `None` before any fetch completes.
     pub event_window: Option<EventWindowHint>,
+    /// Per-sender occurrence counts across `calls.items`. Rebuilt only when
+    /// the list length changes (i.e. on merge), so steady-state renders
+    /// pay nothing.
+    pub call_sender_counts: HashMap<Felt, usize>,
+    /// Slot assignments for repeated, non-tagged senders in the Calls tab.
+    /// Slots are sticky across rebuilds (HashMap insert is idempotent), so
+    /// an address keeps its color once it crosses the 2-occurrence threshold.
+    pub call_color_map: AddressColorMap,
+    /// Cached `calls.items.len()` from the last color-map rebuild. When this
+    /// matches the current length, the cache is up-to-date and renders skip
+    /// the rescan entirely.
+    pub call_color_processed_len: usize,
 }
 
 /// Auto-fill row target for the event-backed tabs (currently MetaTxs;
@@ -231,6 +244,9 @@ impl Default for AddressInfoState {
             meta_tx_from_block: 0,
             meta_tx_last_window: crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW,
             event_window: None,
+            call_sender_counts: HashMap::new(),
+            call_color_map: AddressColorMap::new(),
+            call_color_processed_len: 0,
         }
     }
 }
@@ -270,6 +286,48 @@ impl AddressInfoState {
         self.meta_tx_from_block = 0;
         self.meta_tx_last_window = crate::network::event_window::EXTEND_DOWN_INITIAL_WINDOW;
         self.event_window = None;
+        self.call_sender_counts.clear();
+        self.call_color_map = AddressColorMap::new();
+        self.call_color_processed_len = 0;
+    }
+
+    /// Drop the cached color map so the next render rebuilds it from scratch.
+    /// Use this when a call's sender mutates in place (e.g. a `Felt::ZERO`
+    /// stub being upgraded by enrichment) — `calls.items.len()` doesn't
+    /// change in that case, so the length-keyed fast path in
+    /// `update_call_color_map` would otherwise leave stale entries (a
+    /// phantom `Felt::ZERO` slot lingering in the color map, real senders
+    /// never counted).
+    pub fn invalidate_call_color_cache(&mut self) {
+        self.call_sender_counts.clear();
+        self.call_color_map = AddressColorMap::new();
+        self.call_color_processed_len = 0;
+    }
+
+    /// Refresh the per-sender count map and color slots for the Calls tab.
+    ///
+    /// Cheap fast path: when `calls.items.len()` matches the cached length,
+    /// nothing has merged since the last rebuild and we return immediately.
+    /// On a merge, we rescan the full list — sort interleaving makes index-
+    /// based incremental work unsafe, but `AddressColorMap::register` is
+    /// idempotent so existing senders keep their slots (and thus their
+    /// colors) across rebuilds.
+    ///
+    /// `is_known` is the registry-tagged predicate; tagged addresses skip
+    /// color registration so they keep their `LABEL_STYLE` rendering.
+    pub fn update_call_color_map(&mut self, is_known: impl Fn(&Felt) -> bool) {
+        if self.call_color_processed_len == self.calls.items.len() {
+            return;
+        }
+        self.call_sender_counts.clear();
+        for call in &self.calls.items {
+            let count = self.call_sender_counts.entry(call.sender).or_insert(0);
+            *count += 1;
+            if *count == 2 && !is_known(&call.sender) {
+                self.call_color_map.register(call.sender);
+            }
+        }
+        self.call_color_processed_len = self.calls.items.len();
     }
 
     /// Whether any source thinks there is more data to fetch.
@@ -1023,5 +1081,95 @@ mod tests {
         // Selecting the lower gap → rendered 5.
         state.gap_selected = Some(30);
         assert_eq!(state.tx_list_rendered_selected(), Some(5));
+    }
+
+    fn call_summary(sender: Felt, block: u64) -> ContractCallSummary {
+        ContractCallSummary {
+            tx_hash: Felt::from(block * 31 + 1),
+            sender,
+            function_name: String::new(),
+            block_number: block,
+            timestamp: 0,
+            total_fee_fri: 0,
+            status: "OK".into(),
+            nonce: None,
+            tip: 0,
+        }
+    }
+
+    /// Builds a synthetic call list with `n` rows. ~30% of senders are unique
+    /// one-shots; the remaining 70% are drawn from a pool of 50 repeating
+    /// senders (the "hot" set the color map should pick up). Hot-pool indices
+    /// step by a coprime stride so every slot gets used as `n` grows.
+    fn build_call_corpus(n: usize) -> Vec<ContractCallSummary> {
+        const POOL_SIZE: usize = 50;
+        let hot_pool: Vec<Felt> = (0..POOL_SIZE)
+            .map(|i| Felt::from(0x1000_u64 + i as u64))
+            .collect();
+        let mut hot_cursor: usize = 0;
+        (0..n)
+            .map(|i| {
+                let sender = if i % 10 < 3 {
+                    Felt::from(0x9000_0000_u64 + i as u64)
+                } else {
+                    let s = hot_pool[hot_cursor % POOL_SIZE];
+                    // 7 is coprime to 50 → cycles through every slot.
+                    hot_cursor = hot_cursor.wrapping_add(7);
+                    s
+                };
+                call_summary(sender, (n - i) as u64)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "release-mode microbenchmark; run with `cargo test --release bench_update_call_color_map -- --ignored --nocapture`"]
+    fn bench_update_call_color_map() {
+        // Marked `#[ignore]` so the default `cargo test` run (typically debug)
+        // doesn't flake on the 100ms ceiling. Run explicitly in release with
+        // `--ignored` to print timings.
+        let sizes = [1_000usize, 5_000, 10_000, 25_000];
+        for &n in &sizes {
+            let corpus = build_call_corpus(n);
+
+            // Cold rebuild: full rescan from scratch (worst case — every merge).
+            let mut state = AddressInfoState::default();
+            state.calls.items = corpus.clone();
+            let t0 = std::time::Instant::now();
+            state.update_call_color_map(|_| false);
+            let cold = t0.elapsed();
+
+            // Warm path: items unchanged, length-equal early-out.
+            let t1 = std::time::Instant::now();
+            for _ in 0..1_000 {
+                state.update_call_color_map(|_| false);
+            }
+            let warm_avg = t1.elapsed() / 1_000;
+
+            // Sanity: the hot pool of 50 repeated senders should all have
+            // crossed the count==2 threshold and registered.
+            let registered = state.call_color_map.slots_count();
+            assert!(
+                registered >= 50,
+                "expected ≥50 registered (hot pool), got {} at n={}",
+                registered,
+                n
+            );
+
+            println!(
+                "n={:>5} cold_rebuild={:>8.3?} warm_per_call={:>8.3?} registered={}",
+                n, cold, warm_avg, registered
+            );
+
+            // Hard ceiling: even 25k items should rebuild well under 100 ms
+            // on any modern machine. Anything above this means the design
+            // has regressed.
+            assert!(
+                cold < std::time::Duration::from_millis(100),
+                "cold rebuild for n={} took {:?}, exceeds 100 ms budget",
+                n,
+                cold
+            );
+        }
     }
 }

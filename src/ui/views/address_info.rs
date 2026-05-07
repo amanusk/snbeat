@@ -720,12 +720,24 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Refresh the per-sender count + color slot cache. No-op when the calls
+    // list hasn't grown since the last render.
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+    app.address
+        .update_call_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
+
     let items: Vec<ListItem> = app
         .address
         .calls
         .items
         .iter()
         .map(|call| {
+            let is_known = registry.is_some_and(|r| r.is_known(&call.sender));
+            let sender_style = if is_known {
+                theme::LABEL_STYLE
+            } else {
+                app.address.call_color_map.style_for(&call.sender)
+            };
             let sender_label = app.format_address(&call.sender);
             let sender_display = if sender_label.chars().count() > 25 {
                 let truncated: String = sender_label.chars().take(24).collect();
@@ -766,7 +778,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let line = Line::from(vec![
-                Span::styled(format!(" {:<25} ", sender_display), theme::LABEL_STYLE),
+                Span::styled(format!(" {:<25} ", sender_display), sender_style),
                 Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
                 Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),

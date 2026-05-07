@@ -1773,6 +1773,7 @@ impl App {
                 if self.address.context != Some(address) {
                     return;
                 }
+                let mut sender_changed = false;
                 for enriched in calls {
                     if let Some(existing) = self
                         .address
@@ -1784,6 +1785,7 @@ impl App {
                         // Upgrade placeholder fields with real data from RPC
                         if existing.sender == Felt::ZERO && enriched.sender != Felt::ZERO {
                             existing.sender = enriched.sender;
+                            sender_changed = true;
                         }
                         if existing.function_name.is_empty() && !enriched.function_name.is_empty() {
                             existing.function_name = enriched.function_name;
@@ -1804,6 +1806,13 @@ impl App {
                             existing.tip = enriched.tip;
                         }
                     }
+                }
+                // Sender mutation doesn't change `calls.items.len()`, so the
+                // length-keyed color-map cache wouldn't otherwise rebuild.
+                // Drop it fully so phantom `Felt::ZERO` slots from stub rows
+                // don't take palette colors away from real senders.
+                if sender_changed {
+                    self.address.invalidate_call_color_cache();
                 }
                 // Persist enriched calls to cache so they survive restarts
                 if !self.address.calls.items.is_empty() {
