@@ -291,6 +291,19 @@ impl AddressInfoState {
         self.call_color_processed_len = 0;
     }
 
+    /// Drop the cached color map so the next render rebuilds it from scratch.
+    /// Use this when a call's sender mutates in place (e.g. a `Felt::ZERO`
+    /// stub being upgraded by enrichment) — `calls.items.len()` doesn't
+    /// change in that case, so the length-keyed fast path in
+    /// `update_call_color_map` would otherwise leave stale entries (a
+    /// phantom `Felt::ZERO` slot lingering in the color map, real senders
+    /// never counted).
+    pub fn invalidate_call_color_cache(&mut self) {
+        self.call_sender_counts.clear();
+        self.call_color_map = AddressColorMap::new();
+        self.call_color_processed_len = 0;
+    }
+
     /// Refresh the per-sender count map and color slots for the Calls tab.
     ///
     /// Cheap fast path: when `calls.items.len()` matches the cached length,
@@ -1110,10 +1123,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-mode microbenchmark; run with `cargo test --release bench_update_call_color_map -- --ignored --nocapture`"]
     fn bench_update_call_color_map() {
-        // Skip in default test runs — `cargo test bench_update_call_color_map -- --nocapture --ignored`
-        // We don't gate behind `--ignored` so a normal run still verifies it
-        // completes in well under a second; print timings for inspection.
+        // Marked `#[ignore]` so the default `cargo test` run (typically debug)
+        // doesn't flake on the 100ms ceiling. Run explicitly in release with
+        // `--ignored` to print timings.
         let sizes = [1_000usize, 5_000, 10_000, 25_000];
         for &n in &sizes {
             let corpus = build_call_corpus(n);
