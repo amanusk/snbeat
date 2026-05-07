@@ -13,6 +13,7 @@ use crate::decode::calldata::{self, DecodedValue};
 use crate::decode::events::{DecodedEvent, DecodedParam};
 use crate::decode::functions::RawCall;
 use crate::decode::outside_execution;
+use crate::decode::privacy::PrivacySummary;
 use crate::decode::trace::{DecodedTraceCall, MulticallGroup, TransferRow};
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
@@ -54,23 +55,58 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let color_map = build_color_map(app);
     let mut line_map: Vec<Option<u16>> = vec![None; app.tx_detail.nav_items.len()];
 
+    // Compute the privacy summary once per frame (cheap: scans events + calls
+    // already in memory). Threaded into the header (for the PRIVACY badge),
+    // the tab bar (to conditionally show the Privacy tab), and the body.
+    // The summarizer needs the parsed outside-execution list too, since
+    // sponsored privacy txs (e.g. AVNU gasless) only reach the pool through
+    // an OE inner-call.
+    let oe_for_privacy: Vec<crate::decode::outside_execution::OutsideExecutionInfo> = app
+        .tx_detail
+        .outside_executions
+        .iter()
+        .map(|(_, info)| info.clone())
+        .collect();
+    let privacy_summary = app.tx_detail.transaction.as_ref().and_then(|tx| {
+        crate::decode::privacy::summarize(
+            tx,
+            &app.tx_detail.decoded_calls,
+            &app.tx_detail.decoded_events,
+            &oe_for_privacy,
+        )
+    });
+
     // Header always renders, so it's always rebuilt. Tab bodies are computed
-    // for all three tabs only in visual mode — that's when cross-tab cursor
+    // for all visible tabs only in visual mode — that's when cross-tab cursor
     // navigation needs up-to-date line offsets for every tab. Outside visual
     // mode only the active tab is visible, so we skip building the others to
     // avoid recomputing large traces on every frame.
-    let header_lines = build_header_lines(app, &color_map, selected.as_ref(), &mut line_map);
-    let (events_lines, calls_lines, transfers_lines, trace_lines) = if app.tx_detail.visual_mode {
+    let header_lines = build_header_lines(
+        app,
+        &color_map,
+        selected.as_ref(),
+        &mut line_map,
+        privacy_summary.as_ref(),
+    );
+    let (events_lines, calls_lines, transfers_lines, trace_lines, privacy_lines) = if app
+        .tx_detail
+        .visual_mode
+    {
         (
             build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
             build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
             build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
             build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            privacy_summary
+                .as_ref()
+                .map(|s| build_privacy_lines(app, s, &color_map, selected.as_ref(), &mut line_map))
+                .unwrap_or_default(),
         )
     } else {
         match app.tx_detail.active_tab {
             TxTab::Events => (
                 build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -80,11 +116,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ),
             TxTab::Transfers => (
                 Vec::new(),
                 Vec::new(),
                 build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
                 Vec::new(),
             ),
             TxTab::Trace => (
@@ -92,6 +130,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Vec::new(),
                 Vec::new(),
                 build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
+                Vec::new(),
+            ),
+            TxTab::Privacy => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                privacy_summary
+                    .as_ref()
+                    .map(|s| {
+                        build_privacy_lines(app, s, &color_map, selected.as_ref(), &mut line_map)
+                    })
+                    .unwrap_or_else(|| {
+                        vec![Line::from(Span::styled(
+                            "   (not a privacy-pool transaction)",
+                            theme::SUGGESTION_STYLE,
+                        ))]
+                    }),
             ),
         }
     };
@@ -114,7 +170,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     search_bar::draw_input(f, app, chunks[0]);
     draw_header_panel(f, header_lines, chunks[1]);
-    draw_tabs_bar(f, app, chunks[2]);
+    draw_tabs_bar(f, app, chunks[2], privacy_summary.as_ref());
     draw_active_tab_body(
         f,
         app,
@@ -123,6 +179,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         calls_lines,
         transfers_lines,
         trace_lines,
+        privacy_lines,
     );
     status_bar::draw(f, app, chunks[4]);
 
@@ -142,7 +199,7 @@ fn draw_header_panel(f: &mut Frame, lines: Vec<Line<'static>>, area: Rect) {
     f.render_widget(widget, area);
 }
 
-fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect, privacy: Option<&PrivacySummary>) {
     let events_count = app.tx_detail.decoded_events.len();
     let calls_count = app.tx_detail.decoded_calls.len();
     let trace_count = app
@@ -163,17 +220,26 @@ fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
         None if app.tx_detail.trace_loading => "Transfers (loading…)".to_string(),
         None => "Transfers".to_string(),
     };
-    let titles = vec![
+    let mut titles = vec![
         Span::raw(format!(" Events ({events_count}) ")),
         Span::raw(format!(" Calls ({calls_count}) ")),
         Span::raw(format!(" {transfers_label} ")),
         Span::raw(format!(" {trace_label} ")),
     ];
+    // Privacy tab is conditional: only show when this tx interacts with the
+    // pool. Non-privacy txs keep the original 4-tab layout.
+    if let Some(s) = privacy {
+        titles.push(Span::styled(
+            format!(" Privacy ({}) ", s.actions.total()),
+            theme::META_TX_STYLE,
+        ));
+    }
     let selected = match app.tx_detail.active_tab {
         TxTab::Events => 0,
         TxTab::Calls => 1,
         TxTab::Transfers => 2,
         TxTab::Trace => 3,
+        TxTab::Privacy => 4,
     };
     // Active tab uses a filled background for high contrast — much more
     // visible than the default underline at-a-glance.
@@ -190,6 +256,7 @@ fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_active_tab_body(
     f: &mut Frame,
     app: &App,
@@ -198,6 +265,7 @@ fn draw_active_tab_body(
     calls_lines: Vec<Line<'static>>,
     transfers_lines: Vec<Line<'static>>,
     trace_lines: Vec<Line<'static>>,
+    privacy_lines: Vec<Line<'static>>,
 ) {
     let (lines, scroll, title) = match app.tx_detail.active_tab {
         TxTab::Events => (
@@ -219,6 +287,11 @@ fn draw_active_tab_body(
             trace_lines,
             app.tx_detail.trace_scroll,
             " Trace (j/k: scroll · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
+        ),
+        TxTab::Privacy => (
+            privacy_lines,
+            app.tx_detail.privacy_scroll,
+            " Privacy (j/k: scroll · Ctrl+U/D: page · v: visual · e: expand · Tab: switch · Ctrl+P/N: tx up/down) ",
         ),
     };
     let widget = Paragraph::new(lines)
@@ -333,6 +406,7 @@ fn build_header_lines(
     color_map: &AddressColorMap,
     selected: Option<&TxNavItem>,
     line_map: &mut [Option<u16>],
+    privacy: Option<&PrivacySummary>,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let tx = match &app.tx_detail.transaction {
@@ -428,6 +502,42 @@ fn build_header_lines(
         Span::styled(tx.type_name(), type_style),
     ]));
 
+    // PRIVACY indicator: present only when this tx interacts with the
+    // Starknet Privacy Pool. One line: pool fee + paymaster signal + action
+    // count. The full breakdown lives in the Privacy tab.
+    if let Some(p) = privacy {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(" Tag:    ", theme::NORMAL_STYLE));
+        spans.push(Span::styled("PRIVACY", theme::META_TX_STYLE));
+        spans.push(Span::styled(
+            format!("  ({} actions)", p.actions.total()),
+            theme::SUGGESTION_STYLE,
+        ));
+        if let Some(fee) = p.pool_fee_fri {
+            spans.push(Span::styled("  Pool fee: ", theme::NORMAL_STYLE));
+            spans.push(Span::styled(format_strk_u128(fee), theme::TX_FEE_STYLE));
+        }
+        match p.paymaster {
+            crate::decode::privacy::PaymasterMode::OutsideExecution => {
+                spans.push(Span::styled(
+                    "  paymaster: sponsored (outside-exec)",
+                    theme::STATUS_OK,
+                ));
+            }
+            crate::decode::privacy::PaymasterMode::PaymasterForwarder => {
+                spans.push(Span::styled(
+                    "  paymaster: forwarder route",
+                    theme::STATUS_OK,
+                ));
+            }
+            crate::decode::privacy::PaymasterMode::KnownRelayer => {
+                spans.push(Span::styled("  paymaster: known relayer", theme::STATUS_OK));
+            }
+            crate::decode::privacy::PaymasterMode::None => {}
+        }
+        lines.push(Line::from(spans));
+    }
+
     // META TX indicator for outside executions
     if !app.tx_detail.outside_executions.is_empty() {
         for (_, oe) in &app.tx_detail.outside_executions {
@@ -440,14 +550,36 @@ fn build_header_lines(
                 &app.tx_detail.nav_sections,
                 NavSection::Header,
             );
-            lines.push(Line::from(vec![
+            // For `execute_private_sponsored` the user identity is hidden
+            // inside the privacy proof — there's no "intender" in the
+            // SNIP-9 sense. Label the surfaced address as "Forwarder" and
+            // skip the meaningless `Nonce: 0x0`.
+            let is_private_sponsored = matches!(
+                oe.version,
+                crate::decode::outside_execution::OutsideExecutionVersion::PrivateSponsored
+            );
+            let role_label = if is_private_sponsored {
+                "  Forwarder: "
+            } else {
+                "  Intender: "
+            };
+            let mut spans = vec![
                 addr_marker(&oe.intender, selected),
                 Span::styled("Meta:   ", theme::NORMAL_STYLE),
-                Span::styled(format!("META TX ({})", oe.version), theme::META_TX_STYLE),
-                Span::styled("  Intender: ", theme::NORMAL_STYLE),
+                Span::styled(
+                    format!("META TX ({})", oe.version.verbose()),
+                    theme::META_TX_STYLE,
+                ),
+                Span::styled(role_label, theme::NORMAL_STYLE),
                 Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
-                Span::styled(format!("  Nonce: {:#x}", oe.nonce), theme::SUGGESTION_STYLE),
-            ]));
+            ];
+            if !is_private_sponsored {
+                spans.push(Span::styled(
+                    format!("  Nonce: {:#x}", oe.nonce),
+                    theme::SUGGESTION_STYLE,
+                ));
+            }
+            lines.push(Line::from(spans));
             lines.push(Line::from(vec![
                 Span::raw("        "),
                 Span::styled(format!(" {:#x}", oe.intender), intender_style),
@@ -902,7 +1034,7 @@ fn build_calls_lines(
             lines.push(Line::from(vec![
                 Span::raw("        "),
                 Span::styled(
-                    format!("Outside Execution ({})", oe.version),
+                    format!("Outside Execution ({})", oe.version.verbose()),
                     theme::META_TX_STYLE,
                 ),
                 Span::styled(
@@ -937,30 +1069,57 @@ fn build_calls_lines(
         ]));
         for (_, oe) in &app.tx_detail.outside_executions {
             let intender_style = addr_style(&oe.intender, color_map, selected);
-            let caller_str = outside_execution::format_caller(&oe.caller);
-            lines.push(Line::from(vec![
-                Span::styled("   Intender: ", theme::NORMAL_STYLE),
-                Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("             "),
-                Span::styled(format!("{:#x}", oe.intender), intender_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Caller:   ", theme::NORMAL_STYLE),
-                Span::raw(caller_str),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
-                Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("   Window:   ", theme::NORMAL_STYLE),
-                Span::raw(format!(
-                    "after: {}  before: {}",
-                    oe.execute_after, oe.execute_before
-                )),
-            ]));
+            let is_private_sponsored = matches!(
+                oe.version,
+                crate::decode::outside_execution::OutsideExecutionVersion::PrivateSponsored
+            );
+            // For `execute_private_sponsored` the user is anonymous (proof
+            // is inside the inner call), and there's no caller/nonce/window
+            // to display — the wrapper carries only a call array + relayer
+            // auth blob. Show the forwarder address and jump straight to
+            // the inner calls.
+            if is_private_sponsored {
+                lines.push(Line::from(vec![
+                    Span::styled("   Forwarder: ", theme::NORMAL_STYLE),
+                    Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("              "),
+                    Span::styled(format!("{:#x}", oe.intender), intender_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("   User:      ", theme::NORMAL_STYLE),
+                    Span::styled(
+                        "anonymous (privacy-proven inside inner call)",
+                        theme::SUGGESTION_STYLE,
+                    ),
+                ]));
+            } else {
+                let caller_str = outside_execution::format_caller(&oe.caller);
+                lines.push(Line::from(vec![
+                    Span::styled("   Intender: ", theme::NORMAL_STYLE),
+                    Span::styled(fmt_addr_full(app, &oe.intender), intender_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("             "),
+                    Span::styled(format!("{:#x}", oe.intender), intender_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("   Caller:   ", theme::NORMAL_STYLE),
+                    Span::raw(caller_str),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
+                    Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("   Window:   ", theme::NORMAL_STYLE),
+                    Span::raw(format!(
+                        "after: {}  before: {}",
+                        oe.execute_after, oe.execute_before
+                    )),
+                ]));
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("   Inner Calls ({})", oe.inner_calls.len()),
@@ -1011,6 +1170,364 @@ fn build_calls_lines(
     }
 
     lines
+}
+
+/// Build the Privacy tab body: action-mix line + per-action breakdown of
+/// publicly-observable fields. Encrypted fields (enc_user_addr,
+/// enc_recipient_addr, packed_value) are deliberately not surfaced — they're
+/// auditor-only and showing the bytes is just noise.
+fn build_privacy_lines(
+    app: &App,
+    summary: &PrivacySummary,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+
+    // === Action mix (one-line summary) ===
+    lines.push(Line::from(Span::styled(
+        format!(" Actions ({} total)", summary.actions.total()),
+        theme::TITLE_STYLE,
+    )));
+    let mix = &summary.actions;
+    let mut chips: Vec<String> = Vec::new();
+    if mix.notes_used > 0 {
+        chips.push(format!("{} NoteUsed", mix.notes_used));
+    }
+    if mix.enc_notes_created > 0 {
+        chips.push(format!("{} EncNoteCreated", mix.enc_notes_created));
+    }
+    if mix.open_notes_created > 0 {
+        chips.push(format!("{} OpenNoteCreated", mix.open_notes_created));
+    }
+    if mix.open_notes_deposited > 0 {
+        chips.push(format!("{} OpenNoteDeposited", mix.open_notes_deposited));
+    }
+    if mix.deposits > 0 {
+        chips.push(format!("{} Deposit", mix.deposits));
+    }
+    if mix.withdrawals > 0 {
+        chips.push(format!("{} Withdrawal", mix.withdrawals));
+    }
+    if mix.viewing_keys_set > 0 {
+        chips.push(format!("{} ViewingKeySet", mix.viewing_keys_set));
+    }
+    if mix.invoke_external > 0 {
+        chips.push(format!("{} InvokeExternal", mix.invoke_external));
+    }
+    let mix_line = if chips.is_empty() {
+        "(none)".to_string()
+    } else {
+        chips.join(" · ")
+    };
+    lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled(mix_line, theme::TX_HASH_STYLE),
+    ]));
+    lines.push(Line::from(""));
+
+    // === Public deposits ===
+    if !summary.deposits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" Deposits ({})", summary.deposits.len()),
+            theme::TITLE_STYLE,
+        )));
+        for (i, d) in summary.deposits.iter().enumerate() {
+            let last = i == summary.deposits.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let token_label = fmt_addr(app, &d.token);
+            let token_style = addr_style(&d.token, color_map, selected);
+            let user_style = addr_style(&d.user_addr, color_map, selected);
+            let amount_str = format_amount_for_token(registry, &d.token, d.amount);
+            record(
+                &TxNavItem::Address(d.user_addr),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker_any(&[&d.user_addr, &d.token], selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(amount_str, theme::TX_FEE_STYLE),
+                Span::raw(" "),
+                Span::styled(token_label, token_style),
+                Span::styled("  from ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &d.user_addr), user_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // === Public withdrawals (sender encrypted, recipient clear) ===
+    if !summary.withdrawals.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" Withdrawals ({})", summary.withdrawals.len()),
+            theme::TITLE_STYLE,
+        )));
+        for (i, w) in summary.withdrawals.iter().enumerate() {
+            let last = i == summary.withdrawals.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let token_label = fmt_addr(app, &w.token);
+            let token_style = addr_style(&w.token, color_map, selected);
+            let to_style = addr_style(&w.to_addr, color_map, selected);
+            let amount_str = format_amount_for_token(registry, &w.token, w.amount);
+            record(
+                &TxNavItem::Address(w.to_addr),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker_any(&[&w.to_addr, &w.token], selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(amount_str, theme::TX_FEE_STYLE),
+                Span::raw(" "),
+                Span::styled(token_label, token_style),
+                Span::styled("  → ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &w.to_addr), to_style),
+                Span::styled("    sender: encrypted", theme::SUGGESTION_STYLE),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // === Open notes (created + deposited) ===
+    if !summary.open_notes_created.is_empty() || !summary.open_notes_deposited.is_empty() {
+        let total = summary.open_notes_created.len() + summary.open_notes_deposited.len();
+        lines.push(Line::from(Span::styled(
+            format!(" Open notes ({total})"),
+            theme::TITLE_STYLE,
+        )));
+        for (i, n) in summary.open_notes_created.iter().enumerate() {
+            let last_outer = i == summary.open_notes_created.len() - 1
+                && summary.open_notes_deposited.is_empty();
+            let branch = if last_outer { "└─" } else { "├─" };
+            let token_label = fmt_addr(app, &n.token);
+            let token_style = addr_style(&n.token, color_map, selected);
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled("created  ", theme::NORMAL_STYLE),
+                Span::styled(token_label, token_style),
+                Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
+                Span::styled("    recipient: encrypted", theme::SUGGESTION_STYLE),
+            ]));
+        }
+        for (i, d) in summary.open_notes_deposited.iter().enumerate() {
+            let last = i == summary.open_notes_deposited.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let token_label = fmt_addr(app, &d.token);
+            let token_style = addr_style(&d.token, color_map, selected);
+            let depositor_style = addr_style(&d.depositor, color_map, selected);
+            let amount_str = format_amount_for_token(registry, &d.token, d.amount);
+            record(
+                &TxNavItem::Address(d.depositor),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker_any(&[&d.depositor, &d.token], selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled("deposited ", theme::NORMAL_STYLE),
+                Span::styled(amount_str, theme::TX_FEE_STYLE),
+                Span::raw(" "),
+                Span::styled(token_label, token_style),
+                Span::styled(format!("  note {:#x}", d.note_id), theme::SUGGESTION_STYLE),
+                Span::styled("  by ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &d.depositor), depositor_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // === Viewing-key registrations ===
+    if !summary.viewing_keys_set.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" Joined pool ({})", summary.viewing_keys_set.len()),
+            theme::TITLE_STYLE,
+        )));
+        for (i, v) in summary.viewing_keys_set.iter().enumerate() {
+            let last = i == summary.viewing_keys_set.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let user_style = addr_style(&v.user_addr, color_map, selected);
+            record(
+                &TxNavItem::Address(v.user_addr),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker(&v.user_addr, selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(fmt_addr_full(app, &v.user_addr), user_style),
+                Span::styled(
+                    format!("  pubkey {:#x}", v.public_key),
+                    theme::SUGGESTION_STYLE,
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // === Internal counts (nullifiers + enc-notes) ===
+    // Surfaced as collapsed summaries by default; `e` (expand_all) lists IDs.
+    if !summary.nullifiers.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Nullifiers consumed: ", theme::TITLE_STYLE),
+            Span::styled(
+                format!("{} note(s) spent", summary.nullifiers.len()),
+                theme::TX_HASH_STYLE,
+            ),
+        ]));
+        if app.tx_detail.expand_all {
+            for (i, n) in summary.nullifiers.iter().enumerate() {
+                let last = i == summary.nullifiers.len() - 1;
+                let branch = if last { "└─" } else { "├─" };
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                    Span::styled(format!("{:#x}", n), theme::SUGGESTION_STYLE),
+                ]));
+            }
+        }
+    }
+    if !summary.enc_notes_created.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" Enc-notes created:   ", theme::TITLE_STYLE),
+            Span::styled(
+                format!("{} note(s)", summary.enc_notes_created.len()),
+                theme::TX_HASH_STYLE,
+            ),
+            Span::styled(
+                "    (values encrypted, auditor-only)",
+                theme::SUGGESTION_STYLE,
+            ),
+        ]));
+        if app.tx_detail.expand_all {
+            for (i, n) in summary.enc_notes_created.iter().enumerate() {
+                let last = i == summary.enc_notes_created.len() - 1;
+                let branch = if last { "└─" } else { "├─" };
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                    Span::styled(format!("{:#x}", n), theme::SUGGESTION_STYLE),
+                ]));
+            }
+        }
+    }
+    if !summary.nullifiers.is_empty() || !summary.enc_notes_created.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    // === InvokeExternal target ===
+    if let Some(ie) = &summary.invoke_external {
+        lines.push(Line::from(Span::styled(
+            " Invoke external",
+            theme::TITLE_STYLE,
+        )));
+        let target_style = addr_style(&ie.target, color_map, selected);
+        let fn_label = ie
+            .function_name
+            .clone()
+            .unwrap_or_else(|| format!("{:#x}", ie.selector));
+        record(
+            &TxNavItem::Address(ie.target),
+            lines.len(),
+            line_map,
+            &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Privacy,
+        );
+        lines.push(Line::from(vec![
+            addr_marker(&ie.target, selected),
+            Span::styled("└─ ", theme::BORDER_STYLE),
+            Span::styled(fmt_addr_full(app, &ie.target), target_style),
+            Span::styled("  → ", theme::NORMAL_STYLE),
+            Span::styled(fn_label, theme::TX_HASH_STYLE),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // === Pool fee + paymaster signal ===
+    if let Some(fee) = summary.pool_fee_fri {
+        lines.push(Line::from(vec![
+            Span::styled(" Pool fee: ", theme::NORMAL_STYLE),
+            Span::styled(format_strk_u128(fee), theme::TX_FEE_STYLE),
+            Span::styled(
+                "    (transferred from the pool to its fee collector)",
+                theme::SUGGESTION_STYLE,
+            ),
+        ]));
+    }
+    let (paymaster_label, paymaster_style) = match summary.paymaster {
+        crate::decode::privacy::PaymasterMode::OutsideExecution => (
+            "sponsored (outside-execution intent)".to_string(),
+            theme::STATUS_OK,
+        ),
+        crate::decode::privacy::PaymasterMode::PaymasterForwarder => (
+            "sponsored (multicall routes through a known paymaster forwarder)".to_string(),
+            theme::STATUS_OK,
+        ),
+        crate::decode::privacy::PaymasterMode::KnownRelayer => (
+            "sponsored (sender is a known relayer)".to_string(),
+            theme::STATUS_OK,
+        ),
+        crate::decode::privacy::PaymasterMode::None => (
+            "no sponsorship signal (sender likely paid directly)".to_string(),
+            theme::SUGGESTION_STYLE,
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Paymaster: ", theme::NORMAL_STYLE),
+        Span::styled(paymaster_label, paymaster_style),
+    ]));
+    if let Some(intender) = summary.intender {
+        let intender_style = addr_style(&intender, color_map, selected);
+        record(
+            &TxNavItem::Address(intender),
+            lines.len(),
+            line_map,
+            &app.tx_detail.nav_items,
+            &app.tx_detail.nav_sections,
+            NavSection::Privacy,
+        );
+        lines.push(Line::from(vec![
+            addr_marker(&intender, selected),
+            Span::styled("Intender:  ", theme::NORMAL_STYLE),
+            Span::styled(fmt_addr_full(app, &intender), intender_style),
+            Span::styled(
+                "  (signer of the OE intent — the actual user)",
+                theme::SUGGESTION_STYLE,
+            ),
+        ]));
+    }
+
+    lines
+}
+
+/// Format a u128 amount using token decimals when known. Falls back to a
+/// raw decimal print for tokens we don't have decimals for.
+fn format_amount_for_token(
+    registry: Option<&crate::registry::AddressRegistry>,
+    token: &Felt,
+    amount: u128,
+) -> String {
+    let decimals = registry.and_then(|r| r.get_decimals(token));
+    match decimals {
+        Some(d) => crate::ui::widgets::param_display::format_token_amount(amount, 0, d),
+        None => format!("{}", amount),
+    }
 }
 
 /// Build the Trace tab body: recursive call tree with ABI-decoded function

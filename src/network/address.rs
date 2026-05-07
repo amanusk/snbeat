@@ -3932,13 +3932,13 @@ pub(super) async fn classify_meta_tx_candidate(
         if oe.intender != address {
             continue;
         }
-        let label = match method {
+        // `OutsideExecutionVersion::short()` returns the canonical short tag
+        // (v1/v2/v3/p1, ≤ 2 chars). Centralizing the meta-tx label here lets
+        // a future version variant added to the enum auto-flow into this
+        // column without an extra match-site update here.
+        let label: &'static str = match method {
             DetectionMethod::AvnuForwarder => "avnu",
-            DetectionMethod::Name => match oe.version {
-                crate::decode::outside_execution::OutsideExecutionVersion::V1 => "v1",
-                crate::decode::outside_execution::OutsideExecutionVersion::V2 => "v2",
-                crate::decode::outside_execution::OutsideExecutionVersion::V3 => "v3",
-            },
+            DetectionMethod::Name => oe.version.short(),
             DetectionMethod::Heuristic => "v?",
         };
         found = Some((oe, label));
