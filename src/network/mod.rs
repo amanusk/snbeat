@@ -446,6 +446,37 @@ pub async fn run_network_task(
                             let _ = tx.send(Action::PricesUpdated);
                         }
                     }
+                    Action::FetchPrivateNotes { user, viewing_key } => {
+                        // Re-wrap the raw felt as a SecretFelt so it gets
+                        // zeroize-on-drop after the sync completes. The
+                        // value already passed through the channel as a
+                        // bare Felt — the wrapper is just for in-memory
+                        // hygiene, not for cryptographic confidentiality
+                        // beyond what the channel already provides.
+                        let key =
+                            crate::decode::privacy_crypto::types::SecretFelt::new(viewing_key);
+                        let backend = crate::decode::privacy_sync::StorageBackend::new(
+                            pf.clone(),
+                            Arc::clone(&ds),
+                        );
+                        match crate::decode::privacy_sync::sync_user_incoming_notes(
+                            user, &key, &backend,
+                        )
+                        .await
+                        {
+                            Ok((index, _block_number)) => {
+                                let notes: Vec<_> = index.notes.into_values().collect();
+                                let _ = tx.send(Action::PrivateNotesIndexed { user, notes });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user = %format!("{:#x}", user),
+                                    error = %e,
+                                    "Privacy sync failed"
+                                );
+                            }
+                        }
+                    }
                     // Response actions are not handled here
                     _ => {}
                 }

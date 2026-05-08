@@ -1228,6 +1228,54 @@ fn build_privacy_lines(
     ]));
     lines.push(Line::from(""));
 
+    // === Decrypted notes (viewing keys) ===
+    // Match this tx's `EncNoteCreated` note_ids against the in-memory
+    // index of forward-decrypted notes built by the privacy-pool sync.
+    // Each hit becomes a row showing recipient ← sender, amount, token —
+    // information that without the viewing key would be encrypted
+    // gibberish in the receipt.
+    let decrypted: Vec<&crate::decode::privacy_sync::DecryptedNote> = summary
+        .enc_notes_created
+        .iter()
+        .filter_map(|nid| app.private_notes.get(nid))
+        .collect();
+    if !decrypted.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" Decrypted (viewing keys) ({})", decrypted.len()),
+            theme::TITLE_STYLE,
+        )));
+        for (i, n) in decrypted.iter().enumerate() {
+            let last = i == decrypted.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let amount_str = format_amount_for_token(registry, &n.token, n.amount);
+            let token_label = fmt_addr(app, &n.token);
+            let token_style = addr_style(&n.token, color_map, selected);
+            let user_style = addr_style(&n.user, color_map, selected);
+            let counterparty_style = addr_style(&n.counterparty, color_map, selected);
+            record(
+                &TxNavItem::Address(n.user),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker_any(&[&n.user, &n.counterparty, &n.token], selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(fmt_addr(app, &n.user), user_style),
+                Span::styled(" ← ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
+                Span::raw("  "),
+                Span::styled(amount_str, theme::TX_FEE_STYLE),
+                Span::raw(" "),
+                Span::styled(token_label, token_style),
+                Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     // === Public deposits ===
     if !summary.deposits.is_empty() {
         lines.push(Line::from(Span::styled(

@@ -217,6 +217,27 @@ impl CachingDataSource {
                 class_hash TEXT PRIMARY KEY,
                 fetched_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS private_notes (
+                note_id TEXT PRIMARY KEY,
+                user TEXT NOT NULL,
+                channel_idx INTEGER NOT NULL,
+                subchannel_idx INTEGER NOT NULL,
+                note_idx INTEGER NOT NULL,
+                amount_low INTEGER NOT NULL,
+                amount_high INTEGER NOT NULL,
+                salt_low INTEGER NOT NULL,
+                salt_high INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                block_number INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_private_notes_user
+                ON private_notes(user);
+            CREATE TABLE IF NOT EXISTS private_notes_sync (
+                user TEXT PRIMARY KEY,
+                last_synced_block INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -306,6 +327,19 @@ impl CachingDataSource {
                 SnbeatError::Config(format!("Migration v8 version bump failed: {e}"))
             })?;
             debug!("Migration v8: added class_history_meta table");
+        }
+
+        if version < 9 {
+            // v9: introduce private_notes + private_notes_sync. Caches
+            // forward-decrypted Privacy Pool incoming notes per labelled
+            // user (note_id → amount/token/sender) so the Privacy tab can
+            // annotate EncNoteCreated events without re-syncing storage on
+            // every tx open. The CREATE TABLE IF NOT EXISTS lines above
+            // handle DDL; nothing to migrate from older rows.
+            db.execute("PRAGMA user_version = 9", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v9 version bump failed: {e}"))
+            })?;
+            debug!("Migration v9: added private_notes + private_notes_sync tables");
         }
 
         drop(db);

@@ -293,6 +293,57 @@ impl PathfinderClient {
         Ok(resp)
     }
 
+    /// Bulk-fetch contract storage values in one round trip.
+    ///
+    /// Reads N slots from a single contract at the given block via
+    /// `POST /storage-batch`. Returns values in input order with `Felt::ZERO`
+    /// for slots that have never been written, plus the block number the
+    /// service resolved (so the caller can pin subsequent decoding to the
+    /// same snapshot — important for the privacy-pool sync, which derives
+    /// downstream slot keys from earlier slot values).
+    ///
+    /// `block` is the literal `"latest"` or a decimal block number.
+    pub async fn get_storage_batch(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: &str,
+    ) -> anyhow::Result<(Vec<Felt>, u64)> {
+        let url = format!("{}/storage-batch", self.base_url);
+        let keys_hex: Vec<String> = keys.iter().map(|k| format!("{:#x}", k)).collect();
+        let body = serde_json::json!({
+            "contract": format!("{:#x}", contract),
+            "keys": keys_hex,
+            "block": block,
+        });
+        debug!(url = %url, count = keys.len(), block = %block, "Fetching storage batch from pf-query");
+        #[derive(Deserialize)]
+        struct Resp {
+            values: Vec<String>,
+            block_number: u64,
+        }
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Resp>()
+            .await?;
+        // Convert hex strings → Felt. The service guarantees minimal
+        // `0x...` strings; reject anything we can't parse so a service
+        // bug doesn't silently produce zeros.
+        let mut out = Vec::with_capacity(resp.values.len());
+        for (i, v) in resp.values.iter().enumerate() {
+            let felt = Felt::from_hex(v).map_err(|e| {
+                anyhow::anyhow!("storage-batch returned invalid felt at index {i}: {v} ({e})")
+            })?;
+            out.push(felt);
+        }
+        Ok((out, resp.block_number))
+    }
+
     /// Bulk-fetch tx + receipt data by hash in one round trip.
     ///
     /// Hashes not present in the Pathfinder DB are silently omitted from the

@@ -66,6 +66,20 @@ pub trait DataSource: Send + Sync {
         self.get_class_hash(address).await
     }
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass>;
+    /// Read a single contract storage slot. Used as the RPC fallback when
+    /// pf-query's batch endpoint isn't reachable, called concurrently from
+    /// the privacy-pool sync. Default impl returns an error so non-RPC
+    /// sources don't pretend to support it; the RPC source overrides.
+    async fn get_storage_at(
+        &self,
+        _contract: Felt,
+        _key: Felt,
+        _block: Option<u64>,
+    ) -> Result<Felt> {
+        Err(crate::error::SnbeatError::Provider(
+            "get_storage_at not implemented for this DataSource".into(),
+        ))
+    }
     /// Fetch the execution trace of a transaction (recursive call tree with
     /// nested events, calldata, and results). Used by the tx-detail Trace tab.
     async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace>;

@@ -184,6 +184,29 @@ pub enum Action {
         tx_hash: Felt,
         trace: Option<crate::decode::trace::DecodedTrace>,
     },
+    /// Forward-decrypted Privacy Pool notes for a labelled user. Posted by
+    /// the privacy-sync background task; the reducer merges these into
+    /// `app.private_notes` so the Privacy tab can annotate
+    /// `EncNoteCreated` events that match. `notes = empty` is a valid
+    /// signal that the user has nothing in the pool yet (or the sync ran
+    /// against a wrong key) — caller should NOT treat empty as failure.
+    PrivateNotesIndexed {
+        user: Felt,
+        notes: Vec<crate::decode::privacy_sync::DecryptedNote>,
+    },
+    /// Kick off a privacy-pool storage sync for a labelled user. Sent by
+    /// the App reducer when a tx with `EncNoteCreated` events is opened
+    /// for a user with a viewing key, and we haven't yet synced this
+    /// session. The network task picks it up, runs
+    /// `sync_user_incoming_notes` (~hundreds of pf-query slot reads), and
+    /// posts `Action::PrivateNotesIndexed` when done.
+    FetchPrivateNotes {
+        user: Felt,
+        /// Raw private viewing key felt. Treated as a secret in handlers
+        /// (re-wrapped in `SecretFelt` at the call site to get
+        /// zeroize-on-drop + `[REDACTED]` Debug).
+        viewing_key: Felt,
+    },
     /// Address info loaded.
     AddressInfoLoaded {
         info: SnAddressInfo,

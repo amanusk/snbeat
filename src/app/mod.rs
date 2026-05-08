@@ -118,6 +118,17 @@ pub struct App {
     /// Used as a fallback when neither user labels nor known addresses have an entry.
     pub voyager_labels: HashMap<starknet::core::types::Felt, VoyagerLabelInfo>,
 
+    /// Forward-decrypted Privacy Pool notes, keyed by `note_id`. Populated
+    /// by `Action::PrivateNotesIndexed` for users we hold a viewing key
+    /// for; consumed by the Privacy tab to annotate `EncNoteCreated`
+    /// events with decrypted amount/token/sender.
+    pub private_notes:
+        HashMap<starknet::core::types::Felt, crate::decode::privacy_sync::DecryptedNote>,
+    /// Set of users we've already kicked off a sync for in this session,
+    /// so we don't re-trigger on every tx open. Cleared on app restart;
+    /// the persisted SQLite cache provides cross-session memory.
+    pub private_notes_synced: std::collections::HashSet<starknet::core::types::Felt>,
+
     // Channel to network task
     pub action_tx: mpsc::UnboundedSender<Action>,
 
@@ -166,6 +177,8 @@ impl App {
             pending_tx_boundary: None,
 
             voyager_labels: HashMap::new(),
+            private_notes: HashMap::new(),
+            private_notes_synced: std::collections::HashSet::new(),
 
             action_tx,
 
@@ -195,6 +208,43 @@ impl App {
         let _ = self
             .action_tx
             .send(Action::FetchTokenPricesToday { tokens });
+    }
+
+    /// On a freshly-loaded tx, kick off privacy-pool note sync for any
+    /// labelled user (one with a `viewing_keys.toml` entry) whose decrypted
+    /// notes might be referenced by `EncNoteCreated` events in this tx.
+    /// Idempotent per session — already-synced users are skipped (the
+    /// merged `private_notes` index stays in memory until the user quits).
+    fn dispatch_private_notes_sync(&mut self) {
+        let Some(engine) = &self.search_engine else {
+            return;
+        };
+        let registry = engine.registry();
+        // Cheap signal: only sync when the tx contains pool events. This
+        // catches the obvious cases (deposits, sends, joins, withdrawals).
+        // We could also sync on every privacy-tx open regardless, but
+        // syncing on a tx the user just looks at is the responsive
+        // moment.
+        let pool = *crate::decode::privacy::POOL_ADDRESS;
+        let touches_pool = self
+            .tx_detail
+            .decoded_events
+            .iter()
+            .any(|e| e.contract_address == pool);
+        if !touches_pool {
+            return;
+        }
+        let users: Vec<(starknet::core::types::Felt, starknet::core::types::Felt)> = registry
+            .iter_viewing_keys()
+            .filter(|(u, _)| !self.private_notes_synced.contains(u))
+            .map(|(u, k)| (u, **k))
+            .collect();
+        for (user, viewing_key) in users {
+            self.private_notes_synced.insert(user);
+            let _ = self
+                .action_tx
+                .send(Action::FetchPrivateNotes { user, viewing_key });
+        }
     }
 
     fn dispatch_tx_price_fetch(&self) {
@@ -1030,6 +1080,7 @@ impl App {
                     self.push_view(View::TxDetail);
                 }
                 self.dispatch_tx_price_fetch();
+                self.dispatch_private_notes_sync();
             }
             Action::TransactionTraceLoaded { tx_hash, trace } => {
                 // Drop late-arriving traces for a tx the user has navigated
@@ -1042,6 +1093,21 @@ impl App {
                     self.tx_detail.trace_loading = false;
                     // Rebuild nav so trace addresses become reachable in `v` mode.
                     self.build_tx_nav_items();
+                }
+            }
+            Action::PrivateNotesIndexed { user, notes } => {
+                // Merge the labelled user's freshly-decrypted notes into
+                // the global note_id → DecryptedNote index. Late arrivals
+                // are fine to merge whether or not the user is still
+                // viewing the originating tx — they cost nothing if the
+                // active view doesn't reference the matching note_ids.
+                tracing::info!(
+                    user = %format!("{:#x}", user),
+                    count = notes.len(),
+                    "Privacy notes indexed"
+                );
+                for n in notes {
+                    self.private_notes.insert(n.note_id, n);
                 }
             }
             Action::NavigateToAddress { address } => {

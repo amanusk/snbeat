@@ -290,6 +290,23 @@ impl DataSource for RpcDataSource {
             .map_err(|e| SnbeatError::Provider(e.to_string()))
     }
 
+    async fn get_storage_at(&self, contract: Felt, key: Felt, block: Option<u64>) -> Result<Felt> {
+        let block_id = match block {
+            Some(n) => BlockId::Number(n),
+            None => BlockId::Tag(BlockTag::Latest),
+        };
+        // starknet-rust 0.19 added a 4th param for response flags (RPC v0.10
+        // optional `INCLUDE_LAST_UPDATE_BLOCK` metadata). We don't need
+        // metadata for the privacy-pool sync, so pass `None` and unwrap the
+        // bare value via `GetStorageAtResult::value()`.
+        let result = self
+            .provider
+            .get_storage_at(contract, key, block_id, None)
+            .await
+            .map_err(|e| SnbeatError::Provider(e.to_string()))?;
+        Ok(result.value())
+    }
+
     async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace> {
         self.provider
             .trace_transaction(hash)
