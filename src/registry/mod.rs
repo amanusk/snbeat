@@ -1,5 +1,6 @@
 pub mod known_addresses;
 pub mod user_labels;
+pub mod viewing_keys;
 
 use std::path::Path;
 use std::sync::RwLock;
@@ -7,9 +8,11 @@ use std::sync::RwLock;
 use starknet::core::types::Felt;
 use tracing::info;
 
+use crate::decode::privacy_crypto::types::SecretFelt;
 use crate::error::Result;
 use known_addresses::{KnownAddress, load_known_addresses};
 use user_labels::{UserLabel, UserTxLabel, load_user_labels};
+use viewing_keys::{ViewingKey, load_viewing_keys};
 
 /// What kind of on-chain entity a search entry/result points at. Drives
 /// downstream navigation (address view vs transaction detail view).
@@ -29,6 +32,9 @@ pub struct AddressRegistry {
     tx_labels: Vec<UserTxLabel>,
     /// Known addresses (curated)
     known: Vec<KnownAddress>,
+    /// Privacy-pool viewing keys keyed by user address. Deliberately NOT
+    /// in the search index — secrets shouldn't surface in autocomplete.
+    viewing_keys: Vec<ViewingKey>,
     /// Search index: sorted entries for fast lookup.
     /// Behind RwLock so Voyager labels can be added at runtime.
     search_index: RwLock<Vec<SearchEntry>>,
@@ -67,11 +73,21 @@ pub struct AddressMeta {
 }
 
 impl AddressRegistry {
-    /// Load from user labels file and bundled known addresses.
-    /// Returns (registry, optional_warning) — warning is set when labels file is corrupt.
-    pub fn load(user_labels_path: &Path) -> Result<(Self, Option<String>)> {
-        let (user, tx_labels, warning) = load_user_labels(user_labels_path)?;
+    /// Load from user labels, viewing keys, and bundled known addresses.
+    /// Returns `(registry, warnings)`. Warnings collect non-fatal issues
+    /// from any of the input files (corrupt TOML etc.) so all of them
+    /// can surface in the UI rather than the first one masking the rest.
+    pub fn load(user_labels_path: &Path, viewing_keys_path: &Path) -> Result<(Self, Vec<String>)> {
+        let (user, tx_labels, labels_warning) = load_user_labels(user_labels_path)?;
+        let (viewing_keys, vk_warning) = load_viewing_keys(viewing_keys_path)?;
         let known = load_known_addresses()?;
+        let mut warnings = Vec::new();
+        if let Some(w) = labels_warning {
+            warnings.push(w);
+        }
+        if let Some(w) = vk_warning {
+            warnings.push(w);
+        }
 
         let mut search_index = Vec::with_capacity(user.len() + tx_labels.len() + known.len());
 
@@ -127,6 +143,7 @@ impl AddressRegistry {
         info!(
             user = user.len(),
             tx_labels = tx_labels.len(),
+            viewing_keys = viewing_keys.len(),
             known = known.len(),
             index = search_index.len(),
             "Address registry loaded"
@@ -137,10 +154,28 @@ impl AddressRegistry {
                 user,
                 tx_labels,
                 known,
+                viewing_keys,
                 search_index: RwLock::new(search_index),
             },
-            warning,
+            warnings,
         ))
+    }
+
+    /// Look up a user-supplied private viewing key for an address.
+    /// Returns None if the user has no viewing key registered for it.
+    pub fn viewing_key(&self, user: &Felt) -> Option<&SecretFelt> {
+        self.viewing_keys
+            .iter()
+            .find(|vk| vk.user == *user)
+            .map(|vk| &vk.private_key)
+    }
+
+    /// Iterate over all `(user_address, viewing_key)` pairs the user has
+    /// configured. Order is the file's load order (HashMap iteration).
+    pub fn iter_viewing_keys(&self) -> impl Iterator<Item = (Felt, &SecretFelt)> {
+        self.viewing_keys
+            .iter()
+            .map(|vk| (vk.user, &vk.private_key))
     }
 
     /// Resolve an address to its display name. User labels take priority.

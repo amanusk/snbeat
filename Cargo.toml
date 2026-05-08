@@ -17,6 +17,16 @@ exclude = ["screenshots/", ".github/", ".githooks/", ".env.example"]
 [dependencies]
 # Starknet — Software Mansion's starknet-rust (active development, RPC v0.10 spec)
 starknet = { package = "starknet-rust", version = "0.19.0-rc.2" }
+# Direct dep on starknet-types-core for the `curve` feature (AffinePoint
+# scalar mul / x-recover) and starknet-crypto for Poseidon. Both are pulled
+# transitively by `starknet`, but we re-add them here to opt into the curve
+# feature explicitly and to make the dependency on these primitives obvious
+# (used by the privacy-pool decryption module under decode/privacy_crypto/).
+starknet-types-core = { version = "0.2", features = ["curve", "serde"] }
+starknet-crypto = "0.8"
+
+# Secret material wrapper: zeroize on drop for the privacy-pool viewing keys.
+zeroize = "1"
 
 # TUI
 ratatui = { version = "0.29", features = ["all-widgets"] }

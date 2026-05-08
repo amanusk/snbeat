@@ -1367,7 +1367,13 @@ fn build_privacy_lines(
                 &app.tx_detail.nav_sections,
                 NavSection::Privacy,
             );
-            lines.push(Line::from(vec![
+            // Validation chip: if the user has a labelled viewing key for
+            // this address, derive its public key and check it against
+            // the on-chain `public_key` emitted in this event.
+            let chip = registry
+                .and_then(|r| r.viewing_key(&v.user_addr))
+                .map(|k| crate::decode::privacy::validate_viewing_key(v, k));
+            let mut spans = vec![
                 addr_marker(&v.user_addr, selected),
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled(fmt_addr_full(app, &v.user_addr), user_style),
@@ -1375,7 +1381,19 @@ fn build_privacy_lines(
                     format!("  pubkey {:#x}", v.public_key),
                     theme::SUGGESTION_STYLE,
                 ),
-            ]));
+            ];
+            if let Some(status) = chip {
+                let (label, style) = match status {
+                    crate::decode::privacy::ViewingKeyStatus::Valid => {
+                        ("  ✓ key valid", theme::STATUS_OK)
+                    }
+                    crate::decode::privacy::ViewingKeyStatus::Mismatch => {
+                        ("  ✗ key mismatch", theme::STATUS_ERROR)
+                    }
+                };
+                spans.push(Span::styled(label, style));
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }

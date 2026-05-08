@@ -1,6 +1,7 @@
 /target
 .env
 labels.toml
+viewing_keys.toml
 logs/*
 scripts/
 CLAUDE.md

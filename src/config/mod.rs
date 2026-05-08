@@ -20,6 +20,11 @@ pub struct AppConfig {
     #[arg(long, env = "APP_USER_LABELS", default_value = "labels.toml")]
     pub user_labels: String,
 
+    /// Path to viewing keys TOML file (privacy-pool decryption keys).
+    /// Held separately from labels.toml because the keys are SECRETS.
+    #[arg(long, env = "APP_VIEWING_KEYS", default_value = "viewing_keys.toml")]
+    pub viewing_keys: String,
+
     /// Voyager API key
     #[arg(long, env = "VOYAGER_API_KEY")]
     pub voyager_api_key: Option<String>,
