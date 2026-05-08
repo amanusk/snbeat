@@ -1280,9 +1280,9 @@ fn build_privacy_lines(
             lines.push(Line::from(vec![
                 addr_marker_any(&[&n.user, &n.counterparty, &n.token], selected),
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
-                Span::styled(fmt_addr(app, &n.user), user_style),
-                Span::styled(" ← ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
+                Span::styled(" → ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &n.user), user_style),
                 Span::raw("  "),
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
                 Span::raw(" "),
