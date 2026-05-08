@@ -389,4 +389,45 @@ mod tests {
         assert!(idx.is_empty());
         assert!(idx.get(&Felt::from(1u64)).is_none());
     }
+
+    /// Pins down the exact lookup pattern the Privacy tab does at render
+    /// time: `summary.enc_notes_created.iter().filter_map(|nid|
+    /// private_notes.get(nid))`. Felt equality + Hash must agree across
+    /// the sync-side `compute_note_id` output and the event-side note_id
+    /// parsed from receipts. Sanity check that ensures a regression in
+    /// HashMap behavior over `Felt` doesn't silently break the UI.
+    #[test]
+    fn ui_lookup_matches_round_trip() {
+        let note_id = Felt::from(0xc0ffeeu64);
+        let user = Felt::from(0xabcdu64);
+        let token = Felt::from(0x1234u64);
+        let counterparty = Felt::from(0xdeadu64);
+
+        let mut map: HashMap<Felt, DecryptedNote> = HashMap::new();
+        map.insert(
+            note_id,
+            DecryptedNote {
+                note_id,
+                user,
+                counterparty,
+                token,
+                amount: 140_000_000_000_000_000_000u128,
+                channel_idx: 0,
+                subchannel_idx: 0,
+                note_idx: 3,
+                block_number: 9579062,
+            },
+        );
+
+        // Construct an "event side" Felt from a different code path than
+        // the sync-side one, just to be thorough.
+        let from_event = Felt::from_hex_unchecked("0xc0ffee");
+        let enc_notes_created = [from_event];
+        let hits: Vec<&DecryptedNote> = enc_notes_created
+            .iter()
+            .filter_map(|nid| map.get(nid))
+            .collect();
+        assert_eq!(hits.len(), 1, "lookup should hit exactly once");
+        assert_eq!(hits[0].amount, 140_000_000_000_000_000_000u128);
+    }
 }

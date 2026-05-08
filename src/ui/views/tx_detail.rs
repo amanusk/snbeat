@@ -1239,6 +1239,23 @@ fn build_privacy_lines(
         .iter()
         .filter_map(|nid| app.private_notes.get(nid))
         .collect();
+    // One-shot debug log per render — fires only when there's actually
+    // an EncNoteCreated event so it doesn't spam non-privacy frames.
+    // Helps diagnose "I expected the section to appear" cases by showing
+    // the lookup state every render.
+    if !summary.enc_notes_created.is_empty() {
+        let needles: Vec<String> = summary
+            .enc_notes_created
+            .iter()
+            .map(|n| format!("{:#x}", n))
+            .collect();
+        tracing::debug!(
+            tx_enc_notes = ?needles,
+            indexed = app.private_notes.len(),
+            decrypted_hits = decrypted.len(),
+            "Privacy tab: matching EncNoteCreated note_ids against private_notes index"
+        );
+    }
     if !decrypted.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" Decrypted (viewing keys) ({})", decrypted.len()),
