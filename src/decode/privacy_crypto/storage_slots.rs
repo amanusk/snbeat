@@ -145,3 +145,33 @@ pub fn notes(note_id: Felt) -> Felt {
 pub fn nullifiers(nullifier: Felt) -> Felt {
     slot("nullifiers", &[nullifier])
 }
+
+#[cfg(test)]
+mod live_probes {
+    //! Helpers to print well-known privacy-pool storage slots for live
+    //! `curl /storage-batch` smoke tests. Marked `#[ignore]` so they
+    //! don't run in CI; invoke with `cargo test slot_print -- --ignored
+    //! --nocapture`.
+
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn slot_print_auditor_public_key() {
+        eprintln!("auditor_public_key slot = {:#x}", auditor_public_key());
+    }
+
+    /// Compute the `notes(note_id)` slot for a given note id taken from
+    /// the env var `NOTE_ID` (hex felt). Lets us spot-check the slot
+    /// derivation against on-chain `EncNoteCreated` emissions without
+    /// hard-coding any specific note id in committed test data.
+    ///
+    ///     NOTE_ID=0x... cargo test slot_print_notes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn slot_print_notes() {
+        let hex = std::env::var("NOTE_ID").expect("NOTE_ID env var required (hex felt)");
+        let note_id = Felt::from_hex(&hex).expect("NOTE_ID must be hex felt");
+        eprintln!("notes({:#x}) slot = {:#x}", note_id, notes(note_id));
+    }
+}
