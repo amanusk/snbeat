@@ -80,6 +80,8 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 "0x04daa17763b286d1e59b97c283c0b8c949994c361e426a28f743c67bdfe9a32f" = { name = "tBTC", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x028d709c875c0ceac3dce7065bec5328186dc89fe254527084d1689910954b0a" = { name = "xSTRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x042b8f0484674ca266ac5d08e4ac6a3fe65bd3129795def2dca5c34ecc5f96d2" = { name = "nstSTRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
+"0x02019e47a0bc54ea6b4853c6123ffc8158ea3ae2af4166928b0de6e89f06de6c" = { name = "Relend Network USDC", type = "ERC20", verified = true, source = "bundled", decimals = 6 }
+"0x036834a40984312f7f7de8d31e3f6305b325389eaeea5b1c0664b2fb936461a4" = { name = "LBTC", type = "ERC20", verified = true, source = "bundled", decimals = 8 }
 
 # DEXes
 "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b" = { name = "Ekubo Core", type = "DEX", verified = true, source = "bundled" }
@@ -100,6 +102,9 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 
 # Lending
 "0x02545b2e5d519fc230e9cd781046d3a64e092114f07e44771e0d719d148571e3" = { name = "Vesu Singleton", type = "Lending", verified = true, source = "bundled" }
+# Vesu V1 Singleton — alternate deployment, same V1 class hash
+# (`0x62c6e1d…25750ee`). Padded to 64 hex chars with leading zeros for canonical form.
+"0x000d8d6dfec4d33bfb6895de9f3852143a17c6f92fd2a21da3d6924d34870160" = { name = "Vesu V1 Singleton", type = "Lending", verified = true, source = "bundled" }
 "0x07e2a13b40fc1119ec55e0bcf9428eedaa581ab3c924561ad4e955f95da63138" = { name = "Zklend Market", type = "Lending", verified = true, source = "bundled" }
 
 # Staking
@@ -117,4 +122,14 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 
 # Known exchanges/wallets
 "0x0620102ea610be8518125cf2de850d0c4f5d0c5d81f969cff666fb53b05042d2" = { name = "Kraken Hot Wallet", type = "Exchange", verified = true, source = "bundled" }
+
+# Privacy
+"0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a" = { name = "Privacy Pool", type = "Privacy", verified = true, source = "bundled" }
+# Privacy Pool's Ekubo swap helper (deployed instance of class
+# `0x61047c2...061dc`). Called by the pool's `InvokeExternal` action when
+# a user swaps private funds via Ekubo: pool withdraws to this helper,
+# helper executes the Ekubo swap, helper deposits the proceeds back into
+# the pool as an OpenNote. Identified via getClassHashAt against tx
+# 0x90304ef5b180c520ce866161c0a14618a72af5aa841fe38a243220aa05bfa2.
+"0x00389e0930f2bcf14221adefb71007ca71cec4cd4f64f321836392d2748a14c6" = { name = "Privacy Ekubo Helper", type = "Privacy", verified = true, source = "bundled" }
 "#;

@@ -132,7 +132,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                 return maybe_dispatch_meta_txs_on_entry(app);
             }
             if app.current_view() == View::TxDetail {
-                app.tx_detail.active_tab = app.tx_detail.active_tab.next();
+                let has_privacy = tx_detail_has_privacy(app);
+                app.tx_detail.active_tab = app.tx_detail.active_tab.next_visible(has_privacy);
             }
             None
         }
@@ -149,7 +150,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                 return maybe_dispatch_meta_txs_on_entry(app);
             }
             if app.current_view() == View::TxDetail {
-                app.tx_detail.active_tab = app.tx_detail.active_tab.prev();
+                let has_privacy = tx_detail_has_privacy(app);
+                app.tx_detail.active_tab = app.tx_detail.active_tab.prev_visible(has_privacy);
             }
             None
         }
@@ -782,4 +784,25 @@ fn handle_enter(app: &mut App) -> Option<Action> {
         View::TxDetail => None,
         View::ClassInfo => None,
     }
+}
+
+/// Whether the current tx in `TxDetail` is a privacy-pool tx, controlling
+/// whether `Tab`/`Shift+Tab` includes the Privacy tab in the cycle.
+fn tx_detail_has_privacy(app: &App) -> bool {
+    let Some(tx) = &app.tx_detail.transaction else {
+        return false;
+    };
+    let oe: Vec<_> = app
+        .tx_detail
+        .outside_executions
+        .iter()
+        .map(|(_, info)| info.clone())
+        .collect();
+    crate::decode::privacy::summarize(
+        tx,
+        &app.tx_detail.decoded_calls,
+        &app.tx_detail.decoded_events,
+        &oe,
+    )
+    .is_some()
 }

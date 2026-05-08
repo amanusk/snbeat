@@ -211,6 +211,27 @@ fn hardcoded_selectors() -> Vec<(Felt, &'static str)> {
             "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab",
             "Swap",
         ),
+        // Starknet Privacy Pool events (selectors observed on mainnet)
+        (
+            "0x0247fc60d782e0094e7f98c47f277d92a3345d07a436f1f56b27a9b62be2322e",
+            "NoteUsed",
+        ),
+        (
+            "0x023c20207be8b1ef4430c25eef8ce779c9745ebe04139555ae81bd4f8fdd6ec5",
+            "EncNoteCreated",
+        ),
+        (
+            "0x022330482fd296a27cf9096807b4a3622cd619d31cce42c1e55655914e8459ee",
+            "OpenNoteCreated",
+        ),
+        (
+            "0x002eed7e29b3502a726faf503ac4316b7101f3da813654e8df02c13449e03da8",
+            "Withdrawal",
+        ),
+        (
+            "0x025b6da03c4858d11cb0708d5cb6be79b190fb32eb7a7ce83804e07cbbb9bead",
+            "OpenNoteDeposited",
+        ),
     ];
     for (hex, name) in known_hex {
         if let Ok(felt) = Felt::from_hex(hex) {
@@ -218,7 +239,48 @@ fn hardcoded_selectors() -> Vec<(Felt, &'static str)> {
         }
     }
 
+    // Privacy-pool action / event names that resolve via get_selector_from_name.
+    // We add them here so events emitted by future helper deployments still
+    // get a readable name even before the pool's full ABI lands in cache.
+    let privacy = [
+        "ViewingKeySet",
+        "Deposit",
+        "apply_actions",
+        "compile_actions",
+        "deposit_to_open_note",
+    ];
+    for name in privacy {
+        if let Ok(sel) = get_selector_from_name(name) {
+            selectors.push((sel, name));
+        }
+    }
+
     selectors
+}
+
+/// Class hashes we want to seed directly (no live deployed instance required).
+/// Used for protocol helper classes referenced by InvokeExternal but not in
+/// the address registry.
+fn hardcoded_class_hashes() -> Vec<(Felt, &'static str)> {
+    let mut out = Vec::new();
+    let entries = [
+        (
+            // Starknet Privacy: Ekubo swap helper
+            "0x061047c201f235d66cab8a0c4768ea0ca9f900c64b478a90531fb2fb30e061dc",
+            "Privacy Ekubo Helper",
+        ),
+        (
+            // Starknet Privacy: Vesu lending helper
+            "0x02fec72887f6431e4a66090bec49ecf8bde30cf39a7045e4ed6ce57447704b24",
+            "Privacy Vesu Helper",
+        ),
+    ];
+    for (hex, name) in entries {
+        if let Ok(felt) = Felt::from_hex(hex) {
+            out.push((felt, name));
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -283,6 +345,21 @@ async fn populate_selectors() {
         class_hashes.len(),
         failed
     );
+
+    // Step 3.5: Merge hardcoded helper class hashes (no deployed instance required).
+    let mut hardcoded_added = 0usize;
+    for (ch, name) in hardcoded_class_hashes() {
+        if seen_classes.insert(ch) {
+            class_hashes.push((ch, name.to_string()));
+            hardcoded_added += 1;
+        }
+    }
+    if hardcoded_added > 0 {
+        println!(
+            "Added {} hardcoded class hashes (privacy helpers, etc.)",
+            hardcoded_added
+        );
+    }
 
     // Step 4: Fetch and parse ABIs for each unique class
     println!("\n=== Fetching ABIs for {} classes ===", class_hashes.len());

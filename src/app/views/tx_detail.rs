@@ -10,6 +10,11 @@ use crate::decode::outside_execution::OutsideExecutionInfo;
 use crate::decode::trace::DecodedTrace;
 
 /// Which body tab is active in the tx detail view.
+///
+/// `Privacy` is the only tab that's conditionally rendered: it appears when
+/// the tx interacts with the Starknet Privacy Pool (see
+/// [`crate::decode::privacy::summarize`]). For non-privacy txs the cycle
+/// skips it via [`TxTab::next_visible`]/[`TxTab::prev_visible`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TxTab {
     #[default]
@@ -17,6 +22,7 @@ pub enum TxTab {
     Calls,
     Transfers,
     Trace,
+    Privacy,
 }
 
 impl TxTab {
@@ -25,15 +31,37 @@ impl TxTab {
             Self::Events => Self::Calls,
             Self::Calls => Self::Transfers,
             Self::Transfers => Self::Trace,
-            Self::Trace => Self::Events,
+            Self::Trace => Self::Privacy,
+            Self::Privacy => Self::Events,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            Self::Events => Self::Trace,
+            Self::Events => Self::Privacy,
             Self::Calls => Self::Events,
             Self::Transfers => Self::Calls,
             Self::Trace => Self::Transfers,
+            Self::Privacy => Self::Trace,
+        }
+    }
+
+    /// Tab cycling that skips the Privacy tab when the current tx isn't a
+    /// privacy tx. `has_privacy` is the caller's view of whether
+    /// `decode::privacy::summarize` produced a summary for this tx.
+    pub fn next_visible(self, has_privacy: bool) -> Self {
+        let n = self.next();
+        if matches!(n, Self::Privacy) && !has_privacy {
+            n.next()
+        } else {
+            n
+        }
+    }
+    pub fn prev_visible(self, has_privacy: bool) -> Self {
+        let n = self.prev();
+        if matches!(n, Self::Privacy) && !has_privacy {
+            n.prev()
+        } else {
+            n
         }
     }
 }
@@ -47,6 +75,7 @@ pub enum NavSection {
     Calls,
     Transfers,
     Trace,
+    Privacy,
 }
 
 /// All state related to the transaction detail view.
@@ -63,6 +92,7 @@ pub struct TxDetailState {
     pub calls_scroll: u16,
     pub transfers_scroll: u16,
     pub trace_scroll: u16,
+    pub privacy_scroll: u16,
     /// Decoded recursive call tree (populated lazily after the main fetch).
     pub trace: Option<DecodedTrace>,
     /// True from the moment we trigger the trace fetch until it lands.
@@ -110,6 +140,7 @@ impl TxDetailState {
         self.calls_scroll = 0;
         self.transfers_scroll = 0;
         self.trace_scroll = 0;
+        self.privacy_scroll = 0;
         self.trace = None;
         self.trace_loading = false;
         self.visual_mode = false;
@@ -297,6 +328,64 @@ impl TxDetailState {
             }
         }
 
+        // === Privacy tab ===
+        // Compute the privacy summary once and walk it for nav-able addresses
+        // (deposit user_addr / withdrawal to_addr / open-note depositor /
+        // viewing-key user_addr / invoke-external target / OE intender). The
+        // pool address itself is already covered by the Calls section.
+        let oe_clone: Vec<crate::decode::outside_execution::OutsideExecutionInfo> = self
+            .outside_executions
+            .iter()
+            .map(|(_, oe)| oe.clone())
+            .collect();
+        if let Some(tx) = &self.transaction
+            && let Some(summary) = crate::decode::privacy::summarize(
+                tx,
+                &self.decoded_calls,
+                &self.decoded_events,
+                &oe_clone,
+            )
+        {
+            let push_priv =
+                |felt: starknet::core::types::Felt,
+                 items: &mut Vec<TxNavItem>,
+                 sections: &mut Vec<NavSection>,
+                 seen: &mut HashSet<starknet::core::types::Felt>| {
+                    if felt != starknet::core::types::Felt::ZERO && seen.insert(felt) {
+                        push(
+                            TxNavItem::Address(felt),
+                            NavSection::Privacy,
+                            items,
+                            sections,
+                        );
+                    }
+                };
+            for d in &summary.deposits {
+                push_priv(d.user_addr, &mut items, &mut sections, &mut seen);
+                push_priv(d.token, &mut items, &mut sections, &mut seen);
+            }
+            for w in &summary.withdrawals {
+                push_priv(w.to_addr, &mut items, &mut sections, &mut seen);
+                push_priv(w.token, &mut items, &mut sections, &mut seen);
+            }
+            for n in &summary.open_notes_created {
+                push_priv(n.token, &mut items, &mut sections, &mut seen);
+            }
+            for d in &summary.open_notes_deposited {
+                push_priv(d.depositor, &mut items, &mut sections, &mut seen);
+                push_priv(d.token, &mut items, &mut sections, &mut seen);
+            }
+            for v in &summary.viewing_keys_set {
+                push_priv(v.user_addr, &mut items, &mut sections, &mut seen);
+            }
+            if let Some(ie) = &summary.invoke_external {
+                push_priv(ie.target, &mut items, &mut sections, &mut seen);
+            }
+            if let Some(intender) = summary.intender {
+                push_priv(intender, &mut items, &mut sections, &mut seen);
+            }
+        }
+
         // === Trace tab ===
         if let Some(trace) = &self.trace {
             trace.for_each_call(|call| {
@@ -344,6 +433,7 @@ impl TxDetailState {
             TxTab::Calls => self.calls_scroll,
             TxTab::Transfers => self.transfers_scroll,
             TxTab::Trace => self.trace_scroll,
+            TxTab::Privacy => self.privacy_scroll,
         }
     }
 
@@ -355,6 +445,7 @@ impl TxDetailState {
             TxTab::Calls => &mut self.calls_scroll,
             TxTab::Transfers => &mut self.transfers_scroll,
             TxTab::Trace => &mut self.trace_scroll,
+            TxTab::Privacy => &mut self.privacy_scroll,
         }
     }
 
@@ -376,6 +467,7 @@ impl TxDetailState {
                 NavSection::Calls => self.active_tab = TxTab::Calls,
                 NavSection::Transfers => self.active_tab = TxTab::Transfers,
                 NavSection::Trace => self.active_tab = TxTab::Trace,
+                NavSection::Privacy => self.active_tab = TxTab::Privacy,
                 NavSection::Header => {} // header is always visible — no tab switch
             }
         }
@@ -389,6 +481,7 @@ impl TxDetailState {
                 Some(NavSection::Calls) => self.calls_scroll = target,
                 Some(NavSection::Transfers) => self.transfers_scroll = target,
                 Some(NavSection::Trace) => self.trace_scroll = target,
+                Some(NavSection::Privacy) => self.privacy_scroll = target,
                 Some(NavSection::Header) | None => {}
             }
         }

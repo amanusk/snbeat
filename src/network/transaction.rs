@@ -17,7 +17,8 @@ use crate::decode::events::decode_event;
 use crate::decode::functions::parse_multicall;
 use crate::decode::outside_execution::{
     OutsideExecutionInfo, OutsideExecutionVersion, is_avnu_forwarder, is_outside_execution,
-    looks_like_outside_execution, parse_forwarder_call, parse_outside_execution,
+    looks_like_outside_execution, looks_like_private_sponsored, parse_forwarder_call,
+    parse_outside_execution, parse_private_sponsored,
 };
 
 /// Resolve the ABI for `addr` as of `block`. Prefers the prewarmed
@@ -202,9 +203,20 @@ async fn detect_and_resolve_outside_executions(
 
         let mut oe = None;
 
-        // Method 1: detect by resolved function name
+        // Method 1: detect by resolved function name. `is_outside_execution`
+        // covers both classic SNIP-9 (v1/v2/v3) and the privacy-aware
+        // `execute_private_sponsored` AVNU entrypoint.
         if let Some(version) = is_outside_execution(fname) {
-            oe = parse_outside_execution(call, version);
+            oe = if matches!(version, OutsideExecutionVersion::PrivateSponsored) {
+                parse_private_sponsored(call)
+            } else {
+                parse_outside_execution(call, version)
+            };
+        }
+        // Method 1b: detect `execute_private_sponsored` by selector when the
+        // ABI hasn't resolved a name yet (e.g. cold cache on first run).
+        if oe.is_none() && looks_like_private_sponsored(call) {
+            oe = parse_private_sponsored(call);
         }
         // Method 2: detect by calldata pattern (ANY_CALLER + valid struct)
         if oe.is_none() && fname.is_empty() && looks_like_outside_execution(call) {

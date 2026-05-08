@@ -28,15 +28,54 @@ pub enum OutsideExecutionVersion {
     V1,
     V2,
     V3,
+    /// AVNU `execute_private_sponsored` (selector
+    /// `0x3bd4b5033e788e9cc450fefa99ea20e3bed0fa358c8b280c0488f0c4647472e`).
+    /// A privacy-aware sponsorship entrypoint where the user's identity is
+    /// proven inside the wrapped call (typically a Privacy Pool
+    /// `apply_actions`), so the wrapper carries no caller / nonce /
+    /// timestamps — just a call array followed by auth metadata.
+    PrivateSponsored,
 }
 
+impl OutsideExecutionVersion {
+    /// Short, fixed-width tag used in tight UI contexts (block-list "Meta(...)"
+    /// column, address-info meta-tx column). Stays ≤ 2 chars so it always
+    /// fits within the existing `{:<10}` and `{:<6}` budgets without
+    /// shifting downstream columns.
+    ///
+    /// Versioning convention:
+    /// * `v1` / `v2` / `v3` — SNIP-9 outside-execution variants.
+    /// * `p1` — first AVNU privacy-aware sponsorship variant
+    ///   (`execute_private_sponsored`). A future `p2` slot is reserved if
+    ///   AVNU ships a follow-on entrypoint.
+    pub fn short(&self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::V3 => "v3",
+            Self::PrivateSponsored => "p1",
+        }
+    }
+
+    /// Long, descriptive name. Used in the tx-detail header / Calls-tab
+    /// intent expansion where there's room for clarity.
+    pub fn verbose(&self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::V3 => "v3",
+            Self::PrivateSponsored => "private-sponsored",
+        }
+    }
+}
+
+/// `Display` defaults to the short tag — it's what the block-list and
+/// address-info columns format with `format!("{}", version)` and they
+/// can't tolerate variable widths. Use [`OutsideExecutionVersion::verbose`]
+/// in places that have room for the long form.
 impl std::fmt::Display for OutsideExecutionVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::V1 => write!(f, "v1"),
-            Self::V2 => write!(f, "v2"),
-            Self::V3 => write!(f, "v3"),
-        }
+        f.write_str(self.short())
     }
 }
 
@@ -68,9 +107,16 @@ pub fn is_outside_execution(function_name: &str) -> Option<OutsideExecutionVersi
         "execute_from_outside" => Some(OutsideExecutionVersion::V1),
         "execute_from_outside_v2" => Some(OutsideExecutionVersion::V2),
         "execute_from_outside_v3" => Some(OutsideExecutionVersion::V3),
+        "execute_private_sponsored" => Some(OutsideExecutionVersion::PrivateSponsored),
         _ => None,
     }
 }
+
+/// `execute_private_sponsored` selector — the AVNU privacy-aware
+/// sponsorship entrypoint. Recognized by raw selector too, since
+/// `populate_selectors` may not have indexed AVNU's ABI on every install.
+pub const EXECUTE_PRIVATE_SPONSORED_SELECTOR: Felt =
+    Felt::from_hex_unchecked("0x3bd4b5033e788e9cc450fefa99ea20e3bed0fa358c8b280c0488f0c4647472e");
 
 /// Heuristic: detect outside execution by calldata pattern when function name is
 /// unresolved (e.g. Argent/Dojo contracts with component-based selectors where
@@ -88,6 +134,51 @@ pub fn looks_like_outside_execution(call: &RawCall) -> bool {
     // Try both nonce formats and see if either produces a valid parse
     try_parse_with_nonce_size(&call.data, 1).is_some()
         || try_parse_with_nonce_size(&call.data, 2).is_some()
+}
+
+/// Detect `execute_private_sponsored` by exact selector match. Cheap and
+/// reliable — the ABI may not have been indexed yet when this runs.
+pub fn looks_like_private_sponsored(call: &RawCall) -> bool {
+    call.selector == EXECUTE_PRIVATE_SPONSORED_SELECTOR
+}
+
+/// Parse `execute_private_sponsored` calldata.
+///
+/// Layout (no caller/nonce/timestamps — those don't apply because the user's
+/// authority is proven cryptographically inside the inner call's payload,
+/// typically a Privacy Pool `apply_actions` proof):
+///
+///   [0]     num_calls
+///   [1..]   call array — each call is `(target, selector, data_len, data...)`
+///   [..end] trailing auth metadata (relayer-side; not decoded)
+///
+/// `call.contract_address` is the AVNU forwarder. Surface it as `intender`
+/// so existing nav-item / color-map / privacy-summary paths keep working;
+/// the UI relabels the line "Forwarder" when `version == PrivateSponsored`.
+pub fn parse_private_sponsored(call: &RawCall) -> Option<OutsideExecutionInfo> {
+    let data = &call.data;
+    if data.len() < 4 {
+        return None;
+    }
+    let num_inner_calls = felt_to_u64(&data[0]) as usize;
+    // Same sanity cap as the standard SNIP-9 parser.
+    if num_inner_calls > 100 {
+        return None;
+    }
+    let (inner_calls, _offset_after) = parse_call_array(data, 1, num_inner_calls);
+    if inner_calls.len() != num_inner_calls {
+        return None;
+    }
+    Some(OutsideExecutionInfo {
+        intender: call.contract_address,
+        caller: Felt::ZERO,
+        nonce: Felt::ZERO,
+        execute_after: 0,
+        execute_before: u64::MAX,
+        inner_calls,
+        signature: Vec::new(),
+        version: OutsideExecutionVersion::PrivateSponsored,
+    })
 }
 
 /// Parse an outside execution call's raw calldata into structured info.
@@ -288,7 +379,34 @@ pub fn detect_outside_execution(
     call: &RawCall,
     function_name: Option<&str>,
 ) -> Option<(OutsideExecutionInfo, DetectionMethod)> {
-    // Method 1: AVNU forwarder (address-based).
+    // Method 1a: function name match (covers `execute_from_outside_v*` and
+    // `execute_private_sponsored`). Run before the AVNU-forwarder address
+    // check because `execute_private_sponsored` *is* a call directly to the
+    // forwarder, but with a different calldata layout than the classic
+    // `execute_sponsored(account, entrypoint, calldata, …)` shape.
+    if let Some(name) = function_name
+        && let Some(version) = is_outside_execution(name)
+    {
+        let parsed = if matches!(version, OutsideExecutionVersion::PrivateSponsored) {
+            parse_private_sponsored(call)
+        } else {
+            parse_outside_execution(call, version)
+        };
+        if let Some(oe) = parsed {
+            return Some((oe, DetectionMethod::Name));
+        }
+    }
+
+    // Method 1b: selector match for `execute_private_sponsored` when name
+    // didn't resolve (cold ABI cache).
+    if looks_like_private_sponsored(call)
+        && let Some(oe) = parse_private_sponsored(call)
+    {
+        return Some((oe, DetectionMethod::Name));
+    }
+
+    // Method 2: AVNU forwarder address. The classic forwarder layout
+    // `execute_sponsored(account, entrypoint, calldata, …)`.
     if is_avnu_forwarder(&call.contract_address) {
         if let Some(oe) = parse_forwarder_call(call) {
             return Some((oe, DetectionMethod::AvnuForwarder));
@@ -297,14 +415,6 @@ pub fn detect_outside_execution(
         // won't match the other methods either (different data layout), so
         // short-circuit with `None`.
         return None;
-    }
-
-    // Method 2: function name match.
-    if let Some(name) = function_name
-        && let Some(version) = is_outside_execution(name)
-        && let Some(oe) = parse_outside_execution(call, version)
-    {
-        return Some((oe, DetectionMethod::Name));
     }
 
     // Method 3: calldata heuristic fallback. Runs when the name doesn't
@@ -353,6 +463,10 @@ mod tests {
         assert_eq!(
             is_outside_execution("execute_from_outside_v3"),
             Some(OutsideExecutionVersion::V3)
+        );
+        assert_eq!(
+            is_outside_execution("execute_private_sponsored"),
+            Some(OutsideExecutionVersion::PrivateSponsored)
         );
         assert_eq!(is_outside_execution("transfer"), None);
         assert_eq!(is_outside_execution("execute"), None);
@@ -680,5 +794,70 @@ mod tests {
         );
         assert_eq!(oe.inner_calls[0].data.len(), 3);
         assert_eq!(oe.signature.len(), 2);
+    }
+
+    /// Mirrors the calldata shape of mainnet tx
+    /// `0x3e47f71dfab420be6e157bc704f25c606ca0b6017885655e16a8858d07449fa`
+    /// (a single-call `execute_private_sponsored` wrapping a Privacy Pool
+    /// `apply_actions`). The wrapper has no caller/nonce/timestamps — just
+    /// `[num_calls, …call_array…, …auth_blob…]`.
+    #[test]
+    fn test_parse_private_sponsored_basic() {
+        let forwarder = felt("0x127021a1b5a52d3174c2ab077c2b043c80369250d29428cee956d76ee51584f");
+        let pool = felt("0x40337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a");
+        let apply_actions =
+            felt("0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db");
+
+        // 1 inner call: pool.apply_actions([0xAA, 0xBB, 0xCC])
+        let inner_data = vec![
+            Felt::from(0xAAu64),
+            Felt::from(0xBBu64),
+            Felt::from(0xCCu64),
+        ];
+        let mut data = vec![
+            Felt::from(1u64), // num_inner_calls
+            pool,
+            apply_actions,
+            Felt::from(inner_data.len() as u64),
+        ];
+        data.extend_from_slice(&inner_data);
+        // Trailing relayer-side auth blob (not decoded; just here so the
+        // parser must tolerate trailing data).
+        data.extend_from_slice(&[Felt::from(0x1u64), felt("0xdeadbeef")]);
+
+        let call = RawCall {
+            contract_address: forwarder,
+            selector: EXECUTE_PRIVATE_SPONSORED_SELECTOR,
+            data,
+            function_name: Some("execute_private_sponsored".into()),
+            function_def: None,
+            contract_abi: None,
+        };
+
+        assert!(looks_like_private_sponsored(&call));
+        let oe = parse_private_sponsored(&call).expect("should parse");
+        assert_eq!(oe.intender, forwarder);
+        assert_eq!(oe.version, OutsideExecutionVersion::PrivateSponsored);
+        assert_eq!(oe.inner_calls.len(), 1);
+        assert_eq!(oe.inner_calls[0].contract_address, pool);
+        assert_eq!(oe.inner_calls[0].selector, apply_actions);
+        assert_eq!(oe.inner_calls[0].data, inner_data);
+        // Caller/nonce/timestamps are not part of this wrapper.
+        assert_eq!(oe.caller, Felt::ZERO);
+        assert_eq!(oe.nonce, Felt::ZERO);
+        assert_eq!(oe.signature.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_private_sponsored_too_short() {
+        let call = RawCall {
+            contract_address: felt("0xabc"),
+            selector: EXECUTE_PRIVATE_SPONSORED_SELECTOR,
+            data: vec![Felt::from(1u64)], // missing inner-call body
+            function_name: None,
+            function_def: None,
+            contract_abi: None,
+        };
+        assert!(parse_private_sponsored(&call).is_none());
     }
 }
