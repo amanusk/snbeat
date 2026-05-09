@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::stream::{self, StreamExt};
 use starknet::core::types::Felt;
 use tracing::{debug, info, warn};
 
@@ -59,10 +59,11 @@ const MAX_NOTES_PER_SUBCHANNEL: u64 = 1024;
 /// probes 32 subchannels or 64 notes per pf-query roundtrip.
 const PROBE_BATCH: usize = 64;
 
-/// Concurrency cap for the RPC fallback. 8 in-flight `getStorageAt`
-/// requests is well below typical RPC quota and keeps the sync
-/// progressing without spamming a single endpoint.
-const RPC_CONCURRENCY: usize = 8;
+/// Chunk size for the JSON-RPC batch fallback. Keeps each batch
+/// comfortably below typical provider caps (Alchemy ~500, Infura ~100)
+/// while still amortizing HTTP overhead — 64 slots per batch turns
+/// hundreds of single requests into a handful.
+const RPC_BATCH_CHUNK: usize = 64;
 
 /// Whether a note was discovered via the user's incoming or outgoing
 /// channel tree. Drives both UI direction (sender→user vs. user→recipient)
@@ -133,12 +134,19 @@ impl PrivateNotesIndex {
     }
 }
 
-/// Storage backend used by `sync_user_notes`. Encapsulates
-/// pf-query batch reads with RPC fallback so the sync logic stays
+/// Storage backend used by `sync_user_notes`. Encapsulates pf-query
+/// batch reads with RPC fallback so the sync logic stays
 /// transport-agnostic.
+///
+/// Once a pf-query call fails within a single backend instance, the
+/// `pf_disabled` flag latches and every subsequent batch goes straight
+/// to RPC — without it, every batch would pay the pf-query timeout
+/// before falling back, ballooning a sync's wall-clock when pf-query
+/// is permanently down.
 pub struct StorageBackend {
     pathfinder: Option<Arc<PathfinderClient>>,
     data_source: Arc<dyn DataSource>,
+    pf_disabled: AtomicBool,
 }
 
 impl StorageBackend {
@@ -149,7 +157,19 @@ impl StorageBackend {
         Self {
             pathfinder,
             data_source,
+            pf_disabled: AtomicBool::new(false),
         }
+    }
+
+    fn pf_active(&self) -> Option<&Arc<PathfinderClient>> {
+        if self.pf_disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.pathfinder.as_ref()
+    }
+
+    fn poison_pf(&self) {
+        self.pf_disabled.store(true, Ordering::Relaxed);
     }
 
     /// Read N storage slots from the privacy pool contract at the latest
@@ -159,7 +179,7 @@ impl StorageBackend {
         if keys.is_empty() {
             // Still need to resolve the block; pathfinder returns it for
             // free on an empty request.
-            if let Some(pf) = &self.pathfinder
+            if let Some(pf) = self.pf_active()
                 && let Ok((_, bn)) = pf.get_storage_batch(*POOL_ADDRESS, &[], "latest").await
             {
                 return Ok((Vec::new(), bn));
@@ -175,34 +195,35 @@ impl StorageBackend {
         }
 
         // Try pathfinder batch first.
-        if let Some(pf) = &self.pathfinder {
+        if let Some(pf) = self.pf_active() {
             match pf.get_storage_batch(*POOL_ADDRESS, keys, "latest").await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    warn!(error = %e, "pf-query /storage-batch failed, falling back to RPC");
+                    warn!(
+                        error = %e,
+                        "pf-query /storage-batch failed; disabling pf for this sync, switching to RPC batch"
+                    );
+                    self.poison_pf();
                 }
             }
         }
 
-        // RPC fallback: parallel single-slot reads, capped concurrency.
+        // RPC fallback: chunked JSON-RPC batches via
+        // `starknet_getStorageAt`. One HTTP roundtrip per chunk.
         let bn = self
             .data_source
             .get_latest_block_number()
             .await
             .map_err(|e| SnbeatError::Provider(format!("get_latest_block_number failed: {e}")))?;
-        let ds = Arc::clone(&self.data_source);
-        let pool = *POOL_ADDRESS;
-        let values: Vec<Result<Felt>> = stream::iter(keys.iter().copied())
-            .map(|k| {
-                let ds = Arc::clone(&ds);
-                async move { ds.get_storage_at(pool, k, Some(bn)).await }
-            })
-            .buffered(RPC_CONCURRENCY)
-            .collect()
-            .await;
-        let mut out = Vec::with_capacity(values.len());
-        for v in values {
-            out.push(v?);
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(RPC_BATCH_CHUNK) {
+            let results = self
+                .data_source
+                .batch_get_storage_at(*POOL_ADDRESS, chunk, Some(bn))
+                .await;
+            for r in results {
+                out.push(r?);
+            }
         }
         Ok((out, bn))
     }

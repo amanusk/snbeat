@@ -1571,6 +1571,25 @@ impl DataSource for CachingDataSource {
         self.upstream.batch_call_contracts(calls).await
     }
 
+    async fn get_storage_at(&self, contract: Felt, key: Felt, block: Option<u64>) -> Result<Felt> {
+        // Pass through. Without this override the trait default returns a
+        // "not implemented" error, which would silently break the privacy
+        // sync's RPC fallback when the cached source is in front of RPC.
+        self.upstream.get_storage_at(contract, key, block).await
+    }
+
+    async fn batch_get_storage_at(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: Option<u64>,
+    ) -> Vec<Result<Felt>> {
+        // Pass through to the upstream's batched JSON-RPC implementation.
+        self.upstream
+            .batch_get_storage_at(contract, keys, block)
+            .await
+    }
+
     async fn get_contract_events(
         &self,
         address: Felt,

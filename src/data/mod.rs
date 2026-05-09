@@ -205,6 +205,30 @@ pub trait DataSource: Send + Sync {
         out
     }
 
+    /// Batch many `starknet_getStorageAt` reads into a single JSON-RPC
+    /// round trip. Used as the fast RPC fallback for the privacy-pool
+    /// sync when pf-query's `/storage-batch` isn't reachable — without
+    /// this, the fallback degrades to N individual HTTP calls.
+    ///
+    /// Returns per-key values in the same order as `keys`. The default
+    /// implementation issues each read sequentially via
+    /// `get_storage_at`; the RPC-backed source overrides to use
+    /// `provider.batch_requests`. Order is preserved on success; on
+    /// batch failure the override falls back to per-key sequential
+    /// reads so a single bad key doesn't sink the whole batch.
+    async fn batch_get_storage_at(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: Option<u64>,
+    ) -> Vec<Result<Felt>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.get_storage_at(contract, *k, block).await);
+        }
+        out
+    }
+
     // --- Deploy info cache ---
     /// Load cached deploy tx info for an address. Returns (tx_hash, block, deployer).
     fn load_cached_deploy_info(&self, _address: &Felt) -> Option<(Felt, u64, Option<Felt>)> {
