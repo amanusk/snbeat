@@ -116,6 +116,31 @@ pub trait DataSource: Send + Sync {
     fn save_token_metadata(&self, _address: &Felt, _meta: &crate::data::token_metadata::TokenMeta) {
         // Default: no-op. CachingDataSource overrides.
     }
+    /// Load every persisted forward-decrypted Privacy Pool note plus the
+    /// nullifier→note_id index. Used at boot to seed `app.private_notes`
+    /// and `app.private_nullifiers` so the Privacy tab can annotate
+    /// matching events on the very first frame, before any in-session
+    /// sync has run.
+    fn load_private_notes(
+        &self,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        (Vec::new(), Vec::new())
+    }
+    /// Persist a user's freshly-synced notes + nullifiers + last-synced
+    /// block. Replaces any prior rows for the same user. Called by the
+    /// network task after `sync_user_notes` succeeds.
+    fn save_private_notes_for_user(
+        &self,
+        _user: &Felt,
+        _notes: &[crate::decode::privacy_sync::DecryptedNote],
+        _nullifiers: &[(Felt, Felt)],
+        _last_synced_block: u64,
+    ) {
+        // Default: no-op. CachingDataSource overrides.
+    }
     /// Load cached contract call summaries for an address.
     fn load_cached_address_calls(&self, _address: &Felt) -> Vec<ContractCallSummary> {
         Vec::new()

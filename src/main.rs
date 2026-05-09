@@ -143,6 +143,24 @@ async fn main() -> anyhow::Result<()> {
     // (instead of falling back to raw u128 amounts until the live fetch
     // round-trips).
     app.fetched_token_metadata = data_source.load_token_metadata().into_iter().collect();
+    // Hydrate forward-decrypted Privacy Pool notes from SQLite. The
+    // in-session re-sync still fires on the first privacy-tx open (gated
+    // by `private_notes_synced`, which we deliberately do NOT pre-seed),
+    // but cached entries make the Privacy tab + Balances "Private
+    // holdings" panel correct on the very first frame instead of waiting
+    // a full storage walk.
+    {
+        let (cached_notes, cached_nullifiers) = data_source.load_private_notes();
+        app.private_notes = cached_notes.into_iter().map(|n| (n.note_id, n)).collect();
+        app.private_nullifiers = cached_nullifiers.into_iter().collect();
+        if !app.private_notes.is_empty() || !app.private_nullifiers.is_empty() {
+            info!(
+                notes = app.private_notes.len(),
+                nullifiers = app.private_nullifiers.len(),
+                "Hydrated private notes from cache"
+            );
+        }
+    }
     if !registry_warnings.is_empty() {
         app.error_message = Some(registry_warnings.join("\n"));
     }

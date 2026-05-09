@@ -481,10 +481,19 @@ pub async fn run_network_task(
                         match crate::decode::privacy_sync::sync_user_notes(user, &key, &backend)
                             .await
                         {
-                            Ok((index, _block_number)) => {
+                            Ok((index, block_number)) => {
                                 let nullifiers: Vec<_> =
                                     index.by_nullifier.iter().map(|(n, id)| (*n, *id)).collect();
                                 let notes: Vec<_> = index.notes.into_values().collect();
+                                // Persist before notifying the UI so a crash mid-render
+                                // can't drop the work we just did. Idempotent per user
+                                // — overwrites prior rows.
+                                ds.save_private_notes_for_user(
+                                    &user,
+                                    &notes,
+                                    &nullifiers,
+                                    block_number,
+                                );
                                 let _ = tx.send(Action::PrivateNotesIndexed {
                                     user,
                                     notes,
