@@ -296,12 +296,11 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 .get(i)
                 .copied()
                 .unwrap_or(false);
-            // Total visual width = 4 cells. The shield emoji occupies 2
-            // cells, so private rows render as `🛡 ` + 2 spaces (= 4
-            // cells); empty rows render as 4 spaces (= 4 cells). Width is
-            // computed by ratatui via unicode-width, so don't `format!()`-
-            // pad the emoji string.
-            let prv_marker_text = if is_priv { "🛡  " } else { "    " };
+            // Solid orange vertical bar — single-cell so the column aligns
+            // reliably across terminals (a 🛡 emoji rendered 1 cell wide in
+            // some setups while ratatui's unicode-width measured 2, so the
+            // row shifted by one column).
+            let prv_marker_text = if is_priv { "▌   " } else { "    " };
 
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),

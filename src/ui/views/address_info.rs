@@ -599,7 +599,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             theme::TX_HASH_STYLE
         };
 
-        let prv_marker_text = if is_privacy_tx { "🛡  " } else { "    " };
+        let prv_marker_text = if is_privacy_tx { "▌   " } else { "    " };
         let main_line = Line::from(vec![
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
@@ -983,7 +983,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
-            let prv_marker_text = if is_privacy_meta { "🛡  " } else { "    " };
+            let prv_marker_text = if is_privacy_meta { "▌   " } else { "    " };
             let line = Line::from(vec![
                 Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
