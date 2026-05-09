@@ -68,34 +68,15 @@ fn count_fragment(shown: u64, bound: CountBound) -> String {
 /// so once nonce is known the bound is [`CountBound::Exact`]. Dune's event
 /// count over-counts on hybrid accounts (it counts emitted events, not
 /// sender txs) — not suitable here.
+///
+/// The on-chain `nonce` is the *next* nonce to use, so the total tx count
+/// equals `nonce`. DEPLOY_ACCOUNT (self-deploy) consumes nonce 0 and stays
+/// in `txs.items`; UDC-deployed contracts have `nonce 0` start as their
+/// first invoke. Either way, `nonce` is the count.
 fn tx_count_fragment(app: &App) -> String {
     let count = app.address.txs.items.len() as u64;
-    // The on-chain `nonce` is the *next* nonce to use. For a self-deployed
-    // account (DEPLOY_ACCOUNT), the deploy itself consumed nonce 0 and is
-    // pulled out of `txs.items` by `filter_deployment_txs`, so the Txs tab
-    // ends up holding `nonce - 1` rows. For a UDC-deployed account the
-    // "deployment" entry is the *deployer's* tx (sender != address), the
-    // account's own nonce 0 is its first invoke and stays in `txs.items`,
-    // so the tab holds the full `nonce` rows.
-    //
-    // Distinguish on `deployment.sender`: when it equals the account
-    // address, the deploy was self-sent; otherwise it was UDC-style.
     let bound = match app.address.info.as_ref().map(|i| felt_to_u64(&i.nonce)) {
-        Some(nonce) => {
-            let self_deployed = matches!(
-                (
-                    app.address.context,
-                    app.address.deployment.as_ref().and_then(|d| d.sender),
-                ),
-                (Some(addr), Some(sender)) if sender == addr
-            );
-            let total = if self_deployed {
-                nonce.saturating_sub(1)
-            } else {
-                nonce
-            };
-            CountBound::Exact(total)
-        }
+        Some(nonce) => CountBound::Exact(nonce),
         None => CountBound::LowerBound { hint: None },
     };
     count_fragment(count, bound)

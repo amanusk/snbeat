@@ -97,7 +97,9 @@ pub struct AddressInfoState {
     pub events: StatefulList<DecodedEvent>,
     /// Enriched tx summaries for the Transactions tab.
     pub txs: StatefulList<AddressTxSummary>,
-    /// The DEPLOY_ACCOUNT tx that created this address (filtered out of txs).
+    /// The deploy tx that created this address. For self-deploys
+    /// (DEPLOY_ACCOUNT, sender == address) the same tx also stays in `txs`
+    /// since it consumed nonce 0; for UDC-style deploys it's only here.
     pub deployment: Option<AddressTxSummary>,
     /// Incoming calls to this contract (for the Calls tab).
     pub calls: StatefulList<ContractCallSummary>,
@@ -393,6 +395,12 @@ impl AddressInfoState {
     }
 
     /// Split `txs` into regular txs and deployment tx.
+    ///
+    /// DEPLOY_ACCOUNT txs (where the new account paid for its own deploy,
+    /// `sender == address`) consume nonce 0 and are part of the account's
+    /// history, so they populate `self.deployment` *and* stay in the regular
+    /// list. UDC-style deploys (`sender != address`) are the deployer's tx,
+    /// not the deployed contract's, so they're pulled out entirely.
     pub fn filter_deployment_txs(
         &mut self,
         address: Felt,
@@ -400,17 +408,21 @@ impl AddressInfoState {
     ) -> Vec<AddressTxSummary> {
         let mut regular = Vec::with_capacity(txs.len());
         for tx in txs {
-            let is_deploy = tx.tx_type == "DEPLOY_ACCOUNT"
-                || tx.tx_type.starts_with("DEPLOY")
-                || tx.sender.is_some_and(|s| s != address);
-            if is_deploy {
+            let self_deploy =
+                tx.tx_type == "DEPLOY_ACCOUNT" && tx.sender.is_none_or(|s| s == address);
+            let foreign_deploy =
+                tx.tx_type.starts_with("DEPLOY") || tx.sender.is_some_and(|s| s != address);
+            if self_deploy || foreign_deploy {
                 let should_set = self.deployment.is_none()
                     || self
                         .deployment
                         .as_ref()
                         .is_some_and(|d| d.hash == Felt::ZERO);
                 if should_set {
-                    self.deployment = Some(tx);
+                    self.deployment = Some(tx.clone());
+                }
+                if self_deploy {
+                    regular.push(tx);
                 }
             } else {
                 regular.push(tx);
