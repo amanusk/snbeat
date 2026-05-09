@@ -296,11 +296,11 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 .get(i)
                 .copied()
                 .unwrap_or(false);
-            // Solid orange vertical bar — single-cell so the column aligns
-            // reliably across terminals (a 🛡 emoji rendered 1 cell wide in
-            // some setups while ratatui's unicode-width measured 2, so the
-            // row shifted by one column).
-            let prv_marker_text = if is_priv { "▌   " } else { "    " };
+            // Header is 4 cells ("Prv "); body is 4 cells. The 🛡 emoji
+            // measures as 1 cell via the unicode-width crate (matching how
+            // most terminals actually render it), so use 3 trailing spaces
+            // for a 4-cell total.
+            let prv_marker_text = if is_priv { "🛡   " } else { "    " };
 
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),
