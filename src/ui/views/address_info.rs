@@ -10,6 +10,7 @@ use crate::app::state::TxNavItem;
 use crate::app::{AddressTab, App};
 use crate::data::types::TokenBalance;
 use crate::ui::theme;
+use crate::ui::widgets::address_color::known_or_palette_style;
 use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, tx_hash_cell};
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
@@ -753,12 +754,8 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .items
         .iter()
         .map(|call| {
-            let is_known = registry.is_some_and(|r| r.is_known(&call.sender));
-            let sender_style = if is_known {
-                theme::LABEL_STYLE
-            } else {
-                app.address.call_color_map.style_for(&call.sender)
-            };
+            let sender_style =
+                known_or_palette_style(&call.sender, registry, &app.address.call_color_map);
             let sender_label = app.format_address(&call.sender);
             let sender_display = if sender_label.chars().count() > 25 {
                 let truncated: String = sender_label.chars().take(24).collect();

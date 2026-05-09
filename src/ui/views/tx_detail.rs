@@ -2730,6 +2730,9 @@ fn block_marker(n: u64, selected: Option<&TxNavItem>) -> Span<'static> {
 /// then ContractAddress-typed params — so the same address always gets the same color.
 fn build_color_map(app: &App) -> AddressColorMap {
     let mut cm = AddressColorMap::new();
+    if let Some(engine) = &app.search_engine {
+        cm.set_privacy_overrides(engine.registry().privacy_addresses());
+    }
 
     if let Some(tx) = &app.tx_detail.transaction {
         cm.register(tx.sender());

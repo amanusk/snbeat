@@ -333,6 +333,30 @@ impl AddressRegistry {
         self.resolve(address).is_some()
     }
 
+    /// Every bundled known address tagged `type = "Privacy"`. Used by the
+    /// UI color map to override the per-tx palette slot with the orange
+    /// `PRIVACY_STYLE`, so the pool and its helper contracts visually
+    /// stand out wherever they appear (Calls / Events / Trace / Privacy
+    /// tabs and the address-info Calls tab). User labels can't claim this
+    /// styling — it's reserved for the curated privacy bundle.
+    pub fn privacy_addresses(&self) -> Vec<Felt> {
+        self.known
+            .iter()
+            .filter(|k| k.addr_type == "Privacy")
+            .map(|k| k.address)
+            .collect()
+    }
+
+    /// True iff this address is in the curated privacy bundle. Independent
+    /// of whether the user has shadowed it with their own label — the
+    /// privacy classification comes from the bundled list and isn't
+    /// something a user-label override can disclaim.
+    pub fn is_privacy_address(&self, address: &Felt) -> bool {
+        self.known
+            .iter()
+            .any(|k| k.address == *address && k.addr_type == "Privacy")
+    }
+
     /// Format an address for display: label if known, truncated hex otherwise.
     pub fn format_address(&self, address: &Felt) -> String {
         if let Some(name) = self.resolve(address) {
