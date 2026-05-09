@@ -554,6 +554,27 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             tx.endpoint_names.clone()
         };
         let contracts_display = format_called_contracts(app, &tx.called_contracts);
+        // A tx is "privacy" iff any of its top-level called contracts is in the
+        // curated privacy bundle. Catches the common case (top-level pool call
+        // or pool-via-known-helper). OE-wrapped sponsored txs that only reach
+        // the pool through an inner relayer call won't be flagged here — the
+        // tx-summary level doesn't carry inner-call structure. Acceptable v1
+        // limitation; users still see the Privacy tab when they open the tx.
+        let is_privacy_tx = app
+            .search_engine
+            .as_ref()
+            .map(|e| {
+                let reg = e.registry();
+                tx.called_contracts
+                    .iter()
+                    .any(|c| reg.is_privacy_address(c))
+            })
+            .unwrap_or(false);
+        let contracts_style = if is_privacy_tx {
+            theme::PRIVACY_STYLE
+        } else {
+            theme::LABEL_STYLE
+        };
 
         let status_style = match tx.status.as_str() {
             "OK" => theme::STATUS_OK,
@@ -581,7 +602,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
             Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-            Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
+            Span::styled(format!("{:<30}", contracts_display), contracts_style),
             Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
             Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
             Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -915,6 +936,23 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 protocol
             };
+            // Privacy detection on meta-txs uses the inner-call targets,
+            // which is precisely the place an OE-wrapped sponsored tx
+            // reaches the pool — the on-chain `tx.sender` would be a
+            // relayer.
+            let is_privacy_meta = app
+                .search_engine
+                .as_ref()
+                .map(|e| {
+                    let reg = e.registry();
+                    m.inner_targets.iter().any(|t| reg.is_privacy_address(t))
+                })
+                .unwrap_or(false);
+            let protocol_style = if is_privacy_meta {
+                theme::PRIVACY_STYLE
+            } else {
+                theme::LABEL_STYLE
+            };
 
             let endpoint = if m.inner_endpoints.chars().count() > 34 {
                 let truncated: String = m.inner_endpoints.chars().take(33).collect();
@@ -950,7 +988,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
-                Span::styled(format!("{:<21}", protocol_display), theme::LABEL_STYLE),
+                Span::styled(format!("{:<21}", protocol_display), protocol_style),
                 Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<4}", &m.status), status_style),
