@@ -26,7 +26,7 @@ use snbeat::data::DataSource;
 use snbeat::data::pathfinder::PathfinderClient;
 use snbeat::data::rpc::RpcDataSource;
 use snbeat::decode::privacy_crypto::types::SecretFelt;
-use snbeat::decode::privacy_sync::{StorageBackend, sync_user_notes};
+use snbeat::decode::privacy_sync::{StorageBackend, SyncResume, sync_user_notes};
 use snbeat::registry::viewing_keys::load_viewing_keys;
 use starknet::core::types::Felt;
 
@@ -53,7 +53,7 @@ async fn dump_synced_note_ids() {
         let user = vk.user;
         let private_key = SecretFelt::new(*vk.private_key);
         eprintln!("\n=== syncing user {:#x} ===", user);
-        let (index, block) = sync_user_notes(user, &private_key, &backend)
+        let (index, block) = sync_user_notes(user, &private_key, &backend, SyncResume::default())
             .await
             .expect("sync");
         eprintln!(
@@ -131,7 +131,7 @@ async fn find_synced_note_emission() {
     let vk = keys.first().expect("at least one viewing key");
     let user = vk.user;
     let private_key = SecretFelt::new(*vk.private_key);
-    let (index, _) = sync_user_notes(user, &private_key, &backend)
+    let (index, _) = sync_user_notes(user, &private_key, &backend, SyncResume::default())
         .await
         .expect("sync");
     eprintln!("synced {} notes for {:#x}", index.notes.len(), user);

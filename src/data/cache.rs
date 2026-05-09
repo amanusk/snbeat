@@ -2040,6 +2040,87 @@ impl DataSource for CachingDataSource {
         (notes, nullifiers)
     }
 
+    fn load_private_notes_for_user(
+        &self,
+        user: &Felt,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        use crate::decode::privacy_sync::{DecryptedNote, NoteDirection};
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let user_hex = format!("{:#x}", user);
+
+        let notes: Vec<DecryptedNote> = match db.prepare(
+            "SELECT note_id, user, counterparty, direction, token, amount,
+                    channel_idx, subchannel_idx, note_idx, spent, block_number
+             FROM private_notes WHERE user = ?1",
+        ) {
+            Ok(mut stmt) => match stmt.query_map(params![user_hex], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            }) {
+                Ok(rows) => rows
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(nid, u, cp, dir, tok, amt, ch, sch, ni, sp, bn)| {
+                        let direction = match dir.as_str() {
+                            "incoming" => NoteDirection::Incoming,
+                            "outgoing" => NoteDirection::Outgoing,
+                            _ => return None,
+                        };
+                        Some(DecryptedNote {
+                            note_id: Felt::from_hex(&nid).ok()?,
+                            user: Felt::from_hex(&u).ok()?,
+                            counterparty: Felt::from_hex(&cp).ok()?,
+                            direction,
+                            token: Felt::from_hex(&tok).ok()?,
+                            amount: amt.parse::<u128>().ok()?,
+                            channel_idx: ch.max(0) as u64,
+                            subchannel_idx: sch.max(0) as u64,
+                            note_idx: ni.max(0) as u64,
+                            spent: sp != 0,
+                            block_number: bn.max(0) as u64,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+
+        let nullifiers: Vec<(Felt, Felt)> =
+            match db.prepare("SELECT nullifier, note_id FROM private_nullifiers WHERE user = ?1") {
+                Ok(mut stmt) => match stmt.query_map(params![user_hex], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    Ok(rows) => rows
+                        .filter_map(|r| r.ok())
+                        .filter_map(|(nul, nid)| {
+                            Some((Felt::from_hex(&nul).ok()?, Felt::from_hex(&nid).ok()?))
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+
+        (notes, nullifiers)
+    }
+
     fn save_private_notes_for_user(
         &self,
         user: &Felt,

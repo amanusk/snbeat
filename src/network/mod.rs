@@ -478,8 +478,22 @@ pub async fn run_network_task(
                             pf.clone(),
                             Arc::clone(&ds),
                         );
-                        match crate::decode::privacy_sync::sync_user_notes(user, &key, &backend)
-                            .await
+                        // Build a SyncResume from the cached state for this
+                        // user, so the walk can skip already-enumerated
+                        // channels/subchannels and only probe for new content.
+                        let (cached_notes, cached_nullifiers) =
+                            ds.load_private_notes_for_user(&user);
+                        let mut resume = crate::decode::privacy_sync::SyncResume::default();
+                        for n in cached_notes {
+                            resume.notes.insert(n.note_id, n);
+                        }
+                        for (nul, nid) in cached_nullifiers {
+                            resume.by_nullifier.insert(nul, nid);
+                        }
+                        match crate::decode::privacy_sync::sync_user_notes(
+                            user, &key, &backend, resume,
+                        )
+                        .await
                         {
                             Ok((index, block_number)) => {
                                 let nullifiers: Vec<_> =

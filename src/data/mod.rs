@@ -141,6 +141,20 @@ pub trait DataSource: Send + Sync {
     ) {
         // Default: no-op. CachingDataSource overrides.
     }
+    /// Load the persisted notes + nullifiers for a single user, narrowed
+    /// from the global cache. Used by the network task to seed
+    /// `SyncResume` before invoking `sync_user_notes`, so the walk
+    /// resumes from the last persisted state instead of re-enumerating
+    /// from genesis.
+    fn load_private_notes_for_user(
+        &self,
+        _user: &Felt,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        (Vec::new(), Vec::new())
+    }
     /// Load cached contract call summaries for an address.
     fn load_cached_address_calls(&self, _address: &Felt) -> Vec<ContractCallSummary> {
         Vec::new()
