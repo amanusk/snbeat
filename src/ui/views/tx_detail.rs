@@ -1230,10 +1230,11 @@ fn build_privacy_lines(
 
     // === Decrypted notes (viewing keys) ===
     // Match this tx's `EncNoteCreated` note_ids against the in-memory
-    // index of forward-decrypted notes built by the privacy-pool sync.
-    // Each hit becomes a row showing recipient ← sender, amount, token —
-    // information that without the viewing key would be encrypted
-    // gibberish in the receipt.
+    // index of forward-decrypted notes built by the privacy-pool sync
+    // (both incoming and outgoing trees). Each hit becomes a row showing
+    // sender → recipient, amount, token — information that without the
+    // viewing key would be encrypted gibberish in the receipt. Direction
+    // determines which side of the arrow the user goes on.
     let decrypted: Vec<&crate::decode::privacy_sync::DecryptedNote> = summary
         .enc_notes_created
         .iter()
@@ -1241,8 +1242,6 @@ fn build_privacy_lines(
         .collect();
     // One-shot debug log per render — fires only when there's actually
     // an EncNoteCreated event so it doesn't spam non-privacy frames.
-    // Helps diagnose "I expected the section to appear" cases by showing
-    // the lookup state every render.
     if !summary.enc_notes_created.is_empty() {
         let needles: Vec<String> = summary
             .enc_notes_created
@@ -1256,6 +1255,25 @@ fn build_privacy_lines(
             "Privacy tab: matching EncNoteCreated note_ids against private_notes index"
         );
     }
+    // Net-flow synthesis: condense (decrypted, spent) into one line
+    // per token so the user doesn't have to mentally diff three
+    // sections to figure out what they actually sent / received /
+    // consumed in this tx. Goes above Decrypted so it summarizes the
+    // detail rows that follow.
+    let spent_for_summary: Vec<&crate::decode::privacy_sync::DecryptedNote> = summary
+        .nullifiers
+        .iter()
+        .filter_map(|nul| app.private_nullifiers.get(nul))
+        .filter_map(|nid| app.private_notes.get(nid))
+        .collect();
+    let net_lines = build_privacy_net_flow_lines(app, &decrypted, &spent_for_summary);
+    if !net_lines.is_empty() {
+        for line in net_lines {
+            lines.push(line);
+        }
+        lines.push(Line::from(""));
+    }
+
     if !decrypted.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" Decrypted (viewing keys) ({})", decrypted.len()),
@@ -1264,7 +1282,7 @@ fn build_privacy_lines(
         for (i, n) in decrypted.iter().enumerate() {
             let last = i == decrypted.len() - 1;
             let branch = if last { "└─" } else { "├─" };
-            let amount_str = format_amount_for_token(registry, &n.token, n.amount);
+            let amount_str = format_amount_for_token(app, &n.token, n.amount);
             let token_label = fmt_addr(app, &n.token);
             let token_style = addr_style(&n.token, color_map, selected);
             let user_style = addr_style(&n.user, color_map, selected);
@@ -1277,16 +1295,100 @@ fn build_privacy_lines(
                 &app.tx_detail.nav_sections,
                 NavSection::Privacy,
             );
-            lines.push(Line::from(vec![
+            // Sender is always on the left of the arrow. For incoming
+            // notes the user is the recipient (right); for outgoing the
+            // user is the sender (left). Self-channels (counterparty ==
+            // user) collapse to `self ↺` to avoid the visually
+            // redundant `[label] → [label]` line.
+            let is_self = n.counterparty == n.user;
+            // A self-incoming note created in this tx, when the tx also
+            // spent something, is by definition change — surface it.
+            let is_change = is_self
+                && matches!(
+                    n.direction,
+                    crate::decode::privacy_sync::NoteDirection::Incoming
+                )
+                && !summary.nullifiers.is_empty();
+            let mut spans = vec![
                 addr_marker_any(&[&n.user, &n.counterparty, &n.token], selected),
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
-                Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
-                Span::styled(" → ", theme::SUGGESTION_STYLE),
-                Span::styled(fmt_addr(app, &n.user), user_style),
+            ];
+            if is_self {
+                spans.push(Span::styled("self ↺ ", user_style));
+            } else {
+                let (left_addr, left_style, right_addr, right_style) = match n.direction {
+                    crate::decode::privacy_sync::NoteDirection::Incoming => {
+                        (&n.counterparty, counterparty_style, &n.user, user_style)
+                    }
+                    crate::decode::privacy_sync::NoteDirection::Outgoing => {
+                        (&n.user, user_style, &n.counterparty, counterparty_style)
+                    }
+                };
+                spans.extend([
+                    Span::styled(fmt_addr(app, left_addr), left_style),
+                    Span::styled(" → ", theme::SUGGESTION_STYLE),
+                    Span::styled(fmt_addr(app, right_addr), right_style),
+                ]);
+            }
+            spans.extend([
                 Span::raw("  "),
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
                 Span::raw(" "),
                 Span::styled(token_label, token_style),
+            ]);
+            if is_change {
+                spans.push(Span::styled(" (change)", theme::SUGGESTION_STYLE));
+            }
+            spans.push(Span::styled(
+                format!("  note {:#x}", n.note_id),
+                theme::SUGGESTION_STYLE,
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // === Spent notes (viewing keys) ===
+    // Match this tx's `NoteUsed` nullifiers against the user's known
+    // spend-nullifier index. Each hit means the user spent one of their
+    // own incoming notes — we surface the original sender + amount so
+    // the user can read withdrawal/transfer txs ("spent 0.40 USDC
+    // originally received from alice") without diffing two notes by
+    // hand.
+    let spent: Vec<&crate::decode::privacy_sync::DecryptedNote> = summary
+        .nullifiers
+        .iter()
+        .filter_map(|nul| app.private_nullifiers.get(nul))
+        .filter_map(|nid| app.private_notes.get(nid))
+        .collect();
+    if !spent.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" Spent your notes ({})", spent.len()),
+            theme::TITLE_STYLE,
+        )));
+        for (i, n) in spent.iter().enumerate() {
+            let last = i == spent.len() - 1;
+            let branch = if last { "└─" } else { "├─" };
+            let amount_str = format_amount_for_token(app, &n.token, n.amount);
+            let token_label = fmt_addr(app, &n.token);
+            let token_style = addr_style(&n.token, color_map, selected);
+            let counterparty_style = addr_style(&n.counterparty, color_map, selected);
+            record(
+                &TxNavItem::Address(n.user),
+                lines.len(),
+                line_map,
+                &app.tx_detail.nav_items,
+                &app.tx_detail.nav_sections,
+                NavSection::Privacy,
+            );
+            lines.push(Line::from(vec![
+                addr_marker_any(&[&n.counterparty, &n.token], selected),
+                Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(amount_str, theme::TX_FEE_STYLE),
+                Span::raw(" "),
+                Span::styled(token_label, token_style),
+                Span::styled("  originally from ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
                 Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
             ]));
         }
@@ -1305,7 +1407,7 @@ fn build_privacy_lines(
             let token_label = fmt_addr(app, &d.token);
             let token_style = addr_style(&d.token, color_map, selected);
             let user_style = addr_style(&d.user_addr, color_map, selected);
-            let amount_str = format_amount_for_token(registry, &d.token, d.amount);
+            let amount_str = format_amount_for_token(app, &d.token, d.amount);
             record(
                 &TxNavItem::Address(d.user_addr),
                 lines.len(),
@@ -1339,7 +1441,7 @@ fn build_privacy_lines(
             let token_label = fmt_addr(app, &w.token);
             let token_style = addr_style(&w.token, color_map, selected);
             let to_style = addr_style(&w.to_addr, color_map, selected);
-            let amount_str = format_amount_for_token(registry, &w.token, w.amount);
+            let amount_str = format_amount_for_token(app, &w.token, w.amount);
             record(
                 &TxNavItem::Address(w.to_addr),
                 lines.len(),
@@ -1375,14 +1477,42 @@ fn build_privacy_lines(
             let branch = if last_outer { "└─" } else { "├─" };
             let token_label = fmt_addr(app, &n.token);
             let token_style = addr_style(&n.token, color_map, selected);
-            lines.push(Line::from(vec![
-                Span::raw(" "),
+            // If any of our labelled viewing-key users has this note_id in
+            // their incoming channel walk, they are the recipient — surface
+            // the label instead of "encrypted".
+            let known = app.private_notes.get(&n.note_id);
+            let marker = match known {
+                Some(d) => addr_marker_any(&[&d.user, &n.token], selected),
+                None => Span::raw(" "),
+            };
+            if let Some(d) = known {
+                record(
+                    &TxNavItem::Address(d.user),
+                    lines.len(),
+                    line_map,
+                    &app.tx_detail.nav_items,
+                    &app.tx_detail.nav_sections,
+                    NavSection::Privacy,
+                );
+            }
+            let mut spans = vec![
+                marker,
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled("created  ", theme::NORMAL_STYLE),
                 Span::styled(token_label, token_style),
                 Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
-                Span::styled("    recipient: encrypted", theme::SUGGESTION_STYLE),
-            ]));
+                Span::styled("    recipient: ", theme::SUGGESTION_STYLE),
+            ];
+            match known {
+                Some(d) => {
+                    let recipient_style = addr_style(&d.user, color_map, selected);
+                    spans.push(Span::styled(fmt_addr(app, &d.user), recipient_style));
+                }
+                None => {
+                    spans.push(Span::styled("encrypted", theme::SUGGESTION_STYLE));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         for (i, d) in summary.open_notes_deposited.iter().enumerate() {
             let last = i == summary.open_notes_deposited.len() - 1;
@@ -1390,7 +1520,10 @@ fn build_privacy_lines(
             let token_label = fmt_addr(app, &d.token);
             let token_style = addr_style(&d.token, color_map, selected);
             let depositor_style = addr_style(&d.depositor, color_map, selected);
-            let amount_str = format_amount_for_token(registry, &d.token, d.amount);
+            let amount_str = format_amount_for_token(app, &d.token, d.amount);
+            // Same lookup as `created`: if we hold the recipient's viewing
+            // key, surface them after the depositor.
+            let known = app.private_notes.get(&d.note_id);
             record(
                 &TxNavItem::Address(d.depositor),
                 lines.len(),
@@ -1399,8 +1532,21 @@ fn build_privacy_lines(
                 &app.tx_detail.nav_sections,
                 NavSection::Privacy,
             );
-            lines.push(Line::from(vec![
-                addr_marker_any(&[&d.depositor, &d.token], selected),
+            if let Some(k) = known {
+                record(
+                    &TxNavItem::Address(k.user),
+                    lines.len(),
+                    line_map,
+                    &app.tx_detail.nav_items,
+                    &app.tx_detail.nav_sections,
+                    NavSection::Privacy,
+                );
+            }
+            let mut spans = vec![
+                match known {
+                    Some(k) => addr_marker_any(&[&k.user, &d.depositor, &d.token], selected),
+                    None => addr_marker_any(&[&d.depositor, &d.token], selected),
+                },
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled("deposited ", theme::NORMAL_STYLE),
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
@@ -1409,7 +1555,13 @@ fn build_privacy_lines(
                 Span::styled(format!("  note {:#x}", d.note_id), theme::SUGGESTION_STYLE),
                 Span::styled("  by ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &d.depositor), depositor_style),
-            ]));
+            ];
+            if let Some(k) = known {
+                let recipient_style = addr_style(&k.user, color_map, selected);
+                spans.push(Span::styled("  → ", theme::SUGGESTION_STYLE));
+                spans.push(Span::styled(fmt_addr(app, &k.user), recipient_style));
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }
@@ -1599,15 +1751,146 @@ fn build_privacy_lines(
     lines
 }
 
-/// Format a u128 amount using token decimals when known. Falls back to a
-/// raw decimal print for tokens we don't have decimals for.
-fn format_amount_for_token(
-    registry: Option<&crate::registry::AddressRegistry>,
-    token: &Felt,
-    amount: u128,
-) -> String {
-    let decimals = registry.and_then(|r| r.get_decimals(token));
-    match decimals {
+/// Per-token aggregation used to synthesize one summary line per token
+/// for a privacy-pool tx. All amounts are u128 raw token units.
+#[derive(Default)]
+struct PrivacyTokenFlow {
+    /// Sum of decrypted Outgoing notes to non-self recipients (user
+    /// sent these out).
+    sent_to_external: u128,
+    /// Sum of decrypted Incoming notes from non-self senders (user
+    /// received these).
+    received_from_external: u128,
+    /// Sum of decrypted Incoming notes whose counterparty == user
+    /// (change kept in the user's own self-channel).
+    self_change: u128,
+    /// Sum of nullifier-matched note amounts (user's own incoming
+    /// notes consumed in this tx).
+    spent_self: u128,
+    /// Best-known external counterparty for this token's flow — the
+    /// recipient when sending, the sender when receiving. Used so the
+    /// synth line can name them inline. `None` for purely internal
+    /// flows.
+    external_counterparty: Option<Felt>,
+}
+
+/// Synthesize one Net-flow line per token from the decrypted/spent
+/// note sets for this tx. Returns empty when the tx has no
+/// viewing-key-decoded activity.
+fn build_privacy_net_flow_lines(
+    app: &App,
+    decrypted: &[&crate::decode::privacy_sync::DecryptedNote],
+    spent: &[&crate::decode::privacy_sync::DecryptedNote],
+) -> Vec<Line<'static>> {
+    use crate::decode::privacy_sync::NoteDirection;
+    let mut flows: std::collections::HashMap<Felt, PrivacyTokenFlow> =
+        std::collections::HashMap::new();
+    for n in decrypted {
+        let entry = flows.entry(n.token).or_default();
+        let is_self = n.counterparty == n.user;
+        match (n.direction, is_self) {
+            (NoteDirection::Outgoing, false) => {
+                entry.sent_to_external = entry.sent_to_external.saturating_add(n.amount);
+                entry.external_counterparty = Some(n.counterparty);
+            }
+            (NoteDirection::Incoming, true) => {
+                entry.self_change = entry.self_change.saturating_add(n.amount);
+            }
+            (NoteDirection::Incoming, false) => {
+                entry.received_from_external =
+                    entry.received_from_external.saturating_add(n.amount);
+                entry.external_counterparty = Some(n.counterparty);
+            }
+            // Outgoing-self is filtered at sync time (self-channels are
+            // covered by the incoming walk), so this branch is unreachable.
+            (NoteDirection::Outgoing, true) => {}
+        }
+    }
+    for n in spent {
+        let entry = flows.entry(n.token).or_default();
+        entry.spent_self = entry.spent_self.saturating_add(n.amount);
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (token, f) in &flows {
+        if f.sent_to_external == 0
+            && f.received_from_external == 0
+            && f.self_change == 0
+            && f.spent_self == 0
+        {
+            continue;
+        }
+        // Net pool-position delta = inflows (received + change) - outflows (consumed).
+        // sent_to_external doesn't change the user's pool *position*
+        // (the user already had those funds; they're just leaving) —
+        // it's accounted for in `spent_self`.
+        let inflow = f.received_from_external.saturating_add(f.self_change);
+        let outflow = f.spent_self;
+        let (sign, abs) = if inflow >= outflow {
+            ("+", inflow - outflow)
+        } else {
+            ("-", outflow - inflow)
+        };
+        let token_label = fmt_addr(app, token);
+        let token_style = theme::SUGGESTION_STYLE;
+        let amount_str = format_amount_for_token(app, token, abs);
+
+        let mut details: Vec<String> = Vec::new();
+        if f.sent_to_external > 0 {
+            let cp = f
+                .external_counterparty
+                .map(|c| fmt_addr(app, &c))
+                .unwrap_or_else(|| "?".into());
+            details.push(format!(
+                "sent {} → {}",
+                format_amount_for_token(app, token, f.sent_to_external),
+                cp
+            ));
+        }
+        if f.received_from_external > 0 {
+            let cp = f
+                .external_counterparty
+                .map(|c| fmt_addr(app, &c))
+                .unwrap_or_else(|| "?".into());
+            details.push(format!(
+                "received {} from {}",
+                format_amount_for_token(app, token, f.received_from_external),
+                cp
+            ));
+        }
+        if f.self_change > 0 {
+            details.push(format!(
+                "{} change",
+                format_amount_for_token(app, token, f.self_change)
+            ));
+        }
+        if f.spent_self > 0 {
+            details.push(format!(
+                "consumed {}",
+                format_amount_for_token(app, token, f.spent_self)
+            ));
+        }
+        let mut spans = vec![
+            Span::styled(" Pool change: ", theme::TITLE_STYLE),
+            Span::styled(format!("{sign}{amount_str} "), theme::TX_FEE_STYLE),
+            Span::styled(token_label, token_style),
+        ];
+        if !details.is_empty() {
+            spans.push(Span::styled(
+                format!("  ({})", details.join(" · ")),
+                theme::SUGGESTION_STYLE,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Format a u128 amount using token decimals when known. Consults
+/// `App::token_decimals` so runtime-fetched ERC-20 metadata is honoured
+/// the same as the static registry. Falls back to a raw decimal print
+/// for tokens still entirely unknown.
+pub(super) fn format_amount_for_token(app: &App, token: &Felt, amount: u128) -> String {
+    match app.token_decimals(token) {
         Some(d) => crate::ui::widgets::param_display::format_token_amount(amount, 0, d),
         None => format!("{}", amount),
     }

@@ -26,7 +26,7 @@ use snbeat::data::DataSource;
 use snbeat::data::pathfinder::PathfinderClient;
 use snbeat::data::rpc::RpcDataSource;
 use snbeat::decode::privacy_crypto::types::SecretFelt;
-use snbeat::decode::privacy_sync::{StorageBackend, sync_user_incoming_notes};
+use snbeat::decode::privacy_sync::{StorageBackend, sync_user_notes};
 use snbeat::registry::viewing_keys::load_viewing_keys;
 use starknet::core::types::Felt;
 
@@ -53,16 +53,62 @@ async fn dump_synced_note_ids() {
         let user = vk.user;
         let private_key = SecretFelt::new(*vk.private_key);
         eprintln!("\n=== syncing user {:#x} ===", user);
-        let (index, block) = sync_user_incoming_notes(user, &private_key, &backend)
+        let (index, block) = sync_user_notes(user, &private_key, &backend)
             .await
             .expect("sync");
-        eprintln!("synced {} notes at block {}", index.notes.len(), block);
+        eprintln!(
+            "synced {} notes ({} nullifiers indexed) at block {}",
+            index.notes.len(),
+            index.by_nullifier.len(),
+            block,
+        );
         let mut notes: Vec<_> = index.notes.values().collect();
-        notes.sort_by_key(|n| (n.channel_idx, n.subchannel_idx, n.note_idx));
+        notes.sort_by_key(|n| {
+            (
+                n.direction as u8,
+                n.channel_idx,
+                n.subchannel_idx,
+                n.note_idx,
+            )
+        });
+        let unspent_in: u128 = notes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.direction,
+                    snbeat::decode::privacy_sync::NoteDirection::Incoming
+                ) && !n.spent
+            })
+            .map(|n| n.amount)
+            .sum();
+        let spent_count = notes.iter().filter(|n| n.spent).count();
+        eprintln!(
+            "incoming live = {} (sum, raw u128) · {} spent · {} unspent",
+            unspent_in,
+            spent_count,
+            notes
+                .iter()
+                .filter(|n| matches!(
+                    n.direction,
+                    snbeat::decode::privacy_sync::NoteDirection::Incoming
+                ) && !n.spent)
+                .count(),
+        );
         for n in notes {
+            let dir = match n.direction {
+                snbeat::decode::privacy_sync::NoteDirection::Incoming => "in ",
+                snbeat::decode::privacy_sync::NoteDirection::Outgoing => "out",
+            };
+            let state = if n.spent { "spent" } else { "live " };
             eprintln!(
-                "  ch={} sub={} idx={} note_id={:#x} amount={} token={:#x}",
-                n.channel_idx, n.subchannel_idx, n.note_idx, n.note_id, n.amount, n.token,
+                "  {dir} {state} ch={} sub={} idx={} cp={:#x} note_id={:#x} amount={} token={:#x}",
+                n.channel_idx,
+                n.subchannel_idx,
+                n.note_idx,
+                n.counterparty,
+                n.note_id,
+                n.amount,
+                n.token,
             );
         }
     }
@@ -85,7 +131,7 @@ async fn find_synced_note_emission() {
     let vk = keys.first().expect("at least one viewing key");
     let user = vk.user;
     let private_key = SecretFelt::new(*vk.private_key);
-    let (index, _) = sync_user_incoming_notes(user, &private_key, &backend)
+    let (index, _) = sync_user_notes(user, &private_key, &backend)
         .await
         .expect("sync");
     eprintln!("synced {} notes for {:#x}", index.notes.len(), user);

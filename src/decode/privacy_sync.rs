@@ -30,10 +30,14 @@ use crate::data::DataSource;
 use crate::data::pathfinder::PathfinderClient;
 use crate::decode::privacy::POOL_ADDRESS;
 use crate::decode::privacy_crypto::decryption::{
-    decrypt_channel_info, decrypt_packed_value, decrypt_subchannel_token,
+    decrypt_channel_info, decrypt_outgoing_recipient_addr, decrypt_packed_value,
+    decrypt_subchannel_token,
 };
+use crate::decode::privacy_crypto::hashes;
 use crate::decode::privacy_crypto::storage_slots;
-use crate::decode::privacy_crypto::types::{EncChannelInfo, EncSubchannelInfo, SecretFelt};
+use crate::decode::privacy_crypto::types::{
+    EncChannelInfo, EncOutgoingChannelInfo, EncSubchannelInfo, SecretFelt,
+};
 use crate::error::{Result, SnbeatError};
 use crate::utils::felt_to_u64;
 
@@ -60,15 +64,27 @@ const PROBE_BATCH: usize = 64;
 /// progressing without spamming a single endpoint.
 const RPC_CONCURRENCY: usize = 8;
 
+/// Whether a note was discovered via the user's incoming or outgoing
+/// channel tree. Drives both UI direction (sender→user vs. user→recipient)
+/// and whether we can compute a spend nullifier (incoming only — outgoing
+/// notes are spent by the recipient with the recipient's key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteDirection {
+    /// User is the recipient. Found via `recipient_channels[user]`.
+    Incoming,
+    /// User is the sender. Found via `outgoing_channels` walk.
+    Outgoing,
+}
+
 /// One forward-decrypted note belonging to a user we hold a viewing key for.
 #[derive(Debug, Clone)]
 pub struct DecryptedNote {
     pub note_id: Felt,
-    /// Recipient — the user we synced for.
+    /// The user we synced for.
     pub user: Felt,
-    /// Counterparty address (sender for incoming notes, recipient for
-    /// outgoing — only incoming is implemented in v1).
+    /// Sender for incoming notes, recipient for outgoing notes.
     pub counterparty: Felt,
+    pub direction: NoteDirection,
     pub token: Felt,
     pub amount: u128,
     /// Position within the user's discovery tree. Useful for cache
@@ -76,6 +92,12 @@ pub struct DecryptedNote {
     pub channel_idx: u64,
     pub subchannel_idx: u64,
     pub note_idx: u64,
+    /// True iff the note's nullifier is set on-chain (= already spent).
+    /// For Incoming notes: read from `nullifiers[nullifier]` during
+    /// sync. For Outgoing notes: always `false` — we can't derive the
+    /// nullifier without the recipient's private key, so we have no
+    /// authoritative way to know if it's been spent.
+    pub spent: bool,
     /// Block we synced at (provenance — lets a future reorg detector
     /// invalidate notes that came from a block that got rolled back).
     pub block_number: u64,
@@ -86,11 +108,20 @@ pub struct DecryptedNote {
 #[derive(Debug, Clone, Default)]
 pub struct PrivateNotesIndex {
     pub notes: HashMap<Felt, DecryptedNote>,
+    /// Spend-nullifier → note_id, populated for incoming notes only.
+    /// Lets `NoteUsed` events in a tx be labelled "user spent note X".
+    pub by_nullifier: HashMap<Felt, Felt>,
 }
 
 impl PrivateNotesIndex {
     pub fn get(&self, note_id: &Felt) -> Option<&DecryptedNote> {
         self.notes.get(note_id)
+    }
+
+    pub fn note_for_nullifier(&self, nullifier: &Felt) -> Option<&DecryptedNote> {
+        self.by_nullifier
+            .get(nullifier)
+            .and_then(|nid| self.notes.get(nid))
     }
 
     pub fn len(&self) -> usize {
@@ -102,7 +133,7 @@ impl PrivateNotesIndex {
     }
 }
 
-/// Storage backend used by `sync_user_incoming_notes`. Encapsulates
+/// Storage backend used by `sync_user_notes`. Encapsulates
 /// pf-query batch reads with RPC fallback so the sync logic stays
 /// transport-agnostic.
 pub struct StorageBackend {
@@ -177,21 +208,38 @@ impl StorageBackend {
     }
 }
 
-/// Sync all incoming Privacy Pool notes for a user we hold a viewing key
-/// for. Returns the full forward-decrypted index, plus the block number
-/// it was synced at.
+/// Sync all Privacy Pool notes for a user we hold a viewing key for —
+/// both incoming (user as recipient) and outgoing (user as sender) — and
+/// return the merged index plus the block we synced at.
 ///
-/// Cost: roughly `1 + 3·N + 2·K + M` slot reads (channel count + channel
-/// infos + subchannel probes + note probes), where N=channels,
-/// K=subchannels, M=notes. Batched into pf-query requests so the
-/// wall-clock is roughly one HTTP roundtrip per protocol level.
-pub async fn sync_user_incoming_notes(
+/// Cost: incoming = `1 + 3·N + 2·K + M` slot reads (channel count +
+/// channel infos + subchannel probes + note probes). Outgoing adds a
+/// parallel walk: `2·O` slots to enumerate outgoing channels, `O` slots
+/// for recipient public keys, plus the same subchannel + note probes
+/// per non-self recipient. Self-channels are walked exactly once (via
+/// the incoming side) so users with only a self-channel see no
+/// duplicate work.
+pub async fn sync_user_notes(
     user: Felt,
     viewing_key: &SecretFelt,
     backend: &StorageBackend,
 ) -> Result<(PrivateNotesIndex, u64)> {
     let mut index = PrivateNotesIndex::default();
+    let bn_in = sync_incoming(user, viewing_key, backend, &mut index).await?;
+    let bn_out = sync_outgoing(user, viewing_key, backend, &mut index).await?;
+    Ok((index, bn_in.max(bn_out)))
+}
 
+/// Walk `recipient_channels[user]` and append every discovered note to
+/// `index` with `direction = Incoming`. Also computes the spend
+/// nullifier for each note and adds it to `index.by_nullifier` so
+/// subsequent `NoteUsed` events in tx detail can be labelled.
+async fn sync_incoming(
+    user: Felt,
+    viewing_key: &SecretFelt,
+    backend: &StorageBackend,
+    index: &mut PrivateNotesIndex,
+) -> Result<u64> {
     // Step 1: read channel count.
     let count_slot = storage_slots::recipient_channels_base(user);
     let (count_values, block_number) = backend.read_slots(&[count_slot]).await?;
@@ -199,7 +247,7 @@ pub async fn sync_user_incoming_notes(
     let n_channels: u64 = felt_to_u64(&count_felt);
     if n_channels == 0 {
         debug!(user = %format!("{:#x}", user), block = block_number, "User has no privacy-pool channels");
-        return Ok((index, block_number));
+        return Ok(block_number);
     }
     let n_channels = n_channels.min(MAX_CHANNELS);
 
@@ -228,6 +276,14 @@ pub async fn sync_user_incoming_notes(
     }
 
     // Step 3 + 4: per-channel decrypt + walk subchannels + walk notes.
+    // Insertion is deferred until after a batched nullifier-presence
+    // read so each note can be stamped with its on-chain `spent` state
+    // in a single extra round-trip.
+    struct PendingIncoming {
+        note: DecryptedNote,
+        nullifier: Felt,
+    }
+    let mut pending: Vec<PendingIncoming> = Vec::new();
     for ch_idx in 0..n_channels {
         let base = (ch_idx * 3) as usize;
         let enc = EncChannelInfo {
@@ -259,43 +315,218 @@ pub async fn sync_user_incoming_notes(
             let notes = walk_notes(&info.channel_key, *token, backend).await?;
             for (note_idx, (amount, _salt, packed)) in notes.into_iter().enumerate() {
                 let note_idx = note_idx as u64;
-                let note_id = crate::decode::privacy_crypto::hashes::compute_note_id(
-                    &info.channel_key,
-                    *token,
-                    note_idx,
-                );
-                // Defensive: re-verify our computed note_id against the
-                // packed-value slot we read. If they don't agree, our
-                // walk got out of sync — log + skip rather than caching
-                // garbage.
+                let note_id = hashes::compute_note_id(&info.channel_key, *token, note_idx);
                 if packed == Felt::ZERO {
                     continue;
                 }
-                index.notes.insert(
-                    note_id,
-                    DecryptedNote {
+                let nullifier =
+                    hashes::compute_nullifier(&info.channel_key, *token, note_idx, viewing_key);
+                pending.push(PendingIncoming {
+                    note: DecryptedNote {
                         note_id,
                         user,
                         counterparty: info.sender_addr,
+                        direction: NoteDirection::Incoming,
                         token: *token,
                         amount,
                         channel_idx: ch_idx,
                         subchannel_idx: sub_idx,
                         note_idx,
+                        spent: false,
                         block_number,
                     },
-                );
+                    nullifier,
+                });
             }
         }
+    }
+
+    // One batched read of `nullifiers[nullifier]` for every incoming
+    // note we just enumerated. Lets the UI distinguish live balance
+    // from already-spent without scanning `NoteUsed` events.
+    if !pending.is_empty() {
+        let null_slots: Vec<Felt> = pending
+            .iter()
+            .map(|p| storage_slots::nullifiers(p.nullifier))
+            .collect();
+        let (null_values, _) = backend.read_slots(&null_slots).await?;
+        let mut spent_count = 0usize;
+        for (
+            i,
+            PendingIncoming {
+                mut note,
+                nullifier,
+            },
+        ) in pending.into_iter().enumerate()
+        {
+            let spent = null_values
+                .get(i)
+                .map(|v| *v != Felt::ZERO)
+                .unwrap_or(false);
+            note.spent = spent;
+            if spent {
+                spent_count += 1;
+            }
+            let note_id = note.note_id;
+            index.notes.insert(note_id, note);
+            index.by_nullifier.insert(nullifier, note_id);
+        }
+        debug!(
+            user = %format!("{:#x}", user),
+            spent = spent_count,
+            unspent = index.notes.len() - spent_count,
+            "Incoming spend-state stamped"
+        );
     }
 
     info!(
         user = %format!("{:#x}", user),
         notes = index.notes.len(),
         block = block_number,
-        "Privacy sync: enumeration complete"
+        "Privacy sync: incoming enumeration complete"
     );
-    Ok((index, block_number))
+    Ok(block_number)
+}
+
+/// Walk `outgoing_channels` for the user (where they were the sender).
+/// For each non-self recipient, derive the channel key from `(user,
+/// viewing_key, recipient, recipient_pubkey)`, then walk subchannels +
+/// notes. Each discovered note is appended to `index` with `direction =
+/// Outgoing` and `counterparty = recipient`. No nullifiers — outgoing
+/// notes are spent by the recipient with the recipient's private key.
+async fn sync_outgoing(
+    user: Felt,
+    viewing_key: &SecretFelt,
+    backend: &StorageBackend,
+    index: &mut PrivateNotesIndex,
+) -> Result<u64> {
+    let recipients = walk_outgoing_channels(user, viewing_key, backend).await?;
+    if recipients.is_empty() {
+        let (_, bn) = backend.read_slots(&[]).await?;
+        debug!(user = %format!("{:#x}", user), block = bn, "User has no outgoing channels");
+        return Ok(bn);
+    }
+
+    info!(
+        user = %format!("{:#x}", user),
+        outgoing_channels = recipients.len(),
+        "Privacy sync: enumerating outgoing channels"
+    );
+
+    // Read public_key[recipient] for every recipient in one batch.
+    let pk_slots: Vec<Felt> = recipients
+        .iter()
+        .map(|(_, r)| storage_slots::public_key(*r))
+        .collect();
+    let (pk_values, block_number) = backend.read_slots(&pk_slots).await?;
+    if pk_values.len() != pk_slots.len() {
+        return Err(SnbeatError::Provider(format!(
+            "Storage backend returned {} pubkey values for {} recipients",
+            pk_values.len(),
+            pk_slots.len()
+        )));
+    }
+
+    for ((ch_idx, recipient), recipient_pubkey) in recipients.iter().zip(pk_values.iter()) {
+        // Self-channels are already covered by `sync_incoming` — both
+        // walks would derive the same channel_key + note_ids.
+        if *recipient == user {
+            continue;
+        }
+        if *recipient_pubkey == Felt::ZERO {
+            warn!(
+                recipient = %format!("{:#x}", recipient),
+                "Outgoing recipient has no on-chain public_key, skipping channel"
+            );
+            continue;
+        }
+        let channel_key =
+            hashes::compute_channel_key(user, viewing_key, *recipient, *recipient_pubkey);
+        let tokens = walk_subchannels(&channel_key, backend).await?;
+        debug!(
+            user = %format!("{:#x}", user),
+            channel_idx = ch_idx,
+            recipient = %format!("{:#x}", recipient),
+            subchannels = tokens.len(),
+            "Outgoing channel decrypted"
+        );
+        for (sub_idx, token) in tokens.iter().enumerate() {
+            let sub_idx = sub_idx as u64;
+            let notes = walk_notes(&channel_key, *token, backend).await?;
+            for (note_idx, (amount, _salt, packed)) in notes.into_iter().enumerate() {
+                let note_idx = note_idx as u64;
+                if packed == Felt::ZERO {
+                    continue;
+                }
+                let note_id = hashes::compute_note_id(&channel_key, *token, note_idx);
+                index.notes.insert(
+                    note_id,
+                    DecryptedNote {
+                        note_id,
+                        user,
+                        counterparty: *recipient,
+                        direction: NoteDirection::Outgoing,
+                        token: *token,
+                        amount,
+                        channel_idx: *ch_idx,
+                        subchannel_idx: sub_idx,
+                        note_idx,
+                        // Outgoing nullifiers require the recipient's
+                        // private key to compute, so we leave this as
+                        // `false` — surface only what we can
+                        // authoritatively prove.
+                        spent: false,
+                        block_number,
+                    },
+                );
+            }
+        }
+    }
+    Ok(block_number)
+}
+
+/// Walk `outgoing_channels[outgoing_channel_id(user, viewing_key, i)]`
+/// for `i=0,1,…` in `PROBE_BATCH`-sized rounds, stopping on the first
+/// zero-salt sentinel. Returns `(channel_idx, recipient_addr)` pairs.
+async fn walk_outgoing_channels(
+    user: Felt,
+    viewing_key: &SecretFelt,
+    backend: &StorageBackend,
+) -> Result<Vec<(u64, Felt)>> {
+    let mut out = Vec::new();
+    let mut next_idx: u64 = 0;
+    while next_idx < MAX_CHANNELS {
+        let probe_count = (MAX_CHANNELS - next_idx).min(PROBE_BATCH as u64 / 2) as usize;
+        let mut keys = Vec::with_capacity(probe_count * 2);
+        for off in 0..probe_count {
+            let id = hashes::compute_outgoing_channel_id(user, viewing_key, next_idx + off as u64);
+            let s = storage_slots::outgoing_channels(id);
+            keys.push(s.salt);
+            keys.push(s.enc_recipient_addr);
+        }
+        let (values, _) = backend.read_slots(&keys).await?;
+        let mut hit_sentinel = false;
+        for off in 0..probe_count {
+            let salt = values[off * 2];
+            let enc_recipient_addr = values[off * 2 + 1];
+            if salt == Felt::ZERO {
+                hit_sentinel = true;
+                break;
+            }
+            let enc = EncOutgoingChannelInfo {
+                salt,
+                enc_recipient_addr,
+            };
+            let recipient =
+                decrypt_outgoing_recipient_addr(&enc, user, viewing_key, next_idx + off as u64);
+            out.push((next_idx + off as u64, recipient));
+        }
+        if hit_sentinel {
+            break;
+        }
+        next_idx += probe_count as u64;
+    }
+    Ok(out)
 }
 
 /// Walk `subchannel_tokens[subchannel_id(channel_key, i)]` for `i=0,1,…`
@@ -410,11 +641,13 @@ mod tests {
                 note_id,
                 user,
                 counterparty,
+                direction: NoteDirection::Incoming,
                 token,
                 amount: 140_000_000_000_000_000_000u128,
                 channel_idx: 0,
                 subchannel_idx: 0,
                 note_idx: 3,
+                spent: false,
                 block_number: 9579062,
             },
         );

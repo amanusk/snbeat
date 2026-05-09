@@ -446,6 +446,25 @@ pub async fn run_network_task(
                             let _ = tx.send(Action::PricesUpdated);
                         }
                     }
+                    Action::FetchTokenMetadata { token } => {
+                        let meta =
+                            crate::data::token_metadata::fetch_token_metadata(token, &*ds).await;
+                        if let Some(m) = &meta {
+                            ds.save_token_metadata(&token, m);
+                            tracing::debug!(
+                                token = %format!("{:#x}", token),
+                                symbol = %m.symbol,
+                                decimals = m.decimals,
+                                "Token metadata fetched"
+                            );
+                        } else {
+                            tracing::debug!(
+                                token = %format!("{:#x}", token),
+                                "Token metadata fetch failed (not ERC-20-shaped or RPC error)"
+                            );
+                        }
+                        let _ = tx.send(Action::TokenMetadataLoaded { token, meta });
+                    }
                     Action::FetchPrivateNotes { user, viewing_key } => {
                         // Re-wrap the raw felt as a SecretFelt so it gets
                         // zeroize-on-drop after the sync completes. The
@@ -459,14 +478,18 @@ pub async fn run_network_task(
                             pf.clone(),
                             Arc::clone(&ds),
                         );
-                        match crate::decode::privacy_sync::sync_user_incoming_notes(
-                            user, &key, &backend,
-                        )
-                        .await
+                        match crate::decode::privacy_sync::sync_user_notes(user, &key, &backend)
+                            .await
                         {
                             Ok((index, _block_number)) => {
+                                let nullifiers: Vec<_> =
+                                    index.by_nullifier.iter().map(|(n, id)| (*n, *id)).collect();
                                 let notes: Vec<_> = index.notes.into_values().collect();
-                                let _ = tx.send(Action::PrivateNotesIndexed { user, notes });
+                                let _ = tx.send(Action::PrivateNotesIndexed {
+                                    user,
+                                    notes,
+                                    nullifiers,
+                                });
                             }
                             Err(e) => {
                                 tracing::warn!(

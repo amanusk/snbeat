@@ -984,6 +984,64 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         .filter(|b| felt_to_u128(&b.balance_raw) > 0)
         .collect();
 
+    // Aggregate the user's *private* holdings (viewing-key decrypted,
+    // unspent incoming notes). Outgoing notes are excluded — those belong
+    // to recipients now. Spent incoming notes are excluded via the
+    // sync-time `nullifiers[*]` slot read.
+    let private_by_token: Vec<(Felt, u128, usize)> = compute_private_holdings(app, info.address);
+
+    // Layout: when there are private holdings, stack both panels at
+    // their natural heights and absorb any leftover space below.
+    // Otherwise keep the historical full-area Token Balances widget.
+    if private_by_token.is_empty() {
+        draw_token_balances(f, app, area, &nonzero);
+        return;
+    }
+    // +2 = border rows (top + bottom). The "+ 1" floor keeps an empty
+    // panel from collapsing below "Title" + 1 row.
+    let token_rows = nonzero.len().max(1) as u16;
+    let token_height = (token_rows + 2).clamp(3, 12);
+    let holdings_rows = private_by_token.len() as u16;
+    let holdings_height = (holdings_rows + 2).clamp(3, 12);
+    let chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(token_height),
+            Constraint::Length(holdings_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    draw_token_balances(f, app, chunks[0], &nonzero);
+    draw_private_holdings(f, app, chunks[1], &private_by_token);
+}
+
+/// Pad-or-truncate a token label to a fixed display width so amount
+/// columns line up across rows whose token names vary in length (e.g.
+/// "STRK" vs. an unknown `0x6d6d…6854`). Truncation marks with `…` so
+/// the row stays readable.
+fn fmt_token_name(name: &str, width: usize) -> String {
+    fmt_fixed_width(name, width)
+}
+
+/// Pad-with-spaces or truncate-with-`…` to exactly `width` columns.
+/// Used to keep every column in the Balances tab at a fixed character
+/// budget so the `·` separator aligns regardless of value length —
+/// otherwise an unknown-decimals raw u128 amount (~20 digits) bumps
+/// the suffix off-grid.
+fn fmt_fixed_width(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        let pad = " ".repeat(width - len);
+        format!("{s}{pad}")
+    } else if width == 0 {
+        String::new()
+    } else {
+        let truncated: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
+fn draw_token_balances(f: &mut Frame, app: &App, area: Rect, nonzero: &[&TokenBalance]) {
     if nonzero.is_empty() {
         f.render_widget(
             Paragraph::new(" No token balances found")
@@ -991,7 +1049,8 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(theme::BORDER_STYLE),
+                        .border_style(theme::BORDER_STYLE)
+                        .title(Span::styled(" Token Balances ", theme::TITLE_STYLE)),
                 ),
             area,
         );
@@ -1002,16 +1061,20 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|bal| {
             let formatted = format_token_balance(bal);
-            let mut spans = vec![
-                Span::styled(format!(" {:<8}", bal.token_name), theme::LABEL_STYLE),
-                Span::styled(format!("{:<24}", formatted), theme::NORMAL_STYLE),
-            ];
-            if let Some(usd) = balance_usd_value(app, bal) {
-                spans.push(Span::styled(
-                    format!("  {}", price::format_usd(usd)),
+            let usd_str = balance_usd_value(app, bal)
+                .map(price::format_usd)
+                .unwrap_or_default();
+            let spans = vec![
+                Span::styled(
+                    format!(" {}  ", fmt_token_name(&bal.token_name, 10)),
+                    theme::LABEL_STYLE,
+                ),
+                Span::styled(fmt_fixed_width(&formatted, 18), theme::NORMAL_STYLE),
+                Span::styled(
+                    format!("  {}", fmt_fixed_width(&usd_str, 8)),
                     theme::SUGGESTION_STYLE,
-                ));
-            }
+                ),
+            ];
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1023,6 +1086,104 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
             .title(Span::styled(" Token Balances ", theme::TITLE_STYLE)),
     );
     f.render_widget(list, area);
+}
+
+/// Sum unspent incoming decrypted-note amounts for `address`, grouped by
+/// token. Returns `(token, amount, n_unspent_notes)` rows sorted by
+/// amount descending. Empty when the address has no viewing key, no
+/// notes synced yet, or every note is spent.
+fn compute_private_holdings(app: &App, address: Felt) -> Vec<(Felt, u128, usize)> {
+    use crate::decode::privacy_sync::NoteDirection;
+    let mut by_token: std::collections::HashMap<Felt, (u128, usize)> =
+        std::collections::HashMap::new();
+    for note in app.private_notes.values() {
+        if note.user != address {
+            continue;
+        }
+        if note.spent {
+            continue;
+        }
+        if note.direction != NoteDirection::Incoming {
+            continue;
+        }
+        let entry = by_token.entry(note.token).or_insert((0u128, 0usize));
+        entry.0 = entry.0.saturating_add(note.amount);
+        entry.1 += 1;
+    }
+    let mut rows: Vec<(Felt, u128, usize)> =
+        by_token.into_iter().map(|(t, (a, n))| (t, a, n)).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows
+}
+
+fn draw_private_holdings(f: &mut Frame, app: &App, area: Rect, rows: &[(Felt, u128, usize)]) {
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(token, amount, n_unspent)| {
+            // Prefer the registry/runtime-fetched ticker over the
+            // truncated address. `App::token_symbol` consults the
+            // static registry first, then `fetched_token_metadata`, so
+            // tokens whose `symbol()` was just fetched render the
+            // ticker (e.g. `USDS`) instead of `0x6d6d…68…`.
+            let token_name = app.token_symbol(token).unwrap_or_else(|| short_addr(token));
+            let amount_str =
+                crate::ui::views::tx_detail::format_amount_for_token(app, token, *amount);
+            let suffix = if *n_unspent == 1 {
+                "1 unspent note".to_string()
+            } else {
+                format!("{} unspent notes", n_unspent)
+            };
+            let usd_str = private_holding_usd(app, token, *amount)
+                .map(price::format_usd)
+                .unwrap_or_default();
+            let spans = vec![
+                Span::styled(
+                    format!(" {}  ", fmt_token_name(&token_name, 10)),
+                    theme::LABEL_STYLE,
+                ),
+                Span::styled(fmt_fixed_width(&amount_str, 18), theme::NORMAL_STYLE),
+                Span::styled(
+                    format!("  {}", fmt_fixed_width(&usd_str, 8)),
+                    theme::SUGGESTION_STYLE,
+                ),
+                Span::styled(format!("  · {}", suffix), theme::SUGGESTION_STYLE),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::BORDER_STYLE)
+            .title(Span::styled(
+                " Private holdings (viewing key) ",
+                theme::TITLE_STYLE,
+            )),
+    );
+    f.render_widget(list, area);
+}
+
+fn short_addr(felt: &Felt) -> String {
+    let s = format!("{:#x}", felt);
+    if s.len() <= 10 {
+        s
+    } else {
+        format!("{}…{}", &s[..6], &s[s.len() - 4..])
+    }
+}
+
+/// USD value of a (token, raw u128 amount) pair using today's price and
+/// registry-known decimals. Same semantics as `balance_usd_value` but
+/// for inputs that don't have a `TokenBalance` struct (e.g. summed
+/// private-note amounts).
+fn private_holding_usd(app: &App, token: &Felt, amount: u128) -> Option<f64> {
+    let price = app.price_client.as_ref()?.get_today_price(token)?;
+    let registry = app.search_engine.as_ref().map(|e| e.registry())?;
+    let decimals = registry.get_decimals(token)? as i32;
+    let raw = amount as f64;
+    let scale = 10f64.powi(decimals);
+    Some(raw / scale * price)
 }
 
 fn balance_usd_value(app: &App, bal: &TokenBalance) -> Option<f64> {

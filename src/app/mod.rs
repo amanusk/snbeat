@@ -124,10 +124,23 @@ pub struct App {
     /// events with decrypted amount/token/sender.
     pub private_notes:
         HashMap<starknet::core::types::Felt, crate::decode::privacy_sync::DecryptedNote>,
+    /// `nullifier → note_id` for incoming notes the user can spend.
+    /// Lets the Privacy tab label `NoteUsed` events as "user spent note
+    /// X" and link them back to the originating sender + amount.
+    pub private_nullifiers: HashMap<starknet::core::types::Felt, starknet::core::types::Felt>,
     /// Set of users we've already kicked off a sync for in this session,
     /// so we don't re-trigger on every tx open. Cleared on app restart;
     /// the persisted SQLite cache provides cross-session memory.
     pub private_notes_synced: std::collections::HashSet<starknet::core::types::Felt>,
+    /// On-chain ERC-20 metadata fetched for tokens not in the static
+    /// registry. Hydrated from SQLite on boot, extended at runtime when
+    /// the Privacy / Balances tab encounters a new token.
+    pub fetched_token_metadata:
+        HashMap<starknet::core::types::Felt, crate::data::token_metadata::TokenMeta>,
+    /// Tokens we've already dispatched a metadata fetch for this
+    /// session. Prevents N redundant `FetchTokenMetadata` actions when
+    /// the user opens many txs that share the same unknown token.
+    pub token_metadata_dispatched: std::collections::HashSet<starknet::core::types::Felt>,
 
     // Channel to network task
     pub action_tx: mpsc::UnboundedSender<Action>,
@@ -178,7 +191,10 @@ impl App {
 
             voyager_labels: HashMap::new(),
             private_notes: HashMap::new(),
+            private_nullifiers: HashMap::new(),
             private_notes_synced: std::collections::HashSet::new(),
+            fetched_token_metadata: HashMap::new(),
+            token_metadata_dispatched: std::collections::HashSet::new(),
 
             action_tx,
 
@@ -245,6 +261,63 @@ impl App {
                 .action_tx
                 .send(Action::FetchPrivateNotes { user, viewing_key });
         }
+    }
+
+    /// For every token in `tokens` that we don't already know
+    /// (registry-static or runtime-fetched) and haven't already
+    /// dispatched a fetch for this session, send
+    /// `Action::FetchTokenMetadata`. The network task replies with
+    /// `Action::TokenMetadataLoaded` and the result lands in
+    /// `fetched_token_metadata` for the next render.
+    fn dispatch_token_metadata_for_unknown_tokens<I>(&mut self, tokens: I)
+    where
+        I: IntoIterator<Item = starknet::core::types::Felt>,
+    {
+        let registry_known = |felt: &starknet::core::types::Felt| -> bool {
+            self.search_engine
+                .as_ref()
+                .map(|e| e.registry().get_decimals(felt).is_some())
+                .unwrap_or(false)
+        };
+        let mut seen = std::collections::HashSet::new();
+        for token in tokens {
+            if !seen.insert(token) {
+                continue;
+            }
+            if self.fetched_token_metadata.contains_key(&token) {
+                continue;
+            }
+            if registry_known(&token) {
+                continue;
+            }
+            if !self.token_metadata_dispatched.insert(token) {
+                continue;
+            }
+            let _ = self.action_tx.send(Action::FetchTokenMetadata { token });
+        }
+    }
+
+    /// Targeted version of `dispatch_private_notes_sync`: fires for the
+    /// specific address being opened, and only if we hold a viewing key
+    /// for it. Used by the address-info reducer so the Balances tab can
+    /// render private holdings the moment the address loads, without
+    /// the user having to drill into a tx first.
+    fn dispatch_private_notes_sync_for_address(&mut self, address: starknet::core::types::Felt) {
+        if self.private_notes_synced.contains(&address) {
+            return;
+        }
+        let Some(engine) = &self.search_engine else {
+            return;
+        };
+        let Some(vk) = engine.registry().viewing_key(&address) else {
+            return;
+        };
+        let viewing_key = **vk;
+        self.private_notes_synced.insert(address);
+        let _ = self.action_tx.send(Action::FetchPrivateNotes {
+            user: address,
+            viewing_key,
+        });
     }
 
     fn dispatch_tx_price_fetch(&self) {
@@ -868,13 +941,48 @@ impl App {
         if let Some(label) = self.voyager_labels.get(address)
             && let Some(name) = &label.name
         {
-            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡ marker for Voyager-sourced
+            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced
+        }
+        // Runtime-fetched ERC-20 metadata fallback. Uses a different
+        // marker (◇) so the user can tell the symbol came from an
+        // on-chain `symbol()` lookup rather than a curated label.
+        if let Some(meta) = self.fetched_token_metadata.get(address) {
+            return format!("[{}] \u{25C7}", meta.symbol);
         }
         if let Some(engine) = &self.search_engine {
             engine.registry().format_address(address)
         } else {
             crate::ui::widgets::hex_display::short_address(address)
         }
+    }
+
+    /// Decimals for a token, preferring the static registry over
+    /// runtime-fetched metadata. Used by amount formatters so unknown
+    /// tokens render with decimals as soon as the on-chain
+    /// `decimals()` call lands.
+    pub fn token_decimals(&self, token: &starknet::core::types::Felt) -> Option<u8> {
+        if let Some(engine) = &self.search_engine
+            && let Some(d) = engine.registry().get_decimals(token)
+        {
+            return Some(d);
+        }
+        self.fetched_token_metadata.get(token).map(|m| m.decimals)
+    }
+
+    /// Bare token symbol (e.g. `"STRK"`, `"USDS"`) — registry first, then
+    /// runtime-fetched. Different from `format_address` which wraps the
+    /// label in brackets and adds source markers; this returns the
+    /// ticker plain so the Balances tab can render it in a fixed
+    /// table-style column.
+    pub fn token_symbol(&self, token: &starknet::core::types::Felt) -> Option<String> {
+        if let Some(engine) = &self.search_engine
+            && let Some(name) = engine.registry().resolve(token)
+        {
+            return Some(name.to_string());
+        }
+        self.fetched_token_metadata
+            .get(token)
+            .map(|m| m.symbol.clone())
     }
 
     /// Resolve a tx hash to its user label, if any. Single registry lookup —
@@ -896,7 +1004,11 @@ impl App {
         if let Some(label) = self.voyager_labels.get(address)
             && let Some(name) = &label.name
         {
-            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced // ⬡
+            return format!("[{}] \u{2B21}", name); // ⬡ = Voyager-sourced
+        }
+        // Runtime-fetched ERC-20 metadata fallback (mirrors format_address).
+        if let Some(meta) = self.fetched_token_metadata.get(address) {
+            return format!("[{}] \u{25C7}", meta.symbol);
         }
         if let Some(engine) = &self.search_engine {
             engine.registry().format_address_full(address)
@@ -1095,7 +1207,27 @@ impl App {
                     self.build_tx_nav_items();
                 }
             }
-            Action::PrivateNotesIndexed { user, notes } => {
+            Action::TokenMetadataLoaded {
+                token,
+                meta: Some(m),
+            } => {
+                tracing::debug!(
+                    token = %format!("{:#x}", token),
+                    symbol = %m.symbol,
+                    decimals = m.decimals,
+                    "Token metadata indexed"
+                );
+                self.fetched_token_metadata.insert(token, m);
+            }
+            Action::TokenMetadataLoaded { meta: None, .. } => {
+                // Failed lookup is recorded only via `token_metadata_dispatched`
+                // (set at dispatch time) so we don't re-fire this session.
+            }
+            Action::PrivateNotesIndexed {
+                user,
+                notes,
+                nullifiers,
+            } => {
                 // Merge the labelled user's freshly-decrypted notes into
                 // the global note_id → DecryptedNote index. Late arrivals
                 // are fine to merge whether or not the user is still
@@ -1104,11 +1236,21 @@ impl App {
                 tracing::info!(
                     user = %format!("{:#x}", user),
                     count = notes.len(),
+                    nullifiers = nullifiers.len(),
                     "Privacy notes indexed"
                 );
+                let new_tokens: Vec<starknet::core::types::Felt> =
+                    notes.iter().map(|n| n.token).collect();
                 for n in notes {
                     self.private_notes.insert(n.note_id, n);
                 }
+                for (nul, nid) in nullifiers {
+                    self.private_nullifiers.insert(nul, nid);
+                }
+                // Kick off on-chain decimals + symbol lookup for any
+                // token in the synced notes that we don't know about
+                // yet — without this, unknown tokens render as raw u128.
+                self.dispatch_token_metadata_for_unknown_tokens(new_tokens);
             }
             Action::NavigateToAddress { address } => {
                 // Push view immediately — show cached data while fresh data loads
@@ -1141,6 +1283,12 @@ impl App {
                 }
                 let address = info.address;
                 self.address.context = Some(address);
+
+                // Kick off privacy-pool sync for this address if we hold
+                // a viewing key for it. Drives the Balances tab's
+                // "Private holdings" section without needing the user
+                // to drill into a tx first.
+                self.dispatch_private_notes_sync_for_address(address);
 
                 // Detect contract vs account
                 let is_contract =
@@ -1175,6 +1323,11 @@ impl App {
                 {
                     info.nonce = existing.nonce;
                 }
+                let balance_tokens: Vec<starknet::core::types::Felt> = info
+                    .token_balances
+                    .iter()
+                    .map(|b| b.token_address)
+                    .collect();
                 if info.nonce != starknet::core::types::Felt::ZERO
                     || !info.token_balances.is_empty()
                     || info.class_hash.is_some()
@@ -1182,6 +1335,13 @@ impl App {
                 {
                     self.address.info = Some(info);
                 }
+                // Kick off metadata lookup for any token in this
+                // address's balances that the static registry doesn't
+                // know about. Cheap (1-2 round-trips per token, deduped
+                // via `token_metadata_dispatched`), and makes the
+                // Balances tab render unknown ERC-20s with proper
+                // decimals + symbol on the next frame.
+                self.dispatch_token_metadata_for_unknown_tokens(balance_tokens);
 
                 if !decoded_events.is_empty() {
                     let had_selection = self.address.events.state.selected().is_some();

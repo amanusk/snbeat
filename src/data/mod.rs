@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod pathfinder;
 pub mod rpc;
+pub mod token_metadata;
 pub mod types;
 
 use async_trait::async_trait;
@@ -101,6 +102,18 @@ pub trait DataSource: Send + Sync {
     }
     /// Save tx summaries for an address to persistent cache.
     fn save_address_txs(&self, _address: &Felt, _txs: &[AddressTxSummary]) {
+        // Default: no-op. CachingDataSource overrides.
+    }
+    /// Load every cached on-chain ERC-20 metadata entry. Used at app
+    /// boot to seed the in-memory token-metadata cache so the first
+    /// render of unknown tokens already has decimals + symbol from the
+    /// last session, no round-trip required.
+    fn load_token_metadata(&self) -> Vec<(Felt, crate::data::token_metadata::TokenMeta)> {
+        Vec::new()
+    }
+    /// Save one (token, meta) row. Called from the App reducer after a
+    /// successful background fetch lands.
+    fn save_token_metadata(&self, _address: &Felt, _meta: &crate::data::token_metadata::TokenMeta) {
         // Default: no-op. CachingDataSource overrides.
     }
     /// Load cached contract call summaries for an address.

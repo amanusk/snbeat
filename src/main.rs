@@ -138,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
     // Create app
     let mut app = App::new(action_tx.clone());
     app.search_engine = Some(Arc::clone(&search_engine));
+    // Hydrate the on-chain ERC-20 metadata cache from SQLite so unknown
+    // tokens render correctly on the very first frame of a cold start
+    // (instead of falling back to raw u128 amounts until the live fetch
+    // round-trips).
+    app.fetched_token_metadata = data_source.load_token_metadata().into_iter().collect();
     if !registry_warnings.is_empty() {
         app.error_message = Some(registry_warnings.join("\n"));
     }

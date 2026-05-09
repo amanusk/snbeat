@@ -238,6 +238,12 @@ impl CachingDataSource {
                 last_synced_block INTEGER NOT NULL,
                 synced_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS token_metadata (
+                address TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                decimals INTEGER NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -340,6 +346,18 @@ impl CachingDataSource {
                 SnbeatError::Config(format!("Migration v9 version bump failed: {e}"))
             })?;
             debug!("Migration v9: added private_notes + private_notes_sync tables");
+        }
+
+        if version < 10 {
+            // v10: introduce token_metadata. Caches on-chain ERC-20
+            // (decimals, symbol) for tokens not in the static registry,
+            // so the Privacy + Balances tabs can render unknown tokens
+            // correctly across restarts without re-fetching every cold
+            // start. CREATE TABLE IF NOT EXISTS above handles DDL.
+            db.execute("PRAGMA user_version = 10", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v10 version bump failed: {e}"))
+            })?;
+            debug!("Migration v10: added token_metadata table");
         }
 
         drop(db);
@@ -1824,6 +1842,60 @@ impl DataSource for CachingDataSource {
             );
             if let Err(e) = tx.commit() {
                 warn!(error = %e, "save_class_contracts: commit failed");
+            }
+        }
+    }
+
+    fn load_token_metadata(&self) -> Vec<(Felt, crate::data::token_metadata::TokenMeta)> {
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let mut stmt = match db.prepare("SELECT address, symbol, decimals FROM token_metadata") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(addr, sym, dec)| {
+                let felt = Felt::from_hex(&addr).ok()?;
+                if !(0..=255).contains(&dec) {
+                    return None;
+                }
+                Some((
+                    felt,
+                    crate::data::token_metadata::TokenMeta {
+                        symbol: sym,
+                        decimals: dec as u8,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn save_token_metadata(&self, address: &Felt, meta: &crate::data::token_metadata::TokenMeta) {
+        if let Ok(db) = self.db.get() {
+            let addr_hex = format!("{:#x}", address);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if let Err(e) = db.execute(
+                "INSERT OR REPLACE INTO token_metadata
+                    (address, symbol, decimals, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![addr_hex, meta.symbol, meta.decimals as i64, now],
+            ) {
+                warn!(error = %e, "save_token_metadata failed");
             }
         }
     }

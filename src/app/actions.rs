@@ -187,25 +187,45 @@ pub enum Action {
     /// Forward-decrypted Privacy Pool notes for a labelled user. Posted by
     /// the privacy-sync background task; the reducer merges these into
     /// `app.private_notes` so the Privacy tab can annotate
-    /// `EncNoteCreated` events that match. `notes = empty` is a valid
-    /// signal that the user has nothing in the pool yet (or the sync ran
-    /// against a wrong key) — caller should NOT treat empty as failure.
+    /// `EncNoteCreated` events that match. `nullifiers` carries the
+    /// `(spend_nullifier → note_id)` pairs for incoming notes only — the
+    /// reducer puts them into `app.private_nullifiers` so `NoteUsed`
+    /// events can be labelled "user spent note X". `notes = empty` is a
+    /// valid signal that the user has nothing in the pool yet (or the
+    /// sync ran against a wrong key) — caller should NOT treat empty as
+    /// failure.
     PrivateNotesIndexed {
         user: Felt,
         notes: Vec<crate::decode::privacy_sync::DecryptedNote>,
+        nullifiers: Vec<(Felt, Felt)>,
     },
     /// Kick off a privacy-pool storage sync for a labelled user. Sent by
     /// the App reducer when a tx with `EncNoteCreated` events is opened
     /// for a user with a viewing key, and we haven't yet synced this
-    /// session. The network task picks it up, runs
-    /// `sync_user_incoming_notes` (~hundreds of pf-query slot reads), and
-    /// posts `Action::PrivateNotesIndexed` when done.
+    /// session. The network task picks it up, runs `sync_user_notes`
+    /// (~hundreds of pf-query slot reads, both incoming and outgoing
+    /// channel walks), and posts `Action::PrivateNotesIndexed` when done.
     FetchPrivateNotes {
         user: Felt,
         /// Raw private viewing key felt. Treated as a secret in handlers
         /// (re-wrapped in `SecretFelt` at the call site to get
         /// zeroize-on-drop + `[REDACTED]` Debug).
         viewing_key: Felt,
+    },
+    /// Kick off an on-chain ERC-20 metadata lookup (decimals + symbol)
+    /// for a token we haven't seen before. Dispatched by the App
+    /// reducer when a Privacy or Address load surfaces an unknown
+    /// token; deduped via `App::token_metadata_dispatched`.
+    FetchTokenMetadata {
+        token: Felt,
+    },
+    /// Result of a metadata fetch. `meta = None` means the call failed
+    /// (token doesn't expose ERC-20 entrypoints, RPC error, etc.) — the
+    /// reducer still records the attempt so we don't keep retrying in
+    /// the same session.
+    TokenMetadataLoaded {
+        token: Felt,
+        meta: Option<crate::data::token_metadata::TokenMeta>,
     },
     /// Address info loaded.
     AddressInfoLoaded {
