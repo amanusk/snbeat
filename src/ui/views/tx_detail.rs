@@ -344,6 +344,25 @@ fn fmt_addr_full(app: &App, felt: &Felt) -> String {
     }
 }
 
+/// Truncate a felt-typed identifier (note ID, nullifier, channel hash)
+/// for display. Note IDs aren't navigable and have no labels, so the
+/// goal is just to keep the line short — full hex eats ~66 columns and
+/// pushes amount/token off-screen on a typical terminal. Mirrors the
+/// `0x6d6d..68a4` shape used by the address registry and honours the
+/// `e` (expand_all) toggle so the user can still copy the full hex.
+fn fmt_note_id(app: &App, felt: &Felt) -> String {
+    if app.tx_detail.expand_all {
+        format!("{:#x}", felt)
+    } else {
+        let hex = format!("{:#x}", felt);
+        if hex.len() > 14 {
+            format!("{}..{}", &hex[..6], &hex[hex.len() - 4..])
+        } else {
+            hex
+        }
+    }
+}
+
 /// Render a revert reason. By default we collapse to a single ellipsised
 /// preview so the fixed-height header doesn't get pushed off-screen by a
 /// wrapped multi-line cairo panic. With `expand` on, we split on `\n` and
@@ -1340,7 +1359,7 @@ fn build_privacy_lines(
                 spans.push(Span::styled(" (change)", theme::SUGGESTION_STYLE));
             }
             spans.push(Span::styled(
-                format!("  note {:#x}", n.note_id),
+                format!("  note {}", fmt_note_id(app, &n.note_id)),
                 theme::SUGGESTION_STYLE,
             ));
             lines.push(Line::from(spans));
@@ -1389,7 +1408,10 @@ fn build_privacy_lines(
                 Span::styled(token_label, token_style),
                 Span::styled("  originally from ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
-                Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
+                Span::styled(
+                    format!("  note {}", fmt_note_id(app, &n.note_id)),
+                    theme::SUGGESTION_STYLE,
+                ),
             ]));
         }
         lines.push(Line::from(""));
@@ -1500,7 +1522,10 @@ fn build_privacy_lines(
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled("created  ", theme::NORMAL_STYLE),
                 Span::styled(token_label, token_style),
-                Span::styled(format!("  note {:#x}", n.note_id), theme::SUGGESTION_STYLE),
+                Span::styled(
+                    format!("  note {}", fmt_note_id(app, &n.note_id)),
+                    theme::SUGGESTION_STYLE,
+                ),
                 Span::styled("    recipient: ", theme::SUGGESTION_STYLE),
             ];
             match known {
@@ -1552,7 +1577,10 @@ fn build_privacy_lines(
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
                 Span::raw(" "),
                 Span::styled(token_label, token_style),
-                Span::styled(format!("  note {:#x}", d.note_id), theme::SUGGESTION_STYLE),
+                Span::styled(
+                    format!("  note {}", fmt_note_id(app, &d.note_id)),
+                    theme::SUGGESTION_STYLE,
+                ),
                 Span::styled("  by ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &d.depositor), depositor_style),
             ];

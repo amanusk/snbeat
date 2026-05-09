@@ -422,13 +422,34 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     // label that hides the tab's existence while the classifier spins up.
     let meta_label = format!(" MetaTxs ({}) ", meta_tx_count_fragment(app));
 
-    let titles = vec![
-        Span::raw(tx_label),
-        Span::raw(meta_label),
-        Span::raw(call_label),
-        Span::raw(format!(" Balances ({bal_count}) ")),
-        Span::raw(format!(" Events ({}) ", events_count_fragment(app))),
-        Span::raw(format!(" Class ({class_count}) ")),
+    // Per-token unspent-incoming count for the Balances tab. Suppressed
+    // when the address has no viewing key (or no holdings yet) so the
+    // tab label stays clean for the common non-privacy case.
+    let prv_count = app
+        .address
+        .info
+        .as_ref()
+        .map(|i| compute_private_holdings(app, i.address).len())
+        .unwrap_or(0);
+    let balances_title: Line = if prv_count > 0 {
+        Line::from(vec![
+            Span::raw(format!(" Balances ({bal_count}) ")),
+            Span::styled(format!("Prv ({prv_count}) "), theme::PRIVACY_STYLE),
+        ])
+    } else {
+        Line::from(Span::raw(format!(" Balances ({bal_count}) ")))
+    };
+
+    let titles: Vec<Line> = vec![
+        Line::from(Span::raw(tx_label)),
+        Line::from(Span::raw(meta_label)),
+        Line::from(Span::raw(call_label)),
+        balances_title,
+        Line::from(Span::raw(format!(
+            " Events ({}) ",
+            events_count_fragment(app)
+        ))),
+        Line::from(Span::raw(format!(" Class ({class_count}) "))),
     ];
     let selected = match app.address.tab {
         AddressTab::Transactions => 0,
