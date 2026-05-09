@@ -282,6 +282,18 @@ pub struct AddressTxSummary {
     pub called_contracts: Vec<Felt>,
 }
 
+impl AddressTxSummary {
+    /// Whether this row still needs an enrichment fetch.
+    ///
+    /// `endpoint_names` is only meaningful for INVOKE — DECLARE/DEPLOY_ACCOUNT/
+    /// L1_HANDLER have no multicall to decode, so an empty string there is a
+    /// terminal state, not "unfetched". Treating it as unfetched caused
+    /// pf-query refetches on every scroll keystroke.
+    pub fn needs_enrichment(&self) -> bool {
+        self.timestamp == 0 || (self.tx_type == "INVOKE" && self.endpoint_names.is_empty())
+    }
+}
+
 /// A meta-transaction (SNIP-9 outside execution) summary for the MetaTxs tab on
 /// an address view. Represents a tx where the viewed address is the intender
 /// (original signer), not the on-chain sender (paymaster/relayer).
