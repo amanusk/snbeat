@@ -1374,15 +1374,10 @@ fn build_privacy_lines(
     // the user can read withdrawal/transfer txs ("spent 0.40 USDC
     // originally received from alice") without diffing two notes by
     // hand.
-    let spent: Vec<&crate::decode::privacy_sync::DecryptedNote> = summary
-        .nullifiers
-        .iter()
-        .filter_map(|nul| app.private_nullifiers.get(nul))
-        .filter_map(|nid| app.private_notes.get(nid))
-        .collect();
+    let spent = &spent_for_summary;
     if !spent.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(" Spent your notes ({})", spent.len()),
+            format!(" Spent notes ({})", spent.len()),
             theme::TITLE_STYLE,
         )));
         for (i, n) in spent.iter().enumerate() {
@@ -1391,6 +1386,7 @@ fn build_privacy_lines(
             let amount_str = format_amount_for_token(app, &n.token, n.amount);
             let token_label = fmt_addr(app, &n.token);
             let token_style = addr_style(&n.token, color_map, selected);
+            let user_style = addr_style(&n.user, color_map, selected);
             let counterparty_style = addr_style(&n.counterparty, color_map, selected);
             record(
                 &TxNavItem::Address(n.user),
@@ -1401,17 +1397,17 @@ fn build_privacy_lines(
                 NavSection::Privacy,
             );
             lines.push(Line::from(vec![
-                addr_marker_any(&[&n.counterparty, &n.token], selected),
+                addr_marker_any(&[&n.user, &n.counterparty, &n.token], selected),
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
+                Span::styled(fmt_addr(app, &n.user), user_style),
+                Span::styled(" spent note ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_note_id(app, &n.note_id), theme::SUGGESTION_STYLE),
+                Span::styled(" originally from ", theme::SUGGESTION_STYLE),
+                Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
+                Span::styled(" for ", theme::SUGGESTION_STYLE),
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
                 Span::raw(" "),
                 Span::styled(token_label, token_style),
-                Span::styled("  originally from ", theme::SUGGESTION_STYLE),
-                Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
-                Span::styled(
-                    format!("  note {}", fmt_note_id(app, &n.note_id)),
-                    theme::SUGGESTION_STYLE,
-                ),
             ]));
         }
         lines.push(Line::from(""));
@@ -1452,6 +1448,22 @@ fn build_privacy_lines(
     }
 
     // === Public withdrawals (sender encrypted, recipient clear) ===
+    // The Withdrawal event itself doesn't carry a sender, but every
+    // nullifier consumed in this tx was produced by the spend key of
+    // the note's recipient. So if all resolved spent notes share a
+    // single `user`, that user is the withdrawal sender. Mixed users
+    // (multi-party tx) or no resolved nullifiers fall back to the
+    // privacy-preserving "encrypted" label.
+    let withdrawal_sender: Option<Felt> = {
+        let mut users = spent_for_summary.iter().map(|n| n.user);
+        users.next().and_then(|first| {
+            if users.all(|u| u == first) {
+                Some(first)
+            } else {
+                None
+            }
+        })
+    };
     if !summary.withdrawals.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" Withdrawals ({})", summary.withdrawals.len()),
@@ -1472,16 +1484,32 @@ fn build_privacy_lines(
                 &app.tx_detail.nav_sections,
                 NavSection::Privacy,
             );
-            lines.push(Line::from(vec![
-                addr_marker_any(&[&w.to_addr, &w.token], selected),
+            let mut spans = vec![
+                match withdrawal_sender {
+                    Some(u) => addr_marker_any(&[&u, &w.to_addr, &w.token], selected),
+                    None => addr_marker_any(&[&w.to_addr, &w.token], selected),
+                },
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled(amount_str, theme::TX_FEE_STYLE),
                 Span::raw(" "),
                 Span::styled(token_label, token_style),
                 Span::styled("  → ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &w.to_addr), to_style),
-                Span::styled("    sender: encrypted", theme::SUGGESTION_STYLE),
-            ]));
+            ];
+            match withdrawal_sender {
+                Some(u) => {
+                    let style = addr_style(&u, color_map, selected);
+                    spans.push(Span::styled("    sender: ", theme::SUGGESTION_STYLE));
+                    spans.push(Span::styled(fmt_addr(app, &u), style));
+                }
+                None => {
+                    spans.push(Span::styled(
+                        "    sender: encrypted",
+                        theme::SUGGESTION_STYLE,
+                    ));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }
@@ -1643,19 +1671,44 @@ fn build_privacy_lines(
         lines.push(Line::from(""));
     }
 
-    // === Internal counts (nullifiers + enc-notes) ===
-    // Surfaced as collapsed summaries by default; `e` (expand_all) lists IDs.
-    if !summary.nullifiers.is_empty() {
+    // === Unresolved residual (nullifiers + enc-notes) ===
+    // What's left after the viewing-key-driven sections above. A
+    // nullifier is "resolved" if it landed in `Spent notes`; an
+    // enc-note is "resolved" if it landed in `Decrypted (viewing
+    // keys)`. The rest belong to users we don't hold a key for —
+    // surface only the residual so the panel doesn't double-count
+    // anything we already broke down.
+    let unresolved_nullifiers: Vec<&Felt> = summary
+        .nullifiers
+        .iter()
+        .filter(|nul| {
+            app.private_nullifiers
+                .get(nul)
+                .and_then(|nid| app.private_notes.get(nid))
+                .is_none()
+        })
+        .collect();
+    let unresolved_enc_notes: Vec<&Felt> = summary
+        .enc_notes_created
+        .iter()
+        .filter(|nid| !app.private_notes.contains_key(nid))
+        .collect();
+    if !unresolved_nullifiers.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" Nullifiers consumed: ", theme::TITLE_STYLE),
+            Span::styled(" Nullifiers consumed (unresolved): ", theme::TITLE_STYLE),
             Span::styled(
-                format!("{} note(s) spent", summary.nullifiers.len()),
+                format!(
+                    "{} of {} note(s)",
+                    unresolved_nullifiers.len(),
+                    summary.nullifiers.len()
+                ),
                 theme::TX_HASH_STYLE,
             ),
+            Span::styled("    (no viewing key match)", theme::SUGGESTION_STYLE),
         ]));
         if app.tx_detail.expand_all {
-            for (i, n) in summary.nullifiers.iter().enumerate() {
-                let last = i == summary.nullifiers.len() - 1;
+            for (i, n) in unresolved_nullifiers.iter().enumerate() {
+                let last = i == unresolved_nullifiers.len() - 1;
                 let branch = if last { "└─" } else { "├─" };
                 lines.push(Line::from(vec![
                     Span::raw(" "),
@@ -1665,11 +1718,15 @@ fn build_privacy_lines(
             }
         }
     }
-    if !summary.enc_notes_created.is_empty() {
+    if !unresolved_enc_notes.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" Enc-notes created:   ", theme::TITLE_STYLE),
+            Span::styled(" Enc-notes created (unresolved): ", theme::TITLE_STYLE),
             Span::styled(
-                format!("{} note(s)", summary.enc_notes_created.len()),
+                format!(
+                    "{} of {} note(s)",
+                    unresolved_enc_notes.len(),
+                    summary.enc_notes_created.len()
+                ),
                 theme::TX_HASH_STYLE,
             ),
             Span::styled(
@@ -1678,8 +1735,8 @@ fn build_privacy_lines(
             ),
         ]));
         if app.tx_detail.expand_all {
-            for (i, n) in summary.enc_notes_created.iter().enumerate() {
-                let last = i == summary.enc_notes_created.len() - 1;
+            for (i, n) in unresolved_enc_notes.iter().enumerate() {
+                let last = i == unresolved_enc_notes.len() - 1;
                 let branch = if last { "└─" } else { "├─" };
                 lines.push(Line::from(vec![
                     Span::raw(" "),
@@ -1689,7 +1746,7 @@ fn build_privacy_lines(
             }
         }
     }
-    if !summary.nullifiers.is_empty() || !summary.enc_notes_created.is_empty() {
+    if !unresolved_nullifiers.is_empty() || !unresolved_enc_notes.is_empty() {
         lines.push(Line::from(""));
     }
 
