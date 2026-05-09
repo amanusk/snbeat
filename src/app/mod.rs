@@ -518,7 +518,7 @@ impl App {
             .iter()
             .skip(offset)
             .take(50)
-            .filter(|t| t.endpoint_names.is_empty() || t.timestamp == 0)
+            .filter(|t| t.needs_enrichment())
             .map(|t| t.hash)
             .collect();
         if !hashes.is_empty() {
@@ -1455,7 +1455,7 @@ impl App {
                         .iter()
                         .skip(offset)
                         .take(50)
-                        .filter(|t| t.endpoint_names.is_empty() || t.timestamp == 0)
+                        .filter(|t| t.needs_enrichment())
                         .map(|t| t.hash)
                         .collect();
                     if !hashes.is_empty() {
@@ -1790,7 +1790,7 @@ impl App {
                         .iter()
                         .skip(offset)
                         .take(50)
-                        .filter(|t| t.endpoint_names.is_empty() || t.timestamp == 0)
+                        .filter(|t| t.needs_enrichment())
                         .map(|t| t.hash)
                         .collect();
                     if !hashes.is_empty() {
