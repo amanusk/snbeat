@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod pathfinder;
 pub mod rpc;
+pub mod token_metadata;
 pub mod types;
 
 use async_trait::async_trait;
@@ -66,6 +67,20 @@ pub trait DataSource: Send + Sync {
         self.get_class_hash(address).await
     }
     async fn get_class(&self, class_hash: Felt) -> Result<ContractClass>;
+    /// Read a single contract storage slot. Used as the RPC fallback when
+    /// pf-query's batch endpoint isn't reachable, called concurrently from
+    /// the privacy-pool sync. Default impl returns an error so non-RPC
+    /// sources don't pretend to support it; the RPC source overrides.
+    async fn get_storage_at(
+        &self,
+        _contract: Felt,
+        _key: Felt,
+        _block: Option<u64>,
+    ) -> Result<Felt> {
+        Err(crate::error::SnbeatError::Provider(
+            "get_storage_at not implemented for this DataSource".into(),
+        ))
+    }
     /// Fetch the execution trace of a transaction (recursive call tree with
     /// nested events, calldata, and results). Used by the tx-detail Trace tab.
     async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace>;
@@ -88,6 +103,57 @@ pub trait DataSource: Send + Sync {
     /// Save tx summaries for an address to persistent cache.
     fn save_address_txs(&self, _address: &Felt, _txs: &[AddressTxSummary]) {
         // Default: no-op. CachingDataSource overrides.
+    }
+    /// Load every cached on-chain ERC-20 metadata entry. Used at app
+    /// boot to seed the in-memory token-metadata cache so the first
+    /// render of unknown tokens already has decimals + symbol from the
+    /// last session, no round-trip required.
+    fn load_token_metadata(&self) -> Vec<(Felt, crate::data::token_metadata::TokenMeta)> {
+        Vec::new()
+    }
+    /// Save one (token, meta) row. Called from the App reducer after a
+    /// successful background fetch lands.
+    fn save_token_metadata(&self, _address: &Felt, _meta: &crate::data::token_metadata::TokenMeta) {
+        // Default: no-op. CachingDataSource overrides.
+    }
+    /// Load every persisted forward-decrypted Privacy Pool note plus the
+    /// nullifier→note_id index. Used at boot to seed `app.private_notes`
+    /// and `app.private_nullifiers` so the Privacy tab can annotate
+    /// matching events on the very first frame, before any in-session
+    /// sync has run.
+    fn load_private_notes(
+        &self,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        (Vec::new(), Vec::new())
+    }
+    /// Persist a user's freshly-synced notes + nullifiers + last-synced
+    /// block. Replaces any prior rows for the same user. Called by the
+    /// network task after `sync_user_notes` succeeds.
+    fn save_private_notes_for_user(
+        &self,
+        _user: &Felt,
+        _notes: &[crate::decode::privacy_sync::DecryptedNote],
+        _nullifiers: &[(Felt, Felt)],
+        _last_synced_block: u64,
+    ) {
+        // Default: no-op. CachingDataSource overrides.
+    }
+    /// Load the persisted notes + nullifiers for a single user, narrowed
+    /// from the global cache. Used by the network task to seed
+    /// `SyncResume` before invoking `sync_user_notes`, so the walk
+    /// resumes from the last persisted state instead of re-enumerating
+    /// from genesis.
+    fn load_private_notes_for_user(
+        &self,
+        _user: &Felt,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        (Vec::new(), Vec::new())
     }
     /// Load cached contract call summaries for an address.
     fn load_cached_address_calls(&self, _address: &Felt) -> Vec<ContractCallSummary> {
@@ -174,6 +240,30 @@ pub trait DataSource: Send + Sync {
         let mut out = Vec::with_capacity(calls.len());
         for (contract, selector, calldata) in calls {
             out.push(self.call_contract(contract, selector, calldata).await);
+        }
+        out
+    }
+
+    /// Batch many `starknet_getStorageAt` reads into a single JSON-RPC
+    /// round trip. Used as the fast RPC fallback for the privacy-pool
+    /// sync when pf-query's `/storage-batch` isn't reachable — without
+    /// this, the fallback degrades to N individual HTTP calls.
+    ///
+    /// Returns per-key values in the same order as `keys`. The default
+    /// implementation issues each read sequentially via
+    /// `get_storage_at`; the RPC-backed source overrides to use
+    /// `provider.batch_requests`. Order is preserved on success; on
+    /// batch failure the override falls back to per-key sequential
+    /// reads so a single bad key doesn't sink the whole batch.
+    async fn batch_get_storage_at(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: Option<u64>,
+    ) -> Vec<Result<Felt>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.get_storage_at(contract, *k, block).await);
         }
         out
     }

@@ -182,6 +182,33 @@ pub struct ViewingKeyRegistration {
     pub public_key: Felt,
 }
 
+/// Verdict for a user-supplied private viewing key against an on-chain
+/// `ViewingKeySet` registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewingKeyStatus {
+    /// `private_key * G == registered_public_key`. The supplied key is the
+    /// genuine viewing key for this user.
+    Valid,
+    /// `private_key * G != registered_public_key`. Either a typo in the
+    /// labels file or a stale key (the user has rotated theirs since).
+    Mismatch,
+}
+
+/// Check a user-supplied private viewing key against an on-chain
+/// `ViewingKeyRegistration` for the same user. Returns `None` when the
+/// caller has no labelled key for this user.
+pub fn validate_viewing_key(
+    registration: &ViewingKeyRegistration,
+    supplied: &crate::decode::privacy_crypto::types::SecretFelt,
+) -> ViewingKeyStatus {
+    let derived = crate::decode::privacy_crypto::keys::public_from_private(supplied);
+    if derived == registration.public_key {
+        ViewingKeyStatus::Valid
+    } else {
+        ViewingKeyStatus::Mismatch
+    }
+}
+
 /// Aggregated summary of a Privacy Pool transaction.
 #[derive(Debug, Clone)]
 pub struct PrivacySummary {
@@ -563,6 +590,36 @@ mod tests {
             tip: 0,
             resource_bounds: None,
         })
+    }
+
+    #[test]
+    fn validate_viewing_key_round_trips() {
+        use crate::decode::privacy_crypto::keys::public_from_private;
+        use crate::decode::privacy_crypto::types::SecretFelt;
+
+        // Synthetic test scalar + arbitrary user address. Never use a
+        // real viewing key in committed tests.
+        let priv_key = SecretFelt::new(Felt::from(0xc0ffeeu64));
+        let pub_key = public_from_private(&priv_key);
+        let user = Felt::from(0xabcdu64);
+        let reg = ViewingKeyRegistration {
+            user_addr: user,
+            public_key: pub_key,
+        };
+        assert_eq!(
+            validate_viewing_key(&reg, &priv_key),
+            ViewingKeyStatus::Valid
+        );
+
+        // A wrong registration with a perturbed public key must report Mismatch.
+        let bad_reg = ViewingKeyRegistration {
+            user_addr: user,
+            public_key: pub_key + Felt::ONE,
+        };
+        assert_eq!(
+            validate_viewing_key(&bad_reg, &priv_key),
+            ViewingKeyStatus::Mismatch
+        );
     }
 
     #[test]

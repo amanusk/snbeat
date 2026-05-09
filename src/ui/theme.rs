@@ -16,6 +16,13 @@ pub const TX_FEE_STYLE: Style = Style::new().fg(Color::DarkGray);
 pub const META_TX_STYLE: Style = Style::new()
     .fg(Color::LightMagenta)
     .add_modifier(Modifier::BOLD);
+// Privacy tab + tag. Mirrors META_TX_STYLE structure (bold accent
+// foreground) but in orange so users can distinguish at a glance:
+// purple = meta-tx, orange = privacy. Uses Indexed(208) for broad
+// 256-color terminal compatibility.
+pub const PRIVACY_STYLE: Style = Style::new()
+    .fg(Color::Indexed(208))
+    .add_modifier(Modifier::BOLD);
 
 // Status
 pub const STATUS_OK: Style = Style::new().fg(Color::Green);

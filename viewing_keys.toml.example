@@ -1,0 +1,18 @@
+# viewing_keys.toml — Privacy Pool decryption keys.
+#
+# WARNING: this file contains SECRETS. Anyone holding a viewing key can
+# deanonymize all that user's privacy-pool activity. Keep it out of git
+# (the repo's .gitignore already excludes `viewing_keys.toml`) and chmod
+# it to 600.
+#
+# Resolution order (same as labels.toml):
+#   1. APP_VIEWING_KEYS env var (if set)
+#   2. ./viewing_keys.toml (cwd)
+#   3. ~/.config/snbeat/viewing_keys.toml
+#
+# Format:
+#   [keys]
+#   "<user_address_hex>" = "<private_viewing_key_hex>"
+
+[keys]
+# "0x<your_user_address>" = "0x<your_private_viewing_key>"

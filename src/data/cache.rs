@@ -217,6 +217,39 @@ impl CachingDataSource {
                 class_hash TEXT PRIMARY KEY,
                 fetched_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS private_notes (
+                note_id TEXT PRIMARY KEY,
+                user TEXT NOT NULL,
+                counterparty TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                token TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                channel_idx INTEGER NOT NULL,
+                subchannel_idx INTEGER NOT NULL,
+                note_idx INTEGER NOT NULL,
+                spent INTEGER NOT NULL,
+                block_number INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_private_notes_user
+                ON private_notes(user);
+            CREATE TABLE IF NOT EXISTS private_nullifiers (
+                nullifier TEXT PRIMARY KEY,
+                note_id TEXT NOT NULL,
+                user TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_private_nullifiers_user
+                ON private_nullifiers(user);
+            CREATE TABLE IF NOT EXISTS private_notes_sync (
+                user TEXT PRIMARY KEY,
+                last_synced_block INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS token_metadata (
+                address TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                decimals INTEGER NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| SnbeatError::Config(format!("Failed to init cache schema: {e}")))?;
@@ -306,6 +339,67 @@ impl CachingDataSource {
                 SnbeatError::Config(format!("Migration v8 version bump failed: {e}"))
             })?;
             debug!("Migration v8: added class_history_meta table");
+        }
+
+        if version < 9 {
+            // v9: introduce private_notes + private_notes_sync. Caches
+            // forward-decrypted Privacy Pool incoming notes per labelled
+            // user (note_id → amount/token/sender) so the Privacy tab can
+            // annotate EncNoteCreated events without re-syncing storage on
+            // every tx open. The CREATE TABLE IF NOT EXISTS lines above
+            // handle DDL; nothing to migrate from older rows.
+            db.execute("PRAGMA user_version = 9", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v9 version bump failed: {e}"))
+            })?;
+            debug!("Migration v9: added private_notes + private_notes_sync tables");
+        }
+
+        if version < 10 {
+            // v10: introduce token_metadata. Caches on-chain ERC-20
+            // (decimals, symbol) for tokens not in the static registry,
+            // so the Privacy + Balances tabs can render unknown tokens
+            // correctly across restarts without re-fetching every cold
+            // start. CREATE TABLE IF NOT EXISTS above handles DDL.
+            db.execute("PRAGMA user_version = 10", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v10 version bump failed: {e}"))
+            })?;
+            debug!("Migration v10: added token_metadata table");
+        }
+
+        if version < 11 {
+            // v11: re-shape private_notes to match the actual DecryptedNote
+            // (counterparty, direction, spent — the v9 columns
+            // amount_low/high + salt_low/high + sender were never wired in)
+            // and add private_nullifiers for nullifier→note_id persistence.
+            // The v9 table was never written to, so dropping it is safe.
+            db.execute_batch(
+                "DROP TABLE IF EXISTS private_notes;
+                 CREATE TABLE private_notes (
+                     note_id TEXT PRIMARY KEY,
+                     user TEXT NOT NULL,
+                     counterparty TEXT NOT NULL,
+                     direction TEXT NOT NULL,
+                     token TEXT NOT NULL,
+                     amount TEXT NOT NULL,
+                     channel_idx INTEGER NOT NULL,
+                     subchannel_idx INTEGER NOT NULL,
+                     note_idx INTEGER NOT NULL,
+                     spent INTEGER NOT NULL,
+                     block_number INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_private_notes_user
+                     ON private_notes(user);
+                 CREATE TABLE IF NOT EXISTS private_nullifiers (
+                     nullifier TEXT PRIMARY KEY,
+                     note_id TEXT NOT NULL,
+                     user TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_private_nullifiers_user
+                     ON private_nullifiers(user);
+                 PRAGMA user_version = 11;",
+            )
+            .map_err(|e| SnbeatError::Config(format!("Migration v11 failed: {e}")))?;
+            debug!("Migration v11: reshaped private_notes + added private_nullifiers");
         }
 
         drop(db);
@@ -1519,6 +1613,25 @@ impl DataSource for CachingDataSource {
         self.upstream.batch_call_contracts(calls).await
     }
 
+    async fn get_storage_at(&self, contract: Felt, key: Felt, block: Option<u64>) -> Result<Felt> {
+        // Pass through. Without this override the trait default returns a
+        // "not implemented" error, which would silently break the privacy
+        // sync's RPC fallback when the cached source is in front of RPC.
+        self.upstream.get_storage_at(contract, key, block).await
+    }
+
+    async fn batch_get_storage_at(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: Option<u64>,
+    ) -> Vec<Result<Felt>> {
+        // Pass through to the upstream's batched JSON-RPC implementation.
+        self.upstream
+            .batch_get_storage_at(contract, keys, block)
+            .await
+    }
+
     async fn get_contract_events(
         &self,
         address: Felt,
@@ -1793,6 +1906,323 @@ impl DataSource for CachingDataSource {
             }
         }
     }
+
+    fn load_token_metadata(&self) -> Vec<(Felt, crate::data::token_metadata::TokenMeta)> {
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let mut stmt = match db.prepare("SELECT address, symbol, decimals FROM token_metadata") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(addr, sym, dec)| {
+                let felt = Felt::from_hex(&addr).ok()?;
+                if !(0..=255).contains(&dec) {
+                    return None;
+                }
+                Some((
+                    felt,
+                    crate::data::token_metadata::TokenMeta {
+                        symbol: sym,
+                        decimals: dec as u8,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn save_token_metadata(&self, address: &Felt, meta: &crate::data::token_metadata::TokenMeta) {
+        if let Ok(db) = self.db.get() {
+            let addr_hex = format!("{:#x}", address);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if let Err(e) = db.execute(
+                "INSERT OR REPLACE INTO token_metadata
+                    (address, symbol, decimals, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![addr_hex, meta.symbol, meta.decimals as i64, now],
+            ) {
+                warn!(error = %e, "save_token_metadata failed");
+            }
+        }
+    }
+
+    fn load_private_notes(
+        &self,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        use crate::decode::privacy_sync::{DecryptedNote, NoteDirection};
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+
+        let notes: Vec<DecryptedNote> = match db.prepare(
+            "SELECT note_id, user, counterparty, direction, token, amount,
+                    channel_idx, subchannel_idx, note_idx, spent, block_number
+             FROM private_notes",
+        ) {
+            Ok(mut stmt) => match stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            }) {
+                Ok(rows) => rows
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(nid, u, cp, dir, tok, amt, ch, sch, ni, sp, bn)| {
+                        let direction = match dir.as_str() {
+                            "incoming" => NoteDirection::Incoming,
+                            "outgoing" => NoteDirection::Outgoing,
+                            _ => return None,
+                        };
+                        Some(DecryptedNote {
+                            note_id: Felt::from_hex(&nid).ok()?,
+                            user: Felt::from_hex(&u).ok()?,
+                            counterparty: Felt::from_hex(&cp).ok()?,
+                            direction,
+                            token: Felt::from_hex(&tok).ok()?,
+                            amount: amt.parse::<u128>().ok()?,
+                            channel_idx: ch.max(0) as u64,
+                            subchannel_idx: sch.max(0) as u64,
+                            note_idx: ni.max(0) as u64,
+                            spent: sp != 0,
+                            block_number: bn.max(0) as u64,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+
+        let nullifiers: Vec<(Felt, Felt)> =
+            match db.prepare("SELECT nullifier, note_id FROM private_nullifiers") {
+                Ok(mut stmt) => match stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    Ok(rows) => rows
+                        .filter_map(|r| r.ok())
+                        .filter_map(|(nul, nid)| {
+                            Some((Felt::from_hex(&nul).ok()?, Felt::from_hex(&nid).ok()?))
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+
+        (notes, nullifiers)
+    }
+
+    fn load_private_notes_for_user(
+        &self,
+        user: &Felt,
+    ) -> (
+        Vec<crate::decode::privacy_sync::DecryptedNote>,
+        Vec<(Felt, Felt)>,
+    ) {
+        use crate::decode::privacy_sync::{DecryptedNote, NoteDirection};
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let user_hex = format!("{:#x}", user);
+
+        let notes: Vec<DecryptedNote> = match db.prepare(
+            "SELECT note_id, user, counterparty, direction, token, amount,
+                    channel_idx, subchannel_idx, note_idx, spent, block_number
+             FROM private_notes WHERE user = ?1",
+        ) {
+            Ok(mut stmt) => match stmt.query_map(params![user_hex], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            }) {
+                Ok(rows) => rows
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(nid, u, cp, dir, tok, amt, ch, sch, ni, sp, bn)| {
+                        let direction = match dir.as_str() {
+                            "incoming" => NoteDirection::Incoming,
+                            "outgoing" => NoteDirection::Outgoing,
+                            _ => return None,
+                        };
+                        Some(DecryptedNote {
+                            note_id: Felt::from_hex(&nid).ok()?,
+                            user: Felt::from_hex(&u).ok()?,
+                            counterparty: Felt::from_hex(&cp).ok()?,
+                            direction,
+                            token: Felt::from_hex(&tok).ok()?,
+                            amount: amt.parse::<u128>().ok()?,
+                            channel_idx: ch.max(0) as u64,
+                            subchannel_idx: sch.max(0) as u64,
+                            note_idx: ni.max(0) as u64,
+                            spent: sp != 0,
+                            block_number: bn.max(0) as u64,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+
+        let nullifiers: Vec<(Felt, Felt)> =
+            match db.prepare("SELECT nullifier, note_id FROM private_nullifiers WHERE user = ?1") {
+                Ok(mut stmt) => match stmt.query_map(params![user_hex], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    Ok(rows) => rows
+                        .filter_map(|r| r.ok())
+                        .filter_map(|(nul, nid)| {
+                            Some((Felt::from_hex(&nul).ok()?, Felt::from_hex(&nid).ok()?))
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+
+        (notes, nullifiers)
+    }
+
+    fn save_private_notes_for_user(
+        &self,
+        user: &Felt,
+        notes: &[crate::decode::privacy_sync::DecryptedNote],
+        nullifiers: &[(Felt, Felt)],
+        last_synced_block: u64,
+    ) {
+        use crate::decode::privacy_sync::NoteDirection;
+        let mut db = match self.db.get() {
+            Ok(db) => db,
+            Err(e) => {
+                warn!(error = %e, "save_private_notes_for_user: failed to get db connection");
+                return;
+            }
+        };
+        let user_hex = format!("{:#x}", user);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // SQLite INTEGER is i64 — cap to keep us off the rusqlite u64 sentinel
+        // bug (per project memory).
+        let last_block_i64 = last_synced_block.min(i64::MAX as u64) as i64;
+
+        let tx = match db.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "save_private_notes_for_user: begin tx failed");
+                return;
+            }
+        };
+
+        if let Err(e) = tx.execute(
+            "DELETE FROM private_notes WHERE user = ?1",
+            params![user_hex],
+        ) {
+            warn!(error = %e, "save_private_notes_for_user: delete notes failed");
+            return;
+        }
+        if let Err(e) = tx.execute(
+            "DELETE FROM private_nullifiers WHERE user = ?1",
+            params![user_hex],
+        ) {
+            warn!(error = %e, "save_private_notes_for_user: delete nullifiers failed");
+            return;
+        }
+
+        for n in notes {
+            let dir = match n.direction {
+                NoteDirection::Incoming => "incoming",
+                NoteDirection::Outgoing => "outgoing",
+            };
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO private_notes
+                    (note_id, user, counterparty, direction, token, amount,
+                     channel_idx, subchannel_idx, note_idx, spent, block_number)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    format!("{:#x}", n.note_id),
+                    format!("{:#x}", n.user),
+                    format!("{:#x}", n.counterparty),
+                    dir,
+                    format!("{:#x}", n.token),
+                    n.amount.to_string(),
+                    n.channel_idx.min(i64::MAX as u64) as i64,
+                    n.subchannel_idx.min(i64::MAX as u64) as i64,
+                    n.note_idx.min(i64::MAX as u64) as i64,
+                    if n.spent { 1_i64 } else { 0_i64 },
+                    n.block_number.min(i64::MAX as u64) as i64,
+                ],
+            ) {
+                warn!(error = %e, "save_private_notes_for_user: insert note failed");
+                return;
+            }
+        }
+
+        for (nul, nid) in nullifiers {
+            if let Err(e) = tx.execute(
+                "INSERT OR REPLACE INTO private_nullifiers
+                    (nullifier, note_id, user)
+                 VALUES (?1, ?2, ?3)",
+                params![format!("{:#x}", nul), format!("{:#x}", nid), user_hex],
+            ) {
+                warn!(error = %e, "save_private_notes_for_user: insert nullifier failed");
+                return;
+            }
+        }
+
+        if let Err(e) = tx.execute(
+            "INSERT OR REPLACE INTO private_notes_sync
+                (user, last_synced_block, synced_at)
+             VALUES (?1, ?2, ?3)",
+            params![user_hex, last_block_i64, now],
+        ) {
+            warn!(error = %e, "save_private_notes_for_user: upsert sync row failed");
+            return;
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!(error = %e, "save_private_notes_for_user: commit failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1952,5 +2382,145 @@ mod tests {
             ds.load_search_progress(&addr, FilterKind::Keyed),
             Some((1_000_000, 9_000_000))
         );
+    }
+
+    /// Opens an external cache.db snapshot via env var `SNBEAT_TEST_CACHE_DB`
+    /// and runs the migration. Used to verify v11 against a real production
+    /// snapshot. Ignored by default — set the env var to invoke it.
+    #[test]
+    #[ignore]
+    fn external_cache_migration_smoke() {
+        let path = std::env::var("SNBEAT_TEST_CACHE_DB")
+            .expect("set SNBEAT_TEST_CACHE_DB to a snapshot path");
+        let p = std::path::PathBuf::from(path);
+        let _ds = CachingDataSource::new(Arc::new(NullUpstream), &p).expect("open + migrate");
+    }
+
+    #[test]
+    fn private_notes_roundtrip() {
+        use crate::decode::privacy_sync::{DecryptedNote, NoteDirection};
+        let (ds, _d) = new_cache();
+
+        let user_a = Felt::from_hex("0xa11ce").unwrap();
+        let user_b = Felt::from_hex("0xb0b").unwrap();
+        let token_usdc = Felt::from_hex("0x53c9151").unwrap();
+        let cp1 = Felt::from_hex("0xc1").unwrap();
+        let cp2 = Felt::from_hex("0xc2").unwrap();
+
+        // Pick an amount that exceeds u64 to verify u128 → TEXT round-trips
+        // intact (per the project rule against u64 sentinels for SQLite).
+        let big_amount: u128 = (u64::MAX as u128) + 7;
+
+        let notes = vec![
+            DecryptedNote {
+                note_id: Felt::from_hex("0x111").unwrap(),
+                user: user_a,
+                counterparty: cp1,
+                direction: NoteDirection::Incoming,
+                token: token_usdc,
+                amount: 400_000,
+                channel_idx: 0,
+                subchannel_idx: 0,
+                note_idx: 0,
+                spent: false,
+                block_number: 1_234_567,
+            },
+            DecryptedNote {
+                note_id: Felt::from_hex("0x222").unwrap(),
+                user: user_a,
+                counterparty: cp2,
+                direction: NoteDirection::Outgoing,
+                token: token_usdc,
+                amount: big_amount,
+                channel_idx: 1,
+                subchannel_idx: 2,
+                note_idx: 3,
+                spent: false,
+                block_number: 1_234_700,
+            },
+        ];
+        let nullifiers = vec![(
+            Felt::from_hex("0xdead").unwrap(),
+            Felt::from_hex("0x111").unwrap(),
+        )];
+
+        ds.save_private_notes_for_user(&user_a, &notes, &nullifiers, 1_234_700);
+
+        let (loaded_notes, loaded_nullifiers) = ds.load_private_notes();
+        assert_eq!(loaded_notes.len(), 2);
+        assert_eq!(loaded_nullifiers.len(), 1);
+
+        let n0 = loaded_notes
+            .iter()
+            .find(|n| n.note_id == Felt::from_hex("0x111").unwrap())
+            .expect("note 0x111");
+        assert_eq!(n0.user, user_a);
+        assert_eq!(n0.counterparty, cp1);
+        assert_eq!(n0.direction, NoteDirection::Incoming);
+        assert_eq!(n0.token, token_usdc);
+        assert_eq!(n0.amount, 400_000);
+        assert!(!n0.spent);
+        assert_eq!(n0.block_number, 1_234_567);
+
+        let n1 = loaded_notes
+            .iter()
+            .find(|n| n.note_id == Felt::from_hex("0x222").unwrap())
+            .expect("note 0x222");
+        assert_eq!(n1.direction, NoteDirection::Outgoing);
+        // u128 amount above u64::MAX must survive the TEXT round-trip.
+        assert_eq!(n1.amount, big_amount);
+        assert_eq!(n1.channel_idx, 1);
+        assert_eq!(n1.subchannel_idx, 2);
+        assert_eq!(n1.note_idx, 3);
+
+        assert_eq!(
+            loaded_nullifiers[0],
+            (
+                Felt::from_hex("0xdead").unwrap(),
+                Felt::from_hex("0x111").unwrap(),
+            )
+        );
+
+        // Re-saving for the same user must replace, not duplicate. Saving
+        // a different user must coexist.
+        let notes_b = vec![DecryptedNote {
+            note_id: Felt::from_hex("0x333").unwrap(),
+            user: user_b,
+            counterparty: cp1,
+            direction: NoteDirection::Incoming,
+            token: token_usdc,
+            amount: 1,
+            channel_idx: 0,
+            subchannel_idx: 0,
+            note_idx: 0,
+            spent: true,
+            block_number: 1_234_800,
+        }];
+        ds.save_private_notes_for_user(&user_b, &notes_b, &[], 1_234_800);
+        // Replace user_a with a single note.
+        let notes_a2 = vec![DecryptedNote {
+            note_id: Felt::from_hex("0x999").unwrap(),
+            user: user_a,
+            counterparty: cp1,
+            direction: NoteDirection::Incoming,
+            token: token_usdc,
+            amount: 5,
+            channel_idx: 0,
+            subchannel_idx: 0,
+            note_idx: 0,
+            spent: false,
+            block_number: 1_234_900,
+        }];
+        ds.save_private_notes_for_user(&user_a, &notes_a2, &[], 1_234_900);
+
+        let (loaded2, loaded_nuls2) = ds.load_private_notes();
+        // user_a's old notes (0x111, 0x222) gone, replaced by 0x999. user_b's 0x333 still there.
+        let ids: std::collections::HashSet<Felt> = loaded2.iter().map(|n| n.note_id).collect();
+        assert!(ids.contains(&Felt::from_hex("0x999").unwrap()));
+        assert!(ids.contains(&Felt::from_hex("0x333").unwrap()));
+        assert!(!ids.contains(&Felt::from_hex("0x111").unwrap()));
+        assert!(!ids.contains(&Felt::from_hex("0x222").unwrap()));
+        // user_a's nullifiers cleared on re-save.
+        assert!(loaded_nuls2.is_empty());
     }
 }

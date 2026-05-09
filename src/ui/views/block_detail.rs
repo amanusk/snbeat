@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::ui::theme;
-use crate::ui::widgets::address_color::AddressColorMap;
+use crate::ui::widgets::address_color::{AddressColorMap, known_or_palette_style};
 use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash, tx_hash_cell};
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::felt_to_u64;
@@ -114,6 +114,7 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let header = Paragraph::new(Line::from(vec![
         Span::styled("      Idx  ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
         Span::styled("Meta      ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
@@ -140,6 +141,9 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // registry label. Known addresses are already identifiable by their tag; one-off
     // addresses don't need a color since there's nothing to spot.
     let mut color_map = AddressColorMap::new();
+    if let Some(engine) = &app.search_engine {
+        color_map.set_privacy_overrides(engine.registry().privacy_addresses());
+    }
     for tx in &app.block_detail.txs.items {
         let addr = tx.sender();
         let is_repeat = counts.get(&addr).copied().unwrap_or(0) > 1;
@@ -233,15 +237,10 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             //   - known/tagged address  → LABEL_STYLE (bold yellow, already identifiable)
             //   - repeat unknown        → palette color (spot the pattern)
             //   - one-off unknown       → NORMAL_STYLE (no color wasted)
-            let is_known = app
-                .search_engine
-                .as_ref()
-                .map(|e| e.registry().is_known(&sender))
-                .unwrap_or(false);
+            let registry = app.search_engine.as_ref().map(|e| e.registry());
             let sender_style = match focused_sender {
                 Some(focused) if sender == focused => theme::VISUAL_SELECTED_STYLE,
-                _ if is_known => theme::LABEL_STYLE,
-                _ => color_map.style_for(&sender),
+                _ => known_or_palette_style(&sender, registry, &color_map),
             };
 
             // Marker column: ► on the visually selected row, space otherwise.
@@ -276,18 +275,7 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             let intender_style = if let Some(intender) = meta_intender {
                 match focused_sender {
                     Some(focused) if *intender == focused => theme::VISUAL_SELECTED_STYLE,
-                    _ => {
-                        let is_intender_known = app
-                            .search_engine
-                            .as_ref()
-                            .map(|e| e.registry().is_known(intender))
-                            .unwrap_or(false);
-                        if is_intender_known {
-                            theme::LABEL_STYLE
-                        } else {
-                            color_map.style_for(intender)
-                        }
-                    }
+                    _ => known_or_palette_style(intender, registry, &color_map),
                 }
             } else {
                 theme::NORMAL_STYLE
@@ -302,10 +290,23 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            let is_priv = app
+                .block_detail
+                .is_privacy_tx
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            // Header is 4 cells ("Prv "); body is 4 cells. The 🛡 emoji
+            // measures as 1 cell via the unicode-width crate (matching how
+            // most terminals actually render it), so use 3 trailing spaces
+            // for a 4-cell total.
+            let prv_marker_text = if is_priv { "🛡   " } else { "    " };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<4} ", tx.index()), theme::BLOCK_NUMBER_STYLE),
                 Span::styled(format!("{:<4}", status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
                 Span::styled(format!("{:<15}", tx.type_name()), type_style),
                 Span::styled(format!("{:<10}", meta_str), theme::META_TX_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),

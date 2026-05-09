@@ -3,9 +3,12 @@ use starknet::core::types::Felt;
 const ETH_TOKEN: &str = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
 
 fn registry() -> snbeat::registry::AddressRegistry {
-    snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"))
-        .unwrap()
-        .0
+    snbeat::registry::AddressRegistry::load(
+        std::path::Path::new("/dev/null"),
+        std::path::Path::new("/dev/null"),
+    )
+    .unwrap()
+    .0
 }
 
 // --- Parser tests ---
@@ -123,7 +126,9 @@ fn test_user_labels_prioritized() {
     )
     .unwrap();
 
-    let reg = snbeat::registry::AddressRegistry::load(f.path()).unwrap().0;
+    let reg = snbeat::registry::AddressRegistry::load(f.path(), std::path::Path::new("/dev/null"))
+        .unwrap()
+        .0;
 
     let results = reg.search("My", 10);
     assert!(!results.is_empty());

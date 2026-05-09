@@ -238,6 +238,36 @@ struct TxsByHashRequest {
     hashes: Vec<String>,
 }
 
+/// `POST /storage-batch` request: read N storage slots from a single
+/// contract at a given block in one SQLite transaction. Used by snbeat's
+/// privacy-pool sync, where a single user's note enumeration produces
+/// hundreds of deterministic slot reads against the same pool address.
+///
+/// `block` accepts the literal `"latest"` or a decimal block number.
+/// `block_id` is **not** supported here — we don't need pending state.
+#[derive(Deserialize)]
+struct StorageBatchRequest {
+    contract: String,
+    keys: Vec<String>,
+    /// `"latest"` or a decimal block number.
+    #[serde(default = "default_block")]
+    block: String,
+}
+
+fn default_block() -> String {
+    "latest".to_string()
+}
+
+#[derive(Serialize)]
+struct StorageBatchResponse {
+    /// Hex-encoded values in input-order; missing/never-written slots
+    /// surface as `"0x0"`.
+    values: Vec<String>,
+    /// The block number we actually read at (after `latest` resolution).
+    /// Lets the caller pin subsequent decoding to the same snapshot.
+    block_number: u64,
+}
+
 #[derive(Deserialize)]
 struct BlockTimestampsParams {
     from: u64,
@@ -691,6 +721,152 @@ async fn handler_txs_by_hash(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join error: {e}")))??;
 
     Ok(Json(results))
+}
+
+/// Server-side cap on `/storage-batch` keys per request. ~500 covers a
+/// typical privacy-pool sync; 5000 leaves headroom for bigger users.
+const STORAGE_BATCH_MAX: usize = 5_000;
+
+/// `POST /storage-batch` — read N storage slots from a single contract at a
+/// given block, in one SQLite transaction. Mirrors pathfinder's own
+/// `storage_value(block, contract, key)` query (see
+/// `pathfinder/crates/storage/src/connection/state_update.rs:623`),
+/// running it once per key against a cached prepared statement. Missing
+/// slots come back as `"0x0"`.
+async fn handler_storage_batch(
+    State(state): State<AppState>,
+    Json(req): Json<StorageBatchRequest>,
+) -> ApiResult<StorageBatchResponse> {
+    if req.keys.is_empty() {
+        // Resolve `latest` even on empty input so the caller still gets a
+        // pinning block_number back.
+        let db_path = Arc::clone(&state.db_path);
+        let block = req.block.clone();
+        let block_number =
+            tokio::task::spawn_blocking(move || -> Result<u64, (StatusCode, String)> {
+                let conn = open_db(&db_path).map_err(db_err)?;
+                resolve_block(&conn, &block)
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Join error: {e}"),
+                )
+            })??;
+        return Ok(Json(StorageBatchResponse {
+            values: Vec::new(),
+            block_number,
+        }));
+    }
+    if req.keys.len() > STORAGE_BATCH_MAX {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Too many keys: {} (max {})",
+                req.keys.len(),
+                STORAGE_BATCH_MAX
+            ),
+        ));
+    }
+
+    // Parse the contract + every key up front; reject the whole request on
+    // any malformed entry (the sync caller is generating these
+    // deterministically — a bad input here is a code bug, not a runtime
+    // condition we should silently mask).
+    let contract_bytes = parse_address(&req.contract)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid contract: {e}")))?;
+    let mut key_bytes: Vec<Vec<u8>> = Vec::with_capacity(req.keys.len());
+    for k in &req.keys {
+        let bytes = parse_address(k)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid key {k}: {e}")))?;
+        key_bytes.push(bytes);
+    }
+
+    let db_path = Arc::clone(&state.db_path);
+    let block_param = req.block.clone();
+    let response = tokio::task::spawn_blocking(move || -> Result<StorageBatchResponse, (StatusCode, String)> {
+        let conn = open_db(&db_path).map_err(db_err)?;
+        let block_number = resolve_block(&conn, &block_param)?;
+
+        // Same query pathfinder uses for `storage_value(block_number)`:
+        // join contract_addresses + storage_addresses, take the latest
+        // update at-or-before the target block, return value or
+        // QueryReturnedNoRows for unwritten slots.
+        let mut stmt = conn
+            .prepare_cached(
+                r"
+                SELECT storage_value
+                FROM storage_updates
+                JOIN contract_addresses ON contract_addresses.id = storage_updates.contract_address_id
+                JOIN storage_addresses ON storage_addresses.id = storage_updates.storage_address_id
+                WHERE contract_address = ?1 AND storage_address = ?2 AND block_number <= ?3
+                ORDER BY block_number DESC LIMIT 1
+                ",
+            )
+            .map_err(db_err)?;
+
+        let mut values: Vec<String> = Vec::with_capacity(key_bytes.len());
+        for k in &key_bytes {
+            match stmt.query_row(
+                rusqlite::params![contract_bytes.as_slice(), k.as_slice(), block_number],
+                |row| row.get::<_, Vec<u8>>(0),
+            ) {
+                Ok(bytes) => values.push(bytes_to_hex_felt(&bytes)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => values.push("0x0".to_string()),
+                Err(e) => return Err(db_err(e)),
+            }
+        }
+
+        Ok(StorageBatchResponse {
+            values,
+            block_number,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join error: {e}")))??;
+
+    Ok(Json(response))
+}
+
+/// Resolve the request's `block` parameter (`"latest"` or a decimal number)
+/// to a concrete block number. We intentionally don't accept hashes —
+/// every caller of this endpoint is computing slots they want to read at
+/// either tip or at a known block they fetched themselves.
+fn resolve_block(conn: &Connection, block: &str) -> Result<u64, (StatusCode, String)> {
+    if block.eq_ignore_ascii_case("latest") {
+        return conn
+            .query_row("SELECT MAX(number) FROM block_headers", [], |row| {
+                row.get::<_, Option<u64>>(0)
+            })
+            .map_err(db_err)?
+            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "No blocks indexed".into()));
+    }
+    block.parse::<u64>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid block (expected 'latest' or u64): {block}"),
+        )
+    })
+}
+
+/// Render a 32-byte BE slice as a minimal `0x...` hex felt — leading zero
+/// nibbles stripped, never empty (`"0x0"` for the zero slot).
+fn bytes_to_hex_felt(bytes: &[u8]) -> String {
+    let trimmed = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    if trimmed == bytes.len() {
+        return "0x0".to_string();
+    }
+    let hex = hex::encode(&bytes[trimmed..]);
+    // hex::encode never produces leading zeros within a non-zero byte, but
+    // strip a stray leading "0" within the first nibble for canonical
+    // 0x-style output (e.g. 0x4ff... rather than 0x04ff...).
+    let trimmed_hex = hex.trim_start_matches('0');
+    if trimmed_hex.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{trimmed_hex}")
+    }
 }
 
 /// GET /block-timestamps?from=N&to=M — bulk fetch block timestamps in range.
@@ -1527,6 +1703,7 @@ async fn main() -> Result<()> {
         )
         .route("/tx-by-hash/{hash}", get(handler_tx_by_hash))
         .route("/txs-by-hash", post(handler_txs_by_hash))
+        .route("/storage-batch", post(handler_storage_batch))
         .route("/block-txs/{block_number}", get(handler_block_txs))
         .route("/block-timestamps", get(handler_block_timestamps))
         .route("/sender-txs/{address}", get(handler_sender_txs))
@@ -1717,6 +1894,16 @@ mod tests {
                 to_block INTEGER NOT NULL,
                 bitmap BLOB NOT NULL
             );
+            CREATE TABLE storage_addresses (
+                id INTEGER PRIMARY KEY,
+                storage_address BLOB NOT NULL UNIQUE
+            );
+            CREATE TABLE storage_updates (
+                block_number INTEGER NOT NULL,
+                contract_address_id INTEGER NOT NULL,
+                storage_address_id INTEGER NOT NULL,
+                storage_value BLOB NOT NULL
+            );
             INSERT INTO block_headers(number, timestamp) VALUES (1, 1000);
             ",
         )
@@ -1811,5 +1998,88 @@ mod tests {
         .await;
         let json = result.expect("handler returned error");
         assert!(json.0.is_empty());
+    }
+
+    /// /storage-batch — empty keys round-trips and pins block_number.
+    #[tokio::test]
+    async fn handler_storage_batch_empty() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_storage_batch(
+            AxumState(state),
+            axum::Json(StorageBatchRequest {
+                contract: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a"
+                    .to_string(),
+                keys: Vec::new(),
+                block: "latest".to_string(),
+            }),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert!(json.0.values.is_empty());
+        assert_eq!(json.0.block_number, 1);
+    }
+
+    /// /storage-batch — unwritten slots return "0x0" without erroring.
+    #[tokio::test]
+    async fn handler_storage_batch_missing_slot() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_storage_batch(
+            AxumState(state),
+            axum::Json(StorageBatchRequest {
+                contract: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a"
+                    .to_string(),
+                keys: vec!["0x1".to_string(), "0x2".to_string()],
+                block: "latest".to_string(),
+            }),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert_eq!(json.0.values, vec!["0x0".to_string(), "0x0".to_string()]);
+        assert_eq!(json.0.block_number, 1);
+    }
+
+    /// /storage-batch — populated slot returns the correct hex value, in
+    /// input order, alongside missing siblings.
+    #[tokio::test]
+    async fn handler_storage_batch_populated() {
+        let (_dir, state) = setup_test_db();
+        // Insert one (contract, slot) → value at block 1.
+        let conn = rusqlite::Connection::open(state.db_path.as_str()).expect("reopen test db");
+        let contract_bytes =
+            parse_address("0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a")
+                .unwrap();
+        let slot_bytes = parse_address("0x42").unwrap();
+        let mut value = [0u8; 32];
+        value[31] = 0x99; // Felt(0x99)
+        conn.execute(
+            "INSERT INTO contract_addresses (id, contract_address) VALUES (?, ?)",
+            rusqlite::params![1i64, contract_bytes.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO storage_addresses (id, storage_address) VALUES (?, ?)",
+            rusqlite::params![1i64, slot_bytes.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO storage_updates (block_number, contract_address_id, storage_address_id, storage_value) VALUES (?, ?, ?, ?)",
+            rusqlite::params![1i64, 1i64, 1i64, value.as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = handler_storage_batch(
+            AxumState(state),
+            axum::Json(StorageBatchRequest {
+                contract: "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a"
+                    .to_string(),
+                keys: vec!["0x1".to_string(), "0x42".to_string()],
+                block: "latest".to_string(),
+            }),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert_eq!(json.0.values, vec!["0x0".to_string(), "0x99".to_string()]);
+        assert_eq!(json.0.block_number, 1);
     }
 }

@@ -5,6 +5,8 @@ pub mod events;
 pub mod functions;
 pub mod outside_execution;
 pub mod privacy;
+pub mod privacy_crypto;
+pub mod privacy_sync;
 pub mod trace;
 
 use std::sync::Arc;

@@ -446,6 +446,83 @@ pub async fn run_network_task(
                             let _ = tx.send(Action::PricesUpdated);
                         }
                     }
+                    Action::FetchTokenMetadata { token } => {
+                        let meta =
+                            crate::data::token_metadata::fetch_token_metadata(token, &*ds).await;
+                        if let Some(m) = &meta {
+                            ds.save_token_metadata(&token, m);
+                            tracing::debug!(
+                                token = %format!("{:#x}", token),
+                                symbol = %m.symbol,
+                                decimals = m.decimals,
+                                "Token metadata fetched"
+                            );
+                        } else {
+                            tracing::debug!(
+                                token = %format!("{:#x}", token),
+                                "Token metadata fetch failed (not ERC-20-shaped or RPC error)"
+                            );
+                        }
+                        let _ = tx.send(Action::TokenMetadataLoaded { token, meta });
+                    }
+                    Action::FetchPrivateNotes { user, viewing_key } => {
+                        // Re-wrap the raw felt as a SecretFelt so it gets
+                        // zeroize-on-drop after the sync completes. The
+                        // value already passed through the channel as a
+                        // bare Felt — the wrapper is just for in-memory
+                        // hygiene, not for cryptographic confidentiality
+                        // beyond what the channel already provides.
+                        let key =
+                            crate::decode::privacy_crypto::types::SecretFelt::new(viewing_key);
+                        let backend = crate::decode::privacy_sync::StorageBackend::new(
+                            pf.clone(),
+                            Arc::clone(&ds),
+                        );
+                        // Build a SyncResume from the cached state for this
+                        // user, so the walk can skip already-enumerated
+                        // channels/subchannels and only probe for new content.
+                        let (cached_notes, cached_nullifiers) =
+                            ds.load_private_notes_for_user(&user);
+                        let mut resume = crate::decode::privacy_sync::SyncResume::default();
+                        for n in cached_notes {
+                            resume.notes.insert(n.note_id, n);
+                        }
+                        for (nul, nid) in cached_nullifiers {
+                            resume.by_nullifier.insert(nul, nid);
+                        }
+                        match crate::decode::privacy_sync::sync_user_notes(
+                            user, &key, &backend, resume,
+                        )
+                        .await
+                        {
+                            Ok((index, block_number)) => {
+                                let nullifiers: Vec<_> =
+                                    index.by_nullifier.iter().map(|(n, id)| (*n, *id)).collect();
+                                let notes: Vec<_> = index.notes.into_values().collect();
+                                // Persist before notifying the UI so a crash mid-render
+                                // can't drop the work we just did. Idempotent per user
+                                // — overwrites prior rows.
+                                ds.save_private_notes_for_user(
+                                    &user,
+                                    &notes,
+                                    &nullifiers,
+                                    block_number,
+                                );
+                                let _ = tx.send(Action::PrivateNotesIndexed {
+                                    user,
+                                    notes,
+                                    nullifiers,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user = %format!("{:#x}", user),
+                                    error = %e,
+                                    "Privacy sync failed"
+                                );
+                            }
+                        }
+                    }
                     // Response actions are not handled here
                     _ => {}
                 }

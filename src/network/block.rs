@@ -31,7 +31,7 @@ pub(super) async fn fetch_and_send_block_detail(
     match ds.get_block_with_txs(number).await {
         Ok((block, mut transactions)) => {
             let _ = tx.send(rpc_source_update(crate::app::state::SourceStatus::Live));
-            let (endpoint_names, meta_tx_info) =
+            let (endpoint_names, meta_tx_info, is_privacy_tx) =
                 resolve_endpoint_names(&transactions, abi_reg).await;
 
             // Batch-fetch receipts for execution status + actual fee. `buffered`
@@ -78,6 +78,7 @@ pub(super) async fn fetch_and_send_block_detail(
                 endpoint_names,
                 tx_statuses,
                 meta_tx_info,
+                is_privacy_tx,
             });
         }
         Err(e) => {
@@ -117,12 +118,19 @@ pub(super) fn spawn_voyager_prefetch(
 ///   "transfer, approve" or "transfer, approve, swap, ... +2 more"
 /// Uses the persistent selector DB for instant lookups, then batch-fetches
 /// class ABIs for unknown selectors.
+///
+/// Also returns `is_privacy_tx`: per-tx flag set when any top-level call
+/// (or any OE-inner call inside a top-level OE wrapper) targets the
+/// privacy pool. Catches user-direct pool calls + standard SNIP-9 + AVNU
+/// classic-forwarder patterns. Misses `execute_private_sponsored` (see
+/// issue #41) — that path doesn't surface the user as intender at all.
 async fn resolve_endpoint_names(
     transactions: &[crate::data::types::SnTransaction],
     abi_registry: &AbiRegistry,
 ) -> (
     Vec<Option<String>>,
     Vec<Option<crate::app::views::block_detail::MetaTxSummary>>,
+    Vec<bool>,
 ) {
     use std::collections::HashSet;
 
@@ -186,9 +194,12 @@ async fn resolve_endpoint_names(
 
     use crate::app::views::block_detail::MetaTxSummary;
 
-    // Step 3: Format endpoint names per tx + detect outside execution
+    let pool_addr = *crate::decode::privacy::POOL_ADDRESS;
+
+    // Step 3: Format endpoint names per tx + detect outside execution + flag privacy
     let mut endpoint_names = Vec::with_capacity(tx_calls.len());
     let mut meta_tx_info: Vec<Option<MetaTxSummary>> = vec![None; tx_calls.len()];
+    let mut is_privacy_tx: Vec<bool> = vec![false; tx_calls.len()];
 
     for (i, (calls, raw_calls)) in tx_calls.iter().zip(tx_raw_calls.iter()).enumerate() {
         // Endpoint names (shared helper: "foo, bar, baz, … +N").
@@ -202,22 +213,38 @@ async fn resolve_endpoint_names(
             endpoint_names.push(Some(names));
         }
 
+        // Top-level pool call detection (the user-direct case).
+        if calls.iter().any(|(addr, _)| *addr == pool_addr) {
+            is_privacy_tx[i] = true;
+        }
+
         // Outside execution detection (lightweight — no inner call ABI resolution).
-        // Shared with address-view classify; see `detect_outside_execution`.
+        // Shared with address-view classify; see `detect_outside_execution`. Same
+        // pass also catches OE-inner calls that target the pool, so a single
+        // sponsored privacy tx (standard SNIP-9 / AVNU classic forwarder) gets
+        // its `is_privacy_tx` flag set without re-walking the calls.
         for call in raw_calls {
             let resolved_name = call
                 .function_name
                 .clone()
                 .or_else(|| abi_registry.get_selector_name(&call.selector));
             if let Some((oe, _method)) = detect_outside_execution(call, resolved_name.as_deref()) {
-                meta_tx_info[i] = Some(MetaTxSummary {
-                    intender: oe.intender,
-                    version: oe.version,
-                });
-                break;
+                if meta_tx_info[i].is_none() {
+                    meta_tx_info[i] = Some(MetaTxSummary {
+                        intender: oe.intender,
+                        version: oe.version,
+                    });
+                }
+                if oe
+                    .inner_calls
+                    .iter()
+                    .any(|ic| ic.contract_address == pool_addr)
+                {
+                    is_privacy_tx[i] = true;
+                }
             }
         }
     }
 
-    (endpoint_names, meta_tx_info)
+    (endpoint_names, meta_tx_info, is_privacy_tx)
 }

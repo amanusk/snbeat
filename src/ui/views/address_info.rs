@@ -10,6 +10,7 @@ use crate::app::state::TxNavItem;
 use crate::app::{AddressTab, App};
 use crate::data::types::TokenBalance;
 use crate::ui::theme;
+use crate::ui::widgets::address_color::known_or_palette_style;
 use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, tx_hash_cell};
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
@@ -403,13 +404,34 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     // label that hides the tab's existence while the classifier spins up.
     let meta_label = format!(" MetaTxs ({}) ", meta_tx_count_fragment(app));
 
-    let titles = vec![
-        Span::raw(tx_label),
-        Span::raw(meta_label),
-        Span::raw(call_label),
-        Span::raw(format!(" Balances ({bal_count}) ")),
-        Span::raw(format!(" Events ({}) ", events_count_fragment(app))),
-        Span::raw(format!(" Class ({class_count}) ")),
+    // Per-token unspent-incoming count for the Balances tab. Suppressed
+    // when the address has no viewing key (or no holdings yet) so the
+    // tab label stays clean for the common non-privacy case.
+    let prv_count = app
+        .address
+        .info
+        .as_ref()
+        .map(|i| compute_private_holdings(app, i.address).len())
+        .unwrap_or(0);
+    let balances_title: Line = if prv_count > 0 {
+        Line::from(vec![
+            Span::raw(format!(" Balances ({bal_count}) ")),
+            Span::styled(format!("Prv ({prv_count}) "), theme::PRIVACY_STYLE),
+        ])
+    } else {
+        Line::from(Span::raw(format!(" Balances ({bal_count}) ")))
+    };
+
+    let titles: Vec<Line> = vec![
+        Line::from(Span::raw(tx_label)),
+        Line::from(Span::raw(meta_label)),
+        Line::from(Span::raw(call_label)),
+        balances_title,
+        Line::from(Span::raw(format!(
+            " Events ({}) ",
+            events_count_fragment(app)
+        ))),
+        Line::from(Span::raw(format!(" Class ({class_count}) "))),
     ];
     let selected = match app.address.tab {
         AddressTab::Transactions => 0,
@@ -444,6 +466,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
@@ -513,6 +536,27 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             tx.endpoint_names.clone()
         };
         let contracts_display = format_called_contracts(app, &tx.called_contracts);
+        // A tx is "privacy" iff any of its top-level called contracts is in the
+        // curated privacy bundle. Catches the common case (top-level pool call
+        // or pool-via-known-helper). OE-wrapped sponsored txs that only reach
+        // the pool through an inner relayer call won't be flagged here — the
+        // tx-summary level doesn't carry inner-call structure. Acceptable v1
+        // limitation; users still see the Privacy tab when they open the tx.
+        let is_privacy_tx = app
+            .search_engine
+            .as_ref()
+            .map(|e| {
+                let reg = e.registry();
+                tx.called_contracts
+                    .iter()
+                    .any(|c| reg.is_privacy_address(c))
+            })
+            .unwrap_or(false);
+        let contracts_style = if is_privacy_tx {
+            theme::PRIVACY_STYLE
+        } else {
+            theme::LABEL_STYLE
+        };
 
         let status_style = match tx.status.as_str() {
             "OK" => theme::STATUS_OK,
@@ -536,11 +580,12 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             theme::TX_HASH_STYLE
         };
 
+        let prv_marker_text = if is_privacy_tx { "🛡   " } else { "    " };
         let main_line = Line::from(vec![
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
             Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-            Span::styled(format!("{:<30}", contracts_display), theme::LABEL_STYLE),
+            Span::styled(format!("{:<30}", contracts_display), contracts_style),
             Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
             Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
             Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -549,6 +594,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::BLOCK_NUMBER_STYLE,
             ),
             Span::styled(format!("{:<4}", &tx.status), status_style),
+            Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
             Span::styled(age, theme::BLOCK_AGE_STYLE),
         ]);
         items.push(ListItem::new(main_line));
@@ -713,12 +759,8 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .items
         .iter()
         .map(|call| {
-            let is_known = registry.is_some_and(|r| r.is_known(&call.sender));
-            let sender_style = if is_known {
-                theme::LABEL_STYLE
-            } else {
-                app.address.call_color_map.style_for(&call.sender)
-            };
+            let sender_style =
+                known_or_palette_style(&call.sender, registry, &app.address.call_color_map);
             let sender_label = app.format_address(&call.sender);
             let sender_display = if sender_label.chars().count() > 25 {
                 let truncated: String = sender_label.chars().take(24).collect();
@@ -818,6 +860,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::styled("Fee(STRK)      ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
 
@@ -878,6 +921,23 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 protocol
             };
+            // Privacy detection on meta-txs uses the inner-call targets,
+            // which is precisely the place an OE-wrapped sponsored tx
+            // reaches the pool — the on-chain `tx.sender` would be a
+            // relayer.
+            let is_privacy_meta = app
+                .search_engine
+                .as_ref()
+                .map(|e| {
+                    let reg = e.registry();
+                    m.inner_targets.iter().any(|t| reg.is_privacy_address(t))
+                })
+                .unwrap_or(false);
+            let protocol_style = if is_privacy_meta {
+                theme::PRIVACY_STYLE
+            } else {
+                theme::LABEL_STYLE
+            };
 
             let endpoint = if m.inner_endpoints.chars().count() > 34 {
                 let truncated: String = m.inner_endpoints.chars().take(33).collect();
@@ -904,6 +964,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            let prv_marker_text = if is_privacy_meta { "🛡   " } else { "    " };
             let line = Line::from(vec![
                 Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
@@ -913,10 +974,11 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
                 Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
-                Span::styled(format!("{:<21}", protocol_display), theme::LABEL_STYLE),
+                Span::styled(format!("{:<21}", protocol_display), protocol_style),
                 Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<4}", &m.status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
             ]);
             ListItem::new(line)
         })
@@ -965,6 +1027,64 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         .filter(|b| felt_to_u128(&b.balance_raw) > 0)
         .collect();
 
+    // Aggregate the user's *private* holdings (viewing-key decrypted,
+    // unspent incoming notes). Outgoing notes are excluded — those belong
+    // to recipients now. Spent incoming notes are excluded via the
+    // sync-time `nullifiers[*]` slot read.
+    let private_by_token: Vec<(Felt, u128, usize)> = compute_private_holdings(app, info.address);
+
+    // Layout: when there are private holdings, stack both panels at
+    // their natural heights and absorb any leftover space below.
+    // Otherwise keep the historical full-area Token Balances widget.
+    if private_by_token.is_empty() {
+        draw_token_balances(f, app, area, &nonzero);
+        return;
+    }
+    // +2 = border rows (top + bottom). The "+ 1" floor keeps an empty
+    // panel from collapsing below "Title" + 1 row.
+    let token_rows = nonzero.len().max(1) as u16;
+    let token_height = (token_rows + 2).clamp(3, 12);
+    let holdings_rows = private_by_token.len() as u16;
+    let holdings_height = (holdings_rows + 2).clamp(3, 12);
+    let chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(token_height),
+            Constraint::Length(holdings_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    draw_token_balances(f, app, chunks[0], &nonzero);
+    draw_private_holdings(f, app, chunks[1], &private_by_token);
+}
+
+/// Pad-or-truncate a token label to a fixed display width so amount
+/// columns line up across rows whose token names vary in length (e.g.
+/// "STRK" vs. an unknown `0x6d6d…6854`). Truncation marks with `…` so
+/// the row stays readable.
+fn fmt_token_name(name: &str, width: usize) -> String {
+    fmt_fixed_width(name, width)
+}
+
+/// Pad-with-spaces or truncate-with-`…` to exactly `width` columns.
+/// Used to keep every column in the Balances tab at a fixed character
+/// budget so the `·` separator aligns regardless of value length —
+/// otherwise an unknown-decimals raw u128 amount (~20 digits) bumps
+/// the suffix off-grid.
+fn fmt_fixed_width(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        let pad = " ".repeat(width - len);
+        format!("{s}{pad}")
+    } else if width == 0 {
+        String::new()
+    } else {
+        let truncated: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
+fn draw_token_balances(f: &mut Frame, app: &App, area: Rect, nonzero: &[&TokenBalance]) {
     if nonzero.is_empty() {
         f.render_widget(
             Paragraph::new(" No token balances found")
@@ -972,7 +1092,8 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(theme::BORDER_STYLE),
+                        .border_style(theme::BORDER_STYLE)
+                        .title(Span::styled(" Token Balances ", theme::TITLE_STYLE)),
                 ),
             area,
         );
@@ -983,16 +1104,20 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|bal| {
             let formatted = format_token_balance(bal);
-            let mut spans = vec![
-                Span::styled(format!(" {:<8}", bal.token_name), theme::LABEL_STYLE),
-                Span::styled(format!("{:<24}", formatted), theme::NORMAL_STYLE),
-            ];
-            if let Some(usd) = balance_usd_value(app, bal) {
-                spans.push(Span::styled(
-                    format!("  {}", price::format_usd(usd)),
+            let usd_str = balance_usd_value(app, bal)
+                .map(price::format_usd)
+                .unwrap_or_default();
+            let spans = vec![
+                Span::styled(
+                    format!(" {}  ", fmt_token_name(&bal.token_name, 10)),
+                    theme::LABEL_STYLE,
+                ),
+                Span::styled(fmt_fixed_width(&formatted, 18), theme::NORMAL_STYLE),
+                Span::styled(
+                    format!("  {}", fmt_fixed_width(&usd_str, 8)),
                     theme::SUGGESTION_STYLE,
-                ));
-            }
+                ),
+            ];
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1004,6 +1129,104 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
             .title(Span::styled(" Token Balances ", theme::TITLE_STYLE)),
     );
     f.render_widget(list, area);
+}
+
+/// Sum unspent incoming decrypted-note amounts for `address`, grouped by
+/// token. Returns `(token, amount, n_unspent_notes)` rows sorted by
+/// amount descending. Empty when the address has no viewing key, no
+/// notes synced yet, or every note is spent.
+fn compute_private_holdings(app: &App, address: Felt) -> Vec<(Felt, u128, usize)> {
+    use crate::decode::privacy_sync::NoteDirection;
+    let mut by_token: std::collections::HashMap<Felt, (u128, usize)> =
+        std::collections::HashMap::new();
+    for note in app.private_notes.values() {
+        if note.user != address {
+            continue;
+        }
+        if note.spent {
+            continue;
+        }
+        if note.direction != NoteDirection::Incoming {
+            continue;
+        }
+        let entry = by_token.entry(note.token).or_insert((0u128, 0usize));
+        entry.0 = entry.0.saturating_add(note.amount);
+        entry.1 += 1;
+    }
+    let mut rows: Vec<(Felt, u128, usize)> =
+        by_token.into_iter().map(|(t, (a, n))| (t, a, n)).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows
+}
+
+fn draw_private_holdings(f: &mut Frame, app: &App, area: Rect, rows: &[(Felt, u128, usize)]) {
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(token, amount, n_unspent)| {
+            // Prefer the registry/runtime-fetched ticker over the
+            // truncated address. `App::token_symbol` consults the
+            // static registry first, then `fetched_token_metadata`, so
+            // tokens whose `symbol()` was just fetched render the
+            // ticker (e.g. `USDS`) instead of `0x6d6d…68…`.
+            let token_name = app.token_symbol(token).unwrap_or_else(|| short_addr(token));
+            let amount_str =
+                crate::ui::views::tx_detail::format_amount_for_token(app, token, *amount);
+            let suffix = if *n_unspent == 1 {
+                "1 unspent note".to_string()
+            } else {
+                format!("{} unspent notes", n_unspent)
+            };
+            let usd_str = private_holding_usd(app, token, *amount)
+                .map(price::format_usd)
+                .unwrap_or_default();
+            let spans = vec![
+                Span::styled(
+                    format!(" {}  ", fmt_token_name(&token_name, 10)),
+                    theme::LABEL_STYLE,
+                ),
+                Span::styled(fmt_fixed_width(&amount_str, 18), theme::NORMAL_STYLE),
+                Span::styled(
+                    format!("  {}", fmt_fixed_width(&usd_str, 8)),
+                    theme::SUGGESTION_STYLE,
+                ),
+                Span::styled(format!("  · {}", suffix), theme::SUGGESTION_STYLE),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::BORDER_STYLE)
+            .title(Span::styled(
+                " Private holdings (viewing key) ",
+                theme::PRIVACY_STYLE,
+            )),
+    );
+    f.render_widget(list, area);
+}
+
+fn short_addr(felt: &Felt) -> String {
+    let s = format!("{:#x}", felt);
+    if s.len() <= 10 {
+        s
+    } else {
+        format!("{}…{}", &s[..6], &s[s.len() - 4..])
+    }
+}
+
+/// USD value of a (token, raw u128 amount) pair using today's price and
+/// registry-known decimals. Same semantics as `balance_usd_value` but
+/// for inputs that don't have a `TokenBalance` struct (e.g. summed
+/// private-note amounts).
+fn private_holding_usd(app: &App, token: &Felt, amount: u128) -> Option<f64> {
+    let price = app.price_client.as_ref()?.get_today_price(token)?;
+    let registry = app.search_engine.as_ref().map(|e| e.registry())?;
+    let decimals = registry.get_decimals(token)? as i32;
+    let raw = amount as f64;
+    let scale = 10f64.powi(decimals);
+    Some(raw / scale * price)
 }
 
 fn balance_usd_value(app: &App, bal: &TokenBalance) -> Option<f64> {

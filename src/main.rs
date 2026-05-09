@@ -114,12 +114,19 @@ async fn main() -> anyhow::Result<()> {
     let class_cache = ClassCache::new(class_cache_db, 500);
     let abi_registry = Arc::new(AbiRegistry::new(Arc::clone(&data_source), class_cache));
 
-    // Address registry — resolve labels path with XDG fallback
+    // Address registry — resolve labels and viewing-keys paths with XDG fallback.
+    // viewing_keys.toml is a separate file because the keys it holds are
+    // SECRETS that must not mix with shareable labels.
     let user_labels_path = resolve_config_file(&config.user_labels, "labels.toml");
-    let (registry_inner, labels_warning) =
-        AddressRegistry::load(&user_labels_path).unwrap_or_else(|e| {
+    let viewing_keys_path = resolve_config_file(&config.viewing_keys, "viewing_keys.toml");
+    let (registry_inner, registry_warnings) =
+        AddressRegistry::load(&user_labels_path, &viewing_keys_path).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to load address registry, using empty");
-            AddressRegistry::load(std::path::Path::new("/dev/null")).unwrap()
+            AddressRegistry::load(
+                std::path::Path::new("/dev/null"),
+                std::path::Path::new("/dev/null"),
+            )
+            .unwrap()
         });
     let registry = Arc::new(registry_inner);
     let search_engine = Arc::new(SearchEngine::new(Arc::clone(&registry)));
@@ -131,8 +138,31 @@ async fn main() -> anyhow::Result<()> {
     // Create app
     let mut app = App::new(action_tx.clone());
     app.search_engine = Some(Arc::clone(&search_engine));
-    if let Some(w) = labels_warning {
-        app.error_message = Some(w);
+    // Hydrate the on-chain ERC-20 metadata cache from SQLite so unknown
+    // tokens render correctly on the very first frame of a cold start
+    // (instead of falling back to raw u128 amounts until the live fetch
+    // round-trips).
+    app.fetched_token_metadata = data_source.load_token_metadata().into_iter().collect();
+    // Hydrate forward-decrypted Privacy Pool notes from SQLite. The
+    // in-session re-sync still fires on the first privacy-tx open (gated
+    // by `private_notes_synced`, which we deliberately do NOT pre-seed),
+    // but cached entries make the Privacy tab + Balances "Private
+    // holdings" panel correct on the very first frame instead of waiting
+    // a full storage walk.
+    {
+        let (cached_notes, cached_nullifiers) = data_source.load_private_notes();
+        app.private_notes = cached_notes.into_iter().map(|n| (n.note_id, n)).collect();
+        app.private_nullifiers = cached_nullifiers.into_iter().collect();
+        if !app.private_notes.is_empty() || !app.private_nullifiers.is_empty() {
+            info!(
+                notes = app.private_notes.len(),
+                nullifiers = app.private_nullifiers.len(),
+                "Hydrated private notes from cache"
+            );
+        }
+    }
+    if !registry_warnings.is_empty() {
+        app.error_message = Some(registry_warnings.join("\n"));
     }
     app.connection_status = app::state::ConnectionStatus::Connected {
         network: "mainnet".to_string(),

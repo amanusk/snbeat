@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use starknet::core::types::requests::CallRequest;
+use starknet::core::types::requests::{CallRequest, GetStorageAtRequest};
 use starknet::core::types::{
     AddressFilter, BlockId, BlockTag, BlockWithTxs, ContractClass, DeclareTransaction,
     DeployAccountTransaction, EventFilter, ExecutionResult, Felt, FunctionCall, InvokeTransaction,
-    MaybePreConfirmedBlockWithTxs, Transaction, TransactionReceipt, TransactionTrace,
+    MaybePreConfirmedBlockWithTxs, StorageKey, Transaction, TransactionReceipt, TransactionTrace,
 };
 use starknet::core::utils::get_contract_address;
 use starknet::providers::{
@@ -290,6 +290,23 @@ impl DataSource for RpcDataSource {
             .map_err(|e| SnbeatError::Provider(e.to_string()))
     }
 
+    async fn get_storage_at(&self, contract: Felt, key: Felt, block: Option<u64>) -> Result<Felt> {
+        let block_id = match block {
+            Some(n) => BlockId::Number(n),
+            None => BlockId::Tag(BlockTag::Latest),
+        };
+        // starknet-rust 0.19 added a 4th param for response flags (RPC v0.10
+        // optional `INCLUDE_LAST_UPDATE_BLOCK` metadata). We don't need
+        // metadata for the privacy-pool sync, so pass `None` and unwrap the
+        // bare value via `GetStorageAtResult::value()`.
+        let result = self
+            .provider
+            .get_storage_at(contract, key, block_id, None)
+            .await
+            .map_err(|e| SnbeatError::Provider(e.to_string()))?;
+        Ok(result.value())
+    }
+
     async fn get_trace(&self, hash: Felt) -> Result<TransactionTrace> {
         self.provider
             .trace_transaction(hash)
@@ -448,6 +465,54 @@ impl DataSource for RpcDataSource {
                 let mut out = Vec::with_capacity(calls.len());
                 for (contract, selector, calldata) in calls {
                     out.push(self.call_contract(contract, selector, calldata).await);
+                }
+                out
+            }
+        }
+    }
+
+    async fn batch_get_storage_at(
+        &self,
+        contract: Felt,
+        keys: &[Felt],
+        block: Option<u64>,
+    ) -> Vec<Result<Felt>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let block_id = match block {
+            Some(n) => BlockId::Number(n),
+            None => BlockId::Tag(BlockTag::Latest),
+        };
+        let requests: Vec<ProviderRequestData> = keys
+            .iter()
+            .map(|k| {
+                ProviderRequestData::GetStorageAt(GetStorageAtRequest {
+                    contract_address: contract,
+                    key: StorageKey(format!("{:#x}", k)),
+                    block_id,
+                    response_flags: None,
+                })
+            })
+            .collect();
+        match self.provider.batch_requests(&requests).await {
+            Ok(responses) => responses
+                .into_iter()
+                .map(|resp| match resp {
+                    ProviderResponseData::GetStorageAt(v) => Ok(v.value()),
+                    _ => Err(SnbeatError::Provider(
+                        "unexpected response type in storage batch".into(),
+                    )),
+                })
+                .collect(),
+            Err(e) => {
+                // Batch is all-or-nothing — fall back to sequential per-key
+                // reads so one bad slot (e.g., contract not deployed yet at
+                // `block`) doesn't sink the whole batch.
+                warn!(error = %e, "batch_requests (storage) failed, falling back to sequential");
+                let mut out = Vec::with_capacity(keys.len());
+                for k in keys {
+                    out.push(self.get_storage_at(contract, *k, block).await);
                 }
                 out
             }
