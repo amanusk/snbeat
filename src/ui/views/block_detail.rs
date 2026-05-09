@@ -114,6 +114,7 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let header = Paragraph::new(Line::from(vec![
         Span::styled("      Idx  ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Type            ", theme::SUGGESTION_STYLE),
         Span::styled("Meta      ", theme::SUGGESTION_STYLE),
         Span::styled("Hash          ", theme::SUGGESTION_STYLE),
@@ -289,10 +290,24 @@ fn draw_tx_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            let is_priv = app
+                .block_detail
+                .is_privacy_tx
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            // Total visual width = 4 cells. The shield emoji occupies 2
+            // cells, so private rows render as `🛡 ` + 2 spaces (= 4
+            // cells); empty rows render as 4 spaces (= 4 cells). Width is
+            // computed by ratatui via unicode-width, so don't `format!()`-
+            // pad the emoji string.
+            let prv_marker_text = if is_priv { "🛡  " } else { "    " };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {marker}"), theme::NORMAL_STYLE),
                 Span::styled(format!("{:<4} ", tx.index()), theme::BLOCK_NUMBER_STYLE),
                 Span::styled(format!("{:<4}", status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
                 Span::styled(format!("{:<15}", tx.type_name()), type_style),
                 Span::styled(format!("{:<10}", meta_str), theme::META_TX_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),

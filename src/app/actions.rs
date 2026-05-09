@@ -165,6 +165,10 @@ pub enum Action {
         tx_statuses: Vec<String>,
         /// Outside execution summary per tx. Some for meta txs, None otherwise.
         meta_tx_info: Vec<Option<crate::app::views::block_detail::MetaTxSummary>>,
+        /// True for any tx that touches the privacy pool — top-level call
+        /// or OE-inner call. Drives the "Prv" column shield marker on the
+        /// block tx list.
+        is_privacy_tx: Vec<bool>,
     },
     /// Transaction + receipt + decoded events loaded.
     TransactionLoaded {

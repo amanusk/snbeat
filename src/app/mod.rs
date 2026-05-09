@@ -1103,6 +1103,7 @@ impl App {
                 mut endpoint_names,
                 mut tx_statuses,
                 mut meta_tx_info,
+                mut is_privacy_tx,
             } => {
                 self.block_detail.block = Some(block);
                 // Reverse to show highest index first (descending order)
@@ -1110,10 +1111,12 @@ impl App {
                 endpoint_names.reverse();
                 tx_statuses.reverse();
                 meta_tx_info.reverse();
+                is_privacy_tx.reverse();
                 self.block_detail.txs = StatefulList::with_items(transactions);
                 self.block_detail.endpoint_names = endpoint_names;
                 self.block_detail.tx_statuses = tx_statuses;
                 self.block_detail.meta_tx_info = meta_tx_info;
+                self.block_detail.is_privacy_tx = is_privacy_tx;
 
                 // If a wrap-to-boundary is pending (Ctrl+P/N at the first/last
                 // tx of the prior block), pick the corresponding tx and stay

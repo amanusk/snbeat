@@ -485,6 +485,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
@@ -598,6 +599,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             theme::TX_HASH_STYLE
         };
 
+        let prv_marker_text = if is_privacy_tx { "🛡  " } else { "    " };
         let main_line = Line::from(vec![
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
@@ -611,6 +613,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::BLOCK_NUMBER_STYLE,
             ),
             Span::styled(format!("{:<4}", &tx.status), status_style),
+            Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
             Span::styled(age, theme::BLOCK_AGE_STYLE),
         ]);
         items.push(ListItem::new(main_line));
@@ -876,6 +879,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::styled("Fee(STRK)      ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
 
@@ -979,6 +983,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            let prv_marker_text = if is_privacy_meta { "🛡  " } else { "    " };
             let line = Line::from(vec![
                 Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
                 Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
@@ -992,6 +997,7 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
                 Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
                 Span::styled(format!("{:<4}", &m.status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
             ]);
             ListItem::new(line)
         })
