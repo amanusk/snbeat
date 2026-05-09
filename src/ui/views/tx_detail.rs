@@ -1259,21 +1259,6 @@ fn build_privacy_lines(
         .iter()
         .filter_map(|nid| app.private_notes.get(nid))
         .collect();
-    // One-shot debug log per render — fires only when there's actually
-    // an EncNoteCreated event so it doesn't spam non-privacy frames.
-    if !summary.enc_notes_created.is_empty() {
-        let needles: Vec<String> = summary
-            .enc_notes_created
-            .iter()
-            .map(|n| format!("{:#x}", n))
-            .collect();
-        tracing::debug!(
-            tx_enc_notes = ?needles,
-            indexed = app.private_notes.len(),
-            decrypted_hits = decrypted.len(),
-            "Privacy tab: matching EncNoteCreated note_ids against private_notes index"
-        );
-    }
     // Net-flow synthesis: condense (decrypted, spent) into one line
     // per token so the user doesn't have to mentally diff three
     // sections to figure out what they actually sent / received /
@@ -1896,7 +1881,9 @@ fn build_privacy_net_flow_lines(
         entry.spent_self = entry.spent_self.saturating_add(n.amount);
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (token, f) in &flows {
+    let mut ordered: Vec<(&Felt, &PrivacyTokenFlow)> = flows.iter().collect();
+    ordered.sort_by(|(a, _), (b, _)| a.to_bytes_be().cmp(&b.to_bytes_be()));
+    for (token, f) in ordered {
         if f.sent_to_external == 0
             && f.received_from_external == 0
             && f.self_change == 0

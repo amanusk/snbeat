@@ -153,8 +153,12 @@ fn build_known_state(
     direction: NoteDirection,
 ) -> HashMap<u64, ChannelKnown> {
     let mut out: HashMap<u64, ChannelKnown> = HashMap::new();
+    let mut conflicting_channels: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for n in notes.values() {
         if n.user != user || n.direction != direction {
+            continue;
+        }
+        if conflicting_channels.contains(&n.channel_idx) {
             continue;
         }
         let ck = out.entry(n.channel_idx).or_default();
@@ -171,13 +175,15 @@ fn build_known_state(
                 sub_idx = n.subchannel_idx,
                 "Conflicting tokens in resume state for the same subchannel — falling back to a full walk for this channel"
             );
-            // Reset so the resume probes for this channel won't run; the
-            // next-subchannel watermark stays accurate so we still skip
-            // the deep notes walk for higher-indexed subchannels.
+            conflicting_channels.insert(n.channel_idx);
+            continue;
         }
         if n.note_idx + 1 > entry.1 {
             entry.1 = n.note_idx + 1;
         }
+    }
+    for ch in &conflicting_channels {
+        out.remove(ch);
     }
     out
 }

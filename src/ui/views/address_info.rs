@@ -203,13 +203,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     search_bar::draw_input(f, app, chunks[0]);
     draw_header(f, app, chunks[1]);
-    draw_tabs(f, app, chunks[2]);
+
+    // Compute private holdings once per frame; reused by `draw_tabs`
+    // (for the Balances `Prv (N)` tab fragment) and by
+    // `draw_balances_tab` (which renders the per-token rows). Empty
+    // when no labelled address / no notes yet.
+    let private_holdings: Vec<(Felt, u128, usize)> = app
+        .address
+        .info
+        .as_ref()
+        .map(|i| compute_private_holdings(app, i.address))
+        .unwrap_or_default();
+
+    draw_tabs(f, app, chunks[2], &private_holdings);
 
     match app.address.tab {
         AddressTab::Transactions => draw_transactions_tab(f, app, chunks[3]),
         AddressTab::MetaTxs => draw_meta_txs_tab(f, app, chunks[3]),
         AddressTab::Calls => draw_calls_tab(f, app, chunks[3]),
-        AddressTab::Balances => draw_balances_tab(f, app, chunks[3]),
+        AddressTab::Balances => draw_balances_tab(f, app, chunks[3], &private_holdings),
         AddressTab::Events => draw_events_tab(f, app, chunks[3]),
         AddressTab::ClassHistory => draw_class_history_tab(f, app, chunks[3]),
     }
@@ -389,7 +401,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(widget, area);
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect, private_holdings: &[(Felt, u128, usize)]) {
     let bal_count = app
         .address
         .info
@@ -407,12 +419,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     // Per-token unspent-incoming count for the Balances tab. Suppressed
     // when the address has no viewing key (or no holdings yet) so the
     // tab label stays clean for the common non-privacy case.
-    let prv_count = app
-        .address
-        .info
-        .as_ref()
-        .map(|i| compute_private_holdings(app, i.address).len())
-        .unwrap_or(0);
+    let prv_count = private_holdings.len();
     let balances_title: Line = if prv_count > 0 {
         Line::from(vec![
             Span::raw(format!(" Balances ({bal_count}) ")),
@@ -1015,7 +1022,12 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, list_area, &mut app.address.meta_txs.state);
 }
 
-fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
+fn draw_balances_tab(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    private_by_token: &[(Felt, u128, usize)],
+) {
     let info = match &app.address.info {
         Some(i) => i,
         None => return,
@@ -1027,11 +1039,9 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         .filter(|b| felt_to_u128(&b.balance_raw) > 0)
         .collect();
 
-    // Aggregate the user's *private* holdings (viewing-key decrypted,
-    // unspent incoming notes). Outgoing notes are excluded — those belong
-    // to recipients now. Spent incoming notes are excluded via the
-    // sync-time `nullifiers[*]` slot read.
-    let private_by_token: Vec<(Felt, u128, usize)> = compute_private_holdings(app, info.address);
+    // `private_by_token` is computed once per frame in `draw()` and
+    // shared with `draw_tabs` so the Balances `Prv (N)` fragment and
+    // these rows always agree without scanning `app.private_notes` twice.
 
     // Layout: when there are private holdings, stack both panels at
     // their natural heights and absorb any leftover space below.
@@ -1055,7 +1065,7 @@ fn draw_balances_tab(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
     draw_token_balances(f, app, chunks[0], &nonzero);
-    draw_private_holdings(f, app, chunks[1], &private_by_token);
+    draw_private_holdings(f, app, chunks[1], private_by_token);
 }
 
 /// Pad-or-truncate a token label to a fixed display width so amount

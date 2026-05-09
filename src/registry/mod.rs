@@ -171,7 +171,9 @@ impl AddressRegistry {
     }
 
     /// Iterate over all `(user_address, viewing_key)` pairs the user has
-    /// configured. Order is the file's load order (HashMap iteration).
+    /// configured. Iteration order is stable for the lifetime of the
+    /// registry but is not guaranteed to match the on-disk ordering of
+    /// `viewing_keys.toml` (the file is parsed via TOML's map type).
     pub fn iter_viewing_keys(&self) -> impl Iterator<Item = (Felt, &SecretFelt)> {
         self.viewing_keys
             .iter()

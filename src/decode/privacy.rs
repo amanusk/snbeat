@@ -195,8 +195,9 @@ pub enum ViewingKeyStatus {
 }
 
 /// Check a user-supplied private viewing key against an on-chain
-/// `ViewingKeyRegistration` for the same user. Returns `None` when the
-/// caller has no labelled key for this user.
+/// `ViewingKeyRegistration` for the same user. Returns `Valid` if
+/// `private_key * G` matches the registered public key, `Mismatch`
+/// otherwise.
 pub fn validate_viewing_key(
     registration: &ViewingKeyRegistration,
     supplied: &crate::decode::privacy_crypto::types::SecretFelt,
