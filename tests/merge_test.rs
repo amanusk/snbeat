@@ -136,13 +136,17 @@ fn merge_preserves_selection() {
 }
 
 #[test]
-fn filter_deployment_txs_separates_deploy() {
+fn filter_deployment_txs_self_deploy_stays_in_list() {
+    // DEPLOY_ACCOUNT where the new account paid for its own deploy:
+    // it consumed nonce 0 and is part of the account's tx history,
+    // so it must populate `self.deployment` AND remain in the regular list.
     let mut state = AddressInfoState::default();
     let addr = Felt::from(0x1u64);
 
+    let deploy_hash = Felt::from(0xdu64);
     let txs = vec![
         AddressTxSummary {
-            hash: Felt::from(0xdu64),
+            hash: deploy_hash,
             nonce: 0,
             block_number: 100,
             timestamp: 0,
@@ -158,8 +162,43 @@ fn filter_deployment_txs_separates_deploy() {
     ];
 
     let regular = state.filter_deployment_txs(addr, txs);
-    assert_eq!(regular.len(), 1);
-    assert_eq!(regular[0].nonce, 1);
+    assert_eq!(regular.len(), 2);
+    assert!(
+        regular
+            .iter()
+            .any(|t| t.hash == deploy_hash && t.nonce == 0)
+    );
+    assert!(regular.iter().any(|t| t.nonce == 1));
     assert!(state.deployment.is_some());
     assert_eq!(state.deployment.as_ref().unwrap().tx_type, "DEPLOY_ACCOUNT");
+    assert_eq!(state.deployment.as_ref().unwrap().hash, deploy_hash);
+}
+
+#[test]
+fn filter_deployment_txs_udc_deploy_pulled_out() {
+    // UDC-style deploy: sender != address, so the tx belongs to the
+    // deployer's history, not the deployed contract's. It populates
+    // `self.deployment` and is removed from the regular list.
+    let mut state = AddressInfoState::default();
+    let addr = Felt::from(0x1u64);
+    let deployer = Felt::from(0x2u64);
+
+    let txs = vec![AddressTxSummary {
+        hash: Felt::from(0xdu64),
+        nonce: 0,
+        block_number: 100,
+        timestamp: 0,
+        endpoint_names: String::new(),
+        total_fee_fri: 0,
+        tip: 0,
+        tx_type: "DEPLOY (UDC)".to_string(),
+        status: "OK".to_string(),
+        sender: Some(deployer),
+        called_contracts: Vec::new(),
+    }];
+
+    let regular = state.filter_deployment_txs(addr, txs);
+    assert!(regular.is_empty());
+    assert!(state.deployment.is_some());
+    assert_eq!(state.deployment.as_ref().unwrap().sender, Some(deployer));
 }
