@@ -1158,7 +1158,7 @@ fn draw_private_holdings(f: &mut Frame, app: &App, area: Rect, rows: &[(Felt, u1
             .border_style(theme::BORDER_STYLE)
             .title(Span::styled(
                 " Private holdings (viewing key) ",
-                theme::TITLE_STYLE,
+                theme::PRIVACY_STYLE,
             )),
     );
     f.render_widget(list, area);

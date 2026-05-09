@@ -231,7 +231,7 @@ fn draw_tabs_bar(f: &mut Frame, app: &App, area: Rect, privacy: Option<&PrivacyS
     if let Some(s) = privacy {
         titles.push(Span::styled(
             format!(" Privacy ({}) ", s.actions.total()),
-            theme::META_TX_STYLE,
+            theme::PRIVACY_STYLE,
         ));
     }
     let selected = match app.tx_detail.active_tab {
@@ -508,7 +508,7 @@ fn build_header_lines(
     if let Some(p) = privacy {
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(" Tag:    ", theme::NORMAL_STYLE));
-        spans.push(Span::styled("PRIVACY", theme::META_TX_STYLE));
+        spans.push(Span::styled("PRIVACY", theme::PRIVACY_STYLE));
         spans.push(Span::styled(
             format!("  ({} actions)", p.actions.total()),
             theme::SUGGESTION_STYLE,
