@@ -3393,27 +3393,35 @@ pub(super) async fn derive_meta_txs_from_page(
     summaries
 }
 
-/// Fetch meta-transactions where `address` is the intender (issue #11).
+/// Fetch meta-transactions where `address` is the intender (issue #11) and
+/// privacy meta-txs where `address` is the viewing user (issue #41).
 ///
-/// Backed by [`crate::network::event_window::ensure_address_events_window`] so
-/// events flow through a single persistent cache shared with the Calls/Events
-/// tabs. The `continuation_token` input is repurposed as a "fetch older" flag:
+/// Runs two scans concurrently and merges results dedup'd by tx hash:
+///   - Account-events scan (`EventQueryKind::Account` on `address`) — the
+///     classic SNIP-9 / AVNU classic-forwarder path.
+///   - Pool-events discovery (`discover_private_meta_txs`) — matches
+///     `EncNoteCreated` / `NoteUsed` against the user's cached privacy
+///     index. No-op when no viewing key is configured.
+///
+/// The `continuation_token` input is repurposed as a "fetch older" flag:
 ///
 /// - `None`           → [`EventWindowPolicy::TopDelta`] (tip-of-chain, cold or delta)
 /// - `Some(_)`        → [`EventWindowPolicy::ExtendDown { window_size }`]
 ///   (scan below cached floor, adaptive window size)
 ///
-/// `from_block` is the absolute scan floor (typically deploy block) — the
-/// helper won't scan below it. When `min_searched <= from_block` we return
-/// `next_token = None` to signal "reached floor, stop paginating".
+/// `from_block` is the absolute scan floor for the account scan (typically
+/// deploy block); the pool scan uses `max(from_block, POOL_DEPLOY_BLOCK)`.
 ///
 /// `window_size` is the block range size for the next ExtendDown page; the
 /// caller tracks it across calls (`meta_tx_last_window`) and the helper
 /// returns a suggested next size adapted to the observed hit density.
 ///
-/// The returned `next_token` carries `min_searched` when more older events
-/// remain, or `None` when we've reached the floor. The UI treats it as
-/// opaque — whatever lands in the response gets echoed back on the next call.
+/// The returned `next_token` is non-`None` while *either* scan still has
+/// older blocks below its floor — the caller's auto-fill loop keeps
+/// paginating until both scans converge. When both reach their floors we
+/// return `next_token = None` to signal "reached floor, stop paginating".
+/// The UI treats `next_token` as opaque — whatever lands in the response
+/// gets echoed back on the next call.
 ///
 /// `limit` is currently ignored; kept in the Action schema until all three
 /// event-derived tabs are on the helper and we can cleanly collapse the
@@ -3476,9 +3484,13 @@ pub(super) async fn fetch_address_meta_txs(
 
     let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
     // Public scan (account events) and privacy-pool discovery run concurrently
-    // — they hit different cursors / address_events buckets, so there's no
-    // contention. Issue #41: privacy-sponsored meta-txs never touch the
-    // user's account contract, so account-events alone misses them.
+    // to overlap upstream pf-query latency. They write to disjoint
+    // `address_events` rows (user vs pool), but `merge_address_events`
+    // takes `BEGIN IMMEDIATE` so the two commits still serialize at the
+    // SQLite layer — concurrency only buys us network overlap, not a
+    // doubled disk-write rate. Issue #41: privacy-sponsored meta-txs
+    // never touch the user's account contract, so account-events alone
+    // misses them.
     let account_fut = ensure_address_events_window(
         address,
         EventQueryKind::Account,
@@ -4242,6 +4254,37 @@ pub(super) async fn discover_private_meta_txs(
             pool_floor: Some(pool_floor),
         };
     }
+
+    // Drop hashes we've already classified into `address_meta_txs` for
+    // this user. We match against `outcome.merged` (so warm-cache
+    // TopDelta picks up everything the cache covers), but on subsequent
+    // ExtendDown pages the same already-classified hashes would
+    // otherwise re-trigger `pf.get_txs_by_hash` and `build_*` work every
+    // page — cost grows linearly with the user's accumulated privacy
+    // history. The DB upsert would dedup either way, but the round trip
+    // and ABI work is wasted.
+    let already_classified: HashSet<Felt> = ds
+        .load_cached_meta_txs(&user)
+        .into_iter()
+        .map(|s| s.hash)
+        .collect();
+    let new_matches: HashSet<Felt> = matched.difference(&already_classified).copied().collect();
+    let already_seen = matched.len() - new_matches.len();
+    if new_matches.is_empty() {
+        debug!(
+            user = %format!("{:#x}", user),
+            matched = matched.len(),
+            already_seen,
+            "discover_private_meta_txs: all matches already classified, skipping"
+        );
+        return PrivateDiscoveryOutcome {
+            summaries: Vec::new(),
+            pool_min_searched,
+            pool_suggested_window,
+            pool_floor: Some(pool_floor),
+        };
+    }
+    let matched = new_matches;
 
     // Tx bodies for the fresh page come back inline; for cached events we
     // need to batch-fetch via pf-query. One round trip per
