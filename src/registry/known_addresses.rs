@@ -131,5 +131,12 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 # helper executes the Ekubo swap, helper deposits the proceeds back into
 # the pool as an OpenNote. Identified via getClassHashAt against tx
 # 0x90304ef5b180c520ce866161c0a14618a72af5aa841fe38a243220aa05bfa2.
-"0x00389e0930f2bcf14221adefb71007ca71cec4cd4f64f321836392d2748a14c6" = { name = "Privacy Ekubo Helper", type = "Privacy", verified = true, source = "bundled" }
+"0x00389e0930f2bcf14221adefb71007ca71cec4cd4f64f321836392d2748a14c6" = { name = "Ekubo Anonymizer", type = "Privacy", verified = true, source = "bundled" }
+# Privacy Pool's Vesu lending helper (class
+# `0x2fec72887f6431e4a66090bec49ecf8bde30cf39a7045e4ed6ce57447704b24`,
+# ABI interface `IVesuLendingHelper`). Mirrors the Ekubo helper pattern
+# for Vesu deposits/redeems: wraps ETH ↔ vETH (and analogous yield
+# tokens) on behalf of the pool so private positions can earn lending
+# yield without revealing identity.
+"0x028b49bc7a48b92d06d436d90e889729d7161dfc2fef3f16b674029bf7abc336" = { name = "Vesu Anonymizer", type = "Privacy", verified = true, source = "bundled" }
 "#;
