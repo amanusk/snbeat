@@ -1270,7 +1270,14 @@ fn build_privacy_lines(
         .filter_map(|nul| app.private_nullifiers.get(nul))
         .filter_map(|nid| app.private_notes.get(nid))
         .collect();
-    let net_lines = build_privacy_net_flow_lines(app, &decrypted, &spent_for_summary);
+    let net_lines = build_privacy_net_flow_lines(
+        app,
+        summary,
+        &decrypted,
+        &spent_for_summary,
+        color_map,
+        selected,
+    );
     if !net_lines.is_empty() {
         for line in net_lines {
             lines.push(line);
@@ -1842,15 +1849,32 @@ struct PrivacyTokenFlow {
     /// synth line can name them inline. `None` for purely internal
     /// flows.
     external_counterparty: Option<Felt>,
+    /// Sum of public `Deposit` event amounts (visible without viewing
+    /// keys). Surfaces pool-position changes for tokens we lack
+    /// viewing keys for, and as cross-check detail when we have them.
+    public_deposited: u128,
+    /// Sum of public `Withdrawal` event amounts.
+    public_withdrawn: u128,
+    /// Sum of public `OpenNoteDeposited` event amounts (open-note
+    /// deposits — token + amount are public).
+    public_open_deposited: u128,
+    /// Public depositor address (from `Deposit` / `OpenNoteDeposited`).
+    public_depositor: Option<Felt>,
+    /// Public withdrawal recipient (from `Withdrawal`).
+    public_withdraw_to: Option<Felt>,
 }
 
 /// Synthesize one Net-flow line per token from the decrypted/spent
-/// note sets for this tx. Returns empty when the tx has no
-/// viewing-key-decoded activity.
+/// note sets and public pool events for this tx. Returns empty when
+/// neither viewing-key-decoded activity nor public pool flows exist
+/// for any token.
 fn build_privacy_net_flow_lines(
     app: &App,
+    summary: &PrivacySummary,
     decrypted: &[&crate::decode::privacy_sync::DecryptedNote],
     spent: &[&crate::decode::privacy_sync::DecryptedNote],
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
 ) -> Vec<Line<'static>> {
     use crate::decode::privacy_sync::NoteDirection;
     let mut flows: std::collections::HashMap<Felt, PrivacyTokenFlow> =
@@ -1880,77 +1904,194 @@ fn build_privacy_net_flow_lines(
         let entry = flows.entry(n.token).or_default();
         entry.spent_self = entry.spent_self.saturating_add(n.amount);
     }
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut ordered: Vec<(&Felt, &PrivacyTokenFlow)> = flows.iter().collect();
+    // Public pool flows: visible without viewing keys. Cover tokens we
+    // can't decrypt (no viewing key for the recipient) and act as a
+    // public-side cross-check for tokens we can.
+    for d in &summary.deposits {
+        let entry = flows.entry(d.token).or_default();
+        entry.public_deposited = entry.public_deposited.saturating_add(d.amount);
+        entry.public_depositor.get_or_insert(d.user_addr);
+    }
+    for w in &summary.withdrawals {
+        let entry = flows.entry(w.token).or_default();
+        entry.public_withdrawn = entry.public_withdrawn.saturating_add(w.amount);
+        entry.public_withdraw_to.get_or_insert(w.to_addr);
+    }
+    for ond in &summary.open_notes_deposited {
+        let entry = flows.entry(ond.token).or_default();
+        entry.public_open_deposited = entry.public_open_deposited.saturating_add(ond.amount);
+        entry.public_depositor.get_or_insert(ond.depositor);
+    }
+    let mut ordered: Vec<(&Felt, &PrivacyTokenFlow)> = flows
+        .iter()
+        .filter(|(_, f)| {
+            f.sent_to_external != 0
+                || f.received_from_external != 0
+                || f.self_change != 0
+                || f.spent_self != 0
+                || f.public_deposited != 0
+                || f.public_withdrawn != 0
+                || f.public_open_deposited != 0
+        })
+        .collect();
     ordered.sort_by(|(a, _), (b, _)| a.to_bytes_be().cmp(&b.to_bytes_be()));
-    for (token, f) in ordered {
-        if f.sent_to_external == 0
-            && f.received_from_external == 0
-            && f.self_change == 0
-            && f.spent_self == 0
-        {
-            continue;
-        }
-        // Net pool-position delta = inflows (received + change) - outflows (consumed).
-        // sent_to_external doesn't change the user's pool *position*
-        // (the user already had those funds; they're just leaving) —
-        // it's accounted for in `spent_self`.
-        let inflow = f.received_from_external.saturating_add(f.self_change);
-        let outflow = f.spent_self;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if ordered.is_empty() {
+        return lines;
+    }
+    lines.push(Line::from(Span::styled(
+        format!(" Pool changes ({})", ordered.len()),
+        theme::TITLE_STYLE,
+    )));
+    let total = ordered.len();
+    for (i, (token, f)) in ordered.iter().enumerate() {
+        let last = i == total - 1;
+        let branch = if last { "└─" } else { "├─" };
+        // Net pool-position delta. sent_to_external doesn't change the
+        // user's pool *position* (the user already had those funds;
+        // they're just leaving) — it's accounted for in `spent_self`.
+        //
+        // Public events (Deposit / Withdrawal / OpenNoteDeposited) and
+        // viewing-key flows (self_change / spent_self) describe the
+        // same value movement from two angles: a Withdrawal pairs with
+        // a NoteUsed, a Deposit pairs with an EncNoteCreated. To avoid
+        // double-counting in the common single-actor case we take the
+        // max per side. When viewing keys are missing, the public side
+        // is the only signal and `max` falls back to it cleanly.
+        let inflow_vk = f.received_from_external.saturating_add(f.self_change);
+        let inflow_public = f.public_deposited.saturating_add(f.public_open_deposited);
+        let inflow = inflow_vk.max(inflow_public);
+        let outflow = f.spent_self.max(f.public_withdrawn);
         let (sign, abs) = if inflow >= outflow {
             ("+", inflow - outflow)
         } else {
             ("-", outflow - inflow)
         };
         let token_label = fmt_addr(app, token);
-        let token_style = theme::SUGGESTION_STYLE;
+        let token_style = addr_style(token, color_map, selected);
         let amount_str = format_amount_for_token(app, token, abs);
 
-        let mut details: Vec<String> = Vec::new();
+        // Each detail is a list of spans so addresses can be styled
+        // (registry color / visual-selected highlight) instead of
+        // inlined as plain hex inside one suggestion-styled blob.
+        let mut details: Vec<Vec<Span<'static>>> = Vec::new();
+        let addr_span = |addr: &Felt| -> Span<'static> {
+            Span::styled(fmt_addr(app, addr), addr_style(addr, color_map, selected))
+        };
+        let unknown_addr_span =
+            || -> Span<'static> { Span::styled("?".to_string(), theme::SUGGESTION_STYLE) };
+        let prefix = |s: &str| Span::styled(s.to_string(), theme::SUGGESTION_STYLE);
         if f.sent_to_external > 0 {
-            let cp = f
+            let cp_span = f
                 .external_counterparty
-                .map(|c| fmt_addr(app, &c))
-                .unwrap_or_else(|| "?".into());
-            details.push(format!(
-                "sent {} → {}",
-                format_amount_for_token(app, token, f.sent_to_external),
-                cp
-            ));
+                .as_ref()
+                .map(addr_span)
+                .unwrap_or_else(unknown_addr_span);
+            details.push(vec![
+                prefix(&format!(
+                    "sent {} → ",
+                    format_amount_for_token(app, token, f.sent_to_external)
+                )),
+                cp_span,
+            ]);
         }
         if f.received_from_external > 0 {
-            let cp = f
+            let cp_span = f
                 .external_counterparty
-                .map(|c| fmt_addr(app, &c))
-                .unwrap_or_else(|| "?".into());
-            details.push(format!(
-                "received {} from {}",
-                format_amount_for_token(app, token, f.received_from_external),
-                cp
-            ));
+                .as_ref()
+                .map(addr_span)
+                .unwrap_or_else(unknown_addr_span);
+            details.push(vec![
+                prefix(&format!(
+                    "received {} from ",
+                    format_amount_for_token(app, token, f.received_from_external)
+                )),
+                cp_span,
+            ]);
         }
         if f.self_change > 0 {
-            details.push(format!(
+            details.push(vec![prefix(&format!(
                 "{} change",
                 format_amount_for_token(app, token, f.self_change)
-            ));
+            ))]);
         }
         if f.spent_self > 0 {
-            details.push(format!(
+            details.push(vec![prefix(&format!(
                 "consumed {}",
                 format_amount_for_token(app, token, f.spent_self)
-            ));
+            ))]);
+        }
+        if f.public_deposited > 0 {
+            let from_span = f
+                .public_depositor
+                .as_ref()
+                .map(addr_span)
+                .unwrap_or_else(unknown_addr_span);
+            details.push(vec![
+                prefix(&format!(
+                    "deposited {} from ",
+                    format_amount_for_token(app, token, f.public_deposited)
+                )),
+                from_span,
+            ]);
+        }
+        if f.public_open_deposited > 0 {
+            let from_span = f
+                .public_depositor
+                .as_ref()
+                .map(addr_span)
+                .unwrap_or_else(unknown_addr_span);
+            details.push(vec![
+                prefix(&format!(
+                    "open-deposited {} from ",
+                    format_amount_for_token(app, token, f.public_open_deposited)
+                )),
+                from_span,
+            ]);
+        }
+        if f.public_withdrawn > 0 {
+            let to_span = f
+                .public_withdraw_to
+                .as_ref()
+                .map(addr_span)
+                .unwrap_or_else(unknown_addr_span);
+            details.push(vec![
+                prefix(&format!(
+                    "withdrew {} → ",
+                    format_amount_for_token(app, token, f.public_withdrawn)
+                )),
+                to_span,
+            ]);
+        }
+
+        // Marker prefix highlights the line when any of the involved
+        // addresses (token, counterparty, depositor, withdraw recipient)
+        // is the visual-selected nav target.
+        let mut marker_addrs: Vec<&Felt> = vec![token];
+        if let Some(c) = f.external_counterparty.as_ref() {
+            marker_addrs.push(c);
+        }
+        if let Some(c) = f.public_depositor.as_ref() {
+            marker_addrs.push(c);
+        }
+        if let Some(c) = f.public_withdraw_to.as_ref() {
+            marker_addrs.push(c);
         }
         let mut spans = vec![
-            Span::styled(" Pool change: ", theme::TITLE_STYLE),
+            addr_marker_any(&marker_addrs, selected),
+            Span::styled(format!("{branch} "), theme::BORDER_STYLE),
             Span::styled(format!("{sign}{amount_str} "), theme::TX_FEE_STYLE),
             Span::styled(token_label, token_style),
         ];
         if !details.is_empty() {
-            spans.push(Span::styled(
-                format!("  ({})", details.join(" · ")),
-                theme::SUGGESTION_STYLE,
-            ));
+            spans.push(prefix("  ("));
+            for (di, dpieces) in details.iter().enumerate() {
+                if di > 0 {
+                    spans.push(prefix(" · "));
+                }
+                spans.extend(dpieces.iter().cloned());
+            }
+            spans.push(prefix(")"));
         }
         lines.push(Line::from(spans));
     }
