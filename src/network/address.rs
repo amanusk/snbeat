@@ -3475,7 +3475,11 @@ pub(super) async fn fetch_address_meta_txs(
     };
 
     let ds_dyn: Arc<dyn crate::data::DataSource> = ds.clone();
-    let outcome = match ensure_address_events_window(
+    // Public scan (account events) and privacy-pool discovery run concurrently
+    // — they hit different cursors / address_events buckets, so there's no
+    // contention. Issue #41: privacy-sponsored meta-txs never touch the
+    // user's account contract, so account-events alone misses them.
+    let account_fut = ensure_address_events_window(
         address,
         EventQueryKind::Account,
         policy,
@@ -3483,13 +3487,63 @@ pub(super) async fn fetch_address_meta_txs(
         &ds_dyn,
         latest_block,
         from_block,
-    )
-    .await
-    {
+    );
+    let private_fut = discover_private_meta_txs(
+        address,
+        from_block,
+        continuation_token,
+        window_size,
+        &ds_dyn,
+        pf,
+        abi_reg,
+    );
+    let (outcome_res, private_outcome) = tokio::join!(account_fut, private_fut);
+    let PrivateDiscoveryOutcome {
+        summaries: mut private_summaries,
+        pool_min_searched,
+        pool_suggested_window,
+        pool_floor,
+    } = private_outcome;
+
+    // Pagination must keep going while *either* scan still has older
+    // blocks below the floor — pool may need many more pages of
+    // ExtendDown after the user account scan has reached its floor (the
+    // pool's `address_events` cache is shared and typically partially
+    // filled, so first-time discovery on a long-running user walks the
+    // pool downward over multiple pages even when the account scan is
+    // immediately at floor). The pool's floor is `max(account_deploy,
+    // pool_deploy)` — so accounts deployed before the pool stop walking
+    // at the pool's deploy block (no privacy events possible earlier).
+    let pool_has_more = matches!(
+        (pool_min_searched, pool_floor),
+        (Some(m), Some(f)) if m > f
+    );
+
+    let outcome = match outcome_res {
         Ok(o) => o,
         Err(e) => {
             warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: event window fetch failed");
-            send_empty();
+            // Still surface privacy-discovery results — they don't depend on
+            // the account scan and may be the only rows available for users
+            // whose only meta-txs are sponsored privacy ones.
+            if !private_summaries.is_empty() {
+                ds.save_meta_txs(&address, &private_summaries);
+                sort_meta_txs_recency(&mut private_summaries);
+            }
+            let _ = action_tx.send(Action::AddressMetaTxsLoaded {
+                address,
+                summaries: private_summaries,
+                next_token: if pool_has_more {
+                    pool_min_searched
+                } else {
+                    None
+                },
+                next_window_size: if pool_has_more {
+                    pool_suggested_window
+                } else {
+                    None
+                },
+            });
             return;
         }
     };
@@ -3501,38 +3555,62 @@ pub(super) async fn fetch_address_meta_txs(
         deferred_gap: outcome.deferred_gap,
     });
 
-    // Stop paginating once we've scanned down to (or past) the deploy-block
-    // floor. The UI uses `next_token = None` as the "done" signal.
-    let has_more_below = outcome.min_searched > from_block;
+    // Either scan having unscanned blocks below the floor means more
+    // pages remain. Pick the deeper cursor (lower min_searched) so the
+    // App's auto-fill loop converges; suggested_next_window mirrors that
+    // choice so the next call's window comes from the scan still doing
+    // work.
+    let account_has_more = outcome.min_searched > from_block;
+    let has_more_below = account_has_more || pool_has_more;
+    let (combined_next_token, combined_next_window) = if has_more_below {
+        let pool_min = pool_min_searched.unwrap_or(u64::MAX);
+        if !account_has_more && pool_has_more {
+            (Some(pool_min), pool_suggested_window)
+        } else if account_has_more && !pool_has_more {
+            (Some(outcome.min_searched), outcome.suggested_next_window)
+        } else {
+            // Both have more — drive on whichever is deeper so we don't
+            // re-scan ranges already covered by the other.
+            if outcome.min_searched <= pool_min {
+                (Some(outcome.min_searched), outcome.suggested_next_window)
+            } else {
+                (Some(pool_min), pool_suggested_window)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
-    // `ExtendDown` past floor returns an empty page — still emit an empty
-    // response so the UI clears its loading flag and flips has_more=false.
+    // Empty public page: derive/calls work has nothing to do, but privacy
+    // summaries from the parallel scan may still need to flow through. Emit
+    // them with the combined pagination signal so the App's auto-fill loop
+    // can keep walking the pool down.
     if outcome.page.events.is_empty() {
         debug!(
             addr = %format!("{:#x}", address),
             min_searched = outcome.min_searched,
             max_searched = outcome.max_searched,
             floor = from_block,
+            private_meta_txs = private_summaries.len(),
+            pool_min_searched = ?pool_min_searched,
+            pool_has_more,
+            account_has_more,
             "MetaTxs: no new events in this window"
         );
+        if !private_summaries.is_empty() {
+            ds.save_meta_txs(&address, &private_summaries);
+        }
+        sort_meta_txs_recency(&mut private_summaries);
         let _ = action_tx.send(Action::AddressMetaTxsLoaded {
             address,
-            summaries: Vec::new(),
-            next_token: if has_more_below {
-                Some(outcome.min_searched)
-            } else {
-                None
-            },
-            next_window_size: if has_more_below {
-                outcome.suggested_next_window
-            } else {
-                None
-            },
+            summaries: private_summaries,
+            next_token: combined_next_token,
+            next_window_size: combined_next_window,
         });
         return;
     }
 
-    let summaries = derive_meta_txs_from_page(address, &outcome.page, abi_reg).await;
+    let mut summaries = derive_meta_txs_from_page(address, &outcome.page, abi_reg).await;
 
     // Plan §2: the meta-tx scan's tx_rows are also valuable Calls rows — every
     // `execute_from_outside(intender=ADDR)` tx is an outer invoke whose
@@ -3543,16 +3621,33 @@ pub(super) async fn fetch_address_meta_txs(
     let calls_from_page =
         build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg).await;
 
+    // Merge in the privacy-discovery results, deduping by hash. The DB and
+    // App reducer both upsert on hash, but merging here keeps the logged
+    // counts honest and avoids saving the same row twice in this call.
+    let public_count = summaries.len();
+    let private_count = private_summaries.len();
+    let existing: std::collections::HashSet<_> = summaries.iter().map(|s| s.hash).collect();
+    for s in private_summaries.drain(..) {
+        if !existing.contains(&s.hash) {
+            summaries.push(s);
+        }
+    }
+    sort_meta_txs_recency(&mut summaries);
+
     info!(
         addr = %format!("{:#x}", address),
         events = outcome.page.events.len(),
         candidates = outcome.page.tx_rows.len(),
         meta_txs = summaries.len(),
+        public_meta_txs = public_count,
+        private_meta_txs = private_count,
         supplementary_calls = calls_from_page.len(),
-        min_searched = outcome.min_searched,
-        max_searched = outcome.max_searched,
+        account_min_searched = outcome.min_searched,
+        account_max_searched = outcome.max_searched,
+        pool_min_searched = ?pool_min_searched,
         floor = from_block,
-        suggested_next_window = ?outcome.suggested_next_window,
+        next_token = ?combined_next_token,
+        next_window = ?combined_next_window,
         deferred_gap = ?outcome.deferred_gap,
         "MetaTxs: classified"
     );
@@ -3568,24 +3663,11 @@ pub(super) async fn fetch_address_meta_txs(
         });
     }
 
-    // Signal "has more older" via Some(min_searched). The UI doesn't interpret
-    // the value — it just checks is_some and echoes it back on the next call.
-    let next_token = if has_more_below {
-        Some(outcome.min_searched)
-    } else {
-        None
-    };
-    let next_window_size = if has_more_below {
-        outcome.suggested_next_window
-    } else {
-        None
-    };
-
     let _ = action_tx.send(Action::AddressMetaTxsLoaded {
         address,
         summaries,
-        next_token,
-        next_window_size,
+        next_token: combined_next_token,
+        next_window_size: combined_next_window,
     });
 }
 
@@ -3983,6 +4065,352 @@ pub(super) fn sort_meta_txs_recency(summaries: &mut [crate::data::types::MetaTxI
             .cmp(&a.block_number)
             .then(b.tx_index.cmp(&a.tx_index))
     });
+}
+
+/// Outcome of a single pool-events discovery pass.
+///
+/// `summaries` is what flows into the MetaTxs list. `pool_min_searched`
+/// and `pool_suggested_window` let `fetch_address_meta_txs` decide
+/// whether to keep paginating: even when the user's account-events scan
+/// has reached the deploy-block floor, the pool-events scan may still
+/// have older blocks to cover where the user's privacy txs were
+/// originally emitted. `pool_floor` is the block below which there's
+/// nothing useful to scan — `max(account_deploy, pool_deploy)`.
+pub(super) struct PrivateDiscoveryOutcome {
+    pub summaries: Vec<crate::data::types::MetaTxIntenderSummary>,
+    /// Lowest block the pool's `address_events` cache covers after this
+    /// pass. `None` when discovery was skipped (no privacy index for the
+    /// user) — caller should treat as "no pool-scan pagination needed".
+    pub pool_min_searched: Option<u64>,
+    /// Adapted window size for the pool's next ExtendDown call (mirrors
+    /// the user-account scan's adaptive sizing). `None` when discovery
+    /// was skipped or for non-ExtendDown policies.
+    pub pool_suggested_window: Option<u64>,
+    /// Effective floor used for the pool scan: `max(account_deploy_block,
+    /// pool_deploy_block)`. Pagination should stop once
+    /// `pool_min_searched <= pool_floor`. `None` when discovery was
+    /// skipped.
+    pub pool_floor: Option<u64>,
+}
+
+/// Discover privacy meta-txs by scanning pool events and matching against
+/// the user's already-decrypted note set (issue #41).
+///
+/// `execute_private_sponsored` flows go `relayer → AVNU forwarder → pool`,
+/// so the user's account contract is never invoked and the standard
+/// `EventQueryKind::Account` scan returns nothing for them. The pool,
+/// however, emits at least one `EncNoteCreated` (recipient) or `NoteUsed`
+/// (spender) per privacy tx — matching either against the user's cached
+/// `private_notes` / `private_nullifiers` lets us attribute the tx to the
+/// viewer without breaking privacy. Anchoring on pool events also gives
+/// us a single discovery path that catches every privacy paymaster
+/// pattern (SNIP-9 v\*, AVNU classic forwarder, AVNU paymaster v2,
+/// future wrappers) without per-paymaster carve-outs.
+///
+/// Returns an empty outcome for users with no cached privacy index —
+/// there's nothing observable to match against, which is also a hard
+/// cryptographic limit, not a code limitation.
+///
+/// The pool's `address_events` cache is shared across all viewing-key
+/// users on the same machine, so the second user's MetaTxs tab pays only
+/// the membership-check cost.
+pub(super) async fn discover_private_meta_txs(
+    user: starknet::core::types::Felt,
+    from_block: u64,
+    continuation_token: Option<u64>,
+    window_size: u64,
+    ds: &Arc<dyn DataSource>,
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+    abi_reg: &Arc<AbiRegistry>,
+) -> PrivateDiscoveryOutcome {
+    use std::collections::{HashMap, HashSet};
+
+    use starknet::core::types::Felt;
+
+    use crate::decode::privacy::{
+        POOL_ADDRESS, POOL_DEPLOY_BLOCK, PoolEventMatch, match_pool_event,
+    };
+    use crate::network::event_window::{
+        EXTEND_DOWN_INITIAL_WINDOW, EventWindowPolicy, ensure_address_events_window,
+    };
+
+    let empty_outcome = || PrivateDiscoveryOutcome {
+        summaries: Vec::new(),
+        pool_min_searched: None,
+        pool_suggested_window: None,
+        pool_floor: None,
+    };
+
+    let (notes, nullifier_pairs) = ds.load_private_notes_for_user(&user);
+    if notes.is_empty() && nullifier_pairs.is_empty() {
+        return empty_outcome();
+    }
+    let note_ids: HashSet<Felt> = notes.iter().map(|n| n.note_id).collect();
+    let nullifiers: HashSet<Felt> = nullifier_pairs.iter().map(|(n, _)| *n).collect();
+
+    let latest_block = match ds.get_latest_block_number().await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(
+                user = %format!("{:#x}", user),
+                error = %e,
+                "discover_private_meta_txs: latest block fetch failed"
+            );
+            return empty_outcome();
+        }
+    };
+
+    let effective_window = if window_size == 0 {
+        EXTEND_DOWN_INITIAL_WINDOW
+    } else {
+        window_size
+    };
+    let policy = match continuation_token {
+        None => EventWindowPolicy::TopDelta,
+        Some(_) => EventWindowPolicy::ExtendDown {
+            window_size: effective_window,
+        },
+    };
+
+    let pool = *POOL_ADDRESS;
+    // Tighten the pool scan floor to whichever is later: the user's
+    // account deploy block (no activity possible before they existed) or
+    // the pool's own deploy block (no privacy events possible before it
+    // existed). For accounts deployed pre-pool, this saves walking the
+    // ~9M empty pre-pool blocks. The pool's own cursor (under
+    // `(pool, FilterKind::Unkeyed)`) is shared across viewing-key users,
+    // so additional users on the same machine get cache hits.
+    let pool_floor = from_block.max(POOL_DEPLOY_BLOCK);
+    let outcome = match ensure_address_events_window(
+        pool,
+        EventQueryKind::Contract,
+        policy,
+        Some(pf),
+        ds,
+        latest_block,
+        pool_floor,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(
+                user = %format!("{:#x}", user),
+                error = %e,
+                "discover_private_meta_txs: pool event scan failed"
+            );
+            return empty_outcome();
+        }
+    };
+    let pool_min_searched = Some(outcome.min_searched);
+    let pool_suggested_window = outcome.suggested_next_window;
+
+    // Scan the *full* cached event list (cached + this fetch's delta), not
+    // just the fresh page. The pool's `address_events` cache is shared
+    // across all viewing-key users and is typically warm by the time the
+    // user opens MetaTxs (the pool is also commonly visited as a contract
+    // address), so a TopDelta pass that fetches no new events would
+    // otherwise see `pool_events=0` and miss every prior match.
+    let mut matched: HashSet<Felt> = HashSet::new();
+    for ev in &outcome.merged {
+        match match_pool_event(ev) {
+            Some(PoolEventMatch::Note(nid)) if note_ids.contains(&nid) => {
+                matched.insert(ev.transaction_hash);
+            }
+            Some(PoolEventMatch::Nullifier(nul)) if nullifiers.contains(&nul) => {
+                matched.insert(ev.transaction_hash);
+            }
+            _ => {}
+        }
+    }
+
+    debug!(
+        user = %format!("{:#x}", user),
+        cached_pool_events = outcome.merged.len(),
+        fresh_pool_events = outcome.page.events.len(),
+        matched_txs = matched.len(),
+        min_searched = outcome.min_searched,
+        max_searched = outcome.max_searched,
+        "discover_private_meta_txs: matched"
+    );
+
+    if matched.is_empty() {
+        return PrivateDiscoveryOutcome {
+            summaries: Vec::new(),
+            pool_min_searched,
+            pool_suggested_window,
+            pool_floor: Some(pool_floor),
+        };
+    }
+
+    // Tx bodies for the fresh page come back inline; for cached events we
+    // need to batch-fetch via pf-query. One round trip per
+    // `discover_private_meta_txs` call is fine — `matched` is bounded by
+    // the user's own privacy activity, not by total pool events.
+    let mut row_by_hash: HashMap<Felt, crate::data::pathfinder::TxByHashData> = HashMap::new();
+    for row in &outcome.page.tx_rows {
+        if let Ok(h) = Felt::from_hex(&row.hash) {
+            row_by_hash.insert(h, row.clone());
+        }
+    }
+    let missing: Vec<Felt> = matched
+        .iter()
+        .copied()
+        .filter(|h| !row_by_hash.contains_key(h))
+        .collect();
+    let mut fetched_rows = 0usize;
+    if !missing.is_empty() {
+        match pf.get_txs_by_hash(&missing).await {
+            Ok(rows) => {
+                fetched_rows = rows.len();
+                for row in rows {
+                    if let Ok(h) = Felt::from_hex(&row.hash) {
+                        row_by_hash.insert(h, row);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    user = %format!("{:#x}", user),
+                    error = %e,
+                    missing = missing.len(),
+                    "discover_private_meta_txs: tx body batch fetch failed"
+                );
+                // Continue with whatever rows we do have.
+            }
+        }
+    }
+
+    let mut summaries: Vec<crate::data::types::MetaTxIntenderSummary> =
+        Vec::with_capacity(matched.len());
+    let mut dropped_no_body = 0usize;
+    let mut dropped_no_oe = 0usize;
+    for tx_hash in &matched {
+        let Some(row) = row_by_hash.get(tx_hash) else {
+            // pf-query didn't return a body for this hash (very rare:
+            // pruned, reorged, or outside the pf coverage range). Skip;
+            // a future scan that includes its block will pick it up.
+            dropped_no_body += 1;
+            continue;
+        };
+        match build_private_meta_tx_summary(row, abi_reg).await {
+            Some(s) => summaries.push(s),
+            None => {
+                // Most common: a direct user-signed pool tx (e.g.
+                // viewing-key registration) — not a meta-tx. Logged
+                // for diagnostics.
+                dropped_no_oe += 1;
+                debug!(
+                    user = %format!("{:#x}", user),
+                    tx = %row.hash,
+                    sender = %row.sender,
+                    tx_type = %row.tx_type,
+                    "discover_private_meta_txs: matched tx is not a meta-tx (no OE wrapping the pool call)"
+                );
+            }
+        }
+    }
+    sort_meta_txs_recency(&mut summaries);
+
+    debug!(
+        user = %format!("{:#x}", user),
+        matched = matched.len(),
+        fetched_rows,
+        dropped_no_body,
+        dropped_no_oe,
+        summaries = summaries.len(),
+        "discover_private_meta_txs: built"
+    );
+
+    PrivateDiscoveryOutcome {
+        summaries,
+        pool_min_searched,
+        pool_suggested_window,
+        pool_floor: Some(pool_floor),
+    }
+}
+
+/// Build a `MetaTxIntenderSummary` for a tx that pool-event matching has
+/// already attributed to the viewed user (issue #41).
+///
+/// Differs from [`classify_meta_tx_candidate`] in two ways:
+/// 1. No `oe.intender == address` filter — the user's identity is proven
+///    via the pool-event match, not via the OE struct (for
+///    `execute_private_sponsored` the OE's intender is the AVNU
+///    forwarder, by design).
+/// 2. Requires the wrapping OE's inner_calls to include the privacy pool
+///    — defensive sanity check that we've actually picked up a privacy
+///    tx and not an unrelated meta-tx happening to share a block.
+async fn build_private_meta_tx_summary(
+    row: &crate::data::pathfinder::TxByHashData,
+    abi_reg: &Arc<AbiRegistry>,
+) -> Option<crate::data::types::MetaTxIntenderSummary> {
+    use starknet::core::types::Felt;
+
+    use crate::data::types::MetaTxIntenderSummary;
+    use crate::decode::outside_execution::{DetectionMethod, detect_outside_execution};
+    use crate::decode::privacy::POOL_ADDRESS;
+
+    let hash = Felt::from_hex(&row.hash).ok()?;
+    let sender = Felt::from_hex(&row.sender).ok()?;
+    if helpers::normalize_pf_tx_type(&row.tx_type) != "INVOKE" {
+        return None;
+    }
+
+    let calldata: Vec<Felt> = row
+        .calldata
+        .iter()
+        .filter_map(|h| Felt::from_hex(h).ok())
+        .collect();
+    let calls = parse_multicall(&calldata);
+
+    let pool = *POOL_ADDRESS;
+    let mut found: Option<(
+        crate::decode::outside_execution::OutsideExecutionInfo,
+        DetectionMethod,
+    )> = None;
+    for c in &calls {
+        let name = abi_reg.get_selector_name(&c.selector);
+        let Some((oe, method)) = detect_outside_execution(c, name.as_deref()) else {
+            continue;
+        };
+        if oe.inner_calls.iter().any(|ic| ic.contract_address == pool) {
+            found = Some((oe, method));
+            break;
+        }
+    }
+    let (oe, method) = found?;
+    let label: &'static str = match method {
+        DetectionMethod::AvnuForwarder => "avnu",
+        DetectionMethod::Name => oe.version.short(),
+        DetectionMethod::Heuristic => "v?",
+    };
+
+    let targets: Vec<Felt> = oe
+        .inner_calls
+        .iter()
+        .map(|ic| ic.contract_address)
+        .collect();
+    helpers::prewarm_abis(targets.iter().copied(), abi_reg).await;
+    let inner_endpoints =
+        helpers::format_selector_names(oe.inner_calls.iter().map(|ic| ic.selector), abi_reg);
+
+    let fee_fri = u128::from_str_radix(row.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
+
+    Some(MetaTxIntenderSummary {
+        hash,
+        block_number: row.block_number,
+        tx_index: row.tx_index,
+        timestamp: row.block_timestamp,
+        paymaster: sender,
+        version: label.to_string(),
+        oe_nonce: oe.nonce,
+        total_fee_fri: fee_fri,
+        status: row.status.clone(),
+        inner_targets: targets,
+        inner_endpoints,
+        caller: oe.caller,
+    })
 }
 
 /// Lightweight RPC-only refresh for the currently-viewed account address.

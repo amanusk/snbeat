@@ -30,13 +30,20 @@ use starknet::core::utils::get_selector_from_name;
 use super::events::DecodedEvent;
 use super::functions::RawCall;
 use super::outside_execution::OutsideExecutionInfo;
-use crate::data::types::SnTransaction;
+use crate::data::types::{SnEvent, SnTransaction};
 use crate::utils::felt_to_u128;
 
 /// Mainnet Privacy Pool address.
 pub static POOL_ADDRESS: LazyLock<Felt> = LazyLock::new(|| {
     Felt::from_hex("0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a").unwrap()
 });
+
+/// Block at which the mainnet Privacy Pool was deployed. No privacy events
+/// can exist before this block, so a pool-events scan can use this as a
+/// hard floor regardless of how early the viewing user's account itself
+/// was deployed. Saves walking blocks that provably contain nothing of
+/// interest for the privacy discovery path.
+pub const POOL_DEPLOY_BLOCK: u64 = 8978970;
 
 /// Pool event selectors. Computed lazily so we never pay the cost on
 /// non-privacy txs.
@@ -110,6 +117,44 @@ enum PrivacyEventKind {
     Deposit,
     Withdrawal,
     ViewingKeySet,
+}
+
+/// What a raw pool event identifies, when the event is one we can match a
+/// user against. `EncNoteCreated` carries a `note_id`; `NoteUsed` carries a
+/// `nullifier`. Other pool events (Deposit/Withdrawal/OpenNote*) don't
+/// uniquely identify a user without breaking privacy, so they're ignored
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolEventMatch {
+    /// `keys[1]` of an `EncNoteCreated` — match against the user's
+    /// `private_notes` set to attribute the tx.
+    Note(Felt),
+    /// `keys[1]` of a `NoteUsed` — match against the user's
+    /// `private_nullifiers` set to attribute the tx.
+    Nullifier(Felt),
+}
+
+/// Inspect a raw pool event and return the felt that identifies the user
+/// (note_id or nullifier), if any. Used by the meta-tx tab's privacy
+/// discovery path (issue #41) to attribute pool-bound txs to a viewer
+/// without leaking anything across users.
+///
+/// Returns `None` when the event isn't from the pool, isn't one of the two
+/// matchable selectors, or has a malformed key array.
+pub fn match_pool_event(event: &SnEvent) -> Option<PoolEventMatch> {
+    if event.from_address != *POOL_ADDRESS {
+        return None;
+    }
+    let selector = event.keys.first()?;
+    let s = &*EVENT_SELECTORS;
+    let payload = event.keys.get(1).copied()?;
+    if *selector == s.enc_note_created {
+        Some(PoolEventMatch::Note(payload))
+    } else if *selector == s.note_used {
+        Some(PoolEventMatch::Nullifier(payload))
+    } else {
+        None
+    }
 }
 
 /// One-line action-mix summary.
@@ -817,5 +862,67 @@ mod tests {
         );
         assert_eq!(summary.paymaster, PaymasterMode::OutsideExecution);
         assert_eq!(summary.intender, Some(user_addr));
+    }
+
+    fn raw_event(from: Felt, keys: Vec<Felt>, tx_hash: Felt) -> SnEvent {
+        SnEvent {
+            from_address: from,
+            keys,
+            data: Vec::new(),
+            transaction_hash: tx_hash,
+            block_number: 0,
+            event_index: 0,
+        }
+    }
+
+    #[test]
+    fn match_pool_event_returns_note_id_for_enc_note_created() {
+        let s = &*EVENT_SELECTORS;
+        let note_id = Felt::from(0xC0FFEEu64);
+        let ev = raw_event(pool(), vec![s.enc_note_created, note_id], Felt::ZERO);
+        assert_eq!(match_pool_event(&ev), Some(PoolEventMatch::Note(note_id)));
+    }
+
+    #[test]
+    fn match_pool_event_returns_nullifier_for_note_used() {
+        let s = &*EVENT_SELECTORS;
+        let nullifier = Felt::from(0xDEADBEEFu64);
+        let ev = raw_event(pool(), vec![s.note_used, nullifier], Felt::ZERO);
+        assert_eq!(
+            match_pool_event(&ev),
+            Some(PoolEventMatch::Nullifier(nullifier))
+        );
+    }
+
+    #[test]
+    fn match_pool_event_ignores_non_pool_events() {
+        let s = &*EVENT_SELECTORS;
+        let other = Felt::from(0xBEEFu64);
+        let ev = raw_event(
+            other,
+            vec![s.enc_note_created, Felt::from(1u64)],
+            Felt::ZERO,
+        );
+        assert_eq!(match_pool_event(&ev), None);
+    }
+
+    #[test]
+    fn match_pool_event_ignores_other_pool_events() {
+        let s = &*EVENT_SELECTORS;
+        // Deposit is a pool event but doesn't uniquely identify a user.
+        let ev = raw_event(
+            pool(),
+            vec![s.deposit, Felt::from(1u64), Felt::from(2u64)],
+            Felt::ZERO,
+        );
+        assert_eq!(match_pool_event(&ev), None);
+    }
+
+    #[test]
+    fn match_pool_event_handles_truncated_keys() {
+        let s = &*EVENT_SELECTORS;
+        // Selector only — no payload. Should not panic.
+        let ev = raw_event(pool(), vec![s.enc_note_created], Felt::ZERO);
+        assert_eq!(match_pool_event(&ev), None);
     }
 }
