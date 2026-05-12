@@ -82,6 +82,7 @@ const BUNDLED_KNOWN_ADDRESSES: &str = r#"
 "0x042b8f0484674ca266ac5d08e4ac6a3fe65bd3129795def2dca5c34ecc5f96d2" = { name = "nstSTRK", type = "ERC20", verified = true, source = "bundled", decimals = 18 }
 "0x02019e47a0bc54ea6b4853c6123ffc8158ea3ae2af4166928b0de6e89f06de6c" = { name = "Relend Network USDC", type = "ERC20", verified = true, source = "bundled", decimals = 6 }
 "0x036834a40984312f7f7de8d31e3f6305b325389eaeea5b1c0664b2fb936461a4" = { name = "LBTC", type = "ERC20", verified = true, source = "bundled", decimals = 8 }
+"0x0787150e306e6eae6e3f79dea881770e8bbff2c1b8eb490f969669ee945b3135" = { name = "strkBTC", type = "ERC20", verified = true, source = "bundled", decimals = 8 }
 
 # DEXes
 "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b" = { name = "Ekubo Core", type = "DEX", verified = true, source = "bundled" }

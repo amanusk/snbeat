@@ -52,13 +52,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let color_map = build_color_map(app);
     let mut line_map: Vec<Option<u16>> = vec![None; app.tx_detail.nav_items.len()];
 
     // Compute the privacy summary once per frame (cheap: scans events + calls
     // already in memory). Threaded into the header (for the PRIVACY badge),
-    // the tab bar (to conditionally show the Privacy tab), and the body.
-    // The summarizer needs the parsed outside-execution list too, since
+    // the tab bar (to conditionally show the Privacy tab), the color map (to
+    // register the resolved private-sponsored funder), and the body. The
+    // summarizer needs the parsed outside-execution list too, since
     // sponsored privacy txs (e.g. AVNU gasless) only reach the pool through
     // an OE inner-call.
     let oe_for_privacy: Vec<crate::decode::outside_execution::OutsideExecutionInfo> = app
@@ -75,6 +75,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             &oe_for_privacy,
         )
     });
+
+    let color_map = build_color_map(app, privacy_summary.as_ref());
 
     // Header always renders, so it's always rebuilt. Tab bodies are computed
     // for all visible tabs only in visual mode — that's when cross-tab cursor
@@ -540,6 +542,12 @@ fn build_header_lines(
             crate::decode::privacy::PaymasterMode::OutsideExecution => {
                 spans.push(Span::styled(
                     "  paymaster: sponsored (outside-exec)",
+                    theme::STATUS_OK,
+                ));
+            }
+            crate::decode::privacy::PaymasterMode::PrivateSponsored => {
+                spans.push(Span::styled(
+                    "  paymaster: sponsored (private)",
                     theme::STATUS_OK,
                 ));
             }
@@ -1443,19 +1451,15 @@ fn build_privacy_lines(
     // The Withdrawal event itself doesn't carry a sender, but every
     // nullifier consumed in this tx was produced by the spend key of
     // the note's recipient. So if all resolved spent notes share a
-    // single `user`, that user is the withdrawal sender. Mixed users
-    // (multi-party tx) or no resolved nullifiers fall back to the
-    // privacy-preserving "encrypted" label.
-    let withdrawal_sender: Option<Felt> = {
-        let mut users = spent_for_summary.iter().map(|n| n.user);
-        users.next().and_then(|first| {
-            if users.all(|u| u == first) {
-                Some(first)
-            } else {
-                None
-            }
-        })
-    };
+    // single `user`, that user is the originator. The same value also
+    // names the funder for `execute_private_sponsored` txs (where the
+    // SNIP-9 intender is just the AVNU forwarder). Mixed users or no
+    // resolved nullifiers fall back to the privacy-preserving label.
+    let spent_notes_owner: Option<Felt> = crate::decode::privacy_sync::resolve_single_owner(
+        &summary.nullifiers,
+        &app.private_nullifiers,
+        &app.private_notes,
+    );
     if !summary.withdrawals.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" Withdrawals ({})", summary.withdrawals.len()),
@@ -1477,7 +1481,7 @@ fn build_privacy_lines(
                 NavSection::Privacy,
             );
             let mut spans = vec![
-                match withdrawal_sender {
+                match spent_notes_owner {
                     Some(u) => addr_marker_any(&[&u, &w.to_addr, &w.token], selected),
                     None => addr_marker_any(&[&w.to_addr, &w.token], selected),
                 },
@@ -1488,7 +1492,7 @@ fn build_privacy_lines(
                 Span::styled("  → ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &w.to_addr), to_style),
             ];
-            match withdrawal_sender {
+            match spent_notes_owner {
                 Some(u) => {
                     let style = addr_style(&u, color_map, selected);
                     spans.push(Span::styled("    sender: ", theme::SUGGESTION_STYLE));
@@ -1787,6 +1791,10 @@ fn build_privacy_lines(
             "sponsored (outside-execution intent)".to_string(),
             theme::STATUS_OK,
         ),
+        crate::decode::privacy::PaymasterMode::PrivateSponsored => (
+            "sponsored via execute_private_sponsored (AVNU privacy-aware)".to_string(),
+            theme::STATUS_OK,
+        ),
         crate::decode::privacy::PaymasterMode::PaymasterForwarder => (
             "sponsored (multicall routes through a known paymaster forwarder)".to_string(),
             theme::STATUS_OK,
@@ -1805,6 +1813,10 @@ fn build_privacy_lines(
         Span::styled(paymaster_label, paymaster_style),
     ]));
     if let Some(intender) = summary.intender {
+        let is_private_sponsored = matches!(
+            summary.paymaster,
+            crate::decode::privacy::PaymasterMode::PrivateSponsored
+        );
         let intender_style = addr_style(&intender, color_map, selected);
         record(
             &TxNavItem::Address(intender),
@@ -1814,15 +1826,57 @@ fn build_privacy_lines(
             &app.tx_detail.nav_sections,
             NavSection::Privacy,
         );
+        // For PrivateSponsored, the "intender" slot holds the AVNU
+        // forwarder, not the actual user — relabel accordingly so the
+        // tag doesn't mislead. The real funder (when recoverable) is
+        // surfaced on the line below.
+        let (label, hint) = if is_private_sponsored {
+            ("Forwarder: ", "  (AVNU — pays gas on behalf of the funder)")
+        } else {
+            (
+                "Intender:  ",
+                "  (signer of the OE intent — the actual user)",
+            )
+        };
         lines.push(Line::from(vec![
             addr_marker(&intender, selected),
-            Span::styled("Intender:  ", theme::NORMAL_STYLE),
+            Span::styled(label, theme::NORMAL_STYLE),
             Span::styled(fmt_addr_full(app, &intender), intender_style),
-            Span::styled(
-                "  (signer of the OE intent — the actual user)",
-                theme::SUGGESTION_STYLE,
-            ),
+            Span::styled(hint, theme::SUGGESTION_STYLE),
         ]));
+        if is_private_sponsored {
+            match spent_notes_owner {
+                Some(funder) => {
+                    let funder_style = addr_style(&funder, color_map, selected);
+                    record(
+                        &TxNavItem::Address(funder),
+                        lines.len(),
+                        line_map,
+                        &app.tx_detail.nav_items,
+                        &app.tx_detail.nav_sections,
+                        NavSection::Privacy,
+                    );
+                    lines.push(Line::from(vec![
+                        addr_marker(&funder, selected),
+                        Span::styled("Funder:    ", theme::NORMAL_STYLE),
+                        Span::styled(fmt_addr_full(app, &funder), funder_style),
+                        Span::styled(
+                            "  (from viewing-key nullifier lookup)",
+                            theme::SUGGESTION_STYLE,
+                        ),
+                    ]));
+                }
+                None if !summary.nullifiers.is_empty() => {
+                    lines.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("Funder:    ", theme::NORMAL_STYLE),
+                        Span::styled("encrypted", theme::SUGGESTION_STYLE),
+                        Span::styled("  (no viewing key)", theme::SUGGESTION_STYLE),
+                    ]));
+                }
+                None => {}
+            }
+        }
     }
 
     lines
@@ -2856,7 +2910,7 @@ fn block_marker(n: u64, selected: Option<&TxNavItem>) -> Span<'static> {
 /// Build the address color map for the current tx view.
 /// Sender is registered first (slot 0), then call contracts, then event contracts,
 /// then ContractAddress-typed params — so the same address always gets the same color.
-fn build_color_map(app: &App) -> AddressColorMap {
+fn build_color_map(app: &App, privacy: Option<&PrivacySummary>) -> AddressColorMap {
     let mut cm = AddressColorMap::new();
     if let Some(engine) = &app.search_engine {
         cm.set_privacy_overrides(engine.registry().privacy_addresses());
@@ -2881,6 +2935,23 @@ fn build_color_map(app: &App) -> AddressColorMap {
         for inner in &oe.inner_calls {
             cm.register(inner.contract_address);
         }
+    }
+
+    // PrivateSponsored funder, when nullifier resolution converges on a
+    // single owner via viewing keys. Registering here keeps the funder
+    // colored consistently across tabs (event params, calldata, trace).
+    if let Some(summary) = privacy
+        && matches!(
+            summary.paymaster,
+            crate::decode::privacy::PaymasterMode::PrivateSponsored
+        )
+        && let Some(funder) = crate::decode::privacy_sync::resolve_single_owner(
+            &summary.nullifiers,
+            &app.private_nullifiers,
+            &app.private_notes,
+        )
+    {
+        cm.register(funder);
     }
 
     for event in &app.tx_detail.decoded_events {

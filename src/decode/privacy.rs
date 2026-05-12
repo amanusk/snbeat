@@ -29,7 +29,7 @@ use starknet::core::utils::get_selector_from_name;
 
 use super::events::DecodedEvent;
 use super::functions::RawCall;
-use super::outside_execution::OutsideExecutionInfo;
+use super::outside_execution::{OutsideExecutionInfo, OutsideExecutionVersion};
 use crate::data::types::{SnEvent, SnTransaction};
 use crate::utils::felt_to_u128;
 
@@ -306,6 +306,12 @@ pub enum PaymasterMode {
     /// canonical SNIP-9 / AVNU gasless pattern). The intender (user) is
     /// distinct from `tx.sender` (relayer).
     OutsideExecution,
+    /// `execute_private_sponsored` — AVNU's privacy-aware sponsorship
+    /// entrypoint. The relayer pays gas; the user's authority is proven
+    /// cryptographically inside the inner pool proof, so there's no
+    /// SNIP-9 intender. The actual funder is recoverable only via viewing
+    /// keys at render time (matching consumed nullifiers to known notes).
+    PrivateSponsored,
     /// A top-level multicall entry routes through a known paymaster
     /// forwarder (e.g. AVNU Forwarder) before/around the pool call. This
     /// catches the gasless-token-fee pattern where the user pays the relayer
@@ -529,7 +535,14 @@ pub fn summarize(
     //   3. Sender is itself a known relayer.
     //   4. Otherwise: None.
     let paymaster = if !outside_executions.is_empty() {
-        PaymasterMode::OutsideExecution
+        if outside_executions
+            .iter()
+            .any(|oe| oe.version == OutsideExecutionVersion::PrivateSponsored)
+        {
+            PaymasterMode::PrivateSponsored
+        } else {
+            PaymasterMode::OutsideExecution
+        }
     } else if decoded_calls
         .iter()
         .any(|c| is_known_paymaster_forwarder(&c.contract_address))
@@ -862,6 +875,55 @@ mod tests {
         );
         assert_eq!(summary.paymaster, PaymasterMode::OutsideExecution);
         assert_eq!(summary.intender, Some(user_addr));
+    }
+
+    /// `execute_private_sponsored` wraps an inner pool call. The classifier
+    /// must return `PaymasterMode::PrivateSponsored` (not the generic
+    /// `OutsideExecution`) so the Privacy tab can label the Forwarder line
+    /// and surface a recovered Funder.
+    #[test]
+    fn detects_private_sponsored_oe() {
+        let avnu_forwarder =
+            Felt::from_hex("0x0127021a1b5a52d3174c2ab077c2b043c80369250d29428cee956d76ee51584f")
+                .unwrap();
+        let relayer = Felt::from_hex("0x22d28").unwrap();
+        let tx = invoke_tx_with_sender(relayer);
+
+        let forwarder_call = RawCall {
+            contract_address: avnu_forwarder,
+            selector: Felt::ZERO,
+            data: Vec::new(),
+            function_name: Some("execute_private_sponsored".into()),
+            function_def: None,
+            contract_abi: None,
+        };
+
+        // For execute_private_sponsored the `intender` slot carries the
+        // forwarder address itself (the actual user is hidden inside the
+        // inner proof). The classifier should still pick PrivateSponsored
+        // based on `oe.version`.
+        let oe = OutsideExecutionInfo {
+            intender: avnu_forwarder,
+            caller: Felt::ZERO,
+            nonce: Felt::ZERO,
+            execute_after: 0,
+            execute_before: u64::MAX,
+            inner_calls: vec![RawCall {
+                contract_address: pool(),
+                selector: Felt::ZERO,
+                data: Vec::new(),
+                function_name: Some("apply_actions".into()),
+                function_def: None,
+                contract_abi: None,
+            }],
+            signature: Vec::new(),
+            version: super::super::outside_execution::OutsideExecutionVersion::PrivateSponsored,
+        };
+
+        let summary = summarize(&tx, &[forwarder_call], &[], &[oe])
+            .expect("OE-wrapped pool call should be recognized as a privacy tx");
+        assert_eq!(summary.paymaster, PaymasterMode::PrivateSponsored);
+        assert!(summary.paymaster.is_sponsored());
     }
 
     fn raw_event(from: Felt, keys: Vec<Felt>, tx_hash: Felt) -> SnEvent {
