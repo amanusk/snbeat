@@ -78,11 +78,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let color_map = build_color_map(app, privacy_summary.as_ref());
 
-    // Header always renders, so it's always rebuilt. Tab bodies are computed
-    // for all visible tabs only in visual mode — that's when cross-tab cursor
-    // navigation needs up-to-date line offsets for every tab. Outside visual
-    // mode only the active tab is visible, so we skip building the others to
-    // avoid recomputing large traces on every frame.
+    // Header always renders, so it's always rebuilt. For the body we only
+    // build the active tab — visual-mode cursor navigation is now scoped to
+    // Header + active tab (see `TxDetailState::nav_step`), so we no longer
+    // need line offsets for the other tabs.
     let header_lines = build_header_lines(
         app,
         &color_map,
@@ -90,68 +89,53 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         &mut line_map,
         privacy_summary.as_ref(),
     );
-    let (events_lines, calls_lines, transfers_lines, trace_lines, privacy_lines) = if app
+    let (events_lines, calls_lines, transfers_lines, trace_lines, privacy_lines) = match app
         .tx_detail
-        .visual_mode
+        .active_tab
     {
-        (
+        TxTab::Events => (
             build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        TxTab::Calls => (
+            Vec::new(),
             build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        TxTab::Transfers => (
+            Vec::new(),
+            Vec::new(),
             build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            Vec::new(),
+            Vec::new(),
+        ),
+        TxTab::Trace => (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
+            Vec::new(),
+        ),
+        TxTab::Privacy => (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             privacy_summary
                 .as_ref()
                 .map(|s| build_privacy_lines(app, s, &color_map, selected.as_ref(), &mut line_map))
-                .unwrap_or_default(),
-        )
-    } else {
-        match app.tx_detail.active_tab {
-            TxTab::Events => (
-                build_events_lines(app, &color_map, selected.as_ref(), &mut line_map),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-            TxTab::Calls => (
-                Vec::new(),
-                build_calls_lines(app, &color_map, selected.as_ref(), &mut line_map),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-            TxTab::Transfers => (
-                Vec::new(),
-                Vec::new(),
-                build_transfers_lines(app, &color_map, selected.as_ref(), &mut line_map),
-                Vec::new(),
-                Vec::new(),
-            ),
-            TxTab::Trace => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                build_trace_lines(app, &color_map, selected.as_ref(), &mut line_map),
-                Vec::new(),
-            ),
-            TxTab::Privacy => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                privacy_summary
-                    .as_ref()
-                    .map(|s| {
-                        build_privacy_lines(app, s, &color_map, selected.as_ref(), &mut line_map)
-                    })
-                    .unwrap_or_else(|| {
-                        vec![Line::from(Span::styled(
-                            "   (not a privacy-pool transaction)",
-                            theme::SUGGESTION_STYLE,
-                        ))]
-                    }),
-            ),
-        }
+                .unwrap_or_else(|| {
+                    vec![Line::from(Span::styled(
+                        "   (not a privacy-pool transaction)",
+                        theme::SUGGESTION_STYLE,
+                    ))]
+                }),
+        ),
     };
 
     let header_height = (header_lines.len() as u16).saturating_add(2); // borders
@@ -415,10 +399,15 @@ fn record(
     sections: &[NavSection],
     section: NavSection,
 ) {
-    if let Some(idx) = nav.iter().position(|x| x == item)
-        && sections.get(idx).copied() == Some(section)
-    {
-        map[idx].get_or_insert(cur_line as u16);
+    // Find the nav entry matching both `item` AND `section` — the same
+    // address can be registered under multiple sections (e.g. a token
+    // contract appears in both Events and Transfers), and each section's
+    // rendering needs to record its own line for the corresponding entry.
+    for (idx, x) in nav.iter().enumerate() {
+        if x == item && sections.get(idx).copied() == Some(section) {
+            map[idx].get_or_insert(cur_line as u16);
+            return;
+        }
     }
 }
 
@@ -1308,14 +1297,18 @@ fn build_privacy_lines(
             let token_style = addr_style(&n.token, color_map, selected);
             let user_style = addr_style(&n.user, color_map, selected);
             let counterparty_style = addr_style(&n.counterparty, color_map, selected);
-            record(
-                &TxNavItem::Address(n.user),
-                lines.len(),
-                line_map,
-                &app.tx_detail.nav_items,
-                &app.tx_detail.nav_sections,
-                NavSection::Privacy,
-            );
+            // Record all three navigable addrs on this row so v-mode can
+            // scroll here regardless of which one the cursor lands on.
+            for addr in [&n.user, &n.counterparty, &n.token] {
+                record(
+                    &TxNavItem::Address(*addr),
+                    lines.len(),
+                    line_map,
+                    &app.tx_detail.nav_items,
+                    &app.tx_detail.nav_sections,
+                    NavSection::Privacy,
+                );
+            }
             // Sender is always on the left of the arrow. For incoming
             // notes the user is the recipient (right); for outgoing the
             // user is the sender (left). Self-channels (counterparty ==
@@ -1390,14 +1383,16 @@ fn build_privacy_lines(
             let token_style = addr_style(&n.token, color_map, selected);
             let user_style = addr_style(&n.user, color_map, selected);
             let counterparty_style = addr_style(&n.counterparty, color_map, selected);
-            record(
-                &TxNavItem::Address(n.user),
-                lines.len(),
-                line_map,
-                &app.tx_detail.nav_items,
-                &app.tx_detail.nav_sections,
-                NavSection::Privacy,
-            );
+            for addr in [&n.user, &n.counterparty, &n.token] {
+                record(
+                    &TxNavItem::Address(*addr),
+                    lines.len(),
+                    line_map,
+                    &app.tx_detail.nav_items,
+                    &app.tx_detail.nav_sections,
+                    NavSection::Privacy,
+                );
+            }
             lines.push(Line::from(vec![
                 addr_marker_any(&[&n.user, &n.counterparty, &n.token], selected),
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),

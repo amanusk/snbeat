@@ -1182,10 +1182,7 @@ fn draw_token_balances(f: &mut Frame, app: &App, area: Rect, nonzero: &[&TokenBa
                     theme::LABEL_STYLE,
                 ),
                 Span::styled(fmt_fixed_width(&formatted, 18), theme::NORMAL_STYLE),
-                Span::styled(
-                    format!("  {}", fmt_fixed_width(&usd_str, 8)),
-                    theme::SUGGESTION_STYLE,
-                ),
+                Span::styled(format!("  {usd_str}"), theme::SUGGESTION_STYLE),
             ];
             ListItem::new(Line::from(spans))
         })
