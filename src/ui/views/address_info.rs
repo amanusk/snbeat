@@ -761,6 +761,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
     app.address
         .update_call_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
 
+    // If the viewed contract is itself a privacy address, every incoming
+    // call in this tab is by definition a privacy interaction — no need to
+    // look at `inner_targets` (which would only fire for OE-wrapped flows
+    // when viewing a non-privacy contract).
+    let viewed_is_privacy = registry
+        .zip(app.address.info.as_ref())
+        .map(|(reg, info)| reg.is_privacy_address(&info.address))
+        .unwrap_or(false);
+
     let items: Vec<ListItem> = app
         .address
         .calls
@@ -808,13 +817,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
-            // A call is "privacy" iff any OE inner target is in the curated
-            // privacy bundle. The viewed contract is the top-level callee for
-            // every row in this tab, so checking the top level isn't useful —
-            // the pool only shows up through an OE wrapper here.
-            let is_privacy_call = registry
-                .map(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)))
-                .unwrap_or(false);
+            // Privacy iff the viewed contract is itself a privacy address
+            // (every incoming call is then a privacy interaction) OR any OE
+            // inner target is in the curated bundle (for non-privacy contract
+            // pages like AVNU Forwarder where the pool only appears as an
+            // inner call).
+            let is_privacy_call = viewed_is_privacy
+                || registry
+                    .map(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)))
+                    .unwrap_or(false);
             let prv_marker_text = if is_privacy_call { "🛡   " } else { "    " };
 
             let line = Line::from(vec![
