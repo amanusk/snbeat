@@ -260,6 +260,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             if !app.tx_detail.outside_executions.is_empty() {
                 app.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::Calls;
                 app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+                // OE inner-call rows appear/disappear with this toggle;
+                // rebuild so visual mode doesn't park on a hidden row.
+                app.build_tx_nav_items();
             }
             None
         }
@@ -269,6 +272,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         // and forces decoded-calldata + outside-exec intent on.
         KeyCode::Char('e') if app.current_view() == View::TxDetail => {
             app.tx_detail.expand_all = !app.tx_detail.expand_all;
+            // Same reason as `o`: OE inner-call rows are gated on
+            // `expand_all`, so the nav set has to follow.
+            app.build_tx_nav_items();
             None
         }
 
@@ -321,6 +327,8 @@ fn handle_tx_visual_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') => {
             if !app.tx_detail.outside_executions.is_empty() {
                 app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+                app.build_tx_nav_items();
+                app.tx_detail.reset_nav_cursor_for_active_tab();
             }
             None
         }

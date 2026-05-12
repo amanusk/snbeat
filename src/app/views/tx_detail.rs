@@ -155,9 +155,10 @@ impl TxDetailState {
 
     /// Build the list of navigable items for the current transaction.
     /// Order: header (block, sender, declared class, deployed, call targets,
-    /// outside-exec) → events → trace. Tagging each push with its section
-    /// lets `nav_step()` switch tabs and scroll the right region as the
-    /// cursor cycles.
+    /// outside-exec) → events → trace. Each push is tagged with its
+    /// `NavSection` so `nav_step()` can restrict j/k to Header + the active
+    /// tab's section; tab switching itself is done by `Tab`/`Shift+Tab` in
+    /// visual mode, not by the cursor cycling across tabs.
     ///
     /// `private_notes` / `private_nullifiers` are passed in so the Privacy
     /// section can register the counterparties/users/tokens of decrypted +
@@ -294,18 +295,23 @@ impl TxDetailState {
                 &mut sections,
             );
         }
-        // OE inner calls — only revealed when the Calls tab toggles `o`,
-        // so they belong there.
-        for (_, oe) in &self.outside_executions {
-            for inner in &oe.inner_calls {
-                push_section(
-                    inner.contract_address,
-                    NavSection::Calls,
-                    &mut in_calls,
-                    &in_header,
-                    &mut items,
-                    &mut sections,
-                );
+        // OE inner calls — only revealed when the Calls tab toggles `o` (or
+        // `e` expands everything). Skip them while the OE intent view is
+        // hidden so visual mode doesn't land on a phantom cursor with no
+        // corresponding rendered line. `build_tx_nav_items` is re-run when
+        // `o`/`e` flips, so these reappear as soon as the rows do.
+        if self.show_outside_execution || self.expand_all {
+            for (_, oe) in &self.outside_executions {
+                for inner in &oe.inner_calls {
+                    push_section(
+                        inner.contract_address,
+                        NavSection::Calls,
+                        &mut in_calls,
+                        &in_header,
+                        &mut items,
+                        &mut sections,
+                    );
+                }
             }
         }
 
