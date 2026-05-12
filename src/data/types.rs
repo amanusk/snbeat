@@ -275,9 +275,17 @@ pub struct AddressTxSummary {
     /// The actual sender of this transaction (may differ from the viewed address for deployment txs).
     #[serde(default)]
     pub sender: Option<Felt>,
-    /// Top-level contracts directly invoked by this tx's multicall, in order
-    /// (deduplicated). Populated by the same path that fills `endpoint_names`;
-    /// remains empty for non-INVOKE txs and pre-enrichment stubs.
+    /// Contracts reached by this tx, in first-seen order with duplicates
+    /// removed. Includes each top-level multicall target plus the inner
+    /// target of any outside-execution call so privacy-pool reaches via
+    /// `execute_from_outside*` / `execute_private_sponsored` wrappers are
+    /// surfaced alongside the wrapper itself.
+    ///
+    /// Populated by the same path that fills `endpoint_names`; remains
+    /// empty for non-INVOKE txs and pre-enrichment stubs. Consumers (Txs
+    /// tab Contracts column, privacy-tx predicate, palette color map)
+    /// treat the union as a single set — they don't need to distinguish
+    /// top-level from OE-inner.
     #[serde(default)]
     pub called_contracts: Vec<Felt>,
 }
@@ -342,6 +350,12 @@ pub struct ContractCallSummary {
     /// Sender tip (FRI). `0` from Dune-sourced rows and stubs; filled by RPC/pf path.
     #[serde(default)]
     pub tip: u64,
+    /// Target addresses of any outside-execution inner calls in this tx's
+    /// multicall (deduped, first-seen order). Empty for Dune-only stubs (no
+    /// calldata) and non-INVOKE rows. Used by the Calls-tab Prv column to
+    /// flag txs that reach a privacy address only via an OE wrapper.
+    #[serde(default)]
+    pub inner_targets: Vec<Felt>,
 }
 
 /// Label information fetched from Voyager for a contract/account address.
@@ -406,6 +420,9 @@ pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<Contra
             }
             if existing.tip == 0 && call.tip > 0 {
                 existing.tip = call.tip;
+            }
+            if existing.inner_targets.is_empty() && !call.inner_targets.is_empty() {
+                existing.inner_targets = call.inner_targets;
             }
         } else {
             seen.insert(call.tx_hash, result.len());

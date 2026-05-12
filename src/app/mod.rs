@@ -1610,6 +1610,7 @@ impl App {
                             status: m.status,
                             nonce: None,
                             tip: 0,
+                            inner_targets: m.inner_targets,
                         })
                         .collect();
                     if !promoted.is_empty() {
@@ -1906,6 +1907,7 @@ impl App {
                         status: "OK".to_string(), // events only fire for successful txs
                         nonce: None,              // filled in by EnrichAddressCalls
                         tip: 0,
+                        inner_targets: Vec::new(), // filled in by EnrichAddressCalls
                     };
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
                         address,

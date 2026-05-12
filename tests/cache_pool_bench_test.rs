@@ -158,6 +158,7 @@ fn mk_call_summary(idx: u64) -> ContractCallSummary {
         status: "OK".to_string(),
         nonce: Some(idx),
         tip: 0,
+        inner_targets: Vec::new(),
     }
 }
 

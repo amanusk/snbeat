@@ -13,6 +13,7 @@ fn make_call(tx_hash: u64, sender: u64, function_name: &str, block: u64) -> Cont
         status: "OK".into(),
         nonce: None,
         tip: 0,
+        inner_targets: Vec::new(),
     }
 }
 

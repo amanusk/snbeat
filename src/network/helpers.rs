@@ -14,7 +14,8 @@ use crate::data::types::{
     AddressTxSummary, ContractCallSummary, ExecutionStatus, SnReceipt, SnTransaction,
 };
 use crate::decode::AbiRegistry;
-use crate::decode::functions::parse_multicall;
+use crate::decode::functions::{RawCall, parse_multicall};
+use crate::decode::outside_execution::detect_outside_execution;
 use crate::utils::{felt_to_u64, felt_to_u128};
 
 /// Format endpoint/function names from a transaction's multicall calldata.
@@ -32,8 +33,13 @@ pub fn format_endpoint_names(tx: &SnTransaction, abi_reg: &AbiRegistry) -> Strin
     format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
 }
 
-/// Top-level contracts directly invoked by `tx`'s multicall, in first-seen
-/// order with duplicates removed. Empty for non-Invoke txs.
+/// Top-level multicall targets only, in first-seen order with duplicates
+/// removed. Empty for non-Invoke txs.
+///
+/// Unlike the broader `AddressTxSummary::called_contracts` field (which
+/// `build_tx_summary` extends with OE inner targets), this helper stops
+/// at the top level — callers that need OE-inner addresses should walk
+/// `oe_inner_targets` themselves.
 pub fn tx_called_contracts(tx: &SnTransaction) -> Vec<Felt> {
     let calls = match tx {
         SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
@@ -49,6 +55,29 @@ fn dedupe_preserve_order(items: impl IntoIterator<Item = Felt>) -> Vec<Felt> {
     for item in items {
         if !out.contains(&item) {
             out.push(item);
+        }
+    }
+    out
+}
+
+/// Walk a multicall's raw calls and collect target addresses of any OE inner
+/// calls (deduplicated, first-seen order). Surfaces privacy-pool / anonymizer
+/// interactions that only appear inside `execute_from_outside*` or
+/// `execute_private_sponsored` wrappers — the top-level call list alone would
+/// miss them.
+pub fn oe_inner_targets(calls: &[RawCall], abi_reg: &AbiRegistry) -> Vec<Felt> {
+    let mut out: Vec<Felt> = Vec::new();
+    for call in calls {
+        let resolved_name = call
+            .function_name
+            .clone()
+            .or_else(|| abi_reg.get_selector_name(&call.selector));
+        if let Some((oe, _method)) = detect_outside_execution(call, resolved_name.as_deref()) {
+            for ic in &oe.inner_calls {
+                if !out.contains(&ic.contract_address) {
+                    out.push(ic.contract_address);
+                }
+            }
         }
     }
     out
@@ -272,7 +301,14 @@ pub fn build_tx_summary(
         _ => Vec::new(),
     };
     let endpoint_names = format_selector_names(calls.iter().map(|c| c.selector), abi_reg);
-    let called_contracts = dedupe_preserve_order(calls.iter().map(|c| c.contract_address));
+    let mut called_contracts = dedupe_preserve_order(calls.iter().map(|c| c.contract_address));
+    // Append OE inner targets so the privacy predicate (and the Calls column)
+    // can see the pool when it's reached only via an outside-execution wrapper.
+    for addr in oe_inner_targets(&calls, abi_reg) {
+        if !called_contracts.contains(&addr) {
+            called_contracts.push(addr);
+        }
+    }
 
     AddressTxSummary {
         hash,
@@ -328,7 +364,12 @@ pub fn build_tx_summary_from_pf_data(
             .collect();
         let calls = parse_multicall(&calldata);
         let names = format_selector_names(calls.iter().map(|c| c.selector), abi_reg);
-        let contracts = dedupe_preserve_order(calls.into_iter().map(|c| c.contract_address));
+        let mut contracts = dedupe_preserve_order(calls.iter().map(|c| c.contract_address));
+        for addr in oe_inner_targets(&calls, abi_reg) {
+            if !contracts.contains(&addr) {
+                contracts.push(addr);
+            }
+        }
         (names, contracts)
     } else {
         (String::new(), Vec::new())

@@ -495,6 +495,13 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Refresh the per-contract count + color slot cache for the Contracts
+    // column. No-op when the tx list hasn't grown since the last render.
+    // Done before the gap closure below borrows `app.address` immutably.
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+    app.address
+        .update_tx_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
+
     // (tx_idx, lo_nonce) for each gap, sorted by tx_idx ascending. Each gap
     // renders as its own ListItem above the lo_nonce tx.
     let gap_positions = app.address.gap_render_positions();
@@ -542,7 +549,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             tx.endpoint_names.clone()
         };
-        let contracts_display = format_called_contracts(app, &tx.called_contracts);
+        let contract_spans = format_called_contracts_spans(app, &tx.called_contracts);
         // A tx is "privacy" iff any of its top-level called contracts is in the
         // curated privacy bundle. Catches the common case (top-level pool call
         // or pool-via-known-helper). OE-wrapped sponsored txs that only reach
@@ -559,11 +566,6 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     .any(|c| reg.is_privacy_address(c))
             })
             .unwrap_or(false);
-        let contracts_style = if is_privacy_tx {
-            theme::PRIVACY_STYLE
-        } else {
-            theme::LABEL_STYLE
-        };
 
         let status_style = match tx.status.as_str() {
             "OK" => theme::STATUS_OK,
@@ -588,11 +590,13 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let prv_marker_text = if is_privacy_tx { "🛡   " } else { "    " };
-        let main_line = Line::from(vec![
+        let mut row_spans: Vec<Span<'static>> = vec![
             Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
             Span::styled(format!("{:<15}", tx.tx_type), type_style),
             Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-            Span::styled(format!("{:<30}", contracts_display), contracts_style),
+        ];
+        row_spans.extend(contract_spans);
+        row_spans.extend([
             Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
             Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
             Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
@@ -604,7 +608,7 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
             Span::styled(age, theme::BLOCK_AGE_STYLE),
         ]);
-        items.push(ListItem::new(main_line));
+        items.push(ListItem::new(Line::from(row_spans)));
     }
 
     let gap_suffix = if app.address.unfilled_gaps.is_empty() {
@@ -658,28 +662,61 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
 /// (registry/Voyager-resolved or short hex), followed by ` +N` for any
 /// remaining. Each label is truncated to share the 29-char content budget;
 /// any slack left by a short first label spills over to the second.
-fn format_called_contracts(app: &App, contracts: &[Felt]) -> String {
-    const BUDGET: usize = 29;
+///
+/// Returns a sequence of styled spans so each contract gets its own theme:
+/// privacy contracts render in `PRIVACY_STYLE`, registry-labeled contracts
+/// in `LABEL_STYLE`, repeats in their palette slot, one-offs in `NORMAL_STYLE`.
+/// Separator and `+N` overflow stay in `SUGGESTION_STYLE`. The returned
+/// vector always totals exactly 30 visible chars (one trailing pad column).
+fn format_called_contracts_spans(app: &App, contracts: &[Felt]) -> Vec<Span<'static>> {
+    const CONTENT_BUDGET: usize = 29;
+    const COLUMN_WIDTH: usize = 30;
     if contracts.is_empty() {
-        return String::new();
+        return vec![Span::raw(" ".repeat(COLUMN_WIDTH))];
     }
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+    let color_map = &app.address.tx_color_map;
     let labels: Vec<String> = contracts.iter().map(|c| app.format_address(c)).collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let used_chars;
+
     if labels.len() == 1 {
-        return truncate_to(&labels[0], BUDGET);
-    }
-    let extra = labels.len().saturating_sub(2);
-    let suffix = if extra > 0 {
-        format!(" +{extra}")
+        let label = truncate_to(&labels[0], CONTENT_BUDGET);
+        let style = known_or_palette_style(&contracts[0], registry, color_map);
+        used_chars = label.chars().count();
+        spans.push(Span::styled(label, style));
     } else {
-        String::new()
-    };
-    const SEP: &str = ", ";
-    let usable = BUDGET.saturating_sub(suffix.chars().count() + SEP.len());
-    let a_budget = usable / 2;
-    let a = truncate_to(&labels[0], a_budget);
-    let b_budget = usable.saturating_sub(a.chars().count());
-    let b = truncate_to(&labels[1], b_budget);
-    format!("{a}{SEP}{b}{suffix}")
+        let extra = labels.len().saturating_sub(2);
+        let suffix = if extra > 0 {
+            format!(" +{extra}")
+        } else {
+            String::new()
+        };
+        const SEP: &str = ", ";
+        let inner_budget = CONTENT_BUDGET.saturating_sub(suffix.chars().count() + SEP.len());
+        let a_budget = inner_budget / 2;
+        let a = truncate_to(&labels[0], a_budget);
+        let b_budget = inner_budget.saturating_sub(a.chars().count());
+        let b = truncate_to(&labels[1], b_budget);
+
+        let style_a = known_or_palette_style(&contracts[0], registry, color_map);
+        let style_b = known_or_palette_style(&contracts[1], registry, color_map);
+
+        used_chars = a.chars().count() + SEP.len() + b.chars().count() + suffix.chars().count();
+        spans.push(Span::styled(a, style_a));
+        spans.push(Span::styled(SEP, theme::SUGGESTION_STYLE));
+        spans.push(Span::styled(b, style_b));
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, theme::SUGGESTION_STYLE));
+        }
+    }
+
+    let pad = COLUMN_WIDTH.saturating_sub(used_chars);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 /// Truncate a label to fit `max` chars, appending `…` when shortened. Returns
@@ -733,6 +770,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
@@ -759,6 +797,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let registry = app.search_engine.as_ref().map(|e| e.registry());
     app.address
         .update_call_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
+
+    // If the viewed contract is itself a privacy address, every incoming
+    // call in this tab is by definition a privacy interaction — no need to
+    // look at `inner_targets` (which would only fire for OE-wrapped flows
+    // when viewing a non-privacy contract).
+    let viewed_is_privacy = registry
+        .zip(app.address.info.as_ref())
+        .map(|(reg, info)| reg.is_privacy_address(&info.address))
+        .unwrap_or(false);
 
     let items: Vec<ListItem> = app
         .address
@@ -807,6 +854,17 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            // Privacy iff the viewed contract is itself a privacy address
+            // (every incoming call is then a privacy interaction) OR any OE
+            // inner target is in the curated bundle (for non-privacy contract
+            // pages like AVNU Forwarder where the pool only appears as an
+            // inner call).
+            let is_privacy_call = viewed_is_privacy
+                || registry
+                    .map(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)))
+                    .unwrap_or(false);
+            let prv_marker_text = if is_privacy_call { "🛡   " } else { "    " };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {:<25} ", sender_display), sender_style),
                 Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
@@ -819,6 +877,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::BLOCK_NUMBER_STYLE,
                 ),
                 Span::styled(format!("{:<4}", &call.status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
                 Span::styled(format_age(call.timestamp), theme::BLOCK_AGE_STYLE),
             ]);
             ListItem::new(line)

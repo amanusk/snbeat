@@ -189,6 +189,17 @@ pub struct AddressInfoState {
     /// matches the current length, the cache is up-to-date and renders skip
     /// the rescan entirely.
     pub call_color_processed_len: usize,
+    /// Per-contract occurrence counts across `txs.items`'s `called_contracts`.
+    /// Drives palette assignment in the Txs tab's Contracts column so repeated
+    /// targets pop out, unlabeled one-offs stay neutral, and labeled or
+    /// privacy contracts keep their tagged style.
+    pub tx_contract_counts: HashMap<Felt, usize>,
+    /// Slot assignments for repeated, non-tagged contracts called by this
+    /// address's outbound txs. Same idempotent-slot guarantee as
+    /// `call_color_map`.
+    pub tx_color_map: AddressColorMap,
+    /// Cached `txs.items.len()` from the last contract color-map rebuild.
+    pub tx_color_processed_len: usize,
 }
 
 /// Auto-fill row target for the event-backed tabs (currently MetaTxs;
@@ -249,6 +260,9 @@ impl Default for AddressInfoState {
             call_sender_counts: HashMap::new(),
             call_color_map: AddressColorMap::new(),
             call_color_processed_len: 0,
+            tx_contract_counts: HashMap::new(),
+            tx_color_map: AddressColorMap::new(),
+            tx_color_processed_len: 0,
         }
     }
 }
@@ -291,6 +305,9 @@ impl AddressInfoState {
         self.call_sender_counts.clear();
         self.call_color_map = AddressColorMap::new();
         self.call_color_processed_len = 0;
+        self.tx_contract_counts.clear();
+        self.tx_color_map = AddressColorMap::new();
+        self.tx_color_processed_len = 0;
     }
 
     /// Drop the cached color map so the next render rebuilds it from scratch.
@@ -304,6 +321,16 @@ impl AddressInfoState {
         self.call_sender_counts.clear();
         self.call_color_map = AddressColorMap::new();
         self.call_color_processed_len = 0;
+    }
+
+    /// Drop the cached tx-color map. `merge_tx_summaries` calls this when
+    /// an in-place upgrade fills `called_contracts` on an existing row —
+    /// the length-keyed fast path wouldn't otherwise notice, so the
+    /// Contracts column would stay in NORMAL_STYLE until the list grows.
+    pub fn invalidate_tx_color_cache(&mut self) {
+        self.tx_contract_counts.clear();
+        self.tx_color_map = AddressColorMap::new();
+        self.tx_color_processed_len = 0;
     }
 
     /// Refresh the per-sender count map and color slots for the Calls tab.
@@ -330,6 +357,28 @@ impl AddressInfoState {
             }
         }
         self.call_color_processed_len = self.calls.items.len();
+    }
+
+    /// Refresh the per-contract count map and color slots for the Txs tab's
+    /// Contracts column. Mirrors `update_call_color_map`: counts occurrences
+    /// across every tx's `called_contracts`, and assigns palette slots only
+    /// to repeats that aren't already registry-known (labeled contracts keep
+    /// their `LABEL_STYLE`; privacy contracts keep `PRIVACY_STYLE`).
+    pub fn update_tx_color_map(&mut self, is_known: impl Fn(&Felt) -> bool) {
+        if self.tx_color_processed_len == self.txs.items.len() {
+            return;
+        }
+        self.tx_contract_counts.clear();
+        for tx in &self.txs.items {
+            for contract in &tx.called_contracts {
+                let count = self.tx_contract_counts.entry(*contract).or_insert(0);
+                *count += 1;
+                if *count == 2 && !is_known(contract) {
+                    self.tx_color_map.register(*contract);
+                }
+            }
+        }
+        self.tx_color_processed_len = self.txs.items.len();
     }
 
     /// Whether any source thinks there is more data to fetch.
@@ -445,15 +494,22 @@ impl AddressInfoState {
         let mut seen_hashes: HashSet<Felt> = self.txs.items.iter().map(|t| t.hash).collect();
         let had_selection = self.txs.state.selected();
 
+        let mut called_contracts_upgraded = false;
         for item in incoming {
             if seen_hashes.contains(&item.hash) {
                 if let Some(existing) = self.txs.items.iter_mut().find(|t| t.hash == item.hash) {
-                    upgrade_tx_summary(existing, &item);
+                    called_contracts_upgraded |= upgrade_tx_summary(existing, &item);
                 }
             } else {
                 seen_hashes.insert(item.hash);
                 self.txs.items.push(item);
             }
+        }
+        // In-place called_contracts fill doesn't move items.len(), so the
+        // tx-color cache's length-keyed fast path would miss it. Force a
+        // rebuild now so the Contracts column reflects the enriched rows.
+        if called_contracts_upgraded {
+            self.invalidate_tx_color_cache();
         }
 
         self.txs.items.sort_by(|a, b| b.nonce.cmp(&a.nonce));
@@ -730,7 +786,10 @@ impl AddressInfoState {
 }
 
 /// Upgrade an existing tx summary with better data from an incoming one.
-pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxSummary) {
+/// Returns `true` if `called_contracts` was filled in (was empty, is now
+/// populated). Callers use this to invalidate the Txs-tab color cache,
+/// whose length-keyed fast path would otherwise miss the in-place change.
+pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxSummary) -> bool {
     if existing.block_number == 0 && incoming.block_number > 0 {
         existing.block_number = incoming.block_number;
     }
@@ -746,7 +805,9 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     if existing.endpoint_names.is_empty() && !incoming.endpoint_names.is_empty() {
         existing.endpoint_names.clone_from(&incoming.endpoint_names);
     }
-    if existing.called_contracts.is_empty() && !incoming.called_contracts.is_empty() {
+    let called_contracts_filled =
+        existing.called_contracts.is_empty() && !incoming.called_contracts.is_empty();
+    if called_contracts_filled {
         existing
             .called_contracts
             .clone_from(&incoming.called_contracts);
@@ -757,6 +818,7 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     if existing.tip == 0 && incoming.tip > 0 {
         existing.tip = incoming.tip;
     }
+    called_contracts_filled
 }
 
 #[cfg(test)]
@@ -1106,6 +1168,7 @@ mod tests {
             status: "OK".into(),
             nonce: None,
             tip: 0,
+            inner_targets: Vec::new(),
         }
     }
 
