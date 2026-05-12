@@ -364,6 +364,11 @@ const KNOWN_TOKENS: &[(&str, &str, u8)] = &[
         18,
     ),
     (
+        "0x0787150e306e6eae6e3f79dea881770e8bbff2c1b8eb490f969669ee945b3135",
+        "strkBTC",
+        8,
+    ),
+    (
         "0x0057912720381af14b0e5c87aa4718ed5e527eab60b3801ebf702ab09139e38b",
         "wstETH",
         18,
