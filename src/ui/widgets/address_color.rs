@@ -35,18 +35,23 @@ pub fn known_or_palette_style(
 
 /// Assigns a stable palette color to each unique address seen in a tx view.
 ///
-/// Registration order determines the slot (and thus the color). The caller
-/// should register addresses in a consistent order so the sender always gets
-/// slot 0 (LightCyan).
+/// Registration order determines the slot (and thus the color). Palette
+/// slots are all plain colors so the spot-the-repeat scan stays even —
+/// no one slot draws extra attention.
 ///
-/// Addresses added to `privacy_overrides` skip the palette entirely and
-/// always render in `theme::PRIVACY_STYLE`, so privacy-pool contracts pop
-/// out wherever they appear regardless of which slot they'd otherwise land
-/// in.
+/// Two override sets escape the palette entirely:
+///
+/// - `privacy_overrides` — addresses pinned to `theme::PRIVACY_STYLE` so
+///   curated privacy contracts pop out wherever they appear.
+/// - `sender_override` — at most one address per map, pinned to
+///   `theme::TX_SENDER_STYLE` (bold white). The tx detail view sets this
+///   on the tx initiator so "this is the signer" is visually distinct
+///   from every other address on the page.
 pub struct AddressColorMap {
     slots: HashMap<Felt, usize>,
     next_slot: usize,
     privacy_overrides: HashSet<Felt>,
+    sender_override: Option<Felt>,
 }
 
 impl Default for AddressColorMap {
@@ -61,6 +66,7 @@ impl AddressColorMap {
             slots: HashMap::new(),
             next_slot: 0,
             privacy_overrides: HashSet::new(),
+            sender_override: None,
         }
     }
 
@@ -70,9 +76,21 @@ impl AddressColorMap {
         self.privacy_overrides.extend(addrs);
     }
 
+    /// Mark this address as the "tx sender" anchor. It will always render
+    /// in `TX_SENDER_STYLE` (bold white), shortcutting both palette and
+    /// privacy assignments. Calling this twice replaces the previous
+    /// sender. Intended for tx detail; views that show many senders side
+    /// by side (block detail, calls tab) should leave this unset.
+    pub fn set_sender(&mut self, addr: Felt) {
+        self.sender_override = Some(addr);
+    }
+
     /// Register an address and return its assigned Style.
     /// Idempotent: the same address always gets the same slot.
     pub fn register(&mut self, addr: Felt) -> Style {
+        if self.sender_override == Some(addr) {
+            return theme::TX_SENDER_STYLE;
+        }
         if self.privacy_overrides.contains(&addr) {
             return theme::PRIVACY_STYLE;
         }
@@ -87,6 +105,9 @@ impl AddressColorMap {
     /// Look up an already-registered address.
     /// Returns `NORMAL_STYLE` for addresses not in the map.
     pub fn style_for(&self, addr: &Felt) -> Style {
+        if self.sender_override.as_ref() == Some(addr) {
+            return theme::TX_SENDER_STYLE;
+        }
         if self.privacy_overrides.contains(addr) {
             return theme::PRIVACY_STYLE;
         }

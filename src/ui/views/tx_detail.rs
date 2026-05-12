@@ -614,7 +614,8 @@ fn build_header_lines(
         }
     }
 
-    // Sender + Nonce — colored with slot 0
+    // Sender + Nonce — sender renders in `TX_SENDER_STYLE` via the
+    // color map's sender override.
     let sender = tx.sender();
     let nonce_str = tx
         .nonce()
@@ -2908,8 +2909,11 @@ fn block_marker(n: u64, selected: Option<&TxNavItem>) -> Span<'static> {
 }
 
 /// Build the address color map for the current tx view.
-/// Sender is registered first (slot 0), then call contracts, then event contracts,
-/// then ContractAddress-typed params — so the same address always gets the same color.
+/// The tx sender is pinned to `TX_SENDER_STYLE` via `set_sender` so it
+/// always reads as "the signer" regardless of how many other addresses
+/// the view registers. Other contracts (call targets, deployed addrs,
+/// event params) get plain palette slots in registration order, so a
+/// repeated address keeps a consistent color across tabs.
 fn build_color_map(app: &App, privacy: Option<&PrivacySummary>) -> AddressColorMap {
     let mut cm = AddressColorMap::new();
     if let Some(engine) = &app.search_engine {
@@ -2917,7 +2921,7 @@ fn build_color_map(app: &App, privacy: Option<&PrivacySummary>) -> AddressColorM
     }
 
     if let Some(tx) = &app.tx_detail.transaction {
-        cm.register(tx.sender());
+        cm.set_sender(tx.sender());
     }
 
     // Deployed addresses (via UDC) get their own color slots

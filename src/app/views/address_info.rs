@@ -189,6 +189,17 @@ pub struct AddressInfoState {
     /// matches the current length, the cache is up-to-date and renders skip
     /// the rescan entirely.
     pub call_color_processed_len: usize,
+    /// Per-contract occurrence counts across `txs.items`'s `called_contracts`.
+    /// Drives palette assignment in the Txs tab's Contracts column so repeated
+    /// targets pop out, unlabeled one-offs stay neutral, and labeled or
+    /// privacy contracts keep their tagged style.
+    pub tx_contract_counts: HashMap<Felt, usize>,
+    /// Slot assignments for repeated, non-tagged contracts called by this
+    /// address's outbound txs. Same idempotent-slot guarantee as
+    /// `call_color_map`.
+    pub tx_color_map: AddressColorMap,
+    /// Cached `txs.items.len()` from the last contract color-map rebuild.
+    pub tx_color_processed_len: usize,
 }
 
 /// Auto-fill row target for the event-backed tabs (currently MetaTxs;
@@ -249,6 +260,9 @@ impl Default for AddressInfoState {
             call_sender_counts: HashMap::new(),
             call_color_map: AddressColorMap::new(),
             call_color_processed_len: 0,
+            tx_contract_counts: HashMap::new(),
+            tx_color_map: AddressColorMap::new(),
+            tx_color_processed_len: 0,
         }
     }
 }
@@ -291,6 +305,9 @@ impl AddressInfoState {
         self.call_sender_counts.clear();
         self.call_color_map = AddressColorMap::new();
         self.call_color_processed_len = 0;
+        self.tx_contract_counts.clear();
+        self.tx_color_map = AddressColorMap::new();
+        self.tx_color_processed_len = 0;
     }
 
     /// Drop the cached color map so the next render rebuilds it from scratch.
@@ -330,6 +347,28 @@ impl AddressInfoState {
             }
         }
         self.call_color_processed_len = self.calls.items.len();
+    }
+
+    /// Refresh the per-contract count map and color slots for the Txs tab's
+    /// Contracts column. Mirrors `update_call_color_map`: counts occurrences
+    /// across every tx's `called_contracts`, and assigns palette slots only
+    /// to repeats that aren't already registry-known (labeled contracts keep
+    /// their `LABEL_STYLE`; privacy contracts keep `PRIVACY_STYLE`).
+    pub fn update_tx_color_map(&mut self, is_known: impl Fn(&Felt) -> bool) {
+        if self.tx_color_processed_len == self.txs.items.len() {
+            return;
+        }
+        self.tx_contract_counts.clear();
+        for tx in &self.txs.items {
+            for contract in &tx.called_contracts {
+                let count = self.tx_contract_counts.entry(*contract).or_insert(0);
+                *count += 1;
+                if *count == 2 && !is_known(contract) {
+                    self.tx_color_map.register(*contract);
+                }
+            }
+        }
+        self.tx_color_processed_len = self.txs.items.len();
     }
 
     /// Whether any source thinks there is more data to fetch.

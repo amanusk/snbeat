@@ -59,10 +59,13 @@ pub const TITLE_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifie
 pub const BORDER_STYLE: Style = Style::new().fg(Color::DarkGray);
 pub const BORDER_FOCUSED_STYLE: Style = Style::new().fg(Color::Cyan);
 
-// Per-address color palette for tx detail view.
-// Slot 0 is reserved for the tx sender.
+// Per-address color palette. Used for "spot the repeat" highlighting across
+// list views (block tx list, address-info Txs/Calls tabs, tx detail). All
+// slots are plain (non-bold) so unlabeled, non-special addresses don't draw
+// the eye — bold is reserved for inherently special roles like the tx
+// sender (see `TX_SENDER_STYLE`) or privacy contracts (`PRIVACY_STYLE`).
 pub const ADDRESS_PALETTE: [Style; 8] = [
-    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+    Style::new().fg(Color::LightCyan),
     Style::new().fg(Color::LightMagenta),
     Style::new().fg(Color::LightGreen),
     Style::new().fg(Color::LightYellow),
@@ -71,3 +74,9 @@ pub const ADDRESS_PALETTE: [Style; 8] = [
     Style::new().fg(Color::Magenta),
     Style::new().fg(Color::Blue),
 ];
+
+/// Highlight style for the tx sender in the tx detail view. Bold white so
+/// "this is the signer" pops on the header line. Deliberately NOT in
+/// `ADDRESS_PALETTE` — bold should mean "special role", not "this was
+/// just the first repeat we registered".
+pub const TX_SENDER_STYLE: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
