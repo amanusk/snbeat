@@ -346,13 +346,14 @@ fn fmt_addr_full(app: &App, felt: &Felt) -> String {
     }
 }
 
-/// Truncate a felt-typed identifier (note ID, nullifier, channel hash)
-/// for display. Note IDs aren't navigable and have no labels, so the
-/// goal is just to keep the line short — full hex eats ~66 columns and
-/// pushes amount/token off-screen on a typical terminal. Mirrors the
-/// `0x6d6d..68a4` shape used by the address registry and honours the
-/// `e` (expand_all) toggle so the user can still copy the full hex.
-fn fmt_note_id(app: &App, felt: &Felt) -> String {
+/// Truncate a felt-typed identifier (note ID, nullifier, channel hash,
+/// meta-tx nonce) for display. These values aren't navigable and have no
+/// labels, so the goal is just to keep the line short — full hex eats
+/// ~66 columns and pushes adjacent fields off-screen on a typical
+/// terminal. Mirrors the `0x6d6d..68a4` shape used by the address
+/// registry and honours the `e` (expand_all) toggle so the user can
+/// still copy the full hex.
+fn fmt_short_felt(app: &App, felt: &Felt) -> String {
     if app.tx_detail.expand_all {
         format!("{:#x}", felt)
     } else {
@@ -602,7 +603,7 @@ fn build_header_lines(
             ];
             if !is_private_sponsored {
                 spans.push(Span::styled(
-                    format!("  Nonce: {:#x}", oe.nonce),
+                    format!("  Nonce: {}", fmt_short_felt(app, &oe.nonce)),
                     theme::SUGGESTION_STYLE,
                 ));
             }
@@ -1067,8 +1068,8 @@ fn build_calls_lines(
                 ),
                 Span::styled(
                     format!(
-                        "  nonce: {:#x}  caller: {}  inner calls: {}",
-                        oe.nonce,
+                        "  nonce: {}  caller: {}  inner calls: {}",
+                        fmt_short_felt(app, &oe.nonce),
                         caller_str,
                         oe.inner_calls.len()
                     ),
@@ -1138,7 +1139,7 @@ fn build_calls_lines(
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("   Nonce:    ", theme::NORMAL_STYLE),
-                    Span::styled(format!("{:#x}", oe.nonce), theme::TX_HASH_STYLE),
+                    Span::styled(fmt_short_felt(app, &oe.nonce), theme::TX_HASH_STYLE),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("   Window:   ", theme::NORMAL_STYLE),
@@ -1360,7 +1361,7 @@ fn build_privacy_lines(
                 spans.push(Span::styled(" (change)", theme::SUGGESTION_STYLE));
             }
             spans.push(Span::styled(
-                format!("  note {}", fmt_note_id(app, &n.note_id)),
+                format!("  note {}", fmt_short_felt(app, &n.note_id)),
                 theme::SUGGESTION_STYLE,
             ));
             lines.push(Line::from(spans));
@@ -1402,7 +1403,7 @@ fn build_privacy_lines(
                 Span::styled(format!("{branch} "), theme::BORDER_STYLE),
                 Span::styled(fmt_addr(app, &n.user), user_style),
                 Span::styled(" spent note ", theme::SUGGESTION_STYLE),
-                Span::styled(fmt_note_id(app, &n.note_id), theme::SUGGESTION_STYLE),
+                Span::styled(fmt_short_felt(app, &n.note_id), theme::SUGGESTION_STYLE),
                 Span::styled(" originally from ", theme::SUGGESTION_STYLE),
                 Span::styled(fmt_addr(app, &n.counterparty), counterparty_style),
                 Span::styled(" for ", theme::SUGGESTION_STYLE),
@@ -1548,7 +1549,7 @@ fn build_privacy_lines(
                 Span::styled("created  ", theme::NORMAL_STYLE),
                 Span::styled(token_label, token_style),
                 Span::styled(
-                    format!("  note {}", fmt_note_id(app, &n.note_id)),
+                    format!("  note {}", fmt_short_felt(app, &n.note_id)),
                     theme::SUGGESTION_STYLE,
                 ),
                 Span::styled("    recipient: ", theme::SUGGESTION_STYLE),
@@ -1603,7 +1604,7 @@ fn build_privacy_lines(
                 Span::raw(" "),
                 Span::styled(token_label, token_style),
                 Span::styled(
-                    format!("  note {}", fmt_note_id(app, &d.note_id)),
+                    format!("  note {}", fmt_short_felt(app, &d.note_id)),
                     theme::SUGGESTION_STYLE,
                 ),
                 Span::styled("  by ", theme::SUGGESTION_STYLE),
