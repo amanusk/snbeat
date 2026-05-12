@@ -323,6 +323,16 @@ impl AddressInfoState {
         self.call_color_processed_len = 0;
     }
 
+    /// Drop the cached tx-color map. `merge_tx_summaries` calls this when
+    /// an in-place upgrade fills `called_contracts` on an existing row —
+    /// the length-keyed fast path wouldn't otherwise notice, so the
+    /// Contracts column would stay in NORMAL_STYLE until the list grows.
+    pub fn invalidate_tx_color_cache(&mut self) {
+        self.tx_contract_counts.clear();
+        self.tx_color_map = AddressColorMap::new();
+        self.tx_color_processed_len = 0;
+    }
+
     /// Refresh the per-sender count map and color slots for the Calls tab.
     ///
     /// Cheap fast path: when `calls.items.len()` matches the cached length,
@@ -484,15 +494,22 @@ impl AddressInfoState {
         let mut seen_hashes: HashSet<Felt> = self.txs.items.iter().map(|t| t.hash).collect();
         let had_selection = self.txs.state.selected();
 
+        let mut called_contracts_upgraded = false;
         for item in incoming {
             if seen_hashes.contains(&item.hash) {
                 if let Some(existing) = self.txs.items.iter_mut().find(|t| t.hash == item.hash) {
-                    upgrade_tx_summary(existing, &item);
+                    called_contracts_upgraded |= upgrade_tx_summary(existing, &item);
                 }
             } else {
                 seen_hashes.insert(item.hash);
                 self.txs.items.push(item);
             }
+        }
+        // In-place called_contracts fill doesn't move items.len(), so the
+        // tx-color cache's length-keyed fast path would miss it. Force a
+        // rebuild now so the Contracts column reflects the enriched rows.
+        if called_contracts_upgraded {
+            self.invalidate_tx_color_cache();
         }
 
         self.txs.items.sort_by(|a, b| b.nonce.cmp(&a.nonce));
@@ -769,7 +786,10 @@ impl AddressInfoState {
 }
 
 /// Upgrade an existing tx summary with better data from an incoming one.
-pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxSummary) {
+/// Returns `true` if `called_contracts` was filled in (was empty, is now
+/// populated). Callers use this to invalidate the Txs-tab color cache,
+/// whose length-keyed fast path would otherwise miss the in-place change.
+pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxSummary) -> bool {
     if existing.block_number == 0 && incoming.block_number > 0 {
         existing.block_number = incoming.block_number;
     }
@@ -785,7 +805,9 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     if existing.endpoint_names.is_empty() && !incoming.endpoint_names.is_empty() {
         existing.endpoint_names.clone_from(&incoming.endpoint_names);
     }
-    if existing.called_contracts.is_empty() && !incoming.called_contracts.is_empty() {
+    let called_contracts_filled =
+        existing.called_contracts.is_empty() && !incoming.called_contracts.is_empty();
+    if called_contracts_filled {
         existing
             .called_contracts
             .clone_from(&incoming.called_contracts);
@@ -796,6 +818,7 @@ pub fn upgrade_tx_summary(existing: &mut AddressTxSummary, incoming: &AddressTxS
     if existing.tip == 0 && incoming.tip > 0 {
         existing.tip = incoming.tip;
     }
+    called_contracts_filled
 }
 
 #[cfg(test)]

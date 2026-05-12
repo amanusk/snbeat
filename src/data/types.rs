@@ -275,9 +275,17 @@ pub struct AddressTxSummary {
     /// The actual sender of this transaction (may differ from the viewed address for deployment txs).
     #[serde(default)]
     pub sender: Option<Felt>,
-    /// Top-level contracts directly invoked by this tx's multicall, in order
-    /// (deduplicated). Populated by the same path that fills `endpoint_names`;
-    /// remains empty for non-INVOKE txs and pre-enrichment stubs.
+    /// Contracts reached by this tx, in first-seen order with duplicates
+    /// removed. Includes each top-level multicall target plus the inner
+    /// target of any outside-execution call so privacy-pool reaches via
+    /// `execute_from_outside*` / `execute_private_sponsored` wrappers are
+    /// surfaced alongside the wrapper itself.
+    ///
+    /// Populated by the same path that fills `endpoint_names`; remains
+    /// empty for non-INVOKE txs and pre-enrichment stubs. Consumers (Txs
+    /// tab Contracts column, privacy-tx predicate, palette color map)
+    /// treat the union as a single set — they don't need to distinguish
+    /// top-level from OE-inner.
     #[serde(default)]
     pub called_contracts: Vec<Felt>,
 }

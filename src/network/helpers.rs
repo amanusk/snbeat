@@ -33,8 +33,13 @@ pub fn format_endpoint_names(tx: &SnTransaction, abi_reg: &AbiRegistry) -> Strin
     format_selector_names(calls.iter().map(|c| c.selector), abi_reg)
 }
 
-/// Top-level contracts directly invoked by `tx`'s multicall, in first-seen
-/// order with duplicates removed. Empty for non-Invoke txs.
+/// Top-level multicall targets only, in first-seen order with duplicates
+/// removed. Empty for non-Invoke txs.
+///
+/// Unlike the broader `AddressTxSummary::called_contracts` field (which
+/// `build_tx_summary` extends with OE inner targets), this helper stops
+/// at the top level — callers that need OE-inner addresses should walk
+/// `oe_inner_targets` themselves.
 pub fn tx_called_contracts(tx: &SnTransaction) -> Vec<Felt> {
     let calls = match tx {
         SnTransaction::Invoke(i) => parse_multicall(&i.calldata),
