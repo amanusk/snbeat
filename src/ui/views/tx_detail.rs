@@ -1919,10 +1919,12 @@ struct PrivacyTokenFlow {
     public_withdraw_to: Option<Felt>,
 }
 
-/// Synthesize one Net-flow line per token from the decrypted/spent
-/// note sets and public pool events for this tx. Returns empty when
-/// neither viewing-key-decoded activity nor public pool flows exist
-/// for any token.
+/// Synthesize one Pool-changes line per token whose pool TVL moved in
+/// this tx (public Deposit / Withdrawal / OpenNoteDeposited). The
+/// viewing-key flows (decrypted / spent notes) are folded in as detail
+/// for those tokens but never trigger a row on their own — pure
+/// internal transfers have no pool-TVL effect, and their per-note
+/// breakdown is already shown in the Decrypted / Spent sections.
 fn build_privacy_net_flow_lines(
     app: &App,
     summary: &PrivacySummary,
@@ -1977,16 +1979,15 @@ fn build_privacy_net_flow_lines(
         entry.public_open_deposited = entry.public_open_deposited.saturating_add(ond.amount);
         entry.public_depositor.get_or_insert(ond.depositor);
     }
+    // Only surface tokens whose pool TVL actually moved (a public
+    // Deposit / Withdrawal / OpenNoteDeposited). Purely viewing-key
+    // flows are an internal transfer between two pool users — the
+    // pool's balance didn't change, and the per-note breakdown is
+    // already shown in the Decrypted / Spent notes sections below.
     let mut ordered: Vec<(&Felt, &PrivacyTokenFlow)> = flows
         .iter()
         .filter(|(_, f)| {
-            f.sent_to_external != 0
-                || f.received_from_external != 0
-                || f.self_change != 0
-                || f.spent_self != 0
-                || f.public_deposited != 0
-                || f.public_withdrawn != 0
-                || f.public_open_deposited != 0
+            f.public_deposited != 0 || f.public_withdrawn != 0 || f.public_open_deposited != 0
         })
         .collect();
     ordered.sort_by(|(a, _), (b, _)| a.to_bytes_be().cmp(&b.to_bytes_be()));
