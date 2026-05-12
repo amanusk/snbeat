@@ -641,6 +641,13 @@ pub(super) async fn build_contract_calls_from_hashes(
                     .to_string();
                 let function_name = helpers::format_endpoint_names(&fetched_tx, abi_reg);
                 let (nonce, tip) = helpers::extract_nonce_tip(&fetched_tx);
+                let inner_targets = match &fetched_tx {
+                    crate::data::types::SnTransaction::Invoke(i) => {
+                        let calls = parse_multicall(&i.calldata);
+                        helpers::oe_inner_targets(&calls, abi_reg)
+                    }
+                    _ => Vec::new(),
+                };
                 calls_list.push(crate::data::types::ContractCallSummary {
                     tx_hash: hash,
                     sender: fetched_tx.sender(),
@@ -651,6 +658,7 @@ pub(super) async fn build_contract_calls_from_hashes(
                     status,
                     nonce: Some(nonce),
                     tip,
+                    inner_targets,
                 });
             }
         }
@@ -705,18 +713,20 @@ pub(super) async fn build_contract_calls_from_pf_rows(
         let fee_fri =
             u128::from_str_radix(row.actual_fee.trim_start_matches("0x"), 16).unwrap_or(0);
 
-        let function_name = if helpers::normalize_pf_tx_type(&row.tx_type) == "INVOKE" {
+        let (function_name, inner_targets) = if helpers::normalize_pf_tx_type(&row.tx_type)
+            == "INVOKE"
+        {
             let calldata: Vec<Felt> = row
                 .calldata
                 .iter()
                 .filter_map(|h| Felt::from_hex(h).ok())
                 .collect();
-            helpers::format_selector_names(
-                parse_multicall(&calldata).iter().map(|c| c.selector),
-                abi_reg,
-            )
+            let calls = parse_multicall(&calldata);
+            let name = helpers::format_selector_names(calls.iter().map(|c| c.selector), abi_reg);
+            let inner = helpers::oe_inner_targets(&calls, abi_reg);
+            (name, inner)
         } else {
-            String::new()
+            (String::new(), Vec::new())
         };
 
         calls_list.push(crate::data::types::ContractCallSummary {
@@ -729,6 +739,7 @@ pub(super) async fn build_contract_calls_from_pf_rows(
             status: row.status.clone(),
             nonce: row.nonce,
             tip: row.tip,
+            inner_targets,
         });
     }
 
@@ -3106,6 +3117,12 @@ pub(super) async fn enrich_dune_calls(
                     let (nonce, tip) = helpers::extract_nonce_tip(fetched_tx);
                     call.nonce = Some(nonce);
                     call.tip = tip;
+                    if call.inner_targets.is_empty()
+                        && let crate::data::types::SnTransaction::Invoke(i) = fetched_tx
+                    {
+                        let calls = parse_multicall(&i.calldata);
+                        call.inner_targets = helpers::oe_inner_targets(&calls, abi_reg);
+                    }
                 }
                 if let Ok(receipt) = rx_result {
                     call.total_fee_fri = felt_to_u128(&receipt.actual_fee);

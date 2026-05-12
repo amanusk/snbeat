@@ -242,6 +242,7 @@ impl DuneClient {
                     status,
                     nonce: None, // Not in calls table — merged in from RPC/pf path
                     tip: 0,
+                    inner_targets: Vec::new(), // Dune lacks calldata — filled by RPC enrich path
                 })
             })
             .collect())
@@ -363,6 +364,7 @@ impl DuneClient {
                     status,
                     nonce: None,
                     tip: 0,
+                    inner_targets: Vec::new(),
                 })
             })
             .collect())

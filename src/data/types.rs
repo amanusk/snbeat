@@ -342,6 +342,12 @@ pub struct ContractCallSummary {
     /// Sender tip (FRI). `0` from Dune-sourced rows and stubs; filled by RPC/pf path.
     #[serde(default)]
     pub tip: u64,
+    /// Target addresses of any outside-execution inner calls in this tx's
+    /// multicall (deduped, first-seen order). Empty for Dune-only stubs (no
+    /// calldata) and non-INVOKE rows. Used by the Calls-tab Prv column to
+    /// flag txs that reach a privacy address only via an OE wrapper.
+    #[serde(default)]
+    pub inner_targets: Vec<Felt>,
 }
 
 /// Label information fetched from Voyager for a contract/account address.
@@ -406,6 +412,9 @@ pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<Contra
             }
             if existing.tip == 0 && call.tip > 0 {
                 existing.tip = call.tip;
+            }
+            if existing.inner_targets.is_empty() && !call.inner_targets.is_empty() {
+                existing.inner_targets = call.inner_targets;
             }
         } else {
             seen.insert(call.tx_hash, result.len());

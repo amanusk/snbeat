@@ -733,6 +733,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("Tip              ", theme::SUGGESTION_STYLE),
         Span::styled("Block     ", theme::SUGGESTION_STYLE),
         Span::styled("St  ", theme::SUGGESTION_STYLE),
+        Span::styled("Prv ", theme::SUGGESTION_STYLE),
         Span::styled("Age  ", theme::SUGGESTION_STYLE),
     ]));
     f.render_widget(header, header_area);
@@ -807,6 +808,15 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::TX_HASH_STYLE
             };
 
+            // A call is "privacy" iff any OE inner target is in the curated
+            // privacy bundle. The viewed contract is the top-level callee for
+            // every row in this tab, so checking the top level isn't useful —
+            // the pool only shows up through an OE wrapper here.
+            let is_privacy_call = registry
+                .map(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)))
+                .unwrap_or(false);
+            let prv_marker_text = if is_privacy_call { "🛡   " } else { "    " };
+
             let line = Line::from(vec![
                 Span::styled(format!(" {:<25} ", sender_display), sender_style),
                 Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
@@ -819,6 +829,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::BLOCK_NUMBER_STYLE,
                 ),
                 Span::styled(format!("{:<4}", &call.status), status_style),
+                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
                 Span::styled(format_age(call.timestamp), theme::BLOCK_AGE_STYLE),
             ]);
             ListItem::new(line)

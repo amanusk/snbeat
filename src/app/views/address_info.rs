@@ -1106,6 +1106,7 @@ mod tests {
             status: "OK".into(),
             nonce: None,
             tip: 0,
+            inner_targets: Vec::new(),
         }
     }
 
