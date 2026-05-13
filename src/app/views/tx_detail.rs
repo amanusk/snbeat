@@ -155,16 +155,43 @@ impl TxDetailState {
 
     /// Build the list of navigable items for the current transaction.
     /// Order: header (block, sender, declared class, deployed, call targets,
-    /// outside-exec) → events → trace. Tagging each push with its section
-    /// lets `nav_step()` switch tabs and scroll the right region as the
-    /// cursor cycles.
-    pub fn build_nav_items<F>(&mut self, is_known: F)
-    where
+    /// outside-exec) → events → trace. Each push is tagged with its
+    /// `NavSection` so `nav_step()` can restrict j/k to Header + the active
+    /// tab's section; tab switching itself is done by `Tab`/`Shift+Tab` in
+    /// visual mode, not by the cursor cycling across tabs.
+    ///
+    /// `private_notes` / `private_nullifiers` are passed in so the Privacy
+    /// section can register the counterparties/users/tokens of decrypted +
+    /// spent notes (which only exist for users we hold a viewing key for).
+    pub fn build_nav_items<F>(
+        &mut self,
+        is_known: F,
+        private_notes: &std::collections::HashMap<
+            starknet::core::types::Felt,
+            crate::decode::privacy_sync::DecryptedNote,
+        >,
+        private_nullifiers: &std::collections::HashMap<
+            starknet::core::types::Felt,
+            starknet::core::types::Felt,
+        >,
+    ) where
         F: Fn(&starknet::core::types::Felt) -> bool,
     {
         let mut items: Vec<TxNavItem> = Vec::new();
         let mut sections: Vec<NavSection> = Vec::new();
-        let mut seen: HashSet<starknet::core::types::Felt> = HashSet::new();
+        // Dedup model: Header items dedupe globally (Header is visible from
+        // every tab, so each header address should appear at most once and
+        // doesn't need a per-tab duplicate). Every other section dedupes
+        // within itself only, but skips addresses that are already in
+        // Header — so e.g. a token contract that emits a Transfer event will
+        // appear under Events AND Transfers (both tabs render it), but a
+        // sender already in Header won't be duplicated everywhere.
+        let mut in_header: HashSet<starknet::core::types::Felt> = HashSet::new();
+        let mut in_calls: HashSet<starknet::core::types::Felt> = HashSet::new();
+        let mut in_events: HashSet<starknet::core::types::Felt> = HashSet::new();
+        let mut in_transfers: HashSet<starknet::core::types::Felt> = HashSet::new();
+        let mut in_privacy: HashSet<starknet::core::types::Felt> = HashSet::new();
+        let mut in_trace: HashSet<starknet::core::types::Felt> = HashSet::new();
 
         let push = |item: TxNavItem,
                     section: NavSection,
@@ -193,7 +220,7 @@ impl TxDetailState {
         // Sender
         if let Some(tx) = &self.transaction {
             let sender = tx.sender();
-            if seen.insert(sender) {
+            if in_header.insert(sender) {
                 push(
                     TxNavItem::Address(sender),
                     NavSection::Header,
@@ -215,7 +242,7 @@ impl TxDetailState {
         // Deployed contract addresses (via UDC) — rendered in the header's
         // "Contracts Deployed" section, so they're navigable from there.
         for addr in crate::decode::events::extract_deployed_addresses(&self.decoded_events) {
-            if seen.insert(addr) {
+            if in_header.insert(addr) {
                 push(
                     TxNavItem::Address(addr),
                     NavSection::Header,
@@ -225,24 +252,9 @@ impl TxDetailState {
             }
         }
 
-        // === Calls tab ===
-        // Call contract addresses
-        for call in &self.decoded_calls {
-            if seen.insert(call.contract_address) {
-                push(
-                    TxNavItem::Address(call.contract_address),
-                    NavSection::Calls,
-                    &mut items,
-                    &mut sections,
-                );
-            }
-        }
-
-        // Outside execution: the intender is shown in the header's META line
-        // (always visible), so it's a Header-section nav item. Inner calls are
-        // only revealed when the Calls tab toggles `o`, so they belong there.
+        // Outside execution intender is shown in the header's META line.
         for (_, oe) in &self.outside_executions {
-            if seen.insert(oe.intender) {
+            if in_header.insert(oe.intender) {
                 push(
                     TxNavItem::Address(oe.intender),
                     NavSection::Header,
@@ -250,11 +262,52 @@ impl TxDetailState {
                     &mut sections,
                 );
             }
-            for inner in &oe.inner_calls {
-                if seen.insert(inner.contract_address) {
-                    push(
-                        TxNavItem::Address(inner.contract_address),
+        }
+
+        // Helper for non-Header sections: dedupe within the section but
+        // skip addresses already covered by Header (since Header is
+        // visible from every tab, those would just be redundant stops).
+        let push_section = |felt: starknet::core::types::Felt,
+                            section: NavSection,
+                            section_seen: &mut HashSet<starknet::core::types::Felt>,
+                            in_header: &HashSet<starknet::core::types::Felt>,
+                            items: &mut Vec<TxNavItem>,
+                            sections: &mut Vec<NavSection>| {
+            if felt == starknet::core::types::Felt::ZERO {
+                return;
+            }
+            if in_header.contains(&felt) {
+                return;
+            }
+            if section_seen.insert(felt) {
+                push(TxNavItem::Address(felt), section, items, sections);
+            }
+        };
+
+        // === Calls tab ===
+        for call in &self.decoded_calls {
+            push_section(
+                call.contract_address,
+                NavSection::Calls,
+                &mut in_calls,
+                &in_header,
+                &mut items,
+                &mut sections,
+            );
+        }
+        // OE inner calls — only revealed when the Calls tab toggles `o` (or
+        // `e` expands everything). Skip them while the OE intent view is
+        // hidden so visual mode doesn't land on a phantom cursor with no
+        // corresponding rendered line. `build_tx_nav_items` is re-run when
+        // `o`/`e` flips, so these reappear as soon as the rows do.
+        if self.show_outside_execution || self.expand_all {
+            for (_, oe) in &self.outside_executions {
+                for inner in &oe.inner_calls {
+                    push_section(
+                        inner.contract_address,
                         NavSection::Calls,
+                        &mut in_calls,
+                        &in_header,
                         &mut items,
                         &mut sections,
                     );
@@ -264,14 +317,14 @@ impl TxDetailState {
 
         // === Events tab ===
         for event in &self.decoded_events {
-            if seen.insert(event.contract_address) {
-                push(
-                    TxNavItem::Address(event.contract_address),
-                    NavSection::Events,
-                    &mut items,
-                    &mut sections,
-                );
-            }
+            push_section(
+                event.contract_address,
+                NavSection::Events,
+                &mut in_events,
+                &in_header,
+                &mut items,
+                &mut sections,
+            );
         }
         // Address-typed event params + untyped params that resolve to known labels.
         for event in &self.decoded_events {
@@ -282,10 +335,12 @@ impl TxDetailState {
                     && type_name.is_empty()
                     && p.value != starknet::core::types::Felt::ZERO
                     && is_known(&p.value);
-                if (is_address_type || is_known_label) && seen.insert(p.value) {
-                    push(
-                        TxNavItem::Address(p.value),
+                if is_address_type || is_known_label {
+                    push_section(
+                        p.value,
                         NavSection::Events,
+                        &mut in_events,
+                        &in_header,
                         &mut items,
                         &mut sections,
                     );
@@ -294,25 +349,13 @@ impl TxDetailState {
         }
 
         // === Transfers tab ===
-        // Add token / from / to addresses pulled from Transfer events. Most
-        // are dedup'd against earlier sections (sender is in Header, token
-        // contracts in Events), so this only adds genuinely transfer-unique
-        // addresses (e.g. final recipients).
+        // Token / from / to addresses from Transfer events. These can
+        // overlap with Events (token contracts emit the Transfer event)
+        // and Calls (sender / fee_token are usually call targets too),
+        // but since each tab dedupes independently they end up
+        // selectable from the Transfers tab too.
         if let Some(trace) = &self.trace {
             let groups = trace.collect_transfers();
-            let add = |felt: starknet::core::types::Felt,
-                       items: &mut Vec<TxNavItem>,
-                       sections: &mut Vec<NavSection>,
-                       seen: &mut HashSet<starknet::core::types::Felt>| {
-                if seen.insert(felt) {
-                    push(
-                        TxNavItem::Address(felt),
-                        NavSection::Transfers,
-                        items,
-                        sections,
-                    );
-                }
-            };
             for row in groups
                 .validate
                 .iter()
@@ -322,9 +365,16 @@ impl TxDetailState {
                 .chain(groups.l1_handler.iter())
                 .chain(groups.fee.iter())
             {
-                add(row.token, &mut items, &mut sections, &mut seen);
-                add(row.from, &mut items, &mut sections, &mut seen);
-                add(row.to, &mut items, &mut sections, &mut seen);
+                for felt in [row.token, row.from, row.to] {
+                    push_section(
+                        felt,
+                        NavSection::Transfers,
+                        &mut in_transfers,
+                        &in_header,
+                        &mut items,
+                        &mut sections,
+                    );
+                }
             }
         }
 
@@ -346,72 +396,97 @@ impl TxDetailState {
                 &oe_clone,
             )
         {
-            let push_priv =
-                |felt: starknet::core::types::Felt,
-                 items: &mut Vec<TxNavItem>,
-                 sections: &mut Vec<NavSection>,
-                 seen: &mut HashSet<starknet::core::types::Felt>| {
-                    if felt != starknet::core::types::Felt::ZERO && seen.insert(felt) {
-                        push(
-                            TxNavItem::Address(felt),
-                            NavSection::Privacy,
-                            items,
-                            sections,
-                        );
-                    }
-                };
+            let mut p = |felt: starknet::core::types::Felt,
+                         items: &mut Vec<TxNavItem>,
+                         sections: &mut Vec<NavSection>| {
+                push_section(
+                    felt,
+                    NavSection::Privacy,
+                    &mut in_privacy,
+                    &in_header,
+                    items,
+                    sections,
+                );
+            };
             for d in &summary.deposits {
-                push_priv(d.user_addr, &mut items, &mut sections, &mut seen);
-                push_priv(d.token, &mut items, &mut sections, &mut seen);
+                p(d.user_addr, &mut items, &mut sections);
+                p(d.token, &mut items, &mut sections);
             }
             for w in &summary.withdrawals {
-                push_priv(w.to_addr, &mut items, &mut sections, &mut seen);
-                push_priv(w.token, &mut items, &mut sections, &mut seen);
+                p(w.to_addr, &mut items, &mut sections);
+                p(w.token, &mut items, &mut sections);
             }
             for n in &summary.open_notes_created {
-                push_priv(n.token, &mut items, &mut sections, &mut seen);
+                p(n.token, &mut items, &mut sections);
             }
             for d in &summary.open_notes_deposited {
-                push_priv(d.depositor, &mut items, &mut sections, &mut seen);
-                push_priv(d.token, &mut items, &mut sections, &mut seen);
+                p(d.depositor, &mut items, &mut sections);
+                p(d.token, &mut items, &mut sections);
             }
             for v in &summary.viewing_keys_set {
-                push_priv(v.user_addr, &mut items, &mut sections, &mut seen);
+                p(v.user_addr, &mut items, &mut sections);
             }
             if let Some(ie) = &summary.invoke_external {
-                push_priv(ie.target, &mut items, &mut sections, &mut seen);
+                p(ie.target, &mut items, &mut sections);
             }
             if let Some(intender) = summary.intender {
-                push_priv(intender, &mut items, &mut sections, &mut seen);
+                p(intender, &mut items, &mut sections);
+            }
+
+            // Decrypted notes (created in this tx, for users we hold a
+            // viewing key for): expose the note's user, counterparty, and
+            // token so v-mode can step onto each of them — without this,
+            // the recipient label on the "Decrypted (viewing keys)" rows
+            // (e.g. the receiver of an outgoing transfer) isn't selectable.
+            for nid in &summary.enc_notes_created {
+                if let Some(n) = private_notes.get(nid) {
+                    p(n.user, &mut items, &mut sections);
+                    p(n.counterparty, &mut items, &mut sections);
+                    p(n.token, &mut items, &mut sections);
+                }
+            }
+            // Spent notes (this tx's nullifiers that match notes we know):
+            // same idea — the "Spent notes" rows render user + counterparty
+            // + token, so all three need to be in nav_items.
+            for nul in &summary.nullifiers {
+                if let Some(nid) = private_nullifiers.get(nul)
+                    && let Some(n) = private_notes.get(nid)
+                {
+                    p(n.user, &mut items, &mut sections);
+                    p(n.counterparty, &mut items, &mut sections);
+                    p(n.token, &mut items, &mut sections);
+                }
             }
         }
 
         // === Trace tab ===
         if let Some(trace) = &self.trace {
             trace.for_each_call(|call| {
-                if seen.insert(call.contract_address) {
-                    push(
-                        TxNavItem::Address(call.contract_address),
-                        NavSection::Trace,
-                        &mut items,
-                        &mut sections,
-                    );
-                }
-                for p in call
+                push_section(
+                    call.contract_address,
+                    NavSection::Trace,
+                    &mut in_trace,
+                    &in_header,
+                    &mut items,
+                    &mut sections,
+                );
+                for ep in call
                     .events
                     .iter()
                     .flat_map(|e| e.decoded_keys.iter().chain(e.decoded_data.iter()))
                 {
-                    let type_name = p.type_name.as_deref().unwrap_or("");
+                    let type_name = ep.type_name.as_deref().unwrap_or("");
                     let is_address_type = type_name.contains("ContractAddress");
                     let is_known_label = !is_address_type
                         && type_name.is_empty()
-                        && p.value != starknet::core::types::Felt::ZERO
-                        && is_known(&p.value);
-                    if (is_address_type || is_known_label) && seen.insert(p.value) {
-                        push(
-                            TxNavItem::Address(p.value),
+                        && ep.value != starknet::core::types::Felt::ZERO
+                        && is_known(&ep.value);
+                    if is_address_type || is_known_label {
+                        push_section(
+                            ep.value,
                             NavSection::Trace,
+                            &mut in_trace,
+                            &in_header,
                             &mut items,
                             &mut sections,
                         );
@@ -449,34 +524,51 @@ impl TxDetailState {
         }
     }
 
-    /// Step the visual-mode cursor by `delta` (wrapping). If the next item is
-    /// in a different tab, switch to that tab; then scroll the matching
-    /// section so the item is visible (2 lines of context above).
+    /// `NavSection` that pairs with the currently active tab. Header items are
+    /// always navigable in addition to the active tab's section.
+    fn active_tab_section(&self) -> NavSection {
+        match self.active_tab {
+            TxTab::Events => NavSection::Events,
+            TxTab::Calls => NavSection::Calls,
+            TxTab::Transfers => NavSection::Transfers,
+            TxTab::Trace => NavSection::Trace,
+            TxTab::Privacy => NavSection::Privacy,
+        }
+    }
+
+    /// Step the visual-mode cursor by `delta` (wrapping) within the items
+    /// visible from the active tab — Header items plus items in the active
+    /// tab's section. Tab switching is intentionally NOT done here: j/k
+    /// keeps the user on the current tab so the highlight doesn't jump
+    /// across tabs mid-cycle (use `Tab`/`Shift+Tab` to change tabs).
     pub fn nav_step(&mut self, delta: i64) {
         if self.nav_items.is_empty() {
             return;
         }
-        let len = self.nav_items.len() as i64;
-        let next = (self.nav_cursor as i64 + delta).rem_euclid(len) as usize;
-        self.nav_cursor = next;
-
-        // Switch tab if needed so the selected item is in the active panel.
-        if let Some(section) = self.nav_sections.get(next).copied() {
-            match section {
-                NavSection::Events => self.active_tab = TxTab::Events,
-                NavSection::Calls => self.active_tab = TxTab::Calls,
-                NavSection::Transfers => self.active_tab = TxTab::Transfers,
-                NavSection::Trace => self.active_tab = TxTab::Trace,
-                NavSection::Privacy => self.active_tab = TxTab::Privacy,
-                NavSection::Header => {} // header is always visible — no tab switch
-            }
+        let active_section = self.active_tab_section();
+        let visible: Vec<usize> = self
+            .nav_sections
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(**s, NavSection::Header) || **s == active_section)
+            .map(|(i, _)| i)
+            .collect();
+        if visible.is_empty() {
+            return;
         }
+        let pos = visible
+            .iter()
+            .position(|&i| i == self.nav_cursor)
+            .unwrap_or(0);
+        let len = visible.len() as i64;
+        let next_pos = (pos as i64 + delta).rem_euclid(len) as usize;
+        self.nav_cursor = visible[next_pos];
 
-        // Scroll the relevant tab so the item is visible. Header items don't
+        // Scroll the active tab so the item is visible. Header items don't
         // scroll anything (header is fixed-height).
-        if let Some(&line) = self.nav_item_lines.get(next) {
+        if let Some(&line) = self.nav_item_lines.get(self.nav_cursor) {
             let target = line.saturating_sub(2);
-            match self.nav_sections.get(next).copied() {
+            match self.nav_sections.get(self.nav_cursor).copied() {
                 Some(NavSection::Events) => self.events_scroll = target,
                 Some(NavSection::Calls) => self.calls_scroll = target,
                 Some(NavSection::Transfers) => self.transfers_scroll = target,
@@ -484,6 +576,23 @@ impl TxDetailState {
                 Some(NavSection::Privacy) => self.privacy_scroll = target,
                 Some(NavSection::Header) | None => {}
             }
+        }
+    }
+
+    /// Reset visual-mode cursor to the first item visible from the active tab
+    /// (typically a Header item, since Header items come first in
+    /// `nav_items`). Used when entering visual mode or when the active tab
+    /// changes so the cursor lands somewhere visible.
+    pub fn reset_nav_cursor_for_active_tab(&mut self) {
+        let active_section = self.active_tab_section();
+        if let Some(idx) = self
+            .nav_sections
+            .iter()
+            .position(|s| matches!(*s, NavSection::Header) || *s == active_section)
+        {
+            self.nav_cursor = idx;
+        } else {
+            self.nav_cursor = 0;
         }
     }
 }

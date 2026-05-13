@@ -882,8 +882,11 @@ impl App {
 
     pub fn build_tx_nav_items(&mut self) {
         let registry = self.search_engine.as_ref().map(|e| e.registry());
-        self.tx_detail
-            .build_nav_items(|felt| registry.as_ref().is_some_and(|r| r.resolve(felt).is_some()));
+        self.tx_detail.build_nav_items(
+            |felt| registry.as_ref().is_some_and(|r| r.resolve(felt).is_some()),
+            &self.private_notes,
+            &self.private_nullifiers,
+        );
     }
 
     pub fn tx_nav_step(&mut self, delta: i64) {
@@ -1254,6 +1257,13 @@ impl App {
                 // token in the synced notes that we don't know about
                 // yet — without this, unknown tokens render as raw u128.
                 self.dispatch_token_metadata_for_unknown_tokens(new_tokens);
+                // Rebuild tx-detail nav items so decrypted/spent-note
+                // participants (counterparty/user/token rendered in the
+                // Privacy tab) become selectable via `v` once the sync
+                // lands. Only relevant if we're currently looking at a tx.
+                if self.tx_detail.transaction.is_some() {
+                    self.build_tx_nav_items();
+                }
             }
             Action::NavigateToAddress { address } => {
                 // Push view immediately — show cached data while fresh data loads

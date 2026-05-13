@@ -197,11 +197,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
-        // v: enter visual mode in TxDetail (cycle through navigable items)
+        // v: enter visual mode in TxDetail (cycle through navigable items
+        // within the active tab + always-visible Header items)
         KeyCode::Char('v') if app.current_view() == View::TxDetail => {
             if !app.tx_detail.nav_items.is_empty() {
                 app.tx_detail.visual_mode = true;
-                app.tx_detail.nav_cursor = 0;
+                app.tx_detail.reset_nav_cursor_for_active_tab();
             }
             None
         }
@@ -259,6 +260,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             if !app.tx_detail.outside_executions.is_empty() {
                 app.tx_detail.active_tab = crate::app::views::tx_detail::TxTab::Calls;
                 app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+                // OE inner-call rows appear/disappear with this toggle;
+                // rebuild so visual mode doesn't park on a hidden row.
+                app.build_tx_nav_items();
             }
             None
         }
@@ -268,6 +272,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         // and forces decoded-calldata + outside-exec intent on.
         KeyCode::Char('e') if app.current_view() == View::TxDetail => {
             app.tx_detail.expand_all = !app.tx_detail.expand_all;
+            // Same reason as `o`: OE inner-call rows are gated on
+            // `expand_all`, so the nav set has to follow.
+            app.build_tx_nav_items();
             None
         }
 
@@ -284,6 +291,21 @@ fn handle_tx_visual_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
         KeyCode::Char('k') | KeyCode::Up => {
             app.tx_nav_step(-1);
+            None
+        }
+        // Tab / Shift+Tab inside visual mode: switch tabs without leaving
+        // visual mode, and snap the cursor to the first item visible from
+        // the new tab so the highlight stays valid.
+        KeyCode::Tab => {
+            let has_privacy = tx_detail_has_privacy(app);
+            app.tx_detail.active_tab = app.tx_detail.active_tab.next_visible(has_privacy);
+            app.tx_detail.reset_nav_cursor_for_active_tab();
+            None
+        }
+        KeyCode::BackTab => {
+            let has_privacy = tx_detail_has_privacy(app);
+            app.tx_detail.active_tab = app.tx_detail.active_tab.prev_visible(has_privacy);
+            app.tx_detail.reset_nav_cursor_for_active_tab();
             None
         }
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
@@ -305,6 +327,8 @@ fn handle_tx_visual_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') => {
             if !app.tx_detail.outside_executions.is_empty() {
                 app.tx_detail.show_outside_execution = !app.tx_detail.show_outside_execution;
+                app.build_tx_nav_items();
+                app.tx_detail.reset_nav_cursor_for_active_tab();
             }
             None
         }
