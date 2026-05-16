@@ -1736,6 +1736,10 @@ impl DataSource for CachingDataSource {
         self.cache_nonce_info(address, nonce, block);
     }
 
+    fn load_cached_class_hash(&self, address: &Felt) -> Option<Felt> {
+        self.get_cached_class_hash(address).map(|(ch, _)| ch)
+    }
+
     fn load_search_progress(&self, address: &Felt, filter_kind: FilterKind) -> Option<(u64, u64)> {
         self.get_cached_search_progress(address, filter_kind)
     }

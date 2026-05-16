@@ -311,6 +311,15 @@ pub trait DataSource: Send + Sync {
     /// Save nonce + block number for an address.
     fn save_cached_nonce(&self, _address: &Felt, _nonce: &Felt, _block: u64) {}
 
+    // --- Class-hash cache (synchronous read for cache-first paint paths) ---
+    /// Load the cached class_hash for an address without any network IO.
+    /// Used by the address pipeline's cache-first emit so a re-visit can
+    /// render the live `class_hash` from disk before the RPC join lands.
+    /// `None` ⇒ no class_hash ever cached for this address.
+    fn load_cached_class_hash(&self, _address: &Felt) -> Option<Felt> {
+        None
+    }
+
     // --- Search progress cache ---
     /// Load cached search progress `(min_searched_block, max_searched_block)`
     /// for `(address, filter_kind)`. `None` ⇒ no scan of that kind recorded.

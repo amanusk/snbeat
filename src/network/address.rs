@@ -802,9 +802,16 @@ pub(super) async fn fetch_and_send_address_info(
     let cached_txs = ds.load_cached_address_txs(&address);
     let cached_calls = ds.load_cached_address_calls(&address);
     let cached_meta_txs = ds.load_cached_meta_txs(&address);
-    let cached_top_class_hash = cached_class_history
-        .first()
-        .and_then(|e| starknet::core::types::Felt::from_hex(&e.class_hash).ok());
+    // Prefer the dedicated `class_hashes` cache (populated by every
+    // `get_class_hash` call) over the class-history list, since pathfinder
+    // isn't always available and class history may never have been
+    // written. Fall back to class_history when the dedicated cache is
+    // empty — same code path that was used before.
+    let cached_top_class_hash = ds.load_cached_class_hash(&address).or_else(|| {
+        cached_class_history
+            .first()
+            .and_then(|e| starknet::core::types::Felt::from_hex(&e.class_hash).ok())
+    });
     let cached_nonce_felt = cached_nonce_info
         .map(|(n, _)| n)
         .unwrap_or(starknet::core::types::Felt::ZERO);

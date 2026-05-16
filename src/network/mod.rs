@@ -57,10 +57,15 @@ impl HeadTracker {
     }
 
     /// Publish a freshly-seen block number. Monotonic on the block field
-    /// (a reconnecting WS may briefly replay older heads); the timestamp
-    /// is always overwritten with `now`.
+    /// (a reconnecting WS may briefly replay older heads). The timestamp
+    /// is refreshed only when the block actually advances — otherwise a
+    /// replayed old head would make a stale tracker look fresh and the
+    /// address pipeline would skip its fallback RPC.
     pub fn update(&self, block: u64) {
-        self.block.fetch_max(block, Ordering::Relaxed);
+        let prev = self.block.fetch_max(block, Ordering::Relaxed);
+        if block <= prev {
+            return;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -100,10 +105,10 @@ pub fn spawn_head_keeper(
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // `interval` fires its first tick immediately, which is exactly
+        // what we want: prime the tracker before any address visit can
+        // race a still-empty tracker into a fallback RPC.
         let mut tick = tokio::time::interval(interval);
-        // Burn the immediate first tick — main.rs already wires the
-        // initial fetch through `FetchRecentBlocks`, no need to race it.
-        tick.tick().await;
         loop {
             tick.tick().await;
             match data_source.get_latest_block_number().await {

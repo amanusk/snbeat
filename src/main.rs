@@ -356,7 +356,11 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Spawn block update mechanism: prefer WebSocket, fall back to polling
+    // Spawn block update mechanism: prefer WebSocket, fall back to polling.
+    // When WS is in use we also spawn a head-keeper as a backstop in case
+    // WS disconnects — it keeps `head_block` fresh from a periodic RPC.
+    // The HTTP polling path already calls `get_latest_block_number` every
+    // 3 s and writes the tracker, so we don't double-spawn the keeper.
     let _block_updater: tokio::task::JoinHandle<()> = if let Some(ws_url) = &config.ws_url {
         info!(ws_url = %ws_url, "Using WebSocket for new block headers and address streaming");
         app.data_sources.ws = app::state::SourceStatus::Configured;
@@ -367,6 +371,12 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&head_block),
         );
         app.ws_manager = Some(ws_manager);
+        // Backstop only relevant when WS is the primary head feed.
+        let _head_keeper: tokio::task::JoinHandle<()> = network::spawn_head_keeper(
+            Arc::clone(&data_source),
+            Arc::clone(&head_block),
+            Duration::from_secs(10),
+        );
         handle
     } else {
         info!("No WS URL configured, using HTTP polling (3s interval)");
@@ -377,17 +387,6 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&head_block),
         )
     };
-
-    // Backstop head-keeper: refreshes the shared head tracker every 10s
-    // regardless of WS state. When WS is healthy, the tracker is already
-    // sub-block-time fresh and this RPC is essentially idle. When WS
-    // disconnects, this keeps `latest_block` from going stale so address
-    // pipeline reads stay accurate.
-    let _head_keeper: tokio::task::JoinHandle<()> = network::spawn_head_keeper(
-        Arc::clone(&data_source),
-        Arc::clone(&head_block),
-        Duration::from_secs(10),
-    );
 
     // Periodic address-view refresh ticker: every 60s, nudge the reducer to
     // re-fetch the currently viewed address from RPC if WS isn't `Live`.
