@@ -114,6 +114,7 @@ pub fn spawn_ws_subscriber(
     ws_url: String,
     data_source: Arc<dyn DataSource>,
     response_tx: mpsc::UnboundedSender<Action>,
+    head_block: Arc<super::HeadTracker>,
 ) -> (tokio::task::JoinHandle<()>, WsSubscriptionManager) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsCommand>();
     let manager = WsSubscriptionManager { cmd_tx };
@@ -135,6 +136,7 @@ pub fn spawn_ws_subscriber(
                 &response_tx,
                 &mut cmd_rx,
                 &active_address_subs,
+                &head_block,
             )
             .await
             {
@@ -306,6 +308,7 @@ async fn connect_and_run(
     response_tx: &mpsc::UnboundedSender<Action>,
     cmd_rx: &mut mpsc::UnboundedReceiver<WsCommand>,
     initial_subs: &[WsCommand],
+    head_block: &Arc<super::HeadTracker>,
 ) -> Result<Vec<WsCommand>, Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -336,7 +339,7 @@ async fn connect_and_run(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(&text, &mut write, &mut state, data_source, response_tx).await;
+                        handle_message(&text, &mut write, &mut state, data_source, response_tx, head_block).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = write.send(Message::Pong(data)).await;
@@ -463,6 +466,7 @@ async fn handle_message(
     state: &mut ConnectionState,
     data_source: &Arc<dyn DataSource>,
     response_tx: &mpsc::UnboundedSender<Action>,
+    head_block: &Arc<super::HeadTracker>,
 ) {
     let raw: RawMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -527,7 +531,7 @@ async fn handle_message(
 
     match kind {
         SubscriptionKind::NewHeads => {
-            handle_new_heads(&params.result, data_source, response_tx).await;
+            handle_new_heads(&params.result, data_source, response_tx, head_block).await;
         }
         SubscriptionKind::Events { address } => {
             handle_event(&params.result, address, data_source, response_tx);
@@ -548,6 +552,7 @@ async fn handle_new_heads(
     result: &Value,
     data_source: &Arc<dyn DataSource>,
     response_tx: &mpsc::UnboundedSender<Action>,
+    head_block: &Arc<super::HeadTracker>,
 ) {
     let block_number = match result["block_number"].as_u64() {
         Some(n) => n,
@@ -556,6 +561,12 @@ async fn handle_new_heads(
             return;
         }
     };
+
+    // Publish the head to shared state before any await so other network-task
+    // sub-paths can read it synchronously without an RPC round trip. The
+    // tracker also records the timestamp so stale-detection works after a
+    // WebSocket disconnect.
+    head_block.update(block_number);
 
     info!(block_number, "New block header via WebSocket");
 

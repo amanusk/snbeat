@@ -27,6 +27,7 @@ pub(super) async fn resolve_search(
     dune: &Option<Arc<dune::DuneClient>>,
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager: &Option<Arc<voyager::VoyagerClient>>,
+    head_block: &Arc<super::HeadTracker>,
     tx: &mpsc::UnboundedSender<Action>,
     cancel: &CancellationToken,
 ) {
@@ -49,8 +50,10 @@ pub(super) async fn resolve_search(
     if let Ok(felt) = starknet::core::types::Felt::from_hex(&format!("0x{hex}")) {
         if ds.get_class_hash(felt).await.is_ok() {
             let _ = tx.send(Action::NavigateToAddress { address: felt });
-            address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx, cancel)
-                .await;
+            address::fetch_and_send_address_info(
+                felt, ds, abi_reg, dune, pf, voyager, head_block, tx, cancel,
+            )
+            .await;
             return;
         }
 

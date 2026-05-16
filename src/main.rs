@@ -329,10 +329,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Shared head-block tracker: WS writes the most recent block on every
+    // `starknet_subscribeNewHeads` notification; the network task reads it
+    // synchronously instead of issuing `starknet_blockNumber` RPCs. A
+    // background head-keeper periodically refreshes it as a backstop for
+    // WebSocket disconnects.
+    let head_block = Arc::new(network::HeadTracker::new());
+
     // Spawn network task
     let ds_clone = Arc::clone(&data_source);
     let abi_clone = Arc::clone(&abi_registry);
     let resp_tx_clone = response_tx.clone();
+    let head_clone = Arc::clone(&head_block);
     tokio::spawn(async move {
         network::run_network_task(
             ds_clone,
@@ -341,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
             pf_client,
             voyager_client,
             price_client,
+            head_clone,
             action_rx,
             resp_tx_clone,
         )
@@ -355,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
             ws_url.clone(),
             Arc::clone(&data_source),
             response_tx.clone(),
+            Arc::clone(&head_block),
         );
         app.ws_manager = Some(ws_manager);
         handle
@@ -364,8 +374,20 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&data_source),
             response_tx.clone(),
             Duration::from_secs(3),
+            Arc::clone(&head_block),
         )
     };
+
+    // Backstop head-keeper: refreshes the shared head tracker every 10s
+    // regardless of WS state. When WS is healthy, the tracker is already
+    // sub-block-time fresh and this RPC is essentially idle. When WS
+    // disconnects, this keeps `latest_block` from going stale so address
+    // pipeline reads stay accurate.
+    let _head_keeper: tokio::task::JoinHandle<()> = network::spawn_head_keeper(
+        Arc::clone(&data_source),
+        Arc::clone(&head_block),
+        Duration::from_secs(10),
+    );
 
     // Periodic address-view refresh ticker: every 60s, nudge the reducer to
     // re-fetch the currently viewed address from RPC if WS isn't `Live`.
