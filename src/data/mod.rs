@@ -71,8 +71,18 @@ pub trait DataSource: Send + Sync {
     /// only used to anchor a windowed scan or staleness check; reserve the
     /// authoritative call for paths that actually need to know the tip
     /// (e.g. the head-keeper that populates the tracker).
+    ///
+    /// The underlying RPC error (if any) is logged at debug level here, so
+    /// callers can keep their failure branches concise without losing the
+    /// upstream context (network, HTTP, deserialization, …).
     async fn latest_block_hint(&self) -> Option<u64> {
-        self.get_latest_block_number().await.ok()
+        match self.get_latest_block_number().await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, "latest_block_hint: upstream get_latest_block_number failed");
+                None
+            }
+        }
     }
     async fn get_block(&self, number: u64) -> Result<SnBlock>;
     async fn get_block_by_hash(&self, hash: Felt) -> Result<u64>;

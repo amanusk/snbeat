@@ -96,10 +96,13 @@ impl Default for HeadTracker {
 
 /// Age beyond which we don't trust the tracker for staleness checks.
 /// Mainnet block time is ~2 s; WS feeds us every block and the head-keeper
-/// backstops at 10 s, so a healthy tracker is well under this. 60 s gives
-/// ~30 blocks of slack — far below the 1000-block class_hash staleness
-/// window, so a tracker on the edge of fresh can't cause a stale-cache hit.
-const HEAD_TRACKER_FRESH_SECS: u64 = 60;
+/// backstops at 60 s. Setting the freshness threshold to 120 s gives one
+/// full keeper-interval of slack: if a keeper tick fails or a WS reconnect
+/// is in flight, the tracker is still considered fresh for the next
+/// scheduled tick. ~60 blocks of slack is far below the 1000-block
+/// class_hash staleness window, so a tracker on the edge of fresh still
+/// can't cause a stale-cache hit.
+const HEAD_TRACKER_FRESH_SECS: u64 = 120;
 
 impl crate::data::LatestBlockSource for HeadTracker {
     fn latest(&self) -> Option<u64> {

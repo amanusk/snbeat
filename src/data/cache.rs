@@ -1105,13 +1105,20 @@ impl DataSource for CachingDataSource {
         // so window/anchor math doesn't pay an RPC round trip per call. The
         // tracker reports `None` when empty (cold start) or stale (WS dropped
         // and the head-keeper hasn't ticked); in those cases the upstream RPC
-        // is the only honest answer.
+        // is the only honest answer. Mirror the trait default's logging so
+        // operators can tell a transient RPC outage from a missing tracker.
         if let Some(head) = &self.head
             && let Some(block) = head.latest()
         {
             return Some(block);
         }
-        self.upstream.get_latest_block_number().await.ok()
+        match self.upstream.get_latest_block_number().await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                debug!(error = %e, "latest_block_hint: upstream get_latest_block_number failed");
+                None
+            }
+        }
     }
 
     async fn get_block(&self, number: u64) -> Result<SnBlock> {
@@ -1243,22 +1250,30 @@ impl DataSource for CachingDataSource {
     async fn get_class_hash(&self, address: Felt) -> Result<Felt> {
         // Class hash is mostly stable but CAN change via replace_class syscall.
         // Cache with the block at which we fetched it; refetch if stale (>1000 blocks).
-        // `latest_block_hint().await.unwrap_or(0)`: a missing hint means the
-        // staleness check evaluates `0 - fetched_at = 0 < 1000`, so we keep
-        // the cache entry — "fail open" toward the warm value rather than
-        // hammering the upstream when we couldn't even read the head.
+        //
+        // Head-hint failure handling:
+        //  - Read side: a missing hint makes `0.saturating_sub(fetched_at) = 0`,
+        //    so we treat the cached entry as fresh — "fail open" toward the
+        //    warm value rather than hammering the upstream when we couldn't
+        //    even read the head.
+        //  - Write side: we skip persisting the anchor entirely when the head
+        //    is unknown. Caching with `fetched_at = 0` would force every
+        //    subsequent call (once the tracker recovers) to treat the entry
+        //    as 1000+ blocks stale and refetch unnecessarily.
         const CLASS_HASH_STALE_BLOCKS: u64 = 1000;
         if let Some((class_hash, fetched_at)) = self.get_cached_class_hash(&address) {
             let latest = self.latest_block_hint().await.unwrap_or(0);
-            if latest.saturating_sub(fetched_at) < CLASS_HASH_STALE_BLOCKS {
+            let age = latest.saturating_sub(fetched_at);
+            if age < CLASS_HASH_STALE_BLOCKS {
                 trace!(address = %format!("{:#x}", address), "cache hit: class_hash");
                 return Ok(class_hash);
             }
-            debug!(address = %format!("{:#x}", address), age = latest - fetched_at, "class_hash cache stale, refetching");
+            debug!(address = %format!("{:#x}", address), age, "class_hash cache stale, refetching");
         }
         let class_hash = self.upstream.get_class_hash(address).await?;
-        let block = self.latest_block_hint().await.unwrap_or(0);
-        self.cache_class_hash(&address, &class_hash, block);
+        if let Some(block) = self.latest_block_hint().await {
+            self.cache_class_hash(&address, &class_hash, block);
+        }
         Ok(class_hash)
     }
 
