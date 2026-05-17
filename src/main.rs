@@ -329,10 +329,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Shared head-block tracker: WS writes the most recent block on every
+    // `starknet_subscribeNewHeads` notification; the network task reads it
+    // synchronously instead of issuing `starknet_blockNumber` RPCs. A
+    // background head-keeper periodically refreshes it as a backstop for
+    // WebSocket disconnects.
+    let head_block = Arc::new(network::HeadTracker::new());
+
     // Spawn network task
     let ds_clone = Arc::clone(&data_source);
     let abi_clone = Arc::clone(&abi_registry);
     let resp_tx_clone = response_tx.clone();
+    let head_clone = Arc::clone(&head_block);
     tokio::spawn(async move {
         network::run_network_task(
             ds_clone,
@@ -341,13 +349,18 @@ async fn main() -> anyhow::Result<()> {
             pf_client,
             voyager_client,
             price_client,
+            head_clone,
             action_rx,
             resp_tx_clone,
         )
         .await;
     });
 
-    // Spawn block update mechanism: prefer WebSocket, fall back to polling
+    // Spawn block update mechanism: prefer WebSocket, fall back to polling.
+    // When WS is in use we also spawn a head-keeper as a backstop in case
+    // WS disconnects — it keeps `head_block` fresh from a periodic RPC.
+    // The HTTP polling path already calls `get_latest_block_number` every
+    // 3 s and writes the tracker, so we don't double-spawn the keeper.
     let _block_updater: tokio::task::JoinHandle<()> = if let Some(ws_url) = &config.ws_url {
         info!(ws_url = %ws_url, "Using WebSocket for new block headers and address streaming");
         app.data_sources.ws = app::state::SourceStatus::Configured;
@@ -355,8 +368,15 @@ async fn main() -> anyhow::Result<()> {
             ws_url.clone(),
             Arc::clone(&data_source),
             response_tx.clone(),
+            Arc::clone(&head_block),
         );
         app.ws_manager = Some(ws_manager);
+        // Backstop only relevant when WS is the primary head feed.
+        let _head_keeper: tokio::task::JoinHandle<()> = network::spawn_head_keeper(
+            Arc::clone(&data_source),
+            Arc::clone(&head_block),
+            Duration::from_secs(10),
+        );
         handle
     } else {
         info!("No WS URL configured, using HTTP polling (3s interval)");
@@ -364,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&data_source),
             response_tx.clone(),
             Duration::from_secs(3),
+            Arc::clone(&head_block),
         )
     };
 

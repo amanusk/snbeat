@@ -27,6 +27,7 @@ pub(super) async fn resolve_search(
     dune: &Option<Arc<dune::DuneClient>>,
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager: &Option<Arc<voyager::VoyagerClient>>,
+    head_block: &Arc<super::HeadTracker>,
     tx: &mpsc::UnboundedSender<Action>,
     cancel: &CancellationToken,
 ) {
@@ -47,10 +48,27 @@ pub(super) async fn resolve_search(
     // which `tokio::join!` of all four would otherwise force.
     let hex = query.strip_prefix("0x").unwrap_or(&query);
     if let Ok(felt) = starknet::core::types::Felt::from_hex(&format!("0x{hex}")) {
+        // Cache-first probe: if we've ever resolved this hex as an address
+        // before, we have a cached class_hash, nonce, or class_history row.
+        // Short-circuit straight to the address pipeline so the cache-first
+        // emit can paint without first round-tripping `get_class_hash`.
+        let cached_address = ds.load_cached_class_hash(&felt).is_some()
+            || ds.load_cached_nonce(&felt).is_some()
+            || !ds.load_cached_class_history(&felt).is_empty();
+        if cached_address {
+            let _ = tx.send(Action::NavigateToAddress { address: felt });
+            address::fetch_and_send_address_info(
+                felt, ds, abi_reg, dune, pf, voyager, head_block, tx, cancel,
+            )
+            .await;
+            return;
+        }
         if ds.get_class_hash(felt).await.is_ok() {
             let _ = tx.send(Action::NavigateToAddress { address: felt });
-            address::fetch_and_send_address_info(felt, ds, abi_reg, dune, pf, voyager, tx, cancel)
-                .await;
+            address::fetch_and_send_address_info(
+                felt, ds, abi_reg, dune, pf, voyager, head_block, tx, cancel,
+            )
+            .await;
             return;
         }
 

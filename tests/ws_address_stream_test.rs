@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use snbeat::app::actions::Action;
 use snbeat::app::views::address_info::AddressInfoState;
 use snbeat::data::rpc::RpcDataSource;
+use snbeat::network::HeadTracker;
 use snbeat::network::ws::spawn_ws_subscriber;
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,8 @@ async fn test_eth_token_events_to_tx_summaries() {
     let data_source = Arc::new(RpcDataSource::new(&rpc_url()));
     let address = felt(ETH_TOKEN);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     // Give WS time to connect
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -130,7 +132,8 @@ async fn test_strk_token_events_stream() {
     let data_source = Arc::new(RpcDataSource::new(&rpc_url()));
     let address = felt(STRK_TOKEN);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     manager.subscribe_address(address);
@@ -160,7 +163,8 @@ async fn test_avnu_events_to_tx_summaries() {
     let data_source = Arc::new(RpcDataSource::new(&rpc_url()));
     let address = felt(AVNU);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     manager.subscribe_address(address);
@@ -191,7 +195,8 @@ async fn test_subscribe_unsubscribe_lifecycle() {
     let data_source = Arc::new(RpcDataSource::new(&rpc_url()));
     let address = felt(ETH_TOKEN);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     manager.subscribe_address(address);
@@ -248,7 +253,8 @@ async fn test_event_deduplication_via_merge() {
     let data_source = Arc::new(RpcDataSource::new(&rpc_url()));
     let address = felt(ETH_TOKEN);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     manager.subscribe_address(address);
@@ -313,7 +319,8 @@ async fn test_multiple_addresses_one_connection() {
     let eth = felt(ETH_TOKEN);
     let strk = felt(STRK_TOKEN);
 
-    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx);
+    let head_block = Arc::new(HeadTracker::new());
+    let (_handle, manager) = spawn_ws_subscriber(ws_url(), data_source, response_tx, head_block);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     manager.subscribe_address(eth);

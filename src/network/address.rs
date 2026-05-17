@@ -762,6 +762,7 @@ pub(super) async fn fetch_and_send_address_info(
     dune: &Option<Arc<dune::DuneClient>>,
     pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_c: &Option<Arc<voyager::VoyagerClient>>,
+    head_block: &Arc<super::HeadTracker>,
     tx: &mpsc::UnboundedSender<Action>,
     cancel: &CancellationToken,
 ) {
@@ -788,68 +789,61 @@ pub(super) async fn fetch_and_send_address_info(
         });
     }
 
-    // Step 1: Fetch nonce + class_hash fast, send to UI immediately
-    let ds2 = Arc::clone(ds);
-    let (nonce_r, class_r) = tokio::join!(ds.get_nonce(address), ds2.get_class_hash(address));
-    let nonce = nonce_r.unwrap_or(starknet::core::types::Felt::ZERO);
-    let class_hash = class_r.ok();
-
-    // Detect contract type early: nonce == 0 + has class_hash = likely a contract, not an account
-    let is_contract = nonce == starknet::core::types::Felt::ZERO && class_hash.is_some();
-
-    // Compute nonce delta: how many new txs since last visit?
-    // This tells us whether we can skip fetching entirely (delta=0) or narrow the search.
+    // -----------------------------------------------------------------
+    // Cache-first emit: render whatever's on disk before any RPC round
+    // trip, so a re-visited (or fully offline) address paints in SQLite
+    // time. Live nonce/class_hash arrive later and re-emit; the handler
+    // merges them (nonce clamps upward, txs/calls dedupe by hash).
+    // -----------------------------------------------------------------
     let cached_nonce_info = ds.load_cached_nonce(&address);
-    let nonce_delta = if let Some((prev_nonce, _prev_block)) = &cached_nonce_info {
-        let prev = crate::utils::felt_to_u64(prev_nonce);
-        let curr = crate::utils::felt_to_u64(&nonce);
-        curr.saturating_sub(prev)
-    } else {
-        u64::MAX // unknown — do full search
-    };
+    let cached_class_history = ds.load_cached_class_history(&address);
+    let cached_deploy = ds.load_cached_deploy_info(&address);
+    let cached_events = ds.load_address_events(&address);
+    let cached_txs = ds.load_cached_address_txs(&address);
+    let cached_calls = ds.load_cached_address_calls(&address);
+    let cached_meta_txs = ds.load_cached_meta_txs(&address);
+    // Prefer the dedicated `class_hashes` cache (populated by every
+    // `get_class_hash` call) over the class-history list, since pathfinder
+    // isn't always available and class history may never have been
+    // written. Fall back to class_history when the dedicated cache is
+    // empty — same code path that was used before.
+    let cached_top_class_hash = ds.load_cached_class_hash(&address).or_else(|| {
+        cached_class_history
+            .first()
+            .and_then(|e| starknet::core::types::Felt::from_hex(&e.class_hash).ok())
+    });
+    let cached_nonce_felt = cached_nonce_info
+        .map(|(n, _)| n)
+        .unwrap_or(starknet::core::types::Felt::ZERO);
     let cached_nonce_block = cached_nonce_info.map(|(_, b)| b).unwrap_or(0);
 
-    // Hoisted: needed both for the nonce save below and as the watermark for
-    // class-history re-validation further down. One RPC round-trip either way.
-    let latest_block = ds.get_latest_block_number().await.unwrap_or(0);
+    // Placeholder source list: keeps `sources_pending` non-empty so the
+    // cached AddressInfoLoaded below doesn't trip the handler's spinner
+    // clear. The authoritative list is re-emitted once we know
+    // is_contract from the live nonce.
+    let _ = tx.send(Action::AddressSourcesPending {
+        address,
+        sources: vec![Source::Rpc],
+    });
 
-    // Save current nonce for next visit — but only if non-zero.
-    // A nonce=0 contract might gain account functionality later, so we must
-    // always re-check rather than locking in "no txs" from a cached zero.
-    if nonce != starknet::core::types::Felt::ZERO {
-        ds.save_cached_nonce(&address, &nonce, latest_block);
-    }
-
-    // Replay cached deployment data BEFORE the pf branch so that visiting an
-    // address without pf-query still shows the same "Deployed at / Deployed by"
-    // header and class-history list as the first (pf-backed) visit. The deploy
-    // tx itself is immutable; the class-history cache may be stale (a
-    // replace_class can land between visits) but we always show what we have
-    // and let the pf branch below detect divergence and fix it up.
-    let cached_class_history = ds.load_cached_class_history(&address);
     if !cached_class_history.is_empty() {
         let _ = tx.send(Action::ClassHistoryLoaded {
             address,
             entries: cached_class_history.clone(),
         });
     }
-    let cached_deploy = ds.load_cached_deploy_info(&address);
+
+    // find_deploy_tx short-circuits on the deploy_info cache hit, so
+    // spawning it here is a no-op when the row exists. Falling back to
+    // the earliest class-history block covers the case where a prior
+    // flow warmed class-history without ever triggering the deploy scan.
     if let Some((_, cached_deploy_block, _)) = cached_deploy {
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
         spawn_cancellable(cancel.clone(), async move {
-            // find_deploy_tx hits the deploy_info cache first and returns
-            // immediately on hit, so no network work runs here.
             find_deploy_tx(address, cached_deploy_block, &ds_c, &tx_c).await;
         });
     } else if let Some(earliest) = cached_class_history.last() {
-        // No deploy_info cached, but class history is — meaning a previous
-        // flow (tx-detail decode, class info view) warmed class history but
-        // never triggered the deploy-tx scan. Kick it off here using the
-        // earliest cached entry as the deploy block. Without this, the pf
-        // re-fetch branch below only fires the lookup when the cache is
-        // *stale*, so a fresh-but-deploy-info-less cache would never show
-        // the deployment tx.
         let deploy_block = earliest.block_number;
         let ds_c = Arc::clone(ds);
         let tx_c = tx.clone();
@@ -857,6 +851,113 @@ pub(super) async fn fetch_and_send_address_info(
             find_deploy_tx(address, deploy_block, &ds_c, &tx_c).await;
         });
     }
+
+    // First paint. The fresh re-emit below merges its nonce/class_hash
+    // in; tx_summaries / contract_calls dedupe by hash on second emit.
+    let _ = tx.send(Action::AddressInfoLoaded {
+        info: crate::data::types::SnAddressInfo {
+            address,
+            nonce: cached_nonce_felt,
+            class_hash: cached_top_class_hash,
+            recent_events: cached_events.clone(),
+            token_balances: Vec::new(),
+        },
+        decoded_events: Vec::new(),
+        tx_summaries: cached_txs.clone(),
+        contract_calls: cached_calls.clone(),
+    });
+
+    if !cached_meta_txs.is_empty() {
+        let _ = tx.send(Action::AddressMetaTxsCacheLoaded {
+            address,
+            summaries: cached_meta_txs,
+        });
+    }
+
+    // Cached-event decode pass. Previously inline after the RPC join,
+    // moved up so it kicks off in parallel with the live nonce fetch.
+    if !cached_events.is_empty() {
+        let abi_reg_c = Arc::clone(abi_reg);
+        let tx_c = tx.clone();
+        let evs = cached_events.clone();
+        spawn_cancellable(cancel.clone(), async move {
+            let unique_addrs: std::collections::HashSet<starknet::core::types::Felt> =
+                evs.iter().map(|e| e.from_address).collect();
+            helpers::prewarm_abis(unique_addrs, &abi_reg_c).await;
+
+            use futures::stream::StreamExt;
+            let abi_reg = &abi_reg_c;
+            let event_futs: Vec<_> = evs
+                .iter()
+                .map(|event| async move {
+                    let abi = abi_reg.get_abi_for_address(&event.from_address).await;
+                    decode_event(event, abi.as_deref())
+                })
+                .collect();
+            let decoded: Vec<_> = futures::stream::iter(event_futs)
+                .buffered(8)
+                .collect()
+                .await;
+            let _ = tx_c.send(Action::AddressEventsCacheLoaded {
+                address,
+                decoded_events: decoded,
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Live RPC refresh — runs after the cached emit, so it no longer
+    // gates first paint. Slow / unreachable node only delays the
+    // nonce/class re-emit and the source streams; the UI is already
+    // interactive.
+    // -----------------------------------------------------------------
+    let ds2 = Arc::clone(ds);
+    let (nonce_r, class_r) = tokio::join!(ds.get_nonce(address), ds2.get_class_hash(address));
+    let nonce = nonce_r.unwrap_or(starknet::core::types::Felt::ZERO);
+    let class_hash = class_r.ok();
+
+    // Detect contract type: nonce == 0 + has class_hash → contract, not account.
+    let is_contract = nonce == starknet::core::types::Felt::ZERO && class_hash.is_some();
+
+    // Nonce delta against cache. The downstream pipeline uses this to
+    // narrow the missing-tx scan; gap fill runs after this point.
+    let nonce_delta = if let Some((prev_nonce, _prev_block)) = &cached_nonce_info {
+        let prev = crate::utils::felt_to_u64(prev_nonce);
+        let curr = crate::utils::felt_to_u64(&nonce);
+        curr.saturating_sub(prev)
+    } else {
+        u64::MAX // unknown — do full search
+    };
+
+    // Use the WS-tracked head instead of a `starknet_blockNumber` RPC.
+    // Falls back to a single RPC when the tracker is empty (first visit
+    // before WS primes it) or stale (WS disconnected and the head-keeper
+    // hasn't ticked yet). Threshold matches roughly 5× the typical
+    // Starknet block time so a one-block hiccup doesn't force a refetch.
+    const HEAD_STALENESS_SECS: u64 = 12;
+    let latest_block = {
+        let (block, age) = head_block.read();
+        if block > 0 && age <= HEAD_STALENESS_SECS {
+            block
+        } else {
+            match ds.get_latest_block_number().await {
+                Ok(n) => {
+                    head_block.update(n);
+                    n
+                }
+                Err(_) => block, // best-effort: keep whatever the tracker had
+            }
+        }
+    };
+
+    // Save current nonce for next visit — but only if non-zero.
+    // A nonce=0 contract might gain account functionality later, so we
+    // must always re-check rather than locking in "no txs" from a
+    // cached zero.
+    if nonce != starknet::core::types::Felt::ZERO {
+        ds.save_cached_nonce(&address, &nonce, latest_block);
+    }
+
     let had_cached_deploy = cached_deploy.is_some();
     // Whether the cached fast-path above already kicked off a find_deploy_tx
     // run. Used to suppress a duplicate launch from the pf re-fetch branch.
@@ -937,9 +1038,10 @@ pub(super) async fn fetch_and_send_address_info(
         }
     }
 
-    // --- Determine which sources to fire and tell the UI ---
-    // Must be sent BEFORE AddressInfoLoaded so the handler sees sources_pending
-    // is non-empty and doesn't prematurely clear the loading state.
+    // Authoritative source list, now that we know is_contract from the
+    // live nonce. Overwrites the placeholder `{Rpc}` emitted before the
+    // first paint. Replace semantics in the reducer make this safe — no
+    // source task has spawned yet, so no completions can be lost.
     let mut sources = vec![Source::Rpc];
     if !is_contract && pf.is_some() {
         sources.push(Source::Pathfinder);
@@ -952,17 +1054,8 @@ pub(super) async fn fetch_and_send_address_info(
         sources: sources.clone(),
     });
 
-    // Send partial info immediately (cached txs seed the UI).
-    //
-    // The per-event ABI decode used to run inline here, gating the
-    // `AddressInfoLoaded` send on hundreds of `get_abi_for_address` calls
-    // (each potentially an RPC round-trip + SQLite cache mutex hop). Under
-    // any cache contention that loop could stretch to tens of seconds,
-    // keeping the "Fetching address info…" spinner up even though the
-    // tx/call caches were already in memory. Decode now runs in a
-    // background task; the Events tab renders when `AddressEventsCacheLoaded`
-    // arrives.
-    let cached_events = ds.load_address_events(&address);
+    // Fresh re-emit: nonce / class_hash from RPC, same cached vecs as
+    // the first paint (handler dedupes; nonce clamps upward).
     let _ = tx.send(Action::AddressInfoLoaded {
         info: crate::data::types::SnAddressInfo {
             address,
@@ -972,60 +1065,9 @@ pub(super) async fn fetch_and_send_address_info(
             token_balances: Vec::new(),
         },
         decoded_events: Vec::new(),
-        tx_summaries: ds.load_cached_address_txs(&address),
-        contract_calls: ds.load_cached_address_calls(&address),
+        tx_summaries: cached_txs,
+        contract_calls: cached_calls,
     });
-
-    // Kick off the decode pass in the background. Cancellable so navigation
-    // away from this address doesn't leave the decoder chewing on a stale
-    // class-hash / ABI-fetch queue.
-    if !cached_events.is_empty() {
-        let abi_reg_c = Arc::clone(abi_reg);
-        let tx_c = tx.clone();
-        spawn_cancellable(cancel.clone(), async move {
-            // Prewarm the ABI cache for the unique event sources in parallel
-            // so the per-event decode below is essentially CPU-only after a
-            // single concurrent fan-out, instead of N serial RPC round-trips.
-            let unique_addrs: std::collections::HashSet<starknet::core::types::Felt> =
-                cached_events.iter().map(|e| e.from_address).collect();
-            helpers::prewarm_abis(unique_addrs, &abi_reg_c).await;
-
-            // `buffered(8)` caps in-flight `get_abi_for_address` calls so a
-            // huge cached-event list can't burst hundreds of concurrent lookups
-            // while the prewarm cache is still cold.
-            use futures::stream::StreamExt;
-            let abi_reg = &abi_reg_c;
-            let event_futs: Vec<_> = cached_events
-                .iter()
-                .map(|event| async move {
-                    let abi = abi_reg.get_abi_for_address(&event.from_address).await;
-                    decode_event(event, abi.as_deref())
-                })
-                .collect();
-            let decoded: Vec<_> = futures::stream::iter(event_futs)
-                .buffered(8)
-                .collect()
-                .await;
-            let _ = tx_c.send(Action::AddressEventsCacheLoaded {
-                address,
-                decoded_events: decoded,
-            });
-        });
-    }
-
-    // Seed the MetaTxs tab count from cache up-front, like `tx_summaries` /
-    // `contract_calls` above. Previously the cache was only loaded when the
-    // user tabbed to MetaTxs (via `FetchAddressMetaTxs`), so the tab label
-    // read "(0)" on address entry even when cached classifications existed.
-    // The reducer doesn't flip `meta_txs_dispatched` for this action — a
-    // live pf-query fetch still fires when the user actually enters the tab.
-    let cached_meta_txs = ds.load_cached_meta_txs(&address);
-    if !cached_meta_txs.is_empty() {
-        let _ = tx.send(Action::AddressMetaTxsCacheLoaded {
-            address,
-            summaries: cached_meta_txs,
-        });
-    }
 
     // Check cached activity range — if fresh, skip Dune probe entirely.
     let cached_range = ds.load_cached_activity_range(&address);

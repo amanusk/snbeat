@@ -23,6 +23,8 @@ pub mod voyager;
 pub mod ws;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +33,93 @@ use tracing::{debug, error, info, warn};
 use crate::app::actions::Action;
 use crate::data::DataSource;
 use crate::decode::AbiRegistry;
+
+/// Shared "latest block" tracker. Written by the WebSocket subscriber on
+/// every `NewHeads` notification and by the head-keeper / block-poller
+/// fallback. Read by the address pipeline (and any other path that wants
+/// the chain tip) without issuing a `starknet_blockNumber` RPC.
+///
+/// Pairs the block number with the unix-second timestamp of the last
+/// update so callers can tell when the value is stale (e.g. after a
+/// WebSocket disconnect). A blank tracker reads as `(0, u64::MAX)` —
+/// callers treat that as "always stale, force a refetch."
+pub struct HeadTracker {
+    block: AtomicU64,
+    updated_at: AtomicU64,
+}
+
+impl HeadTracker {
+    pub fn new() -> Self {
+        Self {
+            block: AtomicU64::new(0),
+            updated_at: AtomicU64::new(0),
+        }
+    }
+
+    /// Publish a freshly-seen block number. Monotonic on the block field
+    /// (a reconnecting WS may briefly replay older heads). The timestamp
+    /// is refreshed only when the block actually advances — otherwise a
+    /// replayed old head would make a stale tracker look fresh and the
+    /// address pipeline would skip its fallback RPC.
+    pub fn update(&self, block: u64) {
+        let prev = self.block.fetch_max(block, Ordering::Relaxed);
+        if block <= prev {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.updated_at.store(now, Ordering::Relaxed);
+    }
+
+    /// Returns `(block, age_seconds)`. Age is `u64::MAX` if never written.
+    pub fn read(&self) -> (u64, u64) {
+        let block = self.block.load(Ordering::Relaxed);
+        let updated = self.updated_at.load(Ordering::Relaxed);
+        if updated == 0 {
+            return (block, u64::MAX);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (block, now.saturating_sub(updated))
+    }
+}
+
+impl Default for HeadTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawns a periodic head-keeper that calls `starknet_blockNumber` on a
+/// timer and feeds the result into the shared `HeadTracker`. Runs
+/// unconditionally as a backstop for cases where the WebSocket
+/// disconnects or is never configured; when WS is healthy, the tracker
+/// is always fresh and the RPC result here is a cheap no-op.
+pub fn spawn_head_keeper(
+    data_source: Arc<dyn DataSource>,
+    head: Arc<HeadTracker>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // `interval` fires its first tick immediately, which is exactly
+        // what we want: prime the tracker before any address visit can
+        // race a still-empty tracker into a fallback RPC.
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            match data_source.get_latest_block_number().await {
+                Ok(n) => head.update(n),
+                Err(e) => {
+                    debug!(error = %e, "head-keeper: get_latest_block_number failed");
+                }
+            }
+        }
+    })
+}
 
 /// Runs the network task: receives actions from the UI, dispatches to data source,
 /// sends results back.
@@ -41,6 +130,7 @@ pub async fn run_network_task(
     pf_client: Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_client: Option<Arc<voyager::VoyagerClient>>,
     price_client: Option<Arc<prices::PriceClient>>,
+    head_block: Arc<HeadTracker>,
     mut action_rx: mpsc::UnboundedReceiver<Action>,
     response_tx: mpsc::UnboundedSender<Action>,
 ) {
@@ -67,6 +157,7 @@ pub async fn run_network_task(
         let pf = pf_client.clone();
         let voyager = voyager_client.clone();
         let prices = price_client.clone();
+        let head = Arc::clone(&head_block);
         let tx = response_tx.clone();
         let cancel = session_token.clone();
         let cancellable = action_is_cancellable(&action);
@@ -142,7 +233,7 @@ pub async fn run_network_task(
                     Action::FetchAddressInfo { address } => {
                         let _ = tx.send(Action::NavigateToAddress { address });
                         address::fetch_and_send_address_info(
-                            address, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
+                            address, &ds, &abi_reg, &dune, &pf, &voyager, &head, &tx, &cancel,
                         )
                         .await;
                     }
@@ -255,7 +346,7 @@ pub async fn run_network_task(
                     }
                     Action::ResolveSearch { query } => {
                         search::resolve_search(
-                            query, &ds, &abi_reg, &dune, &pf, &voyager, &tx, &cancel,
+                            query, &ds, &abi_reg, &dune, &pf, &voyager, &head, &tx, &cancel,
                         )
                         .await;
                     }
@@ -601,6 +692,7 @@ pub fn spawn_block_poller(
     data_source: Arc<dyn DataSource>,
     response_tx: mpsc::UnboundedSender<Action>,
     interval: std::time::Duration,
+    head_block: Arc<HeadTracker>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_block = 0u64;
@@ -609,6 +701,7 @@ pub fn spawn_block_poller(
 
             match data_source.get_latest_block_number().await {
                 Ok(latest) => {
+                    head_block.update(latest);
                     if latest > last_block && last_block > 0 {
                         // Fetch new blocks
                         for num in (last_block + 1)..=latest {
