@@ -110,6 +110,7 @@ All variables are optional except `APP_RPC_URL`.
 | `DUNE_API_KEY`               | -                       | Dune Analytics API key                         |
 | `DUNE_PRIVATE_QUERIES`       | `true`                  | Mark dynamic Dune queries private; set `false` to dodge private-query quota |
 | `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
+| `APP_VIEWING_KEYS`           | `viewing_keys.toml`     | Path to privacy-pool viewing keys (held separately because they are secrets) |
 | `APP_LOG_LEVEL`              | `info`                  | `trace` / `debug` / `info` / `warn` / `error`  |
 | `APP_LOG_DIR`                | `~/.config/snbeat/logs` | Log file directory                             |
 
@@ -165,25 +166,28 @@ On subsequent visits to the same block or address, data is served from disk with
 
 ## Keybindings
 
-### Navigation
+Press `?` at any time to open the in-app help overlay; it lists the same controls as the tables below.
 
-| Key                 | Action                              |
-| ------------------- | ----------------------------------- |
-| `j` / `↓`           | Move down                           |
-| `k` / `↑`           | Move up                             |
-| `l` / `→` / `Enter` | Drill in / navigate forward         |
-| `h` / `←` / `Esc`   | Go back                             |
-| `Ctrl+O`            | Jump back (vim-style)               |
-| `]`                 | Jump forward                        |
-| `g`                 | Jump to top                         |
-| `G`                 | Jump to bottom                      |
-| `Ctrl+U` / `PgUp`   | Next block or transaction           |
-| `Ctrl+D` / `PgDn`   | Previous block or transaction       |
-| `n`                 | Next transaction by same sender     |
-| `N`                 | Previous transaction by same sender |
-| `Tab`               | Cycle tabs (Address Info view)      |
-| `q`                 | Jump to home / quit                 |
-| `Ctrl+C`            | Quit                                |
+### Navigation (all views)
+
+| Key                 | Action                                                            |
+| ------------------- | ----------------------------------------------------------------- |
+| `j` / `↓`           | Move down                                                         |
+| `k` / `↑`           | Move up                                                           |
+| `l` / `→` / `Enter` | Drill in / navigate forward                                       |
+| `h` / `←` / `Esc`   | Go back                                                           |
+| `Ctrl+O`            | Jump back (vim-style)                                             |
+| `]`                 | Jump forward in history                                           |
+| `g` / `G`           | Jump to top / bottom                                              |
+| `Ctrl+U` / `PgUp`   | Page up (list scroll, or active tab body in TxDetail)             |
+| `Ctrl+D` / `PgDn`   | Page down                                                         |
+| `Ctrl+P` / `Ctrl+N` | Up / down axis (previous / next block or tx, wraps between blocks)|
+| `n` / `N`           | Next / previous tx by same sender (nonce-based)                   |
+| `Tab` / `Shift+Tab` | Cycle tabs (TxDetail / AddressInfo)                               |
+| `r`                 | Refresh current view (Blocks / Address / Class)                   |
+| `q`                 | Jump to home, or quit if already at home                          |
+| `Ctrl+C`            | Quit                                                              |
+| `?`                 | Toggle help overlay                                               |
 
 ### Search
 
@@ -197,17 +201,38 @@ Arrow keys to navigate suggestions; `Enter` confirms; `Tab` fills in the highlig
 
 ### Transaction Detail
 
-| Key | Action                                               |
-| --- | ---------------------------------------------------- |
-| `c` | Toggle raw calldata                                  |
-| `d` | Toggle ABI-decoded calldata                          |
-| `v` | Enter visual mode (highlight addresses / block refs) |
-| `r` | Refresh                                              |
-| `?` | Toggle help overlay                                  |
+Tabs cycle in this order with `Tab` / `Shift+Tab`: **Events / Calls / Transfers / Trace / Privacy***.
+
+| Key | Action                                                              |
+| --- | ------------------------------------------------------------------- |
+| `c` | Toggle raw calldata (Calls tab)                                     |
+| `d` | Toggle ABI-decoded calldata (Calls tab)                             |
+| `o` | Toggle outside-execution intent view (SNIP-9 meta-txs, Calls tab)   |
+| `e` | Expand everything — un-truncates hashes, expands structs/arrays, forces decoded calldata and OE intent on |
+| `v` | Enter visual mode (highlight addresses / block refs)                |
+
+\* The **Privacy** tab is only shown on transactions that interact with the [Starknet Privacy Pool](https://github.com/starknet-id/privacy-pool).
+
+### Address Info
+
+Tabs cycle in this order with `Tab` / `Shift+Tab`: **Transactions / MetaTxs / Calls / Balances / Events / ClassHistory**.
+
+| Key | Action                                                              |
+| --- | ------------------------------------------------------------------- |
+| `r` | Refresh the address                                                 |
+| `v` | Enter visual mode on the header (class, deployer, deploy tx, block) |
+
+### Class Info
+
+| Key | Action                                                          |
+| --- | --------------------------------------------------------------- |
+| `a` | Toggle the full ABI pane                                        |
+| `v` | Enter visual mode (navigate referenced contracts / classes)     |
+| `r` | Refresh the class info                                          |
 
 ### Visual Mode
 
-Press `v` in a Transaction or Block detail view to enter visual mode. Use `j`/`k` to cycle through addresses and block references, then `Enter` to navigate to the highlighted item. `Esc` exits.
+Press `v` from a TxDetail, BlockDetail, AddressInfo, or ClassInfo view to enter visual mode. Use `j`/`k` to step through navigable items (addresses, block refs, hashes); `Enter` drills into the highlighted item; `Esc` exits. Inside TxDetail visual mode, `Tab` / `Shift+Tab` still switch tabs (and the highlight snaps to the first item visible in the new tab), and `c` / `d` / `o` still work as toggles.
 
 ---
 
@@ -342,17 +367,23 @@ APP_PATHFINDER_SERVICE_URL=http://192.168.1.10:8234
 
 ### API
 
-| Endpoint                               | Description                                             |
-| -------------------------------------- | ------------------------------------------------------- |
-| `GET /health`                          | Returns `{ "latest_block": N }`                         |
-| `GET /nonce-history/{address}?limit=N` | Returns ordered nonce update history (max 2000 entries) |
-| `GET /class-history/{address}`         | Returns class hash history for a contract               |
-| `GET /contracts-by-class/{class_hash}` | Returns contracts deployed with a given class hash      |
-| `GET /class-declaration/{class_hash}`  | Returns declaration info for a class hash               |
-| `GET /tx-by-hash/{hash}`               | Looks up a transaction by hash                          |
-| `GET /block-txs/{block_number}`        | Returns decoded transactions in a block                 |
-| `GET /sender-txs/{address}`            | Returns transactions sent by an address. Supports `?limit=N&before_block=B&from_block=F` for pagination. |
-| `GET /contract-events/{address}`       | Returns events emitted by a contract                    |
+| Endpoint                                   | Description                                                                                              |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `GET /health`                              | Returns `{ "latest_block": N }`                                                                          |
+| `GET /nonce-history/{address}?limit=N`     | Ordered nonce update history (max 2000 entries)                                                          |
+| `GET /class-history/{address}`             | Class hash history for a contract                                                                        |
+| `GET /contracts-by-class/{class_hash}`     | Contracts deployed with a given class hash                                                               |
+| `GET /class-declaration/{class_hash}`      | Declaration info for a class hash                                                                        |
+| `GET /tx-by-hash/{hash}`                   | Looks up a transaction by hash → `(block_number, tx_index)`                                              |
+| `POST /txs-by-hash`                        | Bulk lookup: body `{ hashes: [...] }`, returns sender / nonce / calldata / fee / status per tx           |
+| `POST /storage-batch`                      | Read many storage slots from one contract at a block in a single SQLite transaction                      |
+| `GET /block-txs/{block_number}`            | Decoded transactions in a block                                                                          |
+| `GET /block-timestamps?from=N&to=M`        | Bulk block timestamps (single indexed range scan; max span 50 000)                                       |
+| `GET /sender-txs/{address}`                | Transactions sent by an address. Supports `?limit=N&before_block=B&from_block=F` for pagination.         |
+| `GET /contract-events/{address}`           | Events emitted by a contract, accelerated by bloom filters. Supports `?from_block`, `?to_block`, `?keys` (positional filter), `?limit`, `?continuation_token` for newest-first pagination |
+| `GET /contract-event-count/{address}`      | Total event count over a range. Cheaper than `/contract-events` (skips tx-hash + timestamp decoding)     |
+
+See [`crates/pf-query/README.md`](crates/pf-query/README.md) for full request / response shapes and query-parameter syntax.
 
 ---
 
