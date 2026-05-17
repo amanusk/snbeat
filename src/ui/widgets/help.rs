@@ -42,7 +42,10 @@ pub fn draw_help_overlay(f: &mut Frame, app: &App) {
         Line::from("   e                Expand all (hashes, structs, OE)"),
         Line::from("   * Privacy tab shows only for Privacy-Pool txs"),
         Line::from(""),
-        Line::from(Span::styled(" Address Info / Class Info", theme::TITLE_STYLE)),
+        Line::from(Span::styled(
+            " Address Info / Class Info",
+            theme::TITLE_STYLE,
+        )),
         Line::from("   Tabs (Address): Txs / MetaTxs / Calls / Balances /"),
         Line::from("                   Events / ClassHistory"),
         Line::from("   a                ClassInfo: toggle full ABI pane"),
