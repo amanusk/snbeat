@@ -2,7 +2,13 @@
 name = "pf-query"
 version = "0.1.0"
 edition = "2024"
-publish = false
+description = "HTTP service exposing a Pathfinder SQLite database for fast Starknet queries (nonce history, contract events, storage batch, tx lookups). Companion service for the snbeat block explorer."
+license = "MIT"
+repository = "https://github.com/amanusk/snbeat"
+homepage = "https://github.com/amanusk/snbeat"
+readme = "README.md"
+keywords = ["starknet", "pathfinder", "blockchain", "explorer", "http"]
+categories = ["command-line-utilities", "web-programming::http-server", "database"]
 
 [dependencies]
 axum = "0.8"
