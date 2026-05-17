@@ -166,6 +166,10 @@ impl CachingDataSource {
                 address TEXT PRIMARY KEY,
                 last_known_block INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS class_changes_watermark (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+                block_number INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cached_nonces (
                 address TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
@@ -404,6 +408,20 @@ impl CachingDataSource {
             )
             .map_err(|e| SnbeatError::Config(format!("Migration v11 failed: {e}")))?;
             debug!("Migration v11: reshaped private_notes + added private_nullifiers");
+        }
+
+        if version < 12 {
+            // v12: introduce class_changes_watermark — a single global row
+            // tracking the highest block through which we've polled pf-query
+            // for `replace_class` events. With this watermark, prewarm_abis_at
+            // can skip per-address pf-query calls when the target block is
+            // already covered, replacing 10–20 HTTP calls per tx open with
+            // one cheap "any changes since N?" probe.
+            // DDL is in the CREATE block above; nothing else to migrate.
+            db.execute("PRAGMA user_version = 12", []).map_err(|e| {
+                SnbeatError::Config(format!("Migration v12 version bump failed: {e}"))
+            })?;
+            debug!("Migration v12: added class_changes_watermark table");
         }
 
         drop(db);
@@ -922,6 +940,58 @@ impl CachingDataSource {
                 "INSERT OR REPLACE INTO class_history_meta (address, last_known_block) \
                  VALUES (?1, ?2)",
                 params![addr_hex, block as i64],
+            );
+        }
+    }
+
+    fn get_cached_class_changes_watermark(&self) -> Option<u64> {
+        let db = self.db.get().ok()?;
+        let mut stmt = db
+            .prepare("SELECT block_number FROM class_changes_watermark WHERE singleton = 0")
+            .ok()?;
+        stmt.query_row([], |row| {
+            let block: i64 = row.get(0)?;
+            Ok(block as u64)
+        })
+        .ok()
+    }
+
+    fn cache_class_changes_watermark(&self, block: u64) {
+        if let Ok(db) = self.db.get() {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO class_changes_watermark (singleton, block_number) \
+                 VALUES (0, ?1)",
+                params![block as i64],
+            );
+        }
+    }
+
+    fn clear_class_history_max_block(&self, address: &Felt) {
+        if let Ok(db) = self.db.get() {
+            let addr_hex = format!("{:#x}", address);
+            let _ = db.execute(
+                "DELETE FROM class_history_meta WHERE address = ?1",
+                params![addr_hex],
+            );
+        }
+    }
+
+    /// Advance every per-address `last_known_block` that was at least
+    /// `old_watermark` up to `new_watermark`. Lets a successful global
+    /// `class-changes` probe extend per-address validation cheaply: any
+    /// address that was previously validated through the old watermark
+    /// is, by the probe's no-changes-in-range guarantee, still valid
+    /// through the new watermark.
+    fn advance_class_history_meta(&self, old_watermark: u64, new_watermark: u64) {
+        if new_watermark <= old_watermark {
+            return;
+        }
+        if let Ok(db) = self.db.get() {
+            let _ = db.execute(
+                "UPDATE class_history_meta \
+                 SET last_known_block = ?1 \
+                 WHERE last_known_block >= ?2 AND last_known_block < ?1",
+                params![new_watermark as i64, old_watermark as i64],
             );
         }
     }
@@ -1774,6 +1844,22 @@ impl DataSource for CachingDataSource {
         self.cache_class_history_max_block(address, block);
     }
 
+    fn load_class_changes_watermark(&self) -> Option<u64> {
+        self.get_cached_class_changes_watermark()
+    }
+
+    fn save_class_changes_watermark(&self, block: u64) {
+        self.cache_class_changes_watermark(block);
+    }
+
+    fn invalidate_class_history_max_block(&self, address: &Felt) {
+        self.clear_class_history_max_block(address);
+    }
+
+    fn advance_class_history_meta(&self, old_watermark: u64, new_watermark: u64) {
+        CachingDataSource::advance_class_history_meta(self, old_watermark, new_watermark);
+    }
+
     fn load_cached_nonce(&self, address: &Felt) -> Option<(Felt, u64)> {
         self.get_cached_nonce_info(address)
     }
@@ -2359,6 +2445,52 @@ mod tests {
         // Update is idempotent and overwrites.
         ds.save_activity_total(&addr, 11450);
         assert_eq!(ds.load_activity_total(&addr), Some(11450));
+    }
+
+    #[test]
+    fn class_changes_watermark_roundtrip() {
+        let (ds, _d) = new_cache();
+        assert_eq!(ds.load_class_changes_watermark(), None);
+        ds.save_class_changes_watermark(1000);
+        assert_eq!(ds.load_class_changes_watermark(), Some(1000));
+        // Overwrite to a higher value.
+        ds.save_class_changes_watermark(2000);
+        assert_eq!(ds.load_class_changes_watermark(), Some(2000));
+        // Lower writes still take effect — caller is responsible for monotonicity.
+        ds.save_class_changes_watermark(500);
+        assert_eq!(ds.load_class_changes_watermark(), Some(500));
+    }
+
+    #[test]
+    fn advance_class_history_meta_sweeps_eligible_rows() {
+        // Sweep should bump per-address meta forward for any row that was
+        // already validated through the OLD watermark, leaving older entries
+        // (which have unknown gaps) untouched.
+        let (ds, _d) = new_cache();
+        let recent = Felt::from_hex("0xaa").unwrap();
+        let older = Felt::from_hex("0xbb").unwrap();
+        let untouched = Felt::from_hex("0xcc").unwrap();
+        ds.save_class_history_max_block(&recent, 1000);
+        ds.save_class_history_max_block(&older, 500);
+        ds.save_class_history_max_block(&untouched, 2000);
+
+        // Probe advanced (1000, 1500] cleanly — anything at >=1000 inherits 1500.
+        ds.advance_class_history_meta(1000, 1500);
+
+        assert_eq!(ds.load_class_history_max_block(&recent), Some(1500));
+        assert_eq!(ds.load_class_history_max_block(&older), Some(500));
+        // Already past the new watermark — sweep must not regress it.
+        assert_eq!(ds.load_class_history_max_block(&untouched), Some(2000));
+    }
+
+    #[test]
+    fn invalidate_class_history_max_block_removes_row() {
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0xdead").unwrap();
+        ds.save_class_history_max_block(&addr, 1234);
+        assert_eq!(ds.load_class_history_max_block(&addr), Some(1234));
+        ds.invalidate_class_history_max_block(&addr);
+        assert_eq!(ds.load_class_history_max_block(&addr), None);
     }
 
     #[test]

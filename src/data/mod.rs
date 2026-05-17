@@ -336,6 +336,27 @@ pub trait DataSource: Send + Sync {
     /// the watermark must reflect verified coverage only.
     fn save_class_history_max_block(&self, _address: &Felt, _block: u64) {}
 
+    /// Load the global "we've seen every class change up to this block"
+    /// watermark. `None` if never set.
+    fn load_class_changes_watermark(&self) -> Option<u64> {
+        None
+    }
+    /// Persist the global class-changes watermark. Only advance after a
+    /// successful pf-query `/class-changes` probe that confirmed the cache
+    /// is current through this block.
+    fn save_class_changes_watermark(&self, _block: u64) {}
+    /// Drop the per-address "validated through" watermark for `address`.
+    /// Used when a pf-query probe tells us this address had a class change
+    /// in the just-probed range — its cached class-history is now stale
+    /// and must be refetched on next read.
+    fn invalidate_class_history_max_block(&self, _address: &Felt) {}
+
+    /// Sweep-advance every per-address `last_known_block >= old_watermark`
+    /// to `new_watermark`. Called after a clean global `class-changes`
+    /// probe so previously-validated addresses inherit the new coverage
+    /// without per-address pf-query calls.
+    fn advance_class_history_meta(&self, _old_watermark: u64, _new_watermark: u64) {}
+
     // --- Nonce cache ---
     /// Load cached nonce + block number for an address.
     fn load_cached_nonce(&self, _address: &Felt) -> Option<(Felt, u64)> {

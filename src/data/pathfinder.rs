@@ -51,6 +51,20 @@ pub struct ClassHashEntry {
     pub class_hash: String,
 }
 
+/// Response from `GET /class-changes`. Empty `addresses` is the happy path —
+/// it means no `replace_class` happened in `(from, to]` and the caller can
+/// safely advance its watermark to `to`. `truncated=true` means the result
+/// set exceeded the server cap; the caller must NOT trust the (partial)
+/// address list and should fall back to per-address resolution this round.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassChangesResponse {
+    #[allow(dead_code)]
+    pub from: u64,
+    pub to: u64,
+    pub addresses: Vec<String>,
+    pub truncated: bool,
+}
+
 /// Transaction hash lookup result.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TxHashLookup {
@@ -276,6 +290,29 @@ impl PathfinderClient {
             .json::<Vec<ClassHashEntry>>()
             .await?;
         Ok(entries)
+    }
+
+    /// Probe for any class-hash changes in `(from, to]`. Returns the set of
+    /// distinct contract addresses that had a `replace_class` (or initial
+    /// deploy) in that block range. An empty `addresses` is the common case
+    /// — it means the caller can advance its global watermark to `to` with
+    /// no invalidations.
+    pub async fn get_class_changes(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> anyhow::Result<ClassChangesResponse> {
+        let url = format!("{}/class-changes?from={}&to={}", self.base_url, from, to);
+        debug!(url = %url, "Probing class-changes from pf-query");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ClassChangesResponse>()
+            .await?;
+        Ok(resp)
     }
 
     /// Look up a tx hash to find its block number and index.

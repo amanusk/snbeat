@@ -135,6 +135,58 @@ pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &A
         .await;
 }
 
+/// Try to advance the global "we've polled pf-query for every class change
+/// up to this block" watermark to at least `target`. Cheap probe (one HTTP
+/// round-trip): if no `replace_class` happened in `(watermark, target]`,
+/// we sweep-advance every per-address validation marker so subsequent
+/// `resolve_class_hash_at` calls short-circuit on the cache. If some
+/// addresses did change, only those get invalidated and the rest still
+/// inherit the new coverage.
+///
+/// On truncation (cold start with the watermark far behind `target`) we
+/// leave the watermark untouched — the caller's per-address resolve
+/// fallback handles this call, and the next probe will try again with
+/// hopefully a smaller window.
+async fn try_advance_class_changes_watermark(
+    target: u64,
+    ds: &Arc<dyn DataSource>,
+    pf: &Arc<PathfinderClient>,
+) {
+    let watermark = ds.load_class_changes_watermark().unwrap_or(0);
+    if watermark >= target {
+        return;
+    }
+    match pf.get_class_changes(watermark, target).await {
+        Ok(resp) if !resp.truncated => {
+            for addr_hex in &resp.addresses {
+                if let Ok(addr) = Felt::from_hex(addr_hex) {
+                    ds.invalidate_class_history_max_block(&addr);
+                } else {
+                    warn!(addr = %addr_hex, "Bad address hex in class-changes response");
+                }
+            }
+            ds.advance_class_history_meta(watermark, resp.to);
+            ds.save_class_changes_watermark(resp.to);
+            debug!(
+                from = watermark,
+                to = resp.to,
+                changed = resp.addresses.len(),
+                "Advanced class-changes watermark"
+            );
+        }
+        Ok(_) => {
+            debug!(
+                from = watermark,
+                to = target,
+                "class-changes probe truncated; leaving watermark"
+            );
+        }
+        Err(e) => {
+            debug!(error = %e, "class-changes probe failed");
+        }
+    }
+}
+
 /// Resolve the class hash that was active for `address` at `block`.
 ///
 /// Tries in order:
@@ -145,6 +197,15 @@ pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &A
 ///    Result is intentionally NOT written into class_history — that table
 ///    is a list of class-hash *changes*, and a single point lookup would
 ///    falsely indicate "this is the only class this address ever had".
+///
+/// Coverage check (validates that no unobserved `replace_class` could sit
+/// between the newest cached entry and `block`):
+///   - The cached `last_known_block` for this address satisfies `>= block`, OR
+///   - The global class-changes watermark satisfies `>= block` — which is
+///     valid because `try_advance_class_changes_watermark` sweep-forwards
+///     per-address meta for every address that was validated through the
+///     prior watermark, so a global watermark advance implicitly covers
+///     them all.
 ///
 /// Returns `None` if all three fail; callers should fall back to the
 /// latest-ABI path.
@@ -157,14 +218,6 @@ pub async fn resolve_class_hash_at(
     // 1. cached class_history (desc-ordered).
     let mut history = ds.load_cached_class_history(&address);
 
-    // The cache "covers" the target block only if BOTH:
-    //   * the oldest cached entry is at/before `block` (cache reaches back
-    //     far enough to find the right class), AND
-    //   * pf-query has validated the cache forward through at least `block`
-    //     (no unobserved `replace_class` could sit between the newest cached
-    //     entry and `block`).
-    // Skipping the forward check would let a stale cache satisfy a newer
-    // target block and return the wrong class hash.
     let reaches_back = history
         .last()
         .map(|e| e.block_number <= block)
@@ -172,7 +225,11 @@ pub async fn resolve_class_hash_at(
     let validated_through_target = ds
         .load_class_history_max_block(&address)
         .map(|max_block| max_block >= block)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || ds
+            .load_class_changes_watermark()
+            .map(|w| w >= block)
+            .unwrap_or(false);
     let cache_covers = reaches_back && validated_through_target;
     if !cache_covers && let Some(pf) = pf {
         match pf.get_class_history(address).await {
@@ -230,6 +287,14 @@ pub async fn prewarm_abis_at(
     abi_reg: &AbiRegistry,
 ) -> HashMap<Felt, Felt> {
     let addrs: Vec<Felt> = addresses.into_iter().collect();
+
+    // One up-front probe: if the global class-changes watermark already
+    // covers `block`, every per-address resolve below short-circuits to a
+    // cache hit. If not, advance it in a single round trip — far cheaper
+    // than N parallel `class-history` calls.
+    if let Some(pf) = pf {
+        try_advance_class_changes_watermark(block, ds, pf).await;
+    }
 
     // Resolve all (address → class_hash @ block) in parallel.
     let resolutions = futures::future::join_all(

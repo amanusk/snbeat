@@ -117,6 +117,18 @@ struct ClassDeclarationInfo {
     block_number: u64,
 }
 
+/// Response for `GET /class-changes`. Lists distinct contract addresses whose
+/// class hash changed in `(from, to]`. `truncated=true` means the result set
+/// exceeded the server cap — the client must invalidate everything and fall
+/// back to per-address resolution rather than trust the (partial) list.
+#[derive(Serialize)]
+struct ClassChangesResponse {
+    from: u64,
+    to: u64,
+    addresses: Vec<String>,
+    truncated: bool,
+}
+
 /// Decoded transaction summary from a block blob.
 #[derive(Serialize)]
 struct DecodedTx {
@@ -220,6 +232,14 @@ struct ContractEventCountResponse {
 #[derive(Deserialize)]
 struct NonceHistoryParams {
     limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ClassChangesParams {
+    /// Exclusive lower bound on block_number.
+    from: u64,
+    /// Inclusive upper bound on block_number.
+    to: u64,
 }
 
 #[derive(Deserialize)]
@@ -471,6 +491,66 @@ async fn handler_class_declaration(
             "Class found but declaration block is unknown".into(),
         )),
     }
+}
+
+/// GET /class-changes?from=N&to=M — distinct contract addresses whose class
+/// hash changed in `(from, to]`. Lets a client advance a global "we've seen
+/// every class change up to block M" watermark in one round trip instead of
+/// re-fetching the full per-address class history on every tx open.
+///
+/// Caps the result at `CLASS_CHANGES_LIMIT` distinct addresses to bound the
+/// response size on first-call cold starts (when `from=0` against a chain
+/// with millions of contracts). If the cap is hit, `truncated=true` and the
+/// caller is expected to invalidate everything rather than trust the
+/// (partial) list.
+async fn handler_class_changes(
+    Query(params): Query<ClassChangesParams>,
+    State(state): State<AppState>,
+) -> ApiResult<ClassChangesResponse> {
+    const CLASS_CHANGES_LIMIT: i64 = 50_000;
+
+    if params.from > params.to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("from ({}) must be <= to ({})", params.from, params.to),
+        ));
+    }
+
+    let conn = open_db(&state.db_path).map_err(db_err)?;
+    // SELECT one extra row so we can detect truncation without a separate
+    // COUNT(*). DISTINCT collapses multiple changes for the same contract
+    // within the range into a single entry — the client just needs the
+    // address set, not the per-change history.
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT contract_address \
+             FROM contract_updates \
+             WHERE block_number > ?1 AND block_number <= ?2 \
+             LIMIT ?3",
+        )
+        .map_err(db_err)?;
+
+    let addresses: Vec<String> = stmt
+        .query_map(
+            rusqlite::params![params.from, params.to, CLASS_CHANGES_LIMIT + 1],
+            |row| {
+                let addr_blob: Vec<u8> = row.get(0)?;
+                Ok(format!("0x{}", hex::encode(&addr_blob)))
+            },
+        )
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let truncated = addresses.len() as i64 > CLASS_CHANGES_LIMIT;
+    let addresses = if truncated { Vec::new() } else { addresses };
+
+    Ok(Json(ClassChangesResponse {
+        from: params.from,
+        to: params.to,
+        addresses,
+        truncated,
+    }))
 }
 
 /// GET /tx-by-hash/{hash} — look up block_number + index for a tx hash
@@ -1701,6 +1781,7 @@ async fn main() -> Result<()> {
             "/class-declaration/{class_hash}",
             get(handler_class_declaration),
         )
+        .route("/class-changes", get(handler_class_changes))
         .route("/tx-by-hash/{hash}", get(handler_tx_by_hash))
         .route("/txs-by-hash", post(handler_txs_by_hash))
         .route("/storage-batch", post(handler_storage_batch))
@@ -1962,6 +2043,70 @@ mod tests {
         let result = handler_class_history(AxumPath(TEST_ADDR.to_string()), AxumState(state)).await;
         let json = result.expect("handler returned error");
         assert!(json.0.is_empty());
+    }
+
+    /// /class-changes returns distinct addresses with class updates in the
+    /// (from, to] range. Multiple updates to the same contract collapse to
+    /// one entry; updates outside the range are excluded.
+    #[tokio::test]
+    async fn handler_class_changes_smoke() {
+        let (dir, state) = setup_test_db();
+        let conn = rusqlite::Connection::open(dir.path().join("test.db")).expect("reopen");
+        let addr_a = hex::decode("0a".repeat(32)).unwrap();
+        let addr_b = hex::decode("0b".repeat(32)).unwrap();
+        let addr_c = hex::decode("0c".repeat(32)).unwrap();
+        let ch = hex::decode("ff".repeat(32)).unwrap();
+        // addr_a: changed at 100 and 150 (in range, collapses to one)
+        // addr_b: changed at 200 (in range)
+        // addr_c: changed at 50 (below range — excluded) and 300 (above range — excluded)
+        for (block, addr) in &[
+            (50_u64, &addr_c),
+            (100_u64, &addr_a),
+            (150_u64, &addr_a),
+            (200_u64, &addr_b),
+            (300_u64, &addr_c),
+        ] {
+            conn.execute(
+                "INSERT INTO contract_updates(block_number, contract_address, class_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![block, addr.as_slice(), ch.as_slice()],
+            )
+            .expect("insert");
+        }
+        drop(conn);
+
+        let result = handler_class_changes(
+            AxumQuery(ClassChangesParams { from: 50, to: 250 }),
+            AxumState(state),
+        )
+        .await;
+        let json = result.expect("handler returned error");
+        assert_eq!(json.0.from, 50);
+        assert_eq!(json.0.to, 250);
+        assert!(!json.0.truncated);
+        let mut addrs = json.0.addresses;
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                format!("0x{}", "0a".repeat(32)),
+                format!("0x{}", "0b".repeat(32))
+            ]
+        );
+    }
+
+    /// `from > to` is a 400, not a silent empty result.
+    #[tokio::test]
+    async fn handler_class_changes_rejects_inverted_range() {
+        let (_dir, state) = setup_test_db();
+        let result = handler_class_changes(
+            AxumQuery(ClassChangesParams { from: 200, to: 100 }),
+            AxumState(state),
+        )
+        .await;
+        match result {
+            Err((code, _)) => assert_eq!(code, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("inverted range should error"),
+        }
     }
 
     #[tokio::test]
