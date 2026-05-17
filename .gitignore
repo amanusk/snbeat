@@ -11,5 +11,4 @@ CLAUDE.md
 
 # Local-only artifacts (not part of the published crate)
 privacy-scripts/
-regicide.log.*
 RELEASE_NOTES_*.md
