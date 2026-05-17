@@ -122,13 +122,17 @@ pub fn format_selector_names(
 /// warm data. No-op for addresses that fail to fetch (errors are already
 /// surfaced inside `AbiRegistry`).
 pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &AbiRegistry) {
-    let futs: Vec<_> = addresses
-        .into_iter()
-        .map(|a| async move {
+    use futures::stream::StreamExt;
+    // Bounded fan-out: an address visit with many unique emitters used to
+    // fire `join_all` over all of them. With remote RPC each cold address
+    // costs a class_hash + class fetch, so an unbounded burst saturated the
+    // shared pool. 16 is enough to keep small (5-20) sets effectively
+    // parallel while capping the worst case.
+    futures::stream::iter(addresses)
+        .for_each_concurrent(16, |a| async move {
             let _ = abi_reg.get_abi_for_address(&a).await;
         })
-        .collect();
-    futures::future::join_all(futs).await;
+        .await;
 }
 
 /// Resolve the class hash that was active for `address` at `block`.
@@ -174,7 +178,7 @@ pub async fn resolve_class_hash_at(
         match pf.get_class_history(address).await {
             Ok(entries) => {
                 if !entries.is_empty() {
-                    let latest = ds.get_latest_block_number().await.unwrap_or(0);
+                    let latest = ds.latest_block_hint().await.unwrap_or(0);
                     ds.save_class_history(&address, &entries);
                     if latest > 0 {
                         ds.save_class_history_max_block(&address, latest);

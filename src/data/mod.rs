@@ -47,10 +47,33 @@ impl FilterKind {
     }
 }
 
+/// Cheap, in-process source of the chain's latest block height.
+///
+/// Implementors (typically a WS-fed `HeadTracker`) let cache layers check
+/// staleness without paying an RPC round-trip on every hit. Returning `None`
+/// means "I don't have a recent enough value" — callers fall back to
+/// `DataSource::get_latest_block_number()`.
+pub trait LatestBlockSource: Send + Sync {
+    fn latest(&self) -> Option<u64>;
+}
+
 /// Abstraction over different Starknet data sources (RPC, Pathfinder DB).
 #[async_trait]
 pub trait DataSource: Send + Sync {
     async fn get_latest_block_number(&self) -> Result<u64>;
+    /// Best-effort chain head for window/anchor math. Default falls back to a
+    /// full RPC; `CachingDataSource` overrides to read an in-process tracker
+    /// first (WS-fed, < 2 s old typically). Returns `None` when no usable
+    /// answer is available — callers handle that as "give up" or
+    /// "degrade gracefully" per their own semantics.
+    ///
+    /// Use this instead of `get_latest_block_number` whenever the result is
+    /// only used to anchor a windowed scan or staleness check; reserve the
+    /// authoritative call for paths that actually need to know the tip
+    /// (e.g. the head-keeper that populates the tracker).
+    async fn latest_block_hint(&self) -> Option<u64> {
+        self.get_latest_block_number().await.ok()
+    }
     async fn get_block(&self, number: u64) -> Result<SnBlock>;
     async fn get_block_by_hash(&self, hash: Felt) -> Result<u64>;
     async fn get_block_with_txs(&self, number: u64) -> Result<(SnBlock, Vec<SnTransaction>)>;

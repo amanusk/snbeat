@@ -46,6 +46,10 @@ pub struct CachingDataSource {
     pending_txs: Mutex<HashMap<Felt, SharedTxFut>>,
     pending_receipts: Mutex<HashMap<Felt, SharedRxFut>>,
     pending_traces: Mutex<HashMap<Felt, SharedTraceFut>>,
+    /// In-process chain head, fed by the WS new-heads stream. When set and
+    /// fresh, `get_class_hash` uses this to check cache staleness instead of
+    /// issuing a `starknet_blockNumber` RPC per call.
+    head: Option<Arc<dyn crate::data::LatestBlockSource>>,
 }
 
 impl CachingDataSource {
@@ -409,7 +413,16 @@ impl CachingDataSource {
             pending_txs: Mutex::new(HashMap::new()),
             pending_receipts: Mutex::new(HashMap::new()),
             pending_traces: Mutex::new(HashMap::new()),
+            head: None,
         })
+    }
+
+    /// Plug in a chain-head source (typically a WS-fed `HeadTracker`) so cache
+    /// staleness checks don't pay an RPC round-trip per call. Builder-style:
+    /// call this on the freshly-constructed source before wrapping in `Arc`.
+    pub fn with_head_tracker(mut self, head: Arc<dyn crate::data::LatestBlockSource>) -> Self {
+        self.head = Some(head);
+        self
     }
 
     fn get_cached_block(&self, number: u64) -> Option<SnBlock> {
@@ -1087,6 +1100,20 @@ impl DataSource for CachingDataSource {
         self.upstream.get_latest_block_number().await
     }
 
+    async fn latest_block_hint(&self) -> Option<u64> {
+        // Prefer the in-process tracker — typically WS-fed, sub-second fresh —
+        // so window/anchor math doesn't pay an RPC round trip per call. The
+        // tracker reports `None` when empty (cold start) or stale (WS dropped
+        // and the head-keeper hasn't ticked); in those cases the upstream RPC
+        // is the only honest answer.
+        if let Some(head) = &self.head
+            && let Some(block) = head.latest()
+        {
+            return Some(block);
+        }
+        self.upstream.get_latest_block_number().await.ok()
+    }
+
     async fn get_block(&self, number: u64) -> Result<SnBlock> {
         if let Some(block) = self.get_cached_block(number) {
             trace!(number, "cache hit: block");
@@ -1216,9 +1243,13 @@ impl DataSource for CachingDataSource {
     async fn get_class_hash(&self, address: Felt) -> Result<Felt> {
         // Class hash is mostly stable but CAN change via replace_class syscall.
         // Cache with the block at which we fetched it; refetch if stale (>1000 blocks).
+        // `latest_block_hint().await.unwrap_or(0)`: a missing hint means the
+        // staleness check evaluates `0 - fetched_at = 0 < 1000`, so we keep
+        // the cache entry — "fail open" toward the warm value rather than
+        // hammering the upstream when we couldn't even read the head.
         const CLASS_HASH_STALE_BLOCKS: u64 = 1000;
         if let Some((class_hash, fetched_at)) = self.get_cached_class_hash(&address) {
-            let latest = self.upstream.get_latest_block_number().await.unwrap_or(0);
+            let latest = self.latest_block_hint().await.unwrap_or(0);
             if latest.saturating_sub(fetched_at) < CLASS_HASH_STALE_BLOCKS {
                 trace!(address = %format!("{:#x}", address), "cache hit: class_hash");
                 return Ok(class_hash);
@@ -1226,7 +1257,7 @@ impl DataSource for CachingDataSource {
             debug!(address = %format!("{:#x}", address), age = latest - fetched_at, "class_hash cache stale, refetching");
         }
         let class_hash = self.upstream.get_class_hash(address).await?;
-        let block = self.upstream.get_latest_block_number().await.unwrap_or(0);
+        let block = self.latest_block_hint().await.unwrap_or(0);
         self.cache_class_hash(&address, &class_hash, block);
         Ok(class_hash)
     }
