@@ -507,7 +507,15 @@ async fn handler_class_changes(
     Query(params): Query<ClassChangesParams>,
     State(state): State<AppState>,
 ) -> ApiResult<ClassChangesResponse> {
-    const CLASS_CHANGES_LIMIT: i64 = 50_000;
+    // Cap on distinct addresses per response. Mainnet has ~7M distinct
+    // contracts across the full chain, so a cold-start probe from block 0
+    // can't possibly return them all in one round trip. Instead, scan
+    // block-by-block and stop at a block boundary once accumulating this
+    // many distinct addresses, reporting `to=<last fully-scanned block>`
+    // so the client can advance its watermark partially and resume from
+    // there. A higher cap means fewer probes on cold start but a larger
+    // single response payload (~70 B/address).
+    const CLASS_CHANGES_LIMIT: usize = 100_000;
 
     if params.from > params.to {
         return Err((
@@ -517,40 +525,76 @@ async fn handler_class_changes(
     }
 
     let conn = open_db(&state.db_path).map_err(db_err)?;
-    // SELECT one extra row so we can detect truncation without a separate
-    // COUNT(*). DISTINCT collapses multiple changes for the same contract
-    // within the range into a single entry — the client just needs the
-    // address set, not the per-change history.
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT contract_address \
-             FROM contract_updates \
-             WHERE block_number > ?1 AND block_number <= ?2 \
-             LIMIT ?3",
-        )
-        .map_err(db_err)?;
+    scan_class_changes(&conn, params.from, params.to, CLASS_CHANGES_LIMIT)
+        .map(Json)
+        .map_err(db_err)
+}
 
-    let addresses: Vec<String> = stmt
-        .query_map(
-            rusqlite::params![params.from, params.to, CLASS_CHANGES_LIMIT + 1],
-            |row| {
-                let addr_blob: Vec<u8> = row.get(0)?;
-                Ok(format!("0x{}", hex::encode(&addr_blob)))
-            },
-        )
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
+/// Block-by-block scan of `contract_updates` over `(from, to]`. Commits
+/// per block so the response never includes a partially-scanned block —
+/// the caller relies on `to=<last fully-scanned block>` to advance a
+/// watermark without skipping changes. Pulled out of the handler so unit
+/// tests can drive truncation with a small `limit` without seeding 100k
+/// rows.
+fn scan_class_changes(
+    conn: &rusqlite::Connection,
+    from: u64,
+    to: u64,
+    limit: usize,
+) -> rusqlite::Result<ClassChangesResponse> {
+    let mut stmt = conn.prepare(
+        "SELECT block_number, contract_address \
+         FROM contract_updates \
+         WHERE block_number > ?1 AND block_number <= ?2 \
+         ORDER BY block_number ASC",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![from, to])?;
 
-    let truncated = addresses.len() as i64 > CLASS_CHANGES_LIMIT;
-    let addresses = if truncated { Vec::new() } else { addresses };
+    let mut distinct: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut staged: Vec<Vec<u8>> = Vec::new();
+    let mut staged_block: Option<u64> = None;
+    let mut last_committed_block: u64 = from;
+    let mut truncated = false;
 
-    Ok(Json(ClassChangesResponse {
-        from: params.from,
-        to: params.to,
+    while let Some(row) = rows.next()? {
+        let block: u64 = row.get(0)?;
+        let addr: Vec<u8> = row.get(1)?;
+
+        if staged_block != Some(block) {
+            if let Some(prev) = staged_block {
+                for a in staged.drain(..) {
+                    distinct.insert(a);
+                }
+                last_committed_block = prev;
+                if distinct.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+            }
+            staged_block = Some(block);
+        }
+        staged.push(addr);
+    }
+
+    if !truncated && let Some(prev) = staged_block {
+        for a in staged.drain(..) {
+            distinct.insert(a);
+        }
+        last_committed_block = prev;
+    }
+
+    let to_actual = if truncated { last_committed_block } else { to };
+    let addresses: Vec<String> = distinct
+        .into_iter()
+        .map(|bytes| format!("0x{}", hex::encode(&bytes)))
+        .collect();
+
+    Ok(ClassChangesResponse {
+        from,
+        to: to_actual,
         addresses,
         truncated,
-    }))
+    })
 }
 
 /// GET /tx-by-hash/{hash} — look up block_number + index for a tx hash
@@ -2092,6 +2136,86 @@ mod tests {
                 format!("0x{}", "0b".repeat(32))
             ]
         );
+    }
+
+    /// Truncation must stop at a block boundary, not mid-block — the
+    /// client uses `to=<last fully-scanned block>` to advance its
+    /// watermark and trusts every change up to that block is in the
+    /// response. Drives `scan_class_changes` directly with a tiny limit
+    /// to exercise the cap without seeding 100k rows.
+    #[test]
+    fn scan_class_changes_partial_coverage_stops_on_block_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE contract_updates (
+                 block_number INTEGER NOT NULL,
+                 contract_address BLOB NOT NULL,
+                 class_hash BLOB NOT NULL
+             );",
+        )
+        .expect("init");
+        let ch = hex::decode("ff".repeat(32)).unwrap();
+        // Block 1: 2 distinct addrs, block 2: 1 addr, block 3: 1 addr,
+        // block 4: 1 addr. With limit=3 the scanner should commit blocks
+        // 1 and 2 (3 distinct), hit the cap, and stop *before* block 3.
+        // Reported `to` must be 2, not 3.
+        let mk_addr = |tag: u8| {
+            let mut a = vec![0u8; 32];
+            a[31] = tag;
+            a
+        };
+        for (block, addr) in &[
+            (1u64, mk_addr(0xa1)),
+            (1u64, mk_addr(0xa2)),
+            (2u64, mk_addr(0xa3)),
+            (3u64, mk_addr(0xa4)),
+            (4u64, mk_addr(0xa5)),
+        ] {
+            conn.execute(
+                "INSERT INTO contract_updates(block_number, contract_address, class_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![block, addr.as_slice(), ch.as_slice()],
+            )
+            .expect("insert");
+        }
+
+        let resp = scan_class_changes(&conn, 0, 100, 3).expect("scan");
+        assert!(resp.truncated, "should report truncated when cap is hit");
+        assert_eq!(resp.to, 2, "should stop at last fully-scanned block");
+        assert_eq!(resp.addresses.len(), 3, "should contain all of blocks 1+2");
+    }
+
+    /// When the requested range fits under the cap, `to` matches the
+    /// request (not the highest row's block).
+    #[test]
+    fn scan_class_changes_full_coverage_reports_requested_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE contract_updates (
+                 block_number INTEGER NOT NULL,
+                 contract_address BLOB NOT NULL,
+                 class_hash BLOB NOT NULL
+             );",
+        )
+        .expect("init");
+        let ch = hex::decode("ff".repeat(32)).unwrap();
+        let mut addr = vec![0u8; 32];
+        addr[31] = 0xaa;
+        conn.execute(
+            "INSERT INTO contract_updates(block_number, contract_address, class_hash) VALUES (?1, ?2, ?3)",
+            rusqlite::params![5_u64, addr.as_slice(), ch.as_slice()],
+        )
+        .expect("insert");
+
+        let resp = scan_class_changes(&conn, 0, 100, 1000).expect("scan");
+        assert!(!resp.truncated);
+        // Crucial: even though the only row is at block 5, we still report
+        // to=100 because we fully scanned the requested range.
+        assert_eq!(resp.to, 100);
+        assert_eq!(resp.addresses.len(), 1);
     }
 
     /// `from > to` is a 400, not a silent empty result.

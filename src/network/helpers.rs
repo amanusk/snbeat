@@ -137,16 +137,18 @@ pub async fn prewarm_abis(addresses: impl IntoIterator<Item = Felt>, abi_reg: &A
 
 /// Try to advance the global "we've polled pf-query for every class change
 /// up to this block" watermark to at least `target`. Cheap probe (one HTTP
-/// round-trip): if no `replace_class` happened in `(watermark, target]`,
+/// round-trip): if no `replace_class` happened in `(watermark, resp.to]`,
 /// we sweep-advance every per-address validation marker so subsequent
 /// `resolve_class_hash_at` calls short-circuit on the cache. If some
 /// addresses did change, only those get invalidated and the rest still
 /// inherit the new coverage.
 ///
-/// On truncation (cold start with the watermark far behind `target`) we
-/// leave the watermark untouched — the caller's per-address resolve
-/// fallback handles this call, and the next probe will try again with
-/// hopefully a smaller window.
+/// On cold-start the server reports partial coverage (`truncated=true`
+/// with `resp.to < target` — typically advancing by the first ~100k
+/// distinct-address-worth of blocks). We process those changes and bump
+/// the watermark by however far the server got; the next probe picks up
+/// where this one left off. Within a few probes the watermark catches up
+/// to the chain tip and all subsequent tx opens are cache-hit fast.
 async fn try_advance_class_changes_watermark(
     target: u64,
     ds: &Arc<dyn DataSource>,
@@ -157,7 +159,18 @@ async fn try_advance_class_changes_watermark(
         return;
     }
     match pf.get_class_changes(watermark, target).await {
-        Ok(resp) if !resp.truncated => {
+        Ok(resp) => {
+            // Defensive: a server that returns `to <= watermark` would let
+            // us infinite-loop probing the same range. Drop the response.
+            if resp.to <= watermark {
+                debug!(
+                    from = watermark,
+                    to = resp.to,
+                    truncated = resp.truncated,
+                    "class-changes probe made no progress; skipping watermark update"
+                );
+                return;
+            }
             for addr_hex in &resp.addresses {
                 if let Ok(addr) = Felt::from_hex(addr_hex) {
                     ds.invalidate_class_history_max_block(&addr);
@@ -171,14 +184,8 @@ async fn try_advance_class_changes_watermark(
                 from = watermark,
                 to = resp.to,
                 changed = resp.addresses.len(),
+                truncated = resp.truncated,
                 "Advanced class-changes watermark"
-            );
-        }
-        Ok(_) => {
-            debug!(
-                from = watermark,
-                to = target,
-                "class-changes probe truncated; leaving watermark"
             );
         }
         Err(e) => {
