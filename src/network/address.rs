@@ -50,6 +50,43 @@ use super::dune_source_update;
 use super::helpers;
 use super::voyager;
 
+/// Decode a batch of events with a deduped ABI lookup table.
+///
+/// The naïve `for event in events { abi.get_abi_for_address(...).await }`
+/// fires one staleness check per event. On a busy address that emits via a
+/// handful of contracts (e.g. an account that hits a router + a token), N
+/// events meant N×(class_hash + class) cache walks plus — until recently — an
+/// RPC `starknet_blockNumber` per call. We collect the unique `from_address`
+/// set first, resolve each once concurrently, then look up per event during
+/// `decode_event`. Concurrency is capped to keep cold runs from saturating
+/// pf-query / RPC class fetches.
+async fn decode_events_dedup(
+    events: &[crate::data::types::SnEvent],
+    abi_reg: &Arc<AbiRegistry>,
+) -> Vec<crate::decode::events::DecodedEvent> {
+    use futures::stream::StreamExt;
+    let unique: std::collections::HashSet<starknet::core::types::Felt> =
+        events.iter().map(|e| e.from_address).collect();
+    let abi_map: std::collections::HashMap<_, _> = futures::stream::iter(unique)
+        .map(|addr| {
+            let abi_reg = Arc::clone(abi_reg);
+            async move {
+                let abi = abi_reg.get_abi_for_address(&addr).await;
+                (addr, abi)
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    events
+        .iter()
+        .map(|e| {
+            let abi = abi_map.get(&e.from_address).and_then(|o| o.as_deref());
+            decode_event(e, abi)
+        })
+        .collect()
+}
+
 /// RAII helper that registers an entry in the per-query status bar on
 /// construction and clears it on drop. Every early-return path in the
 /// fetcher it guards gets the clear for free, so we can't leave a stale
@@ -1379,7 +1416,7 @@ pub(super) async fn fetch_and_send_address_info(
             let _ = tx_b.send(Action::LoadingStatus(
                 "Dune: fetching recent account txs...".into(),
             ));
-            let latest_block = ds_b.get_latest_block_number().await.unwrap_or(0);
+            let latest_block = ds_b.latest_block_hint().await.unwrap_or(0);
             let from = latest_block.saturating_sub(INITIAL_WINDOW);
 
             let result = dune_c
@@ -1525,7 +1562,7 @@ pub(super) async fn fetch_and_send_address_info(
         let mut probe_rx_c = probe_watch_rx.clone();
 
         spawn_cancellable(cancel.clone(), async move {
-            let latest_block = ds_c.get_latest_block_number().await.unwrap_or(0);
+            let latest_block = ds_c.latest_block_hint().await.unwrap_or(0);
 
             // --- Use cached search progress + nonce delta to narrow the window ---
             // TASK C's scan uses the same `kind` as ensure_address_events_window
@@ -1696,11 +1733,7 @@ pub(super) async fn fetch_and_send_address_info(
             };
 
             // Decode events for the events tab
-            let mut decoded_events = Vec::new();
-            for event in &events {
-                let abi = abi_c.get_abi_for_address(&event.from_address).await;
-                decoded_events.push(decode_event(event, abi.as_deref()));
-            }
+            let decoded_events = decode_events_dedup(&events, &abi_c).await;
 
             // Cache discovered range from phase 1 events
             if !events.is_empty() {
@@ -1942,11 +1975,7 @@ pub(super) async fn fetch_and_send_address_info(
                                 .map(|e| (e.transaction_hash, e.block_number))
                                 .collect();
 
-                            let mut deep_decoded = Vec::new();
-                            for event in &deeper_events {
-                                let abi = abi_c.get_abi_for_address(&event.from_address).await;
-                                deep_decoded.push(decode_event(event, abi.as_deref()));
-                            }
+                            let deep_decoded = decode_events_dedup(&deeper_events, &abi_c).await;
 
                             if is_contract && !deep_hashes.is_empty() {
                                 let call_hashes: Vec<_> = deep_hashes
@@ -3523,13 +3552,10 @@ pub(super) async fn fetch_address_meta_txs(
     };
 
     // Latest block anchors the TopDelta window and all gap math.
-    let latest_block = match ds.get_latest_block_number().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: latest block fetch failed");
-            send_empty();
-            return;
-        }
+    let Some(latest_block) = ds.latest_block_hint().await else {
+        warn!(addr = %format!("{:#x}", address), "MetaTxs: no chain head available");
+        send_empty();
+        return;
     };
 
     // Guard against a 0 coming in from state defaults: use the initial window.
@@ -4224,16 +4250,12 @@ pub(super) async fn discover_private_meta_txs(
     let note_ids: HashSet<Felt> = notes.iter().map(|n| n.note_id).collect();
     let nullifiers: HashSet<Felt> = nullifier_pairs.iter().map(|(n, _)| *n).collect();
 
-    let latest_block = match ds.get_latest_block_number().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(
-                user = %format!("{:#x}", user),
-                error = %e,
-                "discover_private_meta_txs: latest block fetch failed"
-            );
-            return empty_outcome();
-        }
+    let Some(latest_block) = ds.latest_block_hint().await else {
+        debug!(
+            user = %format!("{:#x}", user),
+            "discover_private_meta_txs: no chain head available"
+        );
+        return empty_outcome();
     };
 
     let effective_window = if window_size == 0 {
@@ -4546,12 +4568,9 @@ pub(super) async fn refresh_address_rpc(
             return;
         }
     };
-    let latest_block = match ds.get_latest_block_number().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(addr = %format!("{:#x}", address), error = %e, "refresh_address_rpc: get_latest_block_number failed");
-            return;
-        }
+    let Some(latest_block) = ds.latest_block_hint().await else {
+        debug!(addr = %format!("{:#x}", address), "refresh_address_rpc: no chain head available");
+        return;
     };
     if nonce != starknet::core::types::Felt::ZERO {
         ds.save_cached_nonce(&address, &nonce, latest_block);

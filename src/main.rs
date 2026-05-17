@@ -94,9 +94,18 @@ async fn main() -> anyhow::Result<()> {
     let cache_db = cache_dir.join("cache.db");
     info!(cache_db = %cache_db.display(), "Using local cache");
 
+    // Shared head-block tracker: WS writes the most recent block on every
+    // `starknet_subscribeNewHeads` notification. Created up here (rather than
+    // after the data source) so the cache layer can read chain head without
+    // an RPC round-trip per class_hash staleness check. The WS subscriber and
+    // head-keeper are spawned later — until they fire, `head.latest()`
+    // returns `None` and the cache falls back to RPC, matching old behavior.
+    let head_block = Arc::new(network::HeadTracker::new());
+
     // Create data source with persistent cache
     let rpc = RpcDataSource::new(&config.rpc_url);
-    let cached = CachingDataSource::new(Arc::new(rpc) as Arc<dyn data::DataSource>, &cache_db)?;
+    let cached = CachingDataSource::new(Arc::new(rpc) as Arc<dyn data::DataSource>, &cache_db)?
+        .with_head_tracker(Arc::clone(&head_block) as Arc<dyn data::LatestBlockSource>);
     let data_source: Arc<dyn data::DataSource> = Arc::new(cached);
 
     // ABI registry with persistent class cache
@@ -329,13 +338,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Shared head-block tracker: WS writes the most recent block on every
-    // `starknet_subscribeNewHeads` notification; the network task reads it
-    // synchronously instead of issuing `starknet_blockNumber` RPCs. A
-    // background head-keeper periodically refreshes it as a backstop for
-    // WebSocket disconnects.
-    let head_block = Arc::new(network::HeadTracker::new());
-
     // Spawn network task
     let ds_clone = Arc::clone(&data_source);
     let abi_clone = Arc::clone(&abi_registry);
@@ -371,11 +373,15 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&head_block),
         );
         app.ws_manager = Some(ws_manager);
-        // Backstop only relevant when WS is the primary head feed.
+        // WS feeds the tracker on every new head (~2 s on mainnet), so this
+        // keeper exists purely as a backstop for WS-disconnect windows. 60 s
+        // is plenty — we still recover well inside the 60 s freshness
+        // threshold the cache layer applies to the tracker — and it saves
+        // ~5 RPC round-trips per minute against a remote node.
         let _head_keeper: tokio::task::JoinHandle<()> = network::spawn_head_keeper(
             Arc::clone(&data_source),
             Arc::clone(&head_block),
-            Duration::from_secs(10),
+            Duration::from_secs(60),
         );
         handle
     } else {

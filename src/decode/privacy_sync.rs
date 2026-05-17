@@ -283,13 +283,9 @@ impl StorageBackend {
             {
                 return Ok((Vec::new(), bn));
             }
-            let bn = self
-                .data_source
-                .get_latest_block_number()
-                .await
-                .map_err(|e| {
-                    SnbeatError::Provider(format!("get_latest_block_number failed: {e}"))
-                })?;
+            let bn = self.data_source.latest_block_hint().await.ok_or_else(|| {
+                SnbeatError::Provider("latest_block_hint: no chain head available".into())
+            })?;
             return Ok((Vec::new(), bn));
         }
 
@@ -309,11 +305,9 @@ impl StorageBackend {
 
         // RPC fallback: chunked JSON-RPC batches via
         // `starknet_getStorageAt`. One HTTP roundtrip per chunk.
-        let bn = self
-            .data_source
-            .get_latest_block_number()
-            .await
-            .map_err(|e| SnbeatError::Provider(format!("get_latest_block_number failed: {e}")))?;
+        let bn = self.data_source.latest_block_hint().await.ok_or_else(|| {
+            SnbeatError::Provider("latest_block_hint: no chain head available".into())
+        })?;
         let mut out = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(RPC_BATCH_CHUNK) {
             let results = self
