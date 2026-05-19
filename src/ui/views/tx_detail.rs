@@ -2554,8 +2554,8 @@ fn push_balance_changes_section(
     }
 
     // USD magnitude for a token delta — used purely for sort order.
-    // Unpriced or unknown-decimals tokens get NEG_INFINITY so they sort
-    // after priced ones; overflow rows get 0 (drop to the end as well).
+    // Overflow rows, unpriced tokens, and tokens with unknown decimals all
+    // return NEG_INFINITY so they sort after priced ones.
     let ts = app.tx_detail.block_timestamp;
     let token_magnitude = |td: &TokenDelta| -> f64 {
         let Some(net) = td.net else {

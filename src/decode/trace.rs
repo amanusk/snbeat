@@ -215,43 +215,59 @@ struct DeltaAccum {
     received_high: u128,
     sent_low: u128,
     sent_high: u128,
-    /// Any contributing row had `value_high != 0`, or a u128 sum saturated.
+    /// Set only when a running sum exceeds 2^256 — astronomically rare. Other
+    /// overflow conditions (u256 net not representable as i128) are detected
+    /// at `finalize()` time so the raw `received_*` / `sent_*` totals stay
+    /// faithful to the actual sum even in the fallback display path.
     overflow: bool,
+}
+
+/// In-place u256 add: `(dst_low, dst_high) += (add_low, add_high)` with
+/// proper carry from the low half into the high half. Sets `overflow_flag`
+/// only when the high half itself overflows (sum > 2^256).
+fn add_u256_inplace(
+    add_low: u128,
+    add_high: u128,
+    dst_low: &mut u128,
+    dst_high: &mut u128,
+    overflow_flag: &mut bool,
+) {
+    let (new_low, carry_low) = dst_low.overflowing_add(add_low);
+    *dst_low = new_low;
+    let (mid_high, c1) = dst_high.overflowing_add(add_high);
+    let (new_high, c2) = mid_high.overflowing_add(u128::from(carry_low));
+    *dst_high = new_high;
+    if c1 || c2 {
+        *overflow_flag = true;
+    }
 }
 
 impl DeltaAccum {
     fn add_received(&mut self, low: u128, high: u128) {
-        if high != 0 {
-            self.overflow = true;
-        }
-        match self.received_low.checked_add(low) {
-            Some(v) => self.received_low = v,
-            None => self.overflow = true,
-        }
-        match self.received_high.checked_add(high) {
-            Some(v) => self.received_high = v,
-            None => self.overflow = true,
-        }
+        add_u256_inplace(
+            low,
+            high,
+            &mut self.received_low,
+            &mut self.received_high,
+            &mut self.overflow,
+        );
     }
     fn add_sent(&mut self, low: u128, high: u128) {
-        if high != 0 {
-            self.overflow = true;
-        }
-        match self.sent_low.checked_add(low) {
-            Some(v) => self.sent_low = v,
-            None => self.overflow = true,
-        }
-        match self.sent_high.checked_add(high) {
-            Some(v) => self.sent_high = v,
-            None => self.overflow = true,
-        }
+        add_u256_inplace(
+            low,
+            high,
+            &mut self.sent_low,
+            &mut self.sent_high,
+            &mut self.overflow,
+        );
     }
     fn finalize(&self) -> (Option<i128>, bool) {
-        if self.overflow {
+        // Either side carrying a non-zero high half means the u256 difference
+        // can't be expressed cleanly as a low-128 signed delta — fall back to
+        // raw display. (The u256 totals are still accurate thanks to carry.)
+        if self.overflow || self.received_high != 0 || self.sent_high != 0 {
             return (None, true);
         }
-        // received_low and sent_low fit in u128; convert to i128 individually.
-        // Both must be ≤ i128::MAX for the subtraction to stay in range.
         let r = i128::try_from(self.received_low).ok();
         let s = i128::try_from(self.sent_low).ok();
         match (r, s) {
@@ -1013,6 +1029,50 @@ mod tests {
             deltas.iter().map(|d| (d.address, d)).collect();
         assert_eq!(by_addr[&alice].tokens[0].net, Some(-42));
         assert_eq!(by_addr[&seq].tokens[0].net, Some(42));
+    }
+
+    /// Sum of multiple in-range transfers can still exceed u128 on either
+    /// side. The carry must propagate cleanly into the high half so the raw
+    /// totals shown in the overflow-fallback row remain accurate.
+    #[test]
+    fn balance_changes_propagates_low_half_carry() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![
+                transfer_event(token, avnu, alice, u128::MAX),
+                transfer_event(token, avnu, alice, 1),
+            ],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        let by_addr: std::collections::HashMap<Felt, &AddressDelta> =
+            deltas.iter().map(|d| (d.address, d)).collect();
+
+        // Alice received u128::MAX + 1 = 2^128, so low wraps to 0 and high = 1.
+        let alice_td = &by_addr[&alice].tokens[0];
+        assert!(alice_td.overflow);
+        assert!(alice_td.net.is_none());
+        assert_eq!(alice_td.received_low, 0, "low half must wrap to 0");
+        assert_eq!(alice_td.received_high, 1, "carry must propagate into high");
+        assert_eq!(alice_td.sent_low, 0);
+        assert_eq!(alice_td.sent_high, 0);
+
+        // Mirrored on the sender side.
+        let avnu_td = &by_addr[&avnu].tokens[0];
+        assert!(avnu_td.overflow);
+        assert!(avnu_td.net.is_none());
+        assert_eq!(avnu_td.sent_low, 0);
+        assert_eq!(avnu_td.sent_high, 1);
+        assert_eq!(avnu_td.received_low, 0);
+        assert_eq!(avnu_td.received_high, 0);
     }
 
     /// A transfer whose value exceeds u128 (value_high != 0) must mark the
