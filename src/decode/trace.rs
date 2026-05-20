@@ -348,7 +348,11 @@ impl TransferGroups {
             for tk in token_order {
                 let accum = accum_map.remove(&tk).expect("token tracked in order");
                 let (net, overflow) = accum.finalize();
-                if matches!(net, Some(0)) && !overflow {
+                // Drop any (address, token) pair whose received and sent u256
+                // totals are exactly equal — that's a true zero net even when
+                // the sums saturated past i128/u128 and `net` had to fall
+                // back to `None`. Subsumes the common `net == Some(0)` case.
+                if accum.received_low == accum.sent_low && accum.received_high == accum.sent_high {
                     continue;
                 }
                 tokens.push(TokenDelta {
@@ -1126,5 +1130,67 @@ mod tests {
             assert!(ad.tokens[0].overflow, "expected overflow flag set");
             assert!(ad.tokens[0].net.is_none());
         }
+    }
+
+    /// A round-trip transfer where each leg's amount exceeds u128 (so the
+    /// per-address accumulators end up `overflow == true`) but received and
+    /// sent u256 totals match exactly. Net is still zero, so the row must
+    /// drop instead of rendering as a misleading overflow-fallback line.
+    #[test]
+    fn balance_changes_drops_overflow_round_trip() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        // value_high = 1 on both legs → each amount is > 2^128, but the
+        // received/sent totals on each side end up identical.
+        let make_ev = |from: Felt, to: Felt| DecodedEvent {
+            contract_address: token,
+            event_name: Some("Transfer".into()),
+            decoded_keys: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: from,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: to,
+                    value_high: None,
+                },
+            ],
+            decoded_data: vec![DecodedParam {
+                name: Some("value".into()),
+                type_name: Some("u256".into()),
+                value: Felt::from(1u32),
+                value_high: Some(Felt::from(1u32)),
+            }],
+            raw: SnEvent {
+                from_address: token,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        };
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![make_ev(alice, avnu), make_ev(avnu, alice)],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        assert!(
+            deltas.is_empty(),
+            "overflow round-trip should drop entirely; got {:?}",
+            deltas
+        );
     }
 }
