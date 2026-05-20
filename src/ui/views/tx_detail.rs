@@ -14,7 +14,9 @@ use crate::decode::events::{DecodedEvent, DecodedParam};
 use crate::decode::functions::RawCall;
 use crate::decode::outside_execution;
 use crate::decode::privacy::PrivacySummary;
-use crate::decode::trace::{DecodedTraceCall, MulticallGroup, TransferRow};
+use crate::decode::trace::{
+    AddressDelta, DecodedTraceCall, MulticallGroup, TokenDelta, TransferGroups, TransferRow,
+};
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
@@ -2367,6 +2369,10 @@ fn build_transfers_lines(
         );
     }
 
+    push_balance_changes_section(
+        app, color_map, registry, selected, line_map, &groups, &mut lines,
+    );
+
     lines
 }
 
@@ -2517,6 +2523,209 @@ fn push_transfer_row(
     {
         let amount_f64 = low as f64 / 10f64.powi(d as i32);
         let (today, historic) = price::token_prices(app, &row.token, app.tx_detail.block_timestamp);
+        if today.is_some() || historic.is_some() {
+            spans.push(Span::styled(
+                format_usd_pair(amount_f64, today, historic),
+                theme::SUGGESTION_STYLE,
+            ));
+        }
+    }
+
+    lines.push(Line::from(spans));
+}
+
+/// Append a Balance Changes summary under the per-transfer sections: one
+/// block per participating address with per-token net deltas (+ received,
+/// − sent) and USD pricing, reusing the same formatters as transfer rows.
+/// Skipped silently when there are no net deltas.
+#[allow(clippy::too_many_arguments)]
+fn push_balance_changes_section(
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    groups: &TransferGroups,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let deltas = groups.balance_changes();
+    if deltas.is_empty() {
+        return;
+    }
+
+    // USD magnitude for a token delta — used purely for sort order.
+    // Overflow rows, unpriced tokens, and tokens with unknown decimals all
+    // return NEG_INFINITY so they sort after priced ones.
+    let ts = app.tx_detail.block_timestamp;
+    let token_magnitude = |td: &TokenDelta| -> f64 {
+        let Some(net) = td.net else {
+            return f64::NEG_INFINITY;
+        };
+        let Some(d) = registry.and_then(|r| r.get_decimals(&td.token)) else {
+            return f64::NEG_INFINITY;
+        };
+        let (today, historic) = price::token_prices(app, &td.token, ts);
+        let Some(p) = today.or(historic) else {
+            return f64::NEG_INFINITY;
+        };
+        let amount = net.unsigned_abs() as f64 / 10f64.powi(d as i32);
+        (amount * p).abs()
+    };
+
+    // Sort tokens within each address by |USD| desc; compute per-address
+    // total |USD| for the outer address sort, with first-appearance index
+    // as the tiebreak for fully-unpriced addresses.
+    let mut indexed: Vec<(usize, AddressDelta, f64)> = deltas
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut ad)| {
+            ad.tokens.sort_by(|a, b| {
+                token_magnitude(b)
+                    .partial_cmp(&token_magnitude(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let total: f64 = ad
+                .tokens
+                .iter()
+                .map(token_magnitude)
+                .filter(|m| m.is_finite())
+                .sum();
+            (idx, ad, total)
+        })
+        .collect();
+    indexed.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Balance Changes",
+        theme::TITLE_STYLE,
+    )));
+
+    for (_, ad, _) in indexed {
+        push_balance_address_header(&ad, app, color_map, selected, line_map, lines);
+        let n = ad.tokens.len();
+        for (i, td) in ad.tokens.iter().enumerate() {
+            let is_last = i == n - 1;
+            let branch = if is_last { "└─" } else { "├─" };
+            push_balance_token_row(
+                &ad.address,
+                td,
+                branch,
+                app,
+                color_map,
+                registry,
+                selected,
+                line_map,
+                lines,
+            );
+        }
+    }
+}
+
+/// Render the header line for one address in the Balance Changes block.
+fn push_balance_address_header(
+    ad: &AddressDelta,
+    app: &App,
+    color_map: &AddressColorMap,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let label = fmt_addr(app, &ad.address);
+    let style = addr_style(&ad.address, color_map, selected);
+    record(
+        &TxNavItem::Address(ad.address),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+    let mut spans: Vec<Span<'static>> = vec![
+        addr_marker(&ad.address, selected),
+        Span::raw(" "),
+        Span::styled(label, style),
+    ];
+    if ad.address == Felt::ZERO {
+        spans.push(Span::styled(" (mint/burn)", theme::SUGGESTION_STYLE));
+    }
+    lines.push(Line::from(spans));
+}
+
+/// Render one token-delta row under an address in the Balance Changes block.
+#[allow(clippy::too_many_arguments)]
+fn push_balance_token_row(
+    addr: &Felt,
+    td: &TokenDelta,
+    branch: &str,
+    app: &App,
+    color_map: &AddressColorMap,
+    registry: Option<&crate::registry::AddressRegistry>,
+    selected: Option<&TxNavItem>,
+    line_map: &mut [Option<u16>],
+    lines: &mut Vec<Line<'static>>,
+) {
+    let token_label = fmt_addr(app, &td.token);
+    let token_style = addr_style(&td.token, color_map, selected);
+    let decimals = registry.and_then(|r| r.get_decimals(&td.token));
+
+    record(
+        &TxNavItem::Address(td.token),
+        lines.len(),
+        line_map,
+        &app.tx_detail.nav_items,
+        &app.tx_detail.nav_sections,
+        NavSection::Transfers,
+    );
+
+    let mut spans: Vec<Span<'static>> = vec![
+        addr_marker_any(&[&td.token, addr], selected),
+        Span::styled(format!(" {branch} "), theme::BORDER_STYLE),
+    ];
+
+    if td.overflow {
+        // Rare: u256 > 2^128 somewhere in the sum. Fall back to raw totals
+        // since signed arithmetic can't represent the difference cleanly.
+        spans.push(Span::styled("± ", theme::SUGGESTION_STYLE));
+        spans.push(Span::styled(
+            format!(
+                "received 0x{:x}{:032x}, sent 0x{:x}{:032x}",
+                td.received_high, td.received_low, td.sent_high, td.sent_low
+            ),
+            theme::TX_HASH_STYLE,
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(token_label, token_style));
+        lines.push(Line::from(spans));
+        return;
+    }
+
+    let net = td.net.expect("non-overflow row carries a net delta");
+    let sign_style = if net >= 0 {
+        theme::STATUS_OK
+    } else {
+        theme::STATUS_ERROR
+    };
+    let sign = if net >= 0 { "+" } else { "-" };
+    let magnitude = net.unsigned_abs();
+    let amount_str = match decimals {
+        Some(d) => crate::ui::widgets::param_display::format_token_amount(magnitude, 0, d),
+        None => magnitude.to_string(),
+    };
+
+    spans.push(Span::styled(format!("{sign}{amount_str}"), sign_style));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(token_label, token_style));
+
+    // USD pair shown unsigned — the +/− on the amount already conveys direction,
+    // and matches how per-transfer rows render USD (always positive magnitude).
+    if let Some(d) = decimals {
+        let amount_f64 = magnitude as f64 / 10f64.powi(d as i32);
+        let (today, historic) = price::token_prices(app, &td.token, app.tx_detail.block_timestamp);
         if today.is_some() || historic.is_some() {
             spans.push(Span::styled(
                 format_usd_pair(amount_f64, today, historic),

@@ -21,6 +21,7 @@ use super::AbiRegistry;
 use super::abi::{FunctionDef, ParsedAbi};
 use super::events::{DecodedEvent, decode_event};
 use crate::data::types::SnEvent;
+use crate::utils::felt_to_u128;
 
 /// One node in the decoded call tree. Mirrors `FunctionInvocation` with
 /// extra ABI-resolved fields. Field naming matches `RawCall` where possible
@@ -180,6 +181,200 @@ pub struct TransferRow {
     pub value_low: Felt,
     /// High 128 bits of the u256 amount.
     pub value_high: Felt,
+}
+
+/// Net delta of one (address, token) pair across every transfer in a tx.
+#[derive(Debug, Clone)]
+pub struct TokenDelta {
+    pub token: Felt,
+    /// Signed net amount (received − sent), low 128 bits. `None` when any
+    /// contributing transfer carried `value_high != 0` or a running total
+    /// exceeded the u128/i128 range — caller should fall back to raw display.
+    pub net: Option<i128>,
+    /// True when `net` could not be computed cleanly (u256 overflow or sum
+    /// saturation). Mutually exclusive with `net == Some(_)` in practice.
+    pub overflow: bool,
+    pub received_low: u128,
+    pub received_high: u128,
+    pub sent_low: u128,
+    pub sent_high: u128,
+}
+
+/// Per-address net balance changes across every token it touched.
+#[derive(Debug, Clone)]
+pub struct AddressDelta {
+    pub address: Felt,
+    /// First-appearance order. Caller sorts for display.
+    pub tokens: Vec<TokenDelta>,
+}
+
+/// Running totals for one (address, token) pair; collapsed into `TokenDelta` at finalize.
+#[derive(Debug, Default)]
+struct DeltaAccum {
+    received_low: u128,
+    received_high: u128,
+    sent_low: u128,
+    sent_high: u128,
+    /// Set only when a running sum exceeds 2^256 — astronomically rare. Other
+    /// overflow conditions (u256 net not representable as i128) are detected
+    /// at `finalize()` time so the raw `received_*` / `sent_*` totals stay
+    /// faithful to the actual sum even in the fallback display path.
+    overflow: bool,
+}
+
+/// In-place u256 add: `(dst_low, dst_high) += (add_low, add_high)` with
+/// proper carry from the low half into the high half. Sets `overflow_flag`
+/// only when the high half itself overflows (sum > 2^256).
+fn add_u256_inplace(
+    add_low: u128,
+    add_high: u128,
+    dst_low: &mut u128,
+    dst_high: &mut u128,
+    overflow_flag: &mut bool,
+) {
+    let (new_low, carry_low) = dst_low.overflowing_add(add_low);
+    *dst_low = new_low;
+    let (mid_high, c1) = dst_high.overflowing_add(add_high);
+    let (new_high, c2) = mid_high.overflowing_add(u128::from(carry_low));
+    *dst_high = new_high;
+    if c1 || c2 {
+        *overflow_flag = true;
+    }
+}
+
+impl DeltaAccum {
+    fn add_received(&mut self, low: u128, high: u128) {
+        add_u256_inplace(
+            low,
+            high,
+            &mut self.received_low,
+            &mut self.received_high,
+            &mut self.overflow,
+        );
+    }
+    fn add_sent(&mut self, low: u128, high: u128) {
+        add_u256_inplace(
+            low,
+            high,
+            &mut self.sent_low,
+            &mut self.sent_high,
+            &mut self.overflow,
+        );
+    }
+    fn finalize(&self) -> (Option<i128>, bool) {
+        // Either side carrying a non-zero high half means the u256 difference
+        // can't be expressed cleanly as a low-128 signed delta — fall back to
+        // raw display. (The u256 totals are still accurate thanks to carry.)
+        if self.overflow || self.received_high != 0 || self.sent_high != 0 {
+            return (None, true);
+        }
+        let r = i128::try_from(self.received_low).ok();
+        let s = i128::try_from(self.sent_low).ok();
+        match (r, s) {
+            (Some(r), Some(s)) => match r.checked_sub(s) {
+                Some(net) => (Some(net), false),
+                None => (None, true),
+            },
+            _ => (None, true),
+        }
+    }
+}
+
+impl TransferGroups {
+    /// Iterate every TransferRow in display/execution order:
+    /// validate → constructor → execute_top → execute_calls[*] → l1_handler → fee.
+    fn all_transfers(&self) -> impl Iterator<Item = &TransferRow> {
+        self.validate
+            .iter()
+            .chain(self.constructor.iter())
+            .chain(self.execute_top.iter())
+            .chain(self.execute_calls.iter().flat_map(|g| g.transfers.iter()))
+            .chain(self.l1_handler.iter())
+            .chain(self.fee.iter())
+    }
+
+    /// Compute per-address per-token net balance changes across every transfer
+    /// in the tx, fees included. Self-transfers (`from == to`) and zero net
+    /// deltas are dropped. Addresses and their tokens are returned in
+    /// first-appearance order; the caller sorts for display.
+    pub fn balance_changes(&self) -> Vec<AddressDelta> {
+        use std::collections::HashMap;
+
+        let mut addr_order: Vec<Felt> = Vec::new();
+        // address -> (token first-appearance order, accumulators per token)
+        let mut per_addr: HashMap<Felt, (Vec<Felt>, HashMap<Felt, DeltaAccum>)> = HashMap::new();
+
+        for row in self.all_transfers() {
+            if row.from == row.to {
+                continue;
+            }
+            let low = felt_to_u128(&row.value_low);
+            let high = felt_to_u128(&row.value_high);
+
+            // from-side: sent grows
+            {
+                let entry = per_addr.entry(row.from).or_insert_with(|| {
+                    addr_order.push(row.from);
+                    (Vec::new(), HashMap::new())
+                });
+                if !entry.1.contains_key(&row.token) {
+                    entry.0.push(row.token);
+                }
+                entry.1.entry(row.token).or_default().add_sent(low, high);
+            }
+
+            // to-side: received grows
+            {
+                let entry = per_addr.entry(row.to).or_insert_with(|| {
+                    addr_order.push(row.to);
+                    (Vec::new(), HashMap::new())
+                });
+                if !entry.1.contains_key(&row.token) {
+                    entry.0.push(row.token);
+                }
+                entry
+                    .1
+                    .entry(row.token)
+                    .or_default()
+                    .add_received(low, high);
+            }
+        }
+
+        let mut out = Vec::with_capacity(addr_order.len());
+        for addr in addr_order {
+            let (token_order, mut accum_map) =
+                per_addr.remove(&addr).expect("address tracked in order");
+            let mut tokens = Vec::with_capacity(token_order.len());
+            for tk in token_order {
+                let accum = accum_map.remove(&tk).expect("token tracked in order");
+                let (net, overflow) = accum.finalize();
+                // Drop any (address, token) pair whose received and sent u256
+                // totals are exactly equal — that's a true zero net even when
+                // the sums saturated past i128/u128 and `net` had to fall
+                // back to `None`. Subsumes the common `net == Some(0)` case.
+                if accum.received_low == accum.sent_low && accum.received_high == accum.sent_high {
+                    continue;
+                }
+                tokens.push(TokenDelta {
+                    token: tk,
+                    net,
+                    overflow,
+                    received_low: accum.received_low,
+                    received_high: accum.received_high,
+                    sent_low: accum.sent_low,
+                    sent_high: accum.sent_high,
+                });
+            }
+            if tokens.is_empty() {
+                continue;
+            }
+            out.push(AddressDelta {
+                address: addr,
+                tokens,
+            });
+        }
+        out
+    }
 }
 
 /// Pre-order walk of one invocation's subtree, appending every Transfer event
@@ -725,5 +920,277 @@ mod tests {
         let groups = trace.collect_transfers();
         assert_eq!(groups.execute_top.len(), 1);
         assert_eq!(groups.total, 1);
+    }
+
+    /// A two-leg swap: alice sends token1 to avnu and receives token2 back.
+    /// Expect both addresses with two-token deltas, opposite signs.
+    #[test]
+    fn balance_changes_pairs_swap_legs() {
+        let token1 = felt(ETH);
+        let token2 = felt(SEQ);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![
+                transfer_event(token1, alice, avnu, 1_000),
+                transfer_event(token2, avnu, alice, 950),
+            ],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+
+        assert_eq!(deltas.len(), 2, "expected two participating addresses");
+        let by_addr: std::collections::HashMap<Felt, &AddressDelta> =
+            deltas.iter().map(|d| (d.address, d)).collect();
+
+        let a = by_addr[&alice];
+        assert_eq!(a.tokens.len(), 2);
+        let a_t1 = a.tokens.iter().find(|t| t.token == token1).unwrap();
+        let a_t2 = a.tokens.iter().find(|t| t.token == token2).unwrap();
+        assert_eq!(a_t1.net, Some(-1_000));
+        assert_eq!(a_t2.net, Some(950));
+
+        let b = by_addr[&avnu];
+        let b_t1 = b.tokens.iter().find(|t| t.token == token1).unwrap();
+        let b_t2 = b.tokens.iter().find(|t| t.token == token2).unwrap();
+        assert_eq!(b_t1.net, Some(1_000));
+        assert_eq!(b_t2.net, Some(-950));
+    }
+
+    /// A round-trip transfer (A → B then B → A, same token, same amount)
+    /// nets to zero on both sides and should drop from the summary entirely.
+    #[test]
+    fn balance_changes_drops_round_trip_to_zero() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![
+                transfer_event(token, alice, avnu, 500),
+                transfer_event(token, avnu, alice, 500),
+            ],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        assert!(deltas.is_empty(), "expected no addresses; got {:?}", deltas);
+    }
+
+    /// A mint from the zero address shows up as +X on the recipient and −X
+    /// on 0x0 — the renderer relabels 0x0 as mint/burn.
+    #[test]
+    fn balance_changes_records_mint_from_zero_address() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let zero = Felt::ZERO;
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![transfer_event(token, zero, alice, 7_777)],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        let by_addr: std::collections::HashMap<Felt, &AddressDelta> =
+            deltas.iter().map(|d| (d.address, d)).collect();
+
+        assert_eq!(by_addr[&alice].tokens[0].net, Some(7_777));
+        assert_eq!(by_addr[&zero].tokens[0].net, Some(-7_777));
+    }
+
+    /// Fee transfers must be included in the per-address net deltas.
+    #[test]
+    fn balance_changes_includes_fee_phase() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let seq = felt(SEQ);
+
+        let fee = leaf_call(
+            token,
+            "transfer",
+            vec![transfer_event(token, alice, seq, 42)],
+        );
+        let trace = DecodedTrace {
+            fee_transfer: Some(fee),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        let by_addr: std::collections::HashMap<Felt, &AddressDelta> =
+            deltas.iter().map(|d| (d.address, d)).collect();
+        assert_eq!(by_addr[&alice].tokens[0].net, Some(-42));
+        assert_eq!(by_addr[&seq].tokens[0].net, Some(42));
+    }
+
+    /// Sum of multiple in-range transfers can still exceed u128 on either
+    /// side. The carry must propagate cleanly into the high half so the raw
+    /// totals shown in the overflow-fallback row remain accurate.
+    #[test]
+    fn balance_changes_propagates_low_half_carry() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![
+                transfer_event(token, avnu, alice, u128::MAX),
+                transfer_event(token, avnu, alice, 1),
+            ],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        let by_addr: std::collections::HashMap<Felt, &AddressDelta> =
+            deltas.iter().map(|d| (d.address, d)).collect();
+
+        // Alice received u128::MAX + 1 = 2^128, so low wraps to 0 and high = 1.
+        let alice_td = &by_addr[&alice].tokens[0];
+        assert!(alice_td.overflow);
+        assert!(alice_td.net.is_none());
+        assert_eq!(alice_td.received_low, 0, "low half must wrap to 0");
+        assert_eq!(alice_td.received_high, 1, "carry must propagate into high");
+        assert_eq!(alice_td.sent_low, 0);
+        assert_eq!(alice_td.sent_high, 0);
+
+        // Mirrored on the sender side.
+        let avnu_td = &by_addr[&avnu].tokens[0];
+        assert!(avnu_td.overflow);
+        assert!(avnu_td.net.is_none());
+        assert_eq!(avnu_td.sent_low, 0);
+        assert_eq!(avnu_td.sent_high, 1);
+        assert_eq!(avnu_td.received_low, 0);
+        assert_eq!(avnu_td.received_high, 0);
+    }
+
+    /// A transfer whose value exceeds u128 (value_high != 0) must mark the
+    /// affected delta as `overflow` so the renderer falls back to raw display.
+    #[test]
+    fn balance_changes_flags_u256_overflow() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        // value_high = 1 → amount > 2^128
+        let ev = DecodedEvent {
+            contract_address: token,
+            event_name: Some("Transfer".into()),
+            decoded_keys: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: alice,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: avnu,
+                    value_high: None,
+                },
+            ],
+            decoded_data: vec![DecodedParam {
+                name: Some("value".into()),
+                type_name: Some("u256".into()),
+                value: Felt::from(1u32),
+                value_high: Some(Felt::from(1u32)),
+            }],
+            raw: SnEvent {
+                from_address: token,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        };
+        let execute = leaf_call(alice, "__execute__", vec![ev]);
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        for ad in &deltas {
+            assert!(ad.tokens[0].overflow, "expected overflow flag set");
+            assert!(ad.tokens[0].net.is_none());
+        }
+    }
+
+    /// A round-trip transfer where each leg's amount exceeds u128 (so the
+    /// per-address accumulators end up `overflow == true`) but received and
+    /// sent u256 totals match exactly. Net is still zero, so the row must
+    /// drop instead of rendering as a misleading overflow-fallback line.
+    #[test]
+    fn balance_changes_drops_overflow_round_trip() {
+        let token = felt(ETH);
+        let alice = felt(ALICE);
+        let avnu = felt(AVNU);
+
+        // value_high = 1 on both legs → each amount is > 2^128, but the
+        // received/sent totals on each side end up identical.
+        let make_ev = |from: Felt, to: Felt| DecodedEvent {
+            contract_address: token,
+            event_name: Some("Transfer".into()),
+            decoded_keys: vec![
+                DecodedParam {
+                    name: Some("from".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: from,
+                    value_high: None,
+                },
+                DecodedParam {
+                    name: Some("to".into()),
+                    type_name: Some("ContractAddress".into()),
+                    value: to,
+                    value_high: None,
+                },
+            ],
+            decoded_data: vec![DecodedParam {
+                name: Some("value".into()),
+                type_name: Some("u256".into()),
+                value: Felt::from(1u32),
+                value_high: Some(Felt::from(1u32)),
+            }],
+            raw: SnEvent {
+                from_address: token,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::ZERO,
+                block_number: 0,
+                event_index: 0,
+            },
+        };
+
+        let execute = leaf_call(
+            alice,
+            "__execute__",
+            vec![make_ev(alice, avnu), make_ev(avnu, alice)],
+        );
+        let trace = DecodedTrace {
+            execute: Some(execute),
+            ..DecodedTrace::default()
+        };
+        let deltas = trace.collect_transfers().balance_changes();
+        assert!(
+            deltas.is_empty(),
+            "overflow round-trip should drop entirely; got {:?}",
+            deltas
+        );
     }
 }
