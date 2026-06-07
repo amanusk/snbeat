@@ -1177,6 +1177,7 @@ impl App {
                 decoded_calls,
                 outside_executions,
                 block_timestamp,
+                block_gas_prices_fri,
             } => {
                 self.tx_detail.transaction = Some(transaction);
                 self.tx_detail.receipt = Some(receipt);
@@ -1184,6 +1185,7 @@ impl App {
                 self.tx_detail.decoded_calls = decoded_calls;
                 self.tx_detail.outside_executions = outside_executions;
                 self.tx_detail.block_timestamp = block_timestamp;
+                self.tx_detail.block_gas_prices_fri = block_gas_prices_fri;
                 self.tx_detail.events_scroll = 0;
                 self.tx_detail.calls_scroll = 0;
                 self.tx_detail.trace_scroll = 0;

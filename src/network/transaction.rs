@@ -163,9 +163,20 @@ pub(super) async fn decode_and_send_transaction(
     )
     .await;
 
-    // Fetch block timestamp (used for age display and price lookups on tracked tokens).
-    // Block fetches are cached, so repeat calls for the same block are cheap.
-    let block_timestamp = ds.get_block(block).await.ok().map(|b| b.timestamp);
+    // Fetch block (cached) — provides the timestamp for age display + tracked-token
+    // price lookups, AND the per-lane gas prices the fee section needs to compute
+    // resources = sum(block_price × gas_used). The fee section can't rely on
+    // `app.block_detail.block` because the user may have opened the tx directly
+    // (search, history) without ever visiting the block view.
+    let block_info = ds.get_block(block).await.ok();
+    let block_timestamp = block_info.as_ref().map(|b| b.timestamp);
+    let block_gas_prices_fri = block_info.as_ref().map(|b| {
+        (
+            b.l1_gas_price_fri,
+            b.l2_gas_price_fri,
+            b.l1_data_gas_price_fri,
+        )
+    });
 
     let tx_hash = transaction.hash();
     let _ = action_tx.send(Action::TransactionLoaded {
@@ -175,6 +186,7 @@ pub(super) async fn decode_and_send_transaction(
         decoded_calls,
         outside_executions,
         block_timestamp,
+        block_gas_prices_fri,
     });
 
     // Fire-and-forget trace fetch. Sent as a separate Action so the rest of

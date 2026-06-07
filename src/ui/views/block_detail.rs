@@ -7,7 +7,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::{AddressColorMap, known_or_palette_style};
-use crate::ui::widgets::hex_display::{format_fee, format_fri, short_hash, tx_hash_cell};
+use crate::ui::widgets::hex_display::{
+    format_age_ago, format_fee, format_fri, short_hash, tx_hash_cell,
+};
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::felt_to_u64;
 
@@ -39,17 +41,10 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
     };
 
-    let age = {
-        let now = chrono::Utc::now().timestamp() as u64;
-        let diff = now.saturating_sub(block.timestamp);
-        if diff < 60 {
-            format!("{diff}s ago")
-        } else if diff < 3600 {
-            format!("{}m ago", diff / 60)
-        } else {
-            format!("{}h ago", diff / 3600)
-        }
-    };
+    let age = format_age_ago(block.timestamp);
+    let timestamp_utc = chrono::DateTime::from_timestamp(block.timestamp as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| block.timestamp.to_string());
 
     let lines = vec![
         Line::from(vec![
@@ -62,7 +57,7 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ]),
         Line::from(vec![
             Span::styled(" Timestamp: ", theme::NORMAL_STYLE),
-            Span::raw(format!("{} ({})", block.timestamp, age)),
+            Span::raw(format!("{} ({})", timestamp_utc, age)),
         ]),
         Line::from(vec![
             Span::styled(" Sequencer: ", theme::NORMAL_STYLE),

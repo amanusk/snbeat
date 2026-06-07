@@ -125,6 +125,10 @@ pub struct TxDetailState {
     /// Whether to show the expanded outside execution intent view.
     pub show_outside_execution: bool,
     pub block_timestamp: Option<u64>,
+    /// Block-level gas prices in FRI (L1, L2, L1-Data). Captured alongside
+    /// the tx so the fee section renders correctly even when the user opens
+    /// the tx without first visiting the block view.
+    pub block_gas_prices_fri: Option<(u128, u128, u128)>,
 }
 
 impl TxDetailState {
@@ -151,6 +155,7 @@ impl TxDetailState {
         self.nav_cursor = 0;
         self.nav_item_lines = Vec::new();
         self.block_timestamp = None;
+        self.block_gas_prices_fri = None;
     }
 
     /// Build the list of navigable items for the current transaction.
