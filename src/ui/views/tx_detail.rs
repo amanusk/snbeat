@@ -19,7 +19,9 @@ use crate::decode::trace::{
 };
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
-use crate::ui::widgets::hex_display::{format_commas, format_fri, format_strk_u128};
+use crate::ui::widgets::hex_display::{
+    format_age_short, format_commas, format_fri, format_strk_u128,
+};
 use crate::ui::widgets::{param_display, price, search_bar, status_bar};
 use crate::utils::felt_to_u128;
 
@@ -470,19 +472,7 @@ fn build_header_lines(
     let age_suffix = app
         .tx_detail
         .block_timestamp
-        .map(|ts| {
-            let now = chrono::Utc::now().timestamp() as u64;
-            let diff = now.saturating_sub(ts);
-            if diff < 60 {
-                format!("  ({diff}s ago)")
-            } else if diff < 3600 {
-                format!("  ({}m ago)", diff / 60)
-            } else if diff < 86400 {
-                format!("  ({}h ago)", diff / 3600)
-            } else {
-                format!("  ({}d ago)", diff / 86400)
-            }
-        })
+        .map(|ts| format!("  ({} ago)", format_age_short(ts)))
         .unwrap_or_default();
     record(
         &TxNavItem::Block(blk_num),
@@ -802,15 +792,17 @@ fn build_header_lines(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" Fee Info", theme::TITLE_STYLE)));
 
-    // Block gas prices
-    if let Some(block) = &app.block_detail.block {
+    // Block gas prices — captured into tx_detail so this works even when the
+    // user opens the tx directly (without going through the block view).
+    let block_gas = app.tx_detail.block_gas_prices_fri;
+    if let Some((l1_price, l2_price, l1_data_price)) = block_gas {
         lines.push(Line::from(vec![
             Span::styled("   Block Gas:  ", theme::NORMAL_STYLE),
             Span::raw(format!(
                 "L1: {}  L2: {}  L1-Data: {}",
-                format_fri(block.l1_gas_price_fri),
-                format_fri(block.l2_gas_price_fri),
-                format_fri(block.l1_data_gas_price_fri),
+                format_fri(l1_price),
+                format_fri(l2_price),
+                format_fri(l1_data_price),
             )),
         ]));
     }
@@ -826,9 +818,18 @@ fn build_header_lines(
     // Actual fee
     if let Some(receipt) = &app.tx_detail.receipt {
         let total_fri = felt_to_u128(&receipt.actual_fee);
-        // tip is per-L2-gas (FRI/gas); actual tip paid = tip * l2_gas_used
-        let tip_paid_fri = (tip as u128) * (receipt.execution_resources.l2_gas as u128);
-        let resource_fee_fri = total_fri.saturating_sub(tip_paid_fri);
+        let res = &receipt.execution_resources;
+        // Resources = sum(block_price * gas_used). For reverted-due-to-gas txs the
+        // sequencer bills on max_amount rather than receipt.l2_gas, so any
+        // over-charge falls into the tip line below (= total - resources).
+        let resource_fee_fri = block_gas
+            .map(|(l1_p, l2_p, l1d_p)| {
+                l1_p.saturating_mul(res.l1_gas as u128)
+                    + l2_p.saturating_mul(res.l2_gas as u128)
+                    + l1d_p.saturating_mul(res.l1_data_gas as u128)
+            })
+            .unwrap_or(0);
+        let tip_paid_fri = total_fri.saturating_sub(resource_fee_fri);
 
         lines.push(Line::from(vec![
             Span::styled("   Total Fee:  ", theme::NORMAL_STYLE),
@@ -847,20 +848,9 @@ fn build_header_lines(
             Span::raw(format_fri(tip as u128)),
             Span::styled("  (Tip/gas)", theme::SUGGESTION_STYLE),
         ]));
-
-        let res = &receipt.execution_resources;
-        lines.push(Line::from(vec![
-            Span::styled("   Gas Used:   ", theme::NORMAL_STYLE),
-            Span::raw(format!(
-                "L1: {}  L2: {}  L1-Data: {}",
-                format_commas(res.l1_gas),
-                format_commas(res.l2_gas),
-                format_commas(res.l1_data_gas),
-            )),
-        ]));
     }
 
-    // Resource bounds
+    // Resource bounds (used / requested)
     let rb = match tx {
         SnTransaction::Invoke(i) => i.resource_bounds.as_ref(),
         SnTransaction::Declare(d) => d.resource_bounds.as_ref(),
@@ -868,23 +858,38 @@ fn build_header_lines(
         _ => None,
     };
     if let Some(rb) = rb {
+        let (l1_used, l2_used, l1_data_used) = app
+            .tx_detail
+            .receipt
+            .as_ref()
+            .map(|r| {
+                (
+                    r.execution_resources.l1_gas,
+                    r.execution_resources.l2_gas,
+                    r.execution_resources.l1_data_gas,
+                )
+            })
+            .unwrap_or((0, 0, 0));
+
         lines.push(Line::from(Span::styled(
-            "   Resource Bounds (requested)",
+            "   Resource Bounds (used / requested)",
             theme::SUGGESTION_STYLE,
         )));
+        let pair =
+            |used: u64, max: u64| format!("{} / {}", format_commas(used), format_commas(max));
         lines.push(Line::from(vec![Span::raw(format!(
-            "     L1:      max_amount={:<14} max_price={}",
-            format_commas(rb.l1_gas_max_amount),
+            "     L1:      {:<28} max_price={}",
+            pair(l1_used, rb.l1_gas_max_amount),
             format_fri(rb.l1_gas_max_price)
         ))]));
         lines.push(Line::from(vec![Span::raw(format!(
-            "     L2:      max_amount={:<14} max_price={}",
-            format_commas(rb.l2_gas_max_amount),
+            "     L2:      {:<28} max_price={}",
+            pair(l2_used, rb.l2_gas_max_amount),
             format_fri(rb.l2_gas_max_price)
         ))]));
         lines.push(Line::from(vec![Span::raw(format!(
-            "     L1-Data: max_amount={:<14} max_price={}",
-            format_commas(rb.l1_data_gas_max_amount),
+            "     L1-Data: {:<28} max_price={}",
+            pair(l1_data_used, rb.l1_data_gas_max_amount),
             format_fri(rb.l1_data_gas_max_price)
         ))]));
     }

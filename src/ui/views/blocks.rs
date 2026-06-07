@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::ui::theme;
-use crate::ui::widgets::hex_display::{format_fri, short_hash};
+use crate::ui::widgets::hex_display::{format_age_short, format_fri, short_hash};
 use crate::ui::widgets::{search_bar, status_bar};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -100,14 +100,5 @@ fn format_age(timestamp: u64) -> String {
     if timestamp > now {
         return "just now".to_string();
     }
-    let diff = now - timestamp;
-    if diff < 60 {
-        format!("{diff}s ago")
-    } else if diff < 3600 {
-        format!("{}m ago", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h ago", diff / 3600)
-    } else {
-        format!("{}d ago", diff / 86400)
-    }
+    format!("{} ago", format_age_short(timestamp))
 }

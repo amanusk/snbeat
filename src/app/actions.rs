@@ -179,6 +179,9 @@ pub enum Action {
         /// Detected outside executions: (call_index, parsed_info).
         outside_executions: Vec<(usize, OutsideExecutionInfo)>,
         block_timestamp: Option<u64>,
+        /// Block-level gas prices in FRI: (L1, L2, L1-Data). Optional in
+        /// case the block fetch fails; the fee view then falls back to 0.
+        block_gas_prices_fri: Option<(u128, u128, u128)>,
     },
     /// Decoded execution trace for a transaction (recursive call tree).
     /// Sent after TransactionLoaded so the user sees the rest of the view

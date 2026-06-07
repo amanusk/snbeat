@@ -733,25 +733,7 @@ fn truncate_to(label: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-fn format_age(timestamp: u64) -> String {
-    if timestamp == 0 {
-        return String::new();
-    }
-    let now = chrono::Utc::now().timestamp() as u64;
-    if timestamp > now {
-        return "now".to_string();
-    }
-    let diff = now - timestamp;
-    if diff < 60 {
-        format!("{diff}s")
-    } else if diff < 3600 {
-        format!("{}m", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h", diff / 3600)
-    } else {
-        format!("{}d", diff / 86400)
-    }
-}
+use crate::ui::widgets::hex_display::format_age_short as format_age;
 
 fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // Column headers

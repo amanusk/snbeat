@@ -80,6 +80,39 @@ pub fn tx_hash_cell(label: Option<&str>, hash: &Felt) -> String {
     }
 }
 
+/// Format a unix timestamp as a compact "time since" string: `"3s"`,
+/// `"42m"`, `"5h"`, `"6d"`, `"4mo"`, `"2y"`. Returns the bare form (no
+/// trailing " ago") so callers can wrap it for prose or drop it straight
+/// into a tight column. `0` → empty string, future timestamps → `"now"`.
+pub fn format_age_short(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return String::new();
+    }
+    let now = chrono::Utc::now().timestamp() as u64;
+    if timestamp > now {
+        return "now".to_string();
+    }
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+    let diff = now - timestamp;
+    if diff < MINUTE {
+        format!("{diff}s")
+    } else if diff < HOUR {
+        format!("{}m", diff / MINUTE)
+    } else if diff < DAY {
+        format!("{}h", diff / HOUR)
+    } else if diff < MONTH {
+        format!("{}d", diff / DAY)
+    } else if diff < YEAR {
+        format!("{}mo", diff / MONTH)
+    } else {
+        format!("{}y", diff / YEAR)
+    }
+}
+
 /// Format a u128 fri value as STRK amount (5 decimal places).
 pub fn format_strk_u128(fri: u128) -> String {
     if fri == 0 {
