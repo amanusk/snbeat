@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::ui::theme;
-use crate::ui::widgets::hex_display::{format_age_short, format_fri, short_hash};
+use crate::ui::widgets::hex_display::{format_age_ago, format_fri, short_hash};
 use crate::ui::widgets::{search_bar, status_bar};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -57,7 +57,7 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
         .items
         .iter()
         .map(|block| {
-            let age = format_age(block.timestamp);
+            let age = format_age_ago(block.timestamp);
             let sequencer = app.format_address(&block.sequencer_address);
             let l2_gas = format_fri(block.l2_gas_price_fri);
             let l1_gas = format_fri(block.l1_gas_price_fri);
@@ -93,12 +93,4 @@ fn draw_block_list(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, list_area, &mut app.blocks.state);
-}
-
-fn format_age(timestamp: u64) -> String {
-    let now = chrono::Utc::now().timestamp() as u64;
-    if timestamp > now {
-        return "just now".to_string();
-    }
-    format!("{} ago", format_age_short(timestamp))
 }

@@ -113,6 +113,20 @@ pub fn format_age_short(timestamp: u64) -> String {
     }
 }
 
+/// Format a unix timestamp as a "time since" string with the right suffix:
+/// `"3s ago"`, `"4mo ago"`, `"now"` (future timestamps — clock skew or
+/// pre-confirmed blocks), `""` (timestamp of 0). Wraps `format_age_short`
+/// so callers don't accidentally produce `"now ago"` when the local clock
+/// runs behind a block timestamp.
+pub fn format_age_ago(timestamp: u64) -> String {
+    let short = format_age_short(timestamp);
+    if short.is_empty() || short == "now" {
+        short
+    } else {
+        format!("{short} ago")
+    }
+}
+
 /// Format a u128 fri value as STRK amount (5 decimal places).
 pub fn format_strk_u128(fri: u128) -> String {
     if fri == 0 {

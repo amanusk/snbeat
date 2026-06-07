@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::{AddressColorMap, known_or_palette_style};
 use crate::ui::widgets::hex_display::{
-    format_age_short, format_fee, format_fri, short_hash, tx_hash_cell,
+    format_age_ago, format_fee, format_fri, short_hash, tx_hash_cell,
 };
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::felt_to_u64;
@@ -41,7 +41,7 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
     };
 
-    let age = format!("{} ago", format_age_short(block.timestamp));
+    let age = format_age_ago(block.timestamp);
     let timestamp_utc = chrono::DateTime::from_timestamp(block.timestamp as i64, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| block.timestamp.to_string());

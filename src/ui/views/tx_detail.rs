@@ -20,7 +20,7 @@ use crate::decode::trace::{
 use crate::ui::theme;
 use crate::ui::widgets::address_color::AddressColorMap;
 use crate::ui::widgets::hex_display::{
-    format_age_short, format_commas, format_fri, format_strk_u128,
+    format_age_ago, format_commas, format_fri, format_strk_u128,
 };
 use crate::ui::widgets::{param_display, price, search_bar, status_bar};
 use crate::utils::felt_to_u128;
@@ -472,7 +472,14 @@ fn build_header_lines(
     let age_suffix = app
         .tx_detail
         .block_timestamp
-        .map(|ts| format!("  ({} ago)", format_age_short(ts)))
+        .map(|ts| {
+            let s = format_age_ago(ts);
+            if s.is_empty() {
+                String::new()
+            } else {
+                format!("  ({s})")
+            }
+        })
         .unwrap_or_default();
     record(
         &TxNavItem::Block(blk_num),
@@ -825,8 +832,8 @@ fn build_header_lines(
         let resource_fee_fri = block_gas
             .map(|(l1_p, l2_p, l1d_p)| {
                 l1_p.saturating_mul(res.l1_gas as u128)
-                    + l2_p.saturating_mul(res.l2_gas as u128)
-                    + l1d_p.saturating_mul(res.l1_data_gas as u128)
+                    .saturating_add(l2_p.saturating_mul(res.l2_gas as u128))
+                    .saturating_add(l1d_p.saturating_mul(res.l1_data_gas as u128))
             })
             .unwrap_or(0);
         let tip_paid_fri = total_fri.saturating_sub(resource_fee_fri);
