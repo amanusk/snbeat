@@ -1,5 +1,22 @@
 [workspace]
 members = [".", "crates/pf-query"]
+# Only build the snbeat binary by default. pf-query is a separate companion
+# service with its own (heavy) dep tree (axum, rayon, tower-http, zstd,
+# bincode, primitive-types, …). Skipping it by default keeps a plain
+# `cargo build` / `cargo build --release` from compiling all of that into
+# `target/`. Build it explicitly when needed: `cargo build -p pf-query`.
+default-members = ["."]
+
+# Compilation speed is a non-goal here — we prioritize a small, fast binary.
+# `lto = "fat"` + `codegen-units = 1` enable whole-program optimization,
+# which prunes dead code across crate boundaries (smaller binary) and lets
+# the optimizer inline more aggressively (faster runtime). `strip` removes
+# debug + linker symbols from the final binary. These are the standard
+# release-binary settings; expect release builds in the multi-minute range.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
 
 [package]
 name = "snbeat"
