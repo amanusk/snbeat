@@ -161,12 +161,16 @@ impl DuneClient {
         limit: u32,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
+        // Partition-pruning floor: kept at Starknet mainnet's first full
+        // year so Dune skips empty partitions for sender lookups, without
+        // silently dropping pre-2025 account history (the previous
+        // 2025-01-01 floor hid legitimate older txs).
         let sql = format!(
             "SELECT hash, sender_address, nonce, execution_status, revert_reason, actual_fee_amount, \
              tip, block_number, block_time, type \
              FROM starknet.transactions \
              WHERE sender_address = {} \
-             AND block_date >= date '2025-01-01' \
+             AND block_date >= date '2021-01-01' \
              ORDER BY nonce DESC \
              LIMIT {}",
             sender_hex, limit
@@ -638,6 +642,24 @@ impl DuneClient {
     }
 }
 
+/// Parse a JSON value that may arrive as a quoted string ("123") or as a
+/// JSON number (123) into a u128. DuneSQL serialises wide numerics as
+/// strings but smaller fields can come back as numbers.
+fn parse_json_u128(v: &serde_json::Value) -> Option<u128> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<u128>().ok();
+    }
+    v.as_u64().map(|n| n as u128)
+}
+
+/// u64 variant of `parse_json_u128`.
+fn parse_json_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<u64>().ok();
+    }
+    v.as_u64()
+}
+
 fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
     rows.iter()
         .filter_map(|row| {
@@ -671,19 +693,17 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
             }
             .to_string();
 
-            // actual_fee_amount comes as a string number
-            let fee_str = row
+            // actual_fee_amount typically arrives as a string (DuneSQL
+            // serialises u128-sized numerics as strings), but smaller values
+            // can come back as JSON numbers. Handle both; the old
+            // `.or_else(|| as_u64().map(|_| "0"))` shape silently dropped
+            // the numeric variant to zero.
+            let total_fee_fri = row
                 .get("actual_fee_amount")
-                .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "0")))
-                .unwrap_or("0");
-            let total_fee_fri = fee_str.parse::<u128>().unwrap_or(0);
-
-            let tip_val = row
-                .get("tip")
-                .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "0")))
-                .unwrap_or("0")
-                .parse::<u64>()
+                .and_then(parse_json_u128)
                 .unwrap_or(0);
+
+            let tip_val = row.get("tip").and_then(parse_json_u64).unwrap_or(0);
 
             let tx_type = row
                 .get("type")
