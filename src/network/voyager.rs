@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -158,8 +158,15 @@ impl VoyagerClient {
         )
         .map_err(|e| format!("Failed to init voyager_labels table: {e}"))?;
 
+        // Bound HTTP latency: without these a hung connection holds a
+        // semaphore permit forever and starves every other label fetch.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to build Voyager reqwest client: {e}"))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             db: Mutex::new(db),
             sem: Semaphore::new(MAX_CONCURRENT_FETCHES),

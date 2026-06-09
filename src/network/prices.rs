@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, params};
@@ -81,8 +81,16 @@ impl PriceClient {
         )
         .map_err(|e| format!("Failed to init token_prices table: {e}"))?;
 
+        // Bound HTTP latency so a hung DefiLlama call can't stall the
+        // price-fetch path. DefiLlama is usually sub-second; 20s is
+        // generous enough for spikes.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|e| format!("Failed to build price reqwest client: {e}"))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             db: Mutex::new(db),
         })
     }
