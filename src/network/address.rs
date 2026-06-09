@@ -3918,37 +3918,50 @@ pub(super) async fn fetch_address_contract_calls(
                     .min()
             });
 
-        if deploy_floor.is_none()
-            && let Some(pf_client) = pf
-        {
-            match pf_client.get_class_history(address).await {
-                Ok(entries) => {
-                    if !entries.is_empty() {
-                        ds.save_class_history(&address, &entries);
-                    }
-                    deploy_floor = entries.iter().map(|e| e.block_number).min();
+        // PF and Voyager are independent network calls (~500ms and ~600ms
+        // respectively). Run them concurrently rather than awaiting PF and
+        // only then awaiting Voyager on miss — the cold-cache path takes
+        // ~max(pf, voyager) instead of pf+voyager. PF is still preferred:
+        // we use Voyager's deploy_block only when PF returned nothing.
+        if deploy_floor.is_none() {
+            let pf_fut = async {
+                if let Some(pf_client) = pf {
+                    Some(pf_client.get_class_history(address).await)
+                } else {
+                    None
                 }
-                Err(e) => {
-                    debug!(
-                        addr = %format!("{:#x}", address),
-                        error = %e,
-                        "Calls: pf class-history fetch failed; trying Voyager"
-                    );
+            };
+            let voyager_fut = async {
+                if let Some(vc) = voyager_c {
+                    Some(vc.get_label(address).await)
+                } else {
+                    None
                 }
-            }
-        }
+            };
+            let (pf_result, voyager_result) = tokio::join!(pf_fut, voyager_fut);
 
-        if deploy_floor.is_none()
-            && let Some(vc) = voyager_c
-        {
-            match vc.get_label(address).await {
-                Ok(label) => deploy_floor = label.deploy_block,
-                Err(e) => {
-                    debug!(
+            if let Some(Ok(entries)) = &pf_result {
+                if !entries.is_empty() {
+                    ds.save_class_history(&address, entries);
+                }
+                deploy_floor = entries.iter().map(|e| e.block_number).min();
+            } else if let Some(Err(e)) = &pf_result {
+                debug!(
+                    addr = %format!("{:#x}", address),
+                    error = %e,
+                    "Calls: pf class-history fetch failed; trying Voyager"
+                );
+            }
+
+            if deploy_floor.is_none() {
+                match voyager_result {
+                    Some(Ok(label)) => deploy_floor = label.deploy_block,
+                    Some(Err(e)) => debug!(
                         addr = %format!("{:#x}", address),
                         error = %e,
                         "Calls: Voyager label fetch failed"
-                    );
+                    ),
+                    None => {}
                 }
             }
         }
