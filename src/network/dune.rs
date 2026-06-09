@@ -597,14 +597,16 @@ impl DuneClient {
             .map_err(|e| format!("Dune execute parse failed: {e}"))?;
 
         let execution_id = &exec_resp.execution_id;
-        let mut attempts = 0;
+        // Poll immediately, then back off exponentially (250ms → 2s cap).
+        // Light queries (COUNT probes) complete in well under a second, so a
+        // fixed pre-poll sleep put a hard ~2s latency floor on every Dune
+        // fetch. The 120s overall deadline is unchanged.
         // Archive runs from `_archive_guard`'s Drop impl so the query is
         // cleaned up on every exit path (success, polling failure, future
         // cancellation, error early-return).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut delay = Duration::from_millis(250);
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            attempts += 1;
-
             let status: ExecutionStatusResponse = self
                 .client
                 .get(format!(
@@ -629,9 +631,11 @@ impl DuneClient {
                     break Err(format!("Dune query {} failed: {}", query_id, status.state));
                 }
                 _ => {
-                    if attempts > 60 {
+                    if tokio::time::Instant::now() >= deadline {
                         break Err("Dune query timed out (120s)".into());
                     }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
                 }
             }
         }
