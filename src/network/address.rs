@@ -2721,17 +2721,36 @@ async fn enrich_all_empty_endpoints(
         missing.len()
     );
 
-    // Process in batches of 20 for streaming UI updates.
-    for (i, chunk) in missing.chunks(20).enumerate() {
-        info!(
-            batch = i + 1,
-            size = chunk.len(),
-            "Sanity check endpoints: enriching batch {}/{}",
-            i + 1,
-            missing.len().div_ceil(20)
-        );
-        enrich_address_txs(address, chunk.to_vec(), ds, pf, abi_reg, action_tx).await;
-    }
+    // Process in batches of 20 for streaming UI updates. Run up to 3
+    // chunks concurrently so the second batch's pf-query fetch is
+    // already in flight by the time the first finishes — chunks were
+    // previously fully serialised, so 60 missing txs paid 3 back-to-back
+    // round trips. Per-chunk emits still happen (each future calls
+    // `enrich_address_txs` which dispatches its own `AddressTxsEnriched`
+    // action on completion), so progressive rendering is preserved;
+    // ordering across chunks is moot because the UI merges by tx hash.
+    use futures::stream::StreamExt;
+    const MAX_PARALLEL_CHUNKS: usize = 3;
+    let total_batches = missing.len().div_ceil(20);
+    let chunks: Vec<_> = missing
+        .chunks(20)
+        .enumerate()
+        .map(|(i, c)| (i, c.to_vec()))
+        .collect();
+    futures::stream::iter(chunks)
+        .map(|(i, chunk)| async move {
+            info!(
+                batch = i + 1,
+                size = chunk.len(),
+                "Sanity check endpoints: enriching batch {}/{}",
+                i + 1,
+                total_batches
+            );
+            enrich_address_txs(address, chunk, ds, pf, abi_reg, action_tx).await;
+        })
+        .buffer_unordered(MAX_PARALLEL_CHUNKS)
+        .collect::<Vec<_>>()
+        .await;
 }
 
 /// Fetch all txs sent by `address` from specific blocks, skipping any already in `known_txs`.
