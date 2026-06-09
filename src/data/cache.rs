@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -619,6 +619,23 @@ impl CachingDataSource {
     /// second commit would drop the first's additions. `BEGIN IMMEDIATE`
     /// acquires the SQLite reserved lock up front so the second merge blocks
     /// until the first commits.
+    /// Merge `cached` into `fresh` newest-first, deduping by
+    /// `(tx_hash, block_number, event_index)`. O(N) — the previous form
+    /// used `Vec::iter().any(...)` per cached event, which was O(N²) and
+    /// on a hot address with 5k cached events did ~25M tuple comparisons
+    /// every merge.
+    fn merge_events_dedup(mut fresh: Vec<SnEvent>, cached: Vec<SnEvent>) -> Vec<SnEvent> {
+        let mut seen: HashSet<(Felt, u64, u64)> =
+            HashSet::with_capacity(fresh.len() + cached.len());
+        fresh.retain(|e| seen.insert((e.transaction_hash, e.block_number, e.event_index)));
+        for e in cached {
+            if seen.insert((e.transaction_hash, e.block_number, e.event_index)) {
+                fresh.push(e);
+            }
+        }
+        fresh
+    }
+
     fn merge_address_events_impl(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
         let addr_hex = format!("{:#x}", address);
         let mut db = match self.db.get() {
@@ -653,17 +670,7 @@ impl CachingDataSource {
                 .collect()
         })();
 
-        let mut merged: Vec<SnEvent> = new_events.to_vec();
-        for event in cached {
-            let dup = merged.iter().any(|e| {
-                e.transaction_hash == event.transaction_hash
-                    && e.block_number == event.block_number
-                    && e.event_index == event.event_index
-            });
-            if !dup {
-                merged.push(event);
-            }
-        }
+        let mut merged = Self::merge_events_dedup(new_events.to_vec(), cached);
         merged.sort_by(|a, b| {
             b.block_number
                 .cmp(&a.block_number)
@@ -1376,17 +1383,7 @@ impl DataSource for CachingDataSource {
             .unwrap_or_default();
 
         // Merge: new + cached (new events are newest-first, cached are newest-first)
-        let mut merged = new_events;
-        for event in cached {
-            let exists = merged.iter().any(|e| {
-                e.transaction_hash == event.transaction_hash
-                    && e.block_number == event.block_number
-                    && e.event_index == event.event_index
-            });
-            if !exists {
-                merged.push(event);
-            }
-        }
+        let mut merged = Self::merge_events_dedup(new_events, cached);
 
         // Sort by block number descending (newest first)
         merged.sort_by(|a, b| b.block_number.cmp(&a.block_number));
@@ -1718,17 +1715,7 @@ impl DataSource for CachingDataSource {
             }
         };
 
-        let mut merged = new_events;
-        for event in cached {
-            let exists = merged.iter().any(|e| {
-                e.transaction_hash == event.transaction_hash
-                    && e.block_number == event.block_number
-                    && e.event_index == event.event_index
-            });
-            if !exists {
-                merged.push(event);
-            }
-        }
+        let mut merged = Self::merge_events_dedup(new_events, cached);
 
         merged.sort_by(|a, b| b.block_number.cmp(&a.block_number));
         self.save_contract_events(&address, &merged);
@@ -2432,6 +2419,46 @@ mod tests {
             ds.load_search_progress(&addr, FilterKind::Keyed),
             Some((1_000_000, 9_000_000))
         );
+    }
+
+    #[test]
+    fn merge_events_dedup_drops_duplicates_preserves_fresh_first_order() {
+        // Helper to build a minimal SnEvent fixture keyed by (tx, block, idx).
+        fn ev(tx: u64, block: u64, idx: u64) -> SnEvent {
+            SnEvent {
+                from_address: Felt::ZERO,
+                keys: Vec::new(),
+                data: Vec::new(),
+                transaction_hash: Felt::from(tx),
+                block_number: block,
+                event_index: idx,
+            }
+        }
+
+        // Two fresh events; cached has one overlap (block 100 idx 0) plus
+        // one strictly older event. Expected merged order: fresh first
+        // (callers sort newest-first after this), then the unique cached one.
+        let fresh = vec![ev(1, 100, 0), ev(2, 101, 0)];
+        let cached = vec![ev(1, 100, 0), ev(3, 99, 0)];
+        let merged = CachingDataSource::merge_events_dedup(fresh, cached);
+        let keys: Vec<_> = merged
+            .iter()
+            .map(|e| (e.transaction_hash, e.block_number, e.event_index))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (Felt::from(1u64), 100, 0),
+                (Felt::from(2u64), 101, 0),
+                (Felt::from(3u64), 99, 0),
+            ]
+        );
+
+        // Duplicates within `fresh` itself are also collapsed (defensive —
+        // upstream sometimes returns the same event in overlapping pages).
+        let fresh = vec![ev(1, 100, 0), ev(1, 100, 0), ev(2, 101, 0)];
+        let merged = CachingDataSource::merge_events_dedup(fresh, vec![]);
+        assert_eq!(merged.len(), 2);
     }
 
     /// Opens an external cache.db snapshot via env var `SNBEAT_TEST_CACHE_DB`
