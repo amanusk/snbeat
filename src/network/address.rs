@@ -2745,6 +2745,8 @@ pub(super) async fn fetch_txs_from_blocks(
     abi_reg: &Arc<AbiRegistry>,
     status_tx: &mpsc::UnboundedSender<Action>,
 ) -> Vec<crate::data::types::AddressTxSummary> {
+    use futures::stream::StreamExt;
+
     let mut found_txs: Vec<crate::data::types::AddressTxSummary> = Vec::new();
     let total_chunks = blocks.chunks(10).count();
 
@@ -2767,27 +2769,70 @@ pub(super) async fn fetch_txs_from_blocks(
             .collect();
         let results = futures::future::join_all(futs).await;
 
+        // Collect matching txs across the whole chunk before fetching
+        // receipts. Previously each receipt was awaited one-by-one in the
+        // inner loop — a gap-fill that found 20 matching txs paid 20
+        // sequential RPC round trips. Fan out receipt fetches via
+        // buffer_unordered(8) instead.
+        let mut pending: Vec<(
+            starknet::core::types::Felt,
+            crate::data::types::SnTransaction,
+            u64,
+            u64,
+        )> = Vec::new();
         for (block_num, result) in results {
             if let Ok((block, txs)) = result {
-                for btx in txs.iter() {
+                for btx in txs.into_iter() {
                     if btx.sender() != address {
                         continue;
                     }
-                    if known_txs.iter().any(|t| t.hash == btx.hash()) {
+                    let hash = btx.hash();
+                    if known_txs.iter().any(|t| t.hash == hash) {
                         continue;
                     }
-
-                    let receipt = ds.get_receipt(btx.hash()).await.ok();
-                    found_txs.push(helpers::build_tx_summary(
-                        btx.hash(),
-                        btx,
-                        receipt.as_ref(),
-                        block_num,
-                        block.timestamp,
-                        abi_reg,
-                    ));
+                    pending.push((hash, btx, block_num, block.timestamp));
                 }
             }
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+
+        // Materialise the future list into a Vec first so the stream
+        // doesn't hold an iterator-borrow of `pending` across the await
+        // boundary — buffer_unordered requires Send, and a borrow into
+        // `pending` would propagate as a non-Send marker up the address
+        // pipeline (which is itself spawned as a tokio task).
+        let hashes: Vec<starknet::core::types::Felt> =
+            pending.iter().map(|(h, _, _, _)| *h).collect();
+        let receipt_futs: Vec<_> = hashes
+            .into_iter()
+            .map(|h| {
+                let ds_r = Arc::clone(ds);
+                async move { (h, ds_r.get_receipt(h).await.ok()) }
+            })
+            .collect();
+        let receipts: std::collections::HashMap<
+            starknet::core::types::Felt,
+            Option<crate::data::types::SnReceipt>,
+        > = futures::stream::iter(receipt_futs)
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect();
+
+        for (hash, btx, block_num, block_ts) in pending {
+            let receipt = receipts.get(&hash).and_then(|r| r.clone());
+            found_txs.push(helpers::build_tx_summary(
+                hash,
+                &btx,
+                receipt.as_ref(),
+                block_num,
+                block_ts,
+                abi_reg,
+            ));
         }
     }
 
