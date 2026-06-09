@@ -425,6 +425,32 @@ impl CachingDataSource {
         self
     }
 
+    /// Dispatch a heavy SQLite write off the async worker thread.
+    ///
+    /// Trait writes are sync, but several do DELETE + N×INSERT in a
+    /// transaction (`save_address_txs`, `save_address_events`,
+    /// `cache_block_with_txs`, ...). Run inline they pin a tokio worker
+    /// for the whole transaction — under WAL write contention that means
+    /// `pool.get()` (default 30s) and `busy_timeout` (5s) can stall the
+    /// worker for seconds, delaying every other async task scheduled on
+    /// it. Hand the closure to `spawn_blocking` instead.
+    ///
+    /// Fire-and-forget — these writes are idempotent caches and callers
+    /// never use the return value. If no tokio runtime is in scope
+    /// (e.g. from a sync unit test), fall back to running inline so
+    /// existing tests still observe the write before they read back.
+    fn dispatch_write<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(f);
+            }
+            Err(_) => f(),
+        }
+    }
+
     fn get_cached_block(&self, number: u64) -> Option<SnBlock> {
         let db = self.db.get().ok()?;
         let mut stmt = db
@@ -485,52 +511,66 @@ impl CachingDataSource {
     /// guard — a false miss that caused upstream re-fetches. Everything now
     /// runs inside one transaction on a single pooled connection.
     fn cache_block_with_txs(&self, block: &SnBlock, txs: &[SnTransaction]) {
+        // Serialize on the caller thread so the spawn_blocking closure only
+        // does I/O. block_hash and tx hashes captured outside the closure.
         let block_json = match serde_json::to_string(block) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut db = match self.db.get() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "cache_block_with_txs: pool get failed");
-                return;
-            }
+        let block_number = block.number;
+        let block_hash_hex = if block.hash != Felt::ZERO {
+            Some(format!("{:#x}", block.hash))
+        } else {
+            None
         };
-        let tx_db = match db.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "cache_block_with_txs: begin transaction failed");
-                return;
-            }
-        };
-        let _ = tx_db.execute(
-            "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
-            params![block.number, block_json],
-        );
-        if block.hash != Felt::ZERO {
-            let hash_hex = format!("{:#x}", block.hash);
+        let tx_rows: Vec<(i64, String, String)> = txs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tx)| {
+                let json = serde_json::to_string(tx).ok()?;
+                Some((i as i64, format!("{:#x}", tx.hash()), json))
+            })
+            .collect();
+        let pool = self.db.clone();
+        Self::dispatch_write(move || {
+            let mut db = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "cache_block_with_txs: pool get failed");
+                    return;
+                }
+            };
+            let tx_db = match db.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "cache_block_with_txs: begin transaction failed");
+                    return;
+                }
+            };
             let _ = tx_db.execute(
-                "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
-                params![hash_hex, block.number as i64],
+                "INSERT OR REPLACE INTO blocks (number, data) VALUES (?1, ?2)",
+                params![block_number, block_json],
             );
-        }
-        for (i, tx) in txs.iter().enumerate() {
-            if let Ok(json) = serde_json::to_string(tx) {
-                let hash_hex = format!("{:#x}", tx.hash());
+            if let Some(hash_hex) = &block_hash_hex {
+                let _ = tx_db.execute(
+                    "INSERT OR REPLACE INTO block_hash_index (hash, number) VALUES (?1, ?2)",
+                    params![hash_hex, block_number as i64],
+                );
+            }
+            for (i, hash_hex, json) in &tx_rows {
                 let _ = tx_db.execute(
                     "INSERT OR REPLACE INTO block_transactions (block_number, tx_index, tx_hash, data) VALUES (?1, ?2, ?3, ?4)",
-                    params![block.number, i as i64, hash_hex, json],
+                    params![block_number, i, hash_hex, json],
                 );
-                // Also cache in transactions table for hash lookup
                 let _ = tx_db.execute(
                     "INSERT OR REPLACE INTO transactions (hash, block_number, data) VALUES (?1, ?2, ?3)",
-                    params![hash_hex, block.number, json],
+                    params![hash_hex, block_number, json],
                 );
             }
-        }
-        if let Err(e) = tx_db.commit() {
-            warn!(error = %e, "cache_block_with_txs: commit failed");
-        }
+            if let Err(e) = tx_db.commit() {
+                warn!(error = %e, "cache_block_with_txs: commit failed");
+            }
+        });
     }
 
     fn get_cached_transaction(&self, hash: Felt) -> Option<SnTransaction> {
@@ -577,32 +617,40 @@ impl CachingDataSource {
     }
 
     fn save_address_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(mut db) = self.db.get() {
-            let addr_hex = format!("{:#x}", address);
-            let tx = match db.transaction() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "save_address_events: begin transaction failed");
-                    return;
-                }
-            };
-            // Clear old events for this address and rewrite atomically.
-            let _ = tx.execute(
-                "DELETE FROM address_events WHERE address = ?1",
-                params![addr_hex],
-            );
-            for (i, event) in events.iter().enumerate() {
-                if let Ok(json) = serde_json::to_string(event) {
+        // Serialize on the caller thread, then ship the rows to a blocking
+        // worker so the DELETE + N×INSERT transaction doesn't stall the
+        // tokio worker that triggered this save.
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        let rows: Vec<(i64, String)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| serde_json::to_string(e).ok().map(|j| (i as i64, j)))
+            .collect();
+        Self::dispatch_write(move || {
+            if let Ok(mut db) = pool.get() {
+                let tx = match db.transaction() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "save_address_events: begin transaction failed");
+                        return;
+                    }
+                };
+                let _ = tx.execute(
+                    "DELETE FROM address_events WHERE address = ?1",
+                    params![&addr_hex],
+                );
+                for (i, json) in &rows {
                     let _ = tx.execute(
                         "INSERT OR REPLACE INTO address_events (address, event_index, data) VALUES (?1, ?2, ?3)",
-                        params![addr_hex, i as i64, json],
+                        params![&addr_hex, i, json],
                     );
                 }
+                if let Err(e) = tx.commit() {
+                    warn!(error = %e, "save_address_events: commit failed");
+                }
             }
-            if let Err(e) = tx.commit() {
-                warn!(error = %e, "save_address_events: commit failed");
-            }
-        }
+        });
     }
 
     /// Additive merge: dedupe `new_events` against what's already cached and
@@ -1065,31 +1113,37 @@ impl CachingDataSource {
     }
 
     fn save_contract_events(&self, address: &Felt, events: &[SnEvent]) {
-        if let Ok(mut db) = self.db.get() {
-            let addr_hex = format!("{:#x}", address);
-            let tx = match db.transaction() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "save_contract_events: begin transaction failed");
-                    return;
-                }
-            };
-            let _ = tx.execute(
-                "DELETE FROM contract_events WHERE address = ?1",
-                params![addr_hex],
-            );
-            for (i, event) in events.iter().enumerate() {
-                if let Ok(json) = serde_json::to_string(event) {
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        let rows: Vec<(i64, String)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| serde_json::to_string(e).ok().map(|j| (i as i64, j)))
+            .collect();
+        Self::dispatch_write(move || {
+            if let Ok(mut db) = pool.get() {
+                let tx = match db.transaction() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "save_contract_events: begin transaction failed");
+                        return;
+                    }
+                };
+                let _ = tx.execute(
+                    "DELETE FROM contract_events WHERE address = ?1",
+                    params![&addr_hex],
+                );
+                for (i, json) in &rows {
                     let _ = tx.execute(
                         "INSERT OR REPLACE INTO contract_events (address, event_index, data) VALUES (?1, ?2, ?3)",
-                        params![addr_hex, i as i64, json],
+                        params![&addr_hex, i, json],
                     );
                 }
+                if let Err(e) = tx.commit() {
+                    warn!(error = %e, "save_contract_events: commit failed");
+                }
             }
-            if let Err(e) = tx.commit() {
-                warn!(error = %e, "save_contract_events: commit failed");
-            }
-        }
+        });
     }
 }
 
@@ -1418,31 +1472,37 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_txs(&self, address: &Felt, txs: &[AddressTxSummary]) {
-        if let Ok(mut db) = self.db.get() {
-            let addr_hex = format!("{:#x}", address);
-            let tx_db = match db.transaction() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "save_address_txs: begin transaction failed");
-                    return;
-                }
-            };
-            let _ = tx_db.execute(
-                "DELETE FROM address_txs WHERE address = ?1",
-                params![addr_hex],
-            );
-            for (i, tx) in txs.iter().enumerate() {
-                if let Ok(json) = serde_json::to_string(tx) {
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        let rows: Vec<(i64, String)> = txs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tx)| serde_json::to_string(tx).ok().map(|j| (i as i64, j)))
+            .collect();
+        Self::dispatch_write(move || {
+            if let Ok(mut db) = pool.get() {
+                let tx_db = match db.transaction() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "save_address_txs: begin transaction failed");
+                        return;
+                    }
+                };
+                let _ = tx_db.execute(
+                    "DELETE FROM address_txs WHERE address = ?1",
+                    params![&addr_hex],
+                );
+                for (i, json) in &rows {
                     let _ = tx_db.execute(
                         "INSERT OR REPLACE INTO address_txs (address, tx_index, data) VALUES (?1, ?2, ?3)",
-                        params![addr_hex, i as i64, json],
+                        params![&addr_hex, i, json],
                     );
                 }
+                if let Err(e) = tx_db.commit() {
+                    warn!(error = %e, "save_address_txs: commit failed");
+                }
             }
-            if let Err(e) = tx_db.commit() {
-                warn!(error = %e, "save_address_txs: commit failed");
-            }
-        }
+        });
     }
 
     fn load_cached_address_calls(&self, address: &Felt) -> Vec<ContractCallSummary> {
@@ -1467,31 +1527,37 @@ impl DataSource for CachingDataSource {
     }
 
     fn save_address_calls(&self, address: &Felt, calls: &[ContractCallSummary]) {
-        if let Ok(mut db) = self.db.get() {
-            let addr_hex = format!("{:#x}", address);
-            let tx = match db.transaction() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "save_address_calls: begin transaction failed");
-                    return;
-                }
-            };
-            let _ = tx.execute(
-                "DELETE FROM address_calls WHERE address = ?1",
-                params![addr_hex],
-            );
-            for (i, call) in calls.iter().enumerate() {
-                if let Ok(json) = serde_json::to_string(call) {
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        let rows: Vec<(i64, String)> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| serde_json::to_string(c).ok().map(|j| (i as i64, j)))
+            .collect();
+        Self::dispatch_write(move || {
+            if let Ok(mut db) = pool.get() {
+                let tx = match db.transaction() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "save_address_calls: begin transaction failed");
+                        return;
+                    }
+                };
+                let _ = tx.execute(
+                    "DELETE FROM address_calls WHERE address = ?1",
+                    params![&addr_hex],
+                );
+                for (i, json) in &rows {
                     let _ = tx.execute(
                         "INSERT OR REPLACE INTO address_calls (address, call_index, data) VALUES (?1, ?2, ?3)",
-                        params![addr_hex, i as i64, json],
+                        params![&addr_hex, i, json],
                     );
                 }
+                if let Err(e) = tx.commit() {
+                    warn!(error = %e, "save_address_calls: commit failed");
+                }
             }
-            if let Err(e) = tx.commit() {
-                warn!(error = %e, "save_address_calls: commit failed");
-            }
-        }
+        });
     }
 
     fn load_cached_meta_txs(&self, address: &Felt) -> Vec<MetaTxIntenderSummary> {
