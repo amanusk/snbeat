@@ -320,28 +320,20 @@ impl DataSource for RpcDataSource {
         let start = latest.saturating_sub(count as u64 - 1);
         let mut blocks = Vec::with_capacity(count);
 
-        // Fetch blocks in parallel batches
-        let mut handles = Vec::new();
-        for num in start..=latest {
-            let provider = JsonRpcClient::new(HttpTransport::new(
-                Url::parse(&self.rpc_url).expect("invalid RPC URL"),
-            ));
-            handles.push(tokio::spawn(async move {
-                let result = provider
+        // Fan out via `join_all` over `&self.provider` instead of building a
+        // fresh `JsonRpcClient<HttpTransport>` (and therefore a fresh reqwest
+        // connection pool) per block. With 30 blocks on a cold start the old
+        // form did 30 separate TCP+TLS handshakes; this reuses one keep-alive
+        // pool for all of them.
+        let futs = (start..=latest).map(|num| async move {
+            (
+                num,
+                self.provider
                     .get_block_with_txs(BlockId::Number(num), None)
-                    .await;
-                (num, result)
-            }));
-        }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            results.push(
-                handle
-                    .await
-                    .map_err(|e| SnbeatError::Other(e.to_string()))?,
-            );
-        }
+                    .await,
+            )
+        });
+        let mut results: Vec<_> = futures::future::join_all(futs).await;
 
         // Sort by block number descending (newest first)
         results.sort_by(|a, b| b.0.cmp(&a.0));
