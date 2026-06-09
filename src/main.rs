@@ -495,34 +495,94 @@ async fn run_loop(
                     }
                 }
             }
-            // Handle responses from network task
+            // Handle responses from network task. Drain a burst of pending
+            // actions in one go so an enrichment storm (hundreds of
+            // streamed tx summaries / decoded events / price updates)
+            // doesn't trigger a full-frame redraw per action — the previous
+            // form did exactly that, which is what made the UI feel sticky
+            // when background work was heaviest.
+            //
+            // Cap the burst at MAX_DRAIN so input latency stays bounded:
+            // even if the network task is firehosing, we still pump
+            // EventStream and redraw at least every MAX_DRAIN actions.
             Some(action) = response_rx.recv() => {
-                match &action {
-                    Action::BlocksLoaded(blocks) => {
-                        info!(count = blocks.len(), "Blocks loaded");
-                    }
-                    Action::NewBlock(block) => {
-                        debug!(number = block.number, "New block received");
-                    }
-                    Action::BlockDetailLoaded { block, transactions, endpoint_names, .. } => {
-                        let resolved = endpoint_names.iter().filter(|n| n.is_some()).count();
-                        info!(block = block.number, tx_count = transactions.len(), resolved_endpoints = resolved, "Block detail loaded");
-                    }
-                    Action::TransactionLoaded { transaction, receipt, decoded_events, .. } => {
-                        let decoded_count = decoded_events.iter().filter(|e| e.event_name.is_some()).count();
-                        info!(tx = %format!("{:#x}", transaction.hash()), events = receipt.events.len(), decoded = decoded_count, "Transaction loaded");
-                    }
-                    Action::AddressInfoLoaded { info, decoded_events, tx_summaries, .. } => {
-                        info!(address = %format!("{:#x}", info.address), events = decoded_events.len(), txs = tx_summaries.len(), balances = info.token_balances.len(), "Address info loaded");
-                    }
-                    Action::Error(msg) => {
-                        warn!(error = %msg, "Network error");
-                    }
-                    _ => {}
-                }
+                const MAX_DRAIN: usize = 64;
+                log_action(&action);
                 app.handle_action(action);
+                for _ in 1..MAX_DRAIN {
+                    match response_rx.try_recv() {
+                        Ok(next) => {
+                            log_action(&next);
+                            app.handle_action(next);
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
         }
+    }
+}
+
+/// Per-action logging extracted so `run_loop` can apply it both to the
+/// first action drained from the channel and to follow-on actions pulled
+/// via `try_recv` in the same burst.
+fn log_action(action: &Action) {
+    match action {
+        Action::BlocksLoaded(blocks) => {
+            info!(count = blocks.len(), "Blocks loaded");
+        }
+        Action::NewBlock(block) => {
+            debug!(number = block.number, "New block received");
+        }
+        Action::BlockDetailLoaded {
+            block,
+            transactions,
+            endpoint_names,
+            ..
+        } => {
+            let resolved = endpoint_names.iter().filter(|n| n.is_some()).count();
+            info!(
+                block = block.number,
+                tx_count = transactions.len(),
+                resolved_endpoints = resolved,
+                "Block detail loaded"
+            );
+        }
+        Action::TransactionLoaded {
+            transaction,
+            receipt,
+            decoded_events,
+            ..
+        } => {
+            let decoded_count = decoded_events
+                .iter()
+                .filter(|e| e.event_name.is_some())
+                .count();
+            info!(
+                tx = %format!("{:#x}", transaction.hash()),
+                events = receipt.events.len(),
+                decoded = decoded_count,
+                "Transaction loaded"
+            );
+        }
+        Action::AddressInfoLoaded {
+            info,
+            decoded_events,
+            tx_summaries,
+            ..
+        } => {
+            info!(
+                address = %format!("{:#x}", info.address),
+                events = decoded_events.len(),
+                txs = tx_summaries.len(),
+                balances = info.token_balances.len(),
+                "Address info loaded"
+            );
+        }
+        Action::Error(msg) => {
+            warn!(error = %msg, "Network error");
+        }
+        _ => {}
     }
 }
 
