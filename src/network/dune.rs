@@ -737,6 +737,46 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
 mod tests {
     use super::*;
 
+    /// Both JSON forms must parse the same value: Dune serialises wide
+    /// numerics (e.g. uint256 fees) as strings but smaller numerics as
+    /// JSON numbers. The previous shape `as_str().or_else(|| as_u64()
+    /// .map(|_| "0"))` silently dropped the numeric variant to zero — a
+    /// regression-prone edge case.
+    #[test]
+    fn parse_json_u128_accepts_string_and_numeric_forms() {
+        let s = serde_json::json!("12345678901234567890");
+        assert_eq!(parse_json_u128(&s), Some(12345678901234567890u128));
+
+        let n = serde_json::json!(42u64);
+        assert_eq!(parse_json_u128(&n), Some(42u128));
+
+        // Wide value that exceeds u64 must still round-trip via the
+        // string path (Dune's uint256 serialisation).
+        let huge_str = format!("{}", (u64::MAX as u128) + 1);
+        let huge = serde_json::Value::String(huge_str);
+        assert_eq!(parse_json_u128(&huge), Some((u64::MAX as u128) + 1));
+
+        // Garbage and null both yield None — the caller falls back to 0.
+        assert_eq!(parse_json_u128(&serde_json::json!("not-a-number")), None);
+        assert_eq!(parse_json_u128(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn parse_json_u64_accepts_string_and_numeric_forms() {
+        let s = serde_json::json!("123456789");
+        assert_eq!(parse_json_u64(&s), Some(123_456_789u64));
+
+        let n = serde_json::json!(7u64);
+        assert_eq!(parse_json_u64(&n), Some(7));
+
+        // Above u64 in string form → None (would have parsed wrong as u64).
+        let too_big = serde_json::Value::String(format!("{}", (u64::MAX as u128) + 1));
+        assert_eq!(parse_json_u64(&too_big), None);
+
+        assert_eq!(parse_json_u64(&serde_json::json!("nope")), None);
+        assert_eq!(parse_json_u64(&serde_json::Value::Null), None);
+    }
+
     /// Public hybrid account (Cartridge Controller class) with both sender-side
     /// txs and heavy inbound traffic — see `src/network/address.rs` test.
     /// No ownership/activity implication.
