@@ -132,8 +132,18 @@ impl AddressActivityProbe {
 
 impl DuneClient {
     pub fn new(api_key: String, is_private: bool) -> Self {
+        // Without timeouts, a hung connection wedges the poll loop
+        // indefinitely — the overall 120s deadline in `execute_sql` only
+        // counts *completed* polls. Match PF's posture: cap each request
+        // at 60s (enough for result fetches on large windows), 10s to
+        // even open a connection.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to build Dune reqwest client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             is_private,
         }
