@@ -315,9 +315,16 @@ impl DataSource for RpcDataSource {
     }
 
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let latest = self.get_latest_block_number().await?;
         debug!(latest, count, "RPC: fetching recent blocks");
-        let start = latest.saturating_sub(count as u64 - 1);
+        // count >= 1 here, so the subtraction can't underflow. The
+        // previous `count as u64 - 1` wrapped when count==0 (silently
+        // producing u64::MAX and then a saturating_sub to 0, which
+        // tried to fetch every block from 0..=latest).
+        let start = latest.saturating_sub((count as u64).saturating_sub(1));
         let mut blocks = Vec::with_capacity(count);
 
         // Fan out via `join_all` over `&self.provider` instead of building a
