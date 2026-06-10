@@ -171,12 +171,16 @@ impl DuneClient {
         limit: u32,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
+        // Partition-pruning floor: kept at Starknet mainnet's first full
+        // year so Dune skips empty partitions for sender lookups, without
+        // silently dropping pre-2025 account history (the previous
+        // 2025-01-01 floor hid legitimate older txs).
         let sql = format!(
             "SELECT hash, sender_address, nonce, execution_status, revert_reason, actual_fee_amount, \
              tip, block_number, block_time, type \
              FROM starknet.transactions \
              WHERE sender_address = {} \
-             AND block_date >= date '2025-01-01' \
+             AND block_date >= date '2021-01-01' \
              ORDER BY nonce DESC \
              LIMIT {}",
             sender_hex, limit
@@ -658,6 +662,24 @@ impl DuneClient {
     }
 }
 
+/// Parse a JSON value that may arrive as a quoted string ("123") or as a
+/// JSON number (123) into a u128. DuneSQL serialises wide numerics as
+/// strings but smaller fields can come back as numbers.
+fn parse_json_u128(v: &serde_json::Value) -> Option<u128> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<u128>().ok();
+    }
+    v.as_u64().map(|n| n as u128)
+}
+
+/// u64 variant of `parse_json_u128`.
+fn parse_json_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        return s.parse::<u64>().ok();
+    }
+    v.as_u64()
+}
+
 fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
     rows.iter()
         .filter_map(|row| {
@@ -691,19 +713,17 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
             }
             .to_string();
 
-            // actual_fee_amount comes as a string number
-            let fee_str = row
+            // actual_fee_amount typically arrives as a string (DuneSQL
+            // serialises u128-sized numerics as strings), but smaller values
+            // can come back as JSON numbers. Handle both; the old
+            // `.or_else(|| as_u64().map(|_| "0"))` shape silently dropped
+            // the numeric variant to zero.
+            let total_fee_fri = row
                 .get("actual_fee_amount")
-                .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "0")))
-                .unwrap_or("0");
-            let total_fee_fri = fee_str.parse::<u128>().unwrap_or(0);
-
-            let tip_val = row
-                .get("tip")
-                .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "0")))
-                .unwrap_or("0")
-                .parse::<u64>()
+                .and_then(parse_json_u128)
                 .unwrap_or(0);
+
+            let tip_val = row.get("tip").and_then(parse_json_u64).unwrap_or(0);
 
             let tx_type = row
                 .get("type")
@@ -736,6 +756,46 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both JSON forms must parse the same value: Dune serialises wide
+    /// numerics (e.g. uint256 fees) as strings but smaller numerics as
+    /// JSON numbers. The previous shape `as_str().or_else(|| as_u64()
+    /// .map(|_| "0"))` silently dropped the numeric variant to zero — a
+    /// regression-prone edge case.
+    #[test]
+    fn parse_json_u128_accepts_string_and_numeric_forms() {
+        let s = serde_json::json!("12345678901234567890");
+        assert_eq!(parse_json_u128(&s), Some(12345678901234567890u128));
+
+        let n = serde_json::json!(42u64);
+        assert_eq!(parse_json_u128(&n), Some(42u128));
+
+        // Wide value that exceeds u64 must still round-trip via the
+        // string path (Dune's uint256 serialisation).
+        let huge_str = format!("{}", (u64::MAX as u128) + 1);
+        let huge = serde_json::Value::String(huge_str);
+        assert_eq!(parse_json_u128(&huge), Some((u64::MAX as u128) + 1));
+
+        // Garbage and null both yield None — the caller falls back to 0.
+        assert_eq!(parse_json_u128(&serde_json::json!("not-a-number")), None);
+        assert_eq!(parse_json_u128(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn parse_json_u64_accepts_string_and_numeric_forms() {
+        let s = serde_json::json!("123456789");
+        assert_eq!(parse_json_u64(&s), Some(123_456_789u64));
+
+        let n = serde_json::json!(7u64);
+        assert_eq!(parse_json_u64(&n), Some(7));
+
+        // Above u64 in string form → None (would have parsed wrong as u64).
+        let too_big = serde_json::Value::String(format!("{}", (u64::MAX as u128) + 1));
+        assert_eq!(parse_json_u64(&too_big), None);
+
+        assert_eq!(parse_json_u64(&serde_json::json!("nope")), None);
+        assert_eq!(parse_json_u64(&serde_json::Value::Null), None);
+    }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
     /// txs and heavy inbound traffic — see `src/network/address.rs` test.
