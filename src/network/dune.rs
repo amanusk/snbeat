@@ -405,12 +405,19 @@ impl DuneClient {
         address: Felt,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
+        // Single-shot probe covering all of mainnet history. Previously the
+        // probe ran a date-pruned (`>= '2024-01-01'`) COUNT first and, on
+        // empty result, ran a *second* full-range probe sequentially — two
+        // complete Dune query lifecycles for every cold/inactive address.
+        // The Starknet mainnet launch was in late 2021 so a 2021-01-01
+        // floor preserves partition pruning (Dune skips empty pre-mainnet
+        // partitions) without ever needing the fallback pass.
         let sql = format!(
             "SELECT COUNT(*) AS cnt, \
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
              FROM starknet.events \
              WHERE from_address = {addr} \
-             AND block_date >= date '2024-01-01'",
+             AND block_date >= date '2021-01-01'",
             addr = addr_hex
         );
 
@@ -428,27 +435,6 @@ impl DuneClient {
             probe.callee_call_count = cnt;
             probe.callee_min_block = min_b;
             probe.callee_max_block = max_b;
-        }
-
-        // If nothing found since 2024, try without date filter to catch pre-2024 activity.
-        if !probe.has_activity() {
-            debug!(address = %addr_hex, "Dune events probe: no activity since 2024, trying full range");
-            let sql_full = format!(
-                "SELECT COUNT(*) AS cnt, \
-                   MIN(block_number) AS min_block, MAX(block_number) AS max_block \
-                 FROM starknet.events \
-                 WHERE from_address = {addr}",
-                addr = addr_hex
-            );
-            let rows_full = self.execute_sql(&sql_full).await?;
-            if let Some(row) = rows_full.first() {
-                let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-                let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-                let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
-                probe.callee_call_count = cnt;
-                probe.callee_min_block = min_b;
-                probe.callee_max_block = max_b;
-            }
         }
 
         info!(
