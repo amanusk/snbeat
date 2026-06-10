@@ -631,10 +631,16 @@ impl DuneClient {
                     break Err(format!("Dune query {} failed: {}", query_id, status.state));
                 }
                 _ => {
-                    if tokio::time::Instant::now() >= deadline {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
                         break Err("Dune query timed out (120s)".into());
                     }
-                    tokio::time::sleep(delay).await;
+                    // Cap the sleep to the remaining budget so a final
+                    // pre-sleep deadline check just under the cap can't
+                    // push wall-clock past 120s by up to a full `delay`
+                    // window (~2s at steady state).
+                    let remaining = deadline.duration_since(now);
+                    tokio::time::sleep(delay.min(remaining)).await;
                     delay = (delay * 2).min(Duration::from_secs(2));
                 }
             }
