@@ -185,10 +185,13 @@ async fn main() -> anyhow::Result<()> {
         .filter(|k| !k.is_empty())
         .map(|key| {
             info!(is_private = config.dune_private_queries, "Dune API enabled");
-            Arc::new(network::dune::DuneClient::new(
-                key.clone(),
-                config.dune_private_queries,
-            ))
+            // Persistent-query fast path: store reusable Dune query_ids
+            // in the same cache.db so repeat probes skip the create +
+            // archive round trips.
+            Arc::new(
+                network::dune::DuneClient::new(key.clone(), config.dune_private_queries)
+                    .with_persistent_cache(&cache_db),
+            )
         });
 
     // DefiLlama needs no API key, so the client is always created when the cache opens.
