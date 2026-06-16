@@ -217,11 +217,12 @@ impl DuneClient {
     pub fn with_persistent_cache(mut self, cache_db_path: &Path) -> Self {
         match Connection::open(cache_db_path) {
             Ok(db) => {
-                // Match the other cache-backed clients (cache.rs, prices.rs,
-                // voyager.rs): WAL is sticky on the file but `busy_timeout`
-                // is per-connection and defaults to 0, so without it a write
-                // here (first query-id creation) racing the main cache pool
-                // returns `database is locked` immediately instead of waiting.
+                // WAL matches every other cache-backed client (cache.rs,
+                // prices.rs, voyager.rs); it's sticky on the file anyway.
+                // `busy_timeout` is per-connection and defaults to 0 — only
+                // cache.rs's pool sets it — so without it here a write (first
+                // query-id creation) racing the main cache pool returns
+                // `database is locked` immediately instead of waiting.
                 if let Err(e) =
                     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                 {
@@ -332,11 +333,16 @@ impl DuneClient {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let _ = db.execute(
+                // Log persist failures: the id stays usable in-memory this
+                // session, but a silently-failed write means a fresh create
+                // (extra Dune churn) on next launch with no trace why.
+                if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO dune_persistent_queries \
                      (shape, query_id, created_at) VALUES (?1, ?2, ?3)",
                     params![shape.name(), qid as i64, now],
-                );
+                ) {
+                    warn!(shape = shape.name(), query_id = qid, error = %e, "Dune persistent cache: failed to persist query_id; will recreate next launch");
+                }
             }
             g.insert(shape.name(), qid);
         }
@@ -1078,6 +1084,41 @@ mod tests {
 
         assert_eq!(parse_json_u64(&serde_json::json!("nope")), None);
         assert_eq!(parse_json_u64(&serde_json::Value::Null), None);
+    }
+
+    /// `with_persistent_cache` must hydrate previously-persisted query_ids
+    /// into the in-memory map so the fast path hits without a SQLite read.
+    /// Guards the schema-init + hydration wiring as more `QueryShape`s land.
+    #[test]
+    fn with_persistent_cache_hydrates_in_memory_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        // Seed a persisted id for the known shape.
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                    shape TEXT PRIMARY KEY,
+                    query_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params!["probe_address_activity", 4242i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
+
+        let map = client.persistent_ids.lock().unwrap();
+        assert_eq!(
+            map.get(QueryShape::ProbeAddressActivity.name()).copied(),
+            Some(4242)
+        );
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
