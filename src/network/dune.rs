@@ -68,6 +68,11 @@ pub struct DuneClient {
     /// a HashMap read, not a SQLite query. Updated on every successful
     /// `get_or_create_persistent_query` call.
     persistent_ids: Mutex<HashMap<&'static str, u64>>,
+    /// Serializes the cold-path create in `get_or_create_persistent_query`
+    /// so two concurrent cold callers (probes run in spawned tasks) can't
+    /// both POST a create to Dune and leave a duplicate query registered.
+    /// Held across the create await; the map is re-checked after acquiring.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +204,7 @@ impl DuneClient {
             is_private,
             persistent_db: None,
             persistent_ids: Mutex::new(HashMap::new()),
+            create_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -211,6 +217,17 @@ impl DuneClient {
     pub fn with_persistent_cache(mut self, cache_db_path: &Path) -> Self {
         match Connection::open(cache_db_path) {
             Ok(db) => {
+                // Match the other cache-backed clients (cache.rs, prices.rs,
+                // voyager.rs): WAL is sticky on the file but `busy_timeout`
+                // is per-connection and defaults to 0, so without it a write
+                // here (first query-id creation) racing the main cache pool
+                // returns `database is locked` immediately instead of waiting.
+                if let Err(e) =
+                    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                {
+                    warn!(error = %e, "Dune persistent cache: pragma init failed; falling back to ephemeral");
+                    return self;
+                }
                 if let Err(e) = db.execute_batch(
                     "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
                         shape TEXT PRIMARY KEY,
@@ -267,7 +284,18 @@ impl DuneClient {
         {
             return Some(*qid);
         }
-        // Cold path: create the query on Dune and persist the id.
+        // Cold path: serialize creates so two concurrent cold callers don't
+        // both POST a create to Dune (which would leave a duplicate query
+        // and burn quota). Hold the async lock across the create await.
+        let _create_guard = self.create_lock.lock().await;
+        // Re-check under the guard: a racing caller may have created the
+        // query while we waited for the lock.
+        if let Ok(g) = self.persistent_ids.lock()
+            && let Some(qid) = g.get(shape.name())
+        {
+            return Some(*qid);
+        }
+        // Create the query on Dune and persist the id.
         let body = serde_json::json!({
             "name": shape.display_name(),
             "query_sql": shape.sql(),
@@ -373,11 +401,17 @@ impl DuneClient {
                     return None;
                 }
                 _ => {
-                    if tokio::time::Instant::now() >= deadline {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
                         warn!(query_id, "Dune persistent execute timed out");
                         return None;
                     }
-                    tokio::time::sleep(delay).await;
+                    // Cap the sleep to the remaining budget so a final
+                    // pre-sleep deadline check just under the cap can't push
+                    // wall-clock past 120s by up to a full `delay` (matches
+                    // execute_sql).
+                    let remaining = deadline.duration_since(now);
+                    tokio::time::sleep(delay.min(remaining)).await;
                     delay = (delay * 2).min(Duration::from_secs(2));
                 }
             }
@@ -677,18 +711,10 @@ impl DuneClient {
         debug!(address = %addr_hex, "Dune events probe: checking address activity range");
         let rows = self.execute_sql(&sql).await?;
 
-        let mut probe = AddressActivityProbe::default();
-        if let Some(row) = rows.first() {
-            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            // Events-from-address counts inbound activity for account-contracts
-            // and emitted events for pure contracts. Both populate callee fields;
-            // sender_tx_count is left at 0 (unknown from this query — use nonce).
-            probe.callee_call_count = cnt;
-            probe.callee_min_block = min_b;
-            probe.callee_max_block = max_b;
-        }
+        // Events-from-address counts inbound activity for account-contracts
+        // and emitted events for pure contracts. Both populate callee fields;
+        // sender_tx_count is left at 0 (unknown from this query — use nonce).
+        let probe = probe_from_rows(&rows);
 
         info!(
             event_count = probe.callee_call_count,
@@ -924,9 +950,12 @@ fn parse_json_u64(v: &serde_json::Value) -> Option<u64> {
 fn probe_from_rows(rows: &[serde_json::Value]) -> AddressActivityProbe {
     let mut probe = AddressActivityProbe::default();
     if let Some(row) = rows.first() {
-        let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-        let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-        let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
+        // DuneSQL can serialize numerics as quoted strings, so use
+        // parse_json_u64 (handles both encodings) rather than as_u64,
+        // which would silently read a stringified count as 0.
+        let cnt = row.get("cnt").and_then(parse_json_u64).unwrap_or(0);
+        let min_b = row.get("min_block").and_then(parse_json_u64).unwrap_or(0);
+        let max_b = row.get("max_block").and_then(parse_json_u64).unwrap_or(0);
         probe.callee_call_count = cnt;
         probe.callee_min_block = min_b;
         probe.callee_max_block = max_b;
