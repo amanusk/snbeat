@@ -1,12 +1,54 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use starknet::core::types::Felt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::data::types::{AddressTxSummary, ContractCallSummary};
 
 const DUNE_API_BASE: &str = "https://api.dune.com/api/v1";
+
+/// Identifier of a SQL shape we want to reuse across calls as a Dune
+/// persistent (parameterized) query. Each variant maps to one Dune
+/// query_id stored in `dune_persistent_queries` after first creation.
+#[derive(Debug, Clone, Copy)]
+enum QueryShape {
+    ProbeAddressActivity,
+}
+
+impl QueryShape {
+    fn name(self) -> &'static str {
+        match self {
+            QueryShape::ProbeAddressActivity => "probe_address_activity",
+        }
+    }
+
+    /// Parameterized SQL body. Uses Dune's `{{key}}` placeholders so we
+    /// can reuse the same query_id across calls (different params) and
+    /// avoid the create + archive round trips that `execute_sql` pays.
+    fn sql(self) -> &'static str {
+        match self {
+            QueryShape::ProbeAddressActivity => {
+                "SELECT COUNT(*) AS cnt, \
+                   MIN(block_number) AS min_block, MAX(block_number) AS max_block \
+                 FROM starknet.events \
+                 WHERE from_address = {{address}} \
+                 AND block_date >= date '2021-01-01'"
+            }
+        }
+    }
+
+    /// Display name to register the query under in Dune.
+    fn display_name(self) -> &'static str {
+        match self {
+            QueryShape::ProbeAddressActivity => "snbeat_probe_address_activity",
+        }
+    }
+}
 
 /// Dune Analytics API client for querying Starknet transaction history.
 pub struct DuneClient {
@@ -17,6 +59,20 @@ pub struct DuneClient {
     /// private-query quota when it's exhausted; archive-on-finish still
     /// runs either way, so the queries stay temporary.
     is_private: bool,
+    /// SQLite-backed cache of Dune query IDs per `QueryShape` so we
+    /// don't pay create + archive round trips on every call. Optional —
+    /// when not configured, the persistent-query fast path falls back
+    /// to `execute_sql`'s create-per-call shape.
+    persistent_db: Option<Mutex<Connection>>,
+    /// In-memory mirror of the persistent_db rows so the common case is
+    /// a HashMap read, not a SQLite query. Updated on every successful
+    /// `get_or_create_persistent_query` call.
+    persistent_ids: Mutex<HashMap<&'static str, u64>>,
+    /// Serializes the cold-path create in `get_or_create_persistent_query`
+    /// so two concurrent cold callers (probes run in spawned tasks) can't
+    /// both POST a create to Dune and leave a duplicate query registered.
+    /// Held across the create await; the map is re-checked after acquiring.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +202,225 @@ impl DuneClient {
             client,
             api_key,
             is_private,
+            persistent_db: None,
+            persistent_ids: Mutex::new(HashMap::new()),
+            create_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Enable the persistent-query fast path by opening (or creating) a
+    /// `dune_persistent_queries` table in `cache_db_path`. Builder-style
+    /// — call once before wrapping the client in `Arc`. If open or
+    /// schema init fails, the client falls back to the ephemeral
+    /// `execute_sql` path (same behaviour as before this feature
+    /// existed), so this method never errors fatally.
+    pub fn with_persistent_cache(mut self, cache_db_path: &Path) -> Self {
+        match Connection::open(cache_db_path) {
+            Ok(db) => {
+                // WAL matches every other cache-backed client (cache.rs,
+                // prices.rs, voyager.rs); it's sticky on the file anyway.
+                // `busy_timeout` is per-connection and defaults to 0 — only
+                // cache.rs's pool sets it — so without it here a write (first
+                // query-id creation) racing the main cache pool returns
+                // `database is locked` immediately instead of waiting.
+                if let Err(e) =
+                    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                {
+                    warn!(error = %e, "Dune persistent cache: pragma init failed; falling back to ephemeral");
+                    return self;
+                }
+                if let Err(e) = db.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                        shape TEXT PRIMARY KEY,
+                        query_id INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL
+                     );",
+                ) {
+                    warn!(error = %e, "Dune persistent cache: schema init failed; falling back to ephemeral");
+                    return self;
+                }
+                // Hydrate the in-memory map so the common case never
+                // touches SQLite.
+                let mut hydrated: HashMap<&'static str, u64> = HashMap::new();
+                if let Ok(mut stmt) =
+                    db.prepare("SELECT shape, query_id FROM dune_persistent_queries")
+                {
+                    let rows = stmt.query_map([], |row| {
+                        let shape: String = row.get(0)?;
+                        let qid: i64 = row.get(1)?;
+                        Ok((shape, qid as u64))
+                    });
+                    if let Ok(iter) = rows {
+                        for (shape, qid) in iter.flatten() {
+                            let key = match shape.as_str() {
+                                "probe_address_activity" => {
+                                    Some(QueryShape::ProbeAddressActivity.name())
+                                }
+                                _ => None,
+                            };
+                            if let Some(k) = key {
+                                hydrated.insert(k, qid);
+                            }
+                        }
+                    }
+                }
+                self.persistent_ids = Mutex::new(hydrated);
+                self.persistent_db = Some(Mutex::new(db));
+            }
+            Err(e) => {
+                warn!(error = %e, "Dune persistent cache: open failed; falling back to ephemeral");
+            }
+        }
+        self
+    }
+
+    /// Look up the Dune query_id for `shape`, creating and persisting it
+    /// on first use. Returns None when the persistent cache isn't
+    /// configured — callers then fall back to `execute_sql`.
+    async fn get_or_create_persistent_query(&self, shape: QueryShape) -> Option<u64> {
+        self.persistent_db.as_ref()?;
+        // Fast path: in-memory hit.
+        if let Ok(g) = self.persistent_ids.lock()
+            && let Some(qid) = g.get(shape.name())
+        {
+            return Some(*qid);
+        }
+        // Cold path: serialize creates so two concurrent cold callers don't
+        // both POST a create to Dune (which would leave a duplicate query
+        // and burn quota). Hold the async lock across the create await.
+        let _create_guard = self.create_lock.lock().await;
+        // Re-check under the guard: a racing caller may have created the
+        // query while we waited for the lock.
+        if let Ok(g) = self.persistent_ids.lock()
+            && let Some(qid) = g.get(shape.name())
+        {
+            return Some(*qid);
+        }
+        // Create the query on Dune and persist the id.
+        let body = serde_json::json!({
+            "name": shape.display_name(),
+            "query_sql": shape.sql(),
+            // Persistent queries are deliberately NOT private — they'd
+            // churn the per-account private quota and the SQL has no
+            // secrets (parameters carry the per-call values).
+            "is_private": false,
+        });
+        let resp: CreateQueryResponse = match self
+            .client
+            .post(format!("{}/query", DUNE_API_BASE))
+            .header("X-Dune-API-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(shape = shape.name(), error = %e, "Dune persistent create failed");
+                return None;
+            }
+        };
+        let qid = resp.query_id;
+        if let (Some(db_mutex), Ok(mut g)) =
+            (self.persistent_db.as_ref(), self.persistent_ids.lock())
+        {
+            if let Ok(db) = db_mutex.lock() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                // Log persist failures: the id stays usable in-memory this
+                // session, but a silently-failed write means a fresh create
+                // (extra Dune churn) on next launch with no trace why.
+                if let Err(e) = db.execute(
+                    "INSERT OR REPLACE INTO dune_persistent_queries \
+                     (shape, query_id, created_at) VALUES (?1, ?2, ?3)",
+                    params![shape.name(), qid as i64, now],
+                ) {
+                    warn!(shape = shape.name(), query_id = qid, error = %e, "Dune persistent cache: failed to persist query_id; will recreate next launch");
+                }
+            }
+            g.insert(shape.name(), qid);
+        }
+        debug!(
+            shape = shape.name(),
+            query_id = qid,
+            "Dune persistent query created"
+        );
+        Some(qid)
+    }
+
+    /// Execute a persistent (parameterized) Dune query and return rows.
+    /// Cheap relative to `execute_sql`: no create, no archive — just
+    /// execute + poll. Returns None on failure so callers can fall back
+    /// to `execute_sql`.
+    async fn execute_persistent(
+        &self,
+        query_id: u64,
+        params_map: serde_json::Value,
+    ) -> Option<Vec<serde_json::Value>> {
+        let exec_resp: ExecuteResponse = self
+            .client
+            .post(format!("{}/query/{}/execute", DUNE_API_BASE, query_id))
+            .header("X-Dune-API-Key", &self.api_key)
+            .json(&serde_json::json!({ "query_parameters": params_map }))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let execution_id = exec_resp.execution_id;
+
+        // Same polling cadence as execute_sql — poll immediately, back
+        // off 250ms → 2s cap, 120s overall deadline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut delay = Duration::from_millis(250);
+        loop {
+            let status: ExecutionStatusResponse = self
+                .client
+                .get(format!(
+                    "{}/execution/{}/results",
+                    DUNE_API_BASE, execution_id
+                ))
+                .header("X-Dune-API-Key", &self.api_key)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            match status.state.as_str() {
+                "QUERY_STATE_COMPLETED" => {
+                    return Some(status.result.map(|r| r.rows).unwrap_or_default());
+                }
+                "QUERY_STATE_FAILED" | "QUERY_STATE_CANCELLED" | "QUERY_STATE_EXPIRED" => {
+                    warn!(query_id, state = %status.state, "Dune persistent execute failed");
+                    return None;
+                }
+                _ => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        warn!(query_id, "Dune persistent execute timed out");
+                        return None;
+                    }
+                    // Cap the sleep to the remaining budget so a final
+                    // pre-sleep deadline check just under the cap can't push
+                    // wall-clock past 120s by up to a full `delay` (matches
+                    // execute_sql).
+                    let remaining = deadline.duration_since(now);
+                    tokio::time::sleep(delay.min(remaining)).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+            }
         }
     }
 
@@ -405,13 +680,31 @@ impl DuneClient {
         address: Felt,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
-        // Single-shot probe covering all of mainnet history. Previously the
-        // probe ran a date-pruned (`>= '2024-01-01'`) COUNT first and, on
-        // empty result, ran a *second* full-range probe sequentially — two
-        // complete Dune query lifecycles for every cold/inactive address.
-        // The Starknet mainnet launch was in late 2021 so a 2021-01-01
-        // floor preserves partition pruning (Dune skips empty pre-mainnet
-        // partitions) without ever needing the fallback pass.
+        // Fast path: reuse a persistent parameterized query so we skip
+        // the create + archive round trips that `execute_sql` pays on
+        // every call. On any failure (no persistent cache configured,
+        // network glitch on the execute, etc.) fall through to the
+        // ephemeral `execute_sql` path so the probe still completes.
+        if let Some(qid) = self
+            .get_or_create_persistent_query(QueryShape::ProbeAddressActivity)
+            .await
+        {
+            let params = serde_json::json!({ "address": addr_hex });
+            if let Some(rows) = self.execute_persistent(qid, params).await {
+                debug!(address = %addr_hex, "Dune events probe (persistent): hit");
+                return Ok(probe_from_rows(&rows));
+            }
+            debug!(address = %addr_hex, "Dune events probe (persistent): failed; falling back to execute_sql");
+        }
+
+        // Single-shot ephemeral fallback covering all of mainnet history.
+        // Previously the probe ran a date-pruned (`>= '2024-01-01'`) COUNT
+        // first and, on empty result, ran a *second* full-range probe
+        // sequentially — two complete Dune query lifecycles for every
+        // cold/inactive address. The Starknet mainnet launch was in late
+        // 2021 so a 2021-01-01 floor preserves partition pruning (Dune
+        // skips empty pre-mainnet partitions) without ever needing the
+        // second pass.
         let sql = format!(
             "SELECT COUNT(*) AS cnt, \
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
@@ -424,18 +717,10 @@ impl DuneClient {
         debug!(address = %addr_hex, "Dune events probe: checking address activity range");
         let rows = self.execute_sql(&sql).await?;
 
-        let mut probe = AddressActivityProbe::default();
-        if let Some(row) = rows.first() {
-            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            // Events-from-address counts inbound activity for account-contracts
-            // and emitted events for pure contracts. Both populate callee fields;
-            // sender_tx_count is left at 0 (unknown from this query — use nonce).
-            probe.callee_call_count = cnt;
-            probe.callee_min_block = min_b;
-            probe.callee_max_block = max_b;
-        }
+        // Events-from-address counts inbound activity for account-contracts
+        // and emitted events for pure contracts. Both populate callee fields;
+        // sender_tx_count is left at 0 (unknown from this query — use nonce).
+        let probe = probe_from_rows(&rows);
 
         info!(
             event_count = probe.callee_call_count,
@@ -666,6 +951,24 @@ fn parse_json_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_u64()
 }
 
+/// Shared row-shaping for the `probe_address_activity` SQL — used by
+/// both the persistent fast path and the legacy `execute_sql` fallback.
+fn probe_from_rows(rows: &[serde_json::Value]) -> AddressActivityProbe {
+    let mut probe = AddressActivityProbe::default();
+    if let Some(row) = rows.first() {
+        // DuneSQL can serialize numerics as quoted strings, so use
+        // parse_json_u64 (handles both encodings) rather than as_u64,
+        // which would silently read a stringified count as 0.
+        let cnt = row.get("cnt").and_then(parse_json_u64).unwrap_or(0);
+        let min_b = row.get("min_block").and_then(parse_json_u64).unwrap_or(0);
+        let max_b = row.get("max_block").and_then(parse_json_u64).unwrap_or(0);
+        probe.callee_call_count = cnt;
+        probe.callee_min_block = min_b;
+        probe.callee_max_block = max_b;
+    }
+    probe
+}
+
 fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
     rows.iter()
         .filter_map(|row| {
@@ -781,6 +1084,41 @@ mod tests {
 
         assert_eq!(parse_json_u64(&serde_json::json!("nope")), None);
         assert_eq!(parse_json_u64(&serde_json::Value::Null), None);
+    }
+
+    /// `with_persistent_cache` must hydrate previously-persisted query_ids
+    /// into the in-memory map so the fast path hits without a SQLite read.
+    /// Guards the schema-init + hydration wiring as more `QueryShape`s land.
+    #[test]
+    fn with_persistent_cache_hydrates_in_memory_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        // Seed a persisted id for the known shape.
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                    shape TEXT PRIMARY KEY,
+                    query_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params!["probe_address_activity", 4242i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
+
+        let map = client.persistent_ids.lock().unwrap();
+        assert_eq!(
+            map.get(QueryShape::ProbeAddressActivity.name()).copied(),
+            Some(4242)
+        );
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
