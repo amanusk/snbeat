@@ -444,13 +444,21 @@ fn build_header_lines(
     }
     lines.push(Line::from(hash_spans));
 
-    // Block + index from receipt
+    // Block + index from receipt. Finality is sourced from the (re-probed)
+    // block status when available so it advances ACCEPTED_ON_L2 -> _L1; the
+    // cached receipt's finality is the immutable fallback.
     let (blk_num, blk_hash_str, finality_str) = if let Some(receipt) = &app.tx_detail.receipt {
         let hash_str = receipt
             .block_hash
             .map(|h| format!("{:#x}", h))
             .unwrap_or_default();
-        (receipt.block_number, hash_str, receipt.finality.clone())
+        let finality = app
+            .tx_detail
+            .block_status
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| receipt.finality.clone());
+        (receipt.block_number, hash_str, finality)
     } else {
         (tx.block_number(), String::new(), String::new())
     };
@@ -495,7 +503,10 @@ fn build_header_lines(
         Span::styled(format!("#{}", blk_num), blk_style),
         Span::styled(format!("  {}", block_hash_short), theme::BLOCK_HASH_STYLE),
         Span::styled(format!("  Idx: {}", tx.index()), theme::NORMAL_STYLE),
-        Span::styled(format!("  {}", finality_str), theme::STATUS_OK),
+        Span::styled(
+            format!("  {}", finality_str),
+            theme::finality_style(&finality_str),
+        ),
         Span::styled(age_suffix, theme::SUGGESTION_STYLE),
     ]));
 

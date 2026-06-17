@@ -177,6 +177,7 @@ pub(super) async fn decode_and_send_transaction(
             b.l1_data_gas_price_fri,
         )
     });
+    let block_status = block_info.as_ref().map(|b| b.status.clone());
 
     let tx_hash = transaction.hash();
     let _ = action_tx.send(Action::TransactionLoaded {
@@ -187,6 +188,7 @@ pub(super) async fn decode_and_send_transaction(
         outside_executions,
         block_timestamp,
         block_gas_prices_fri,
+        block_status,
     });
 
     // Fire-and-forget trace fetch. Sent as a separate Action so the rest of

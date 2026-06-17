@@ -822,6 +822,10 @@ fn block_from_raw(v: &Value) -> Option<crate::data::types::SnBlock> {
         l2_gas_price_fri: gas_fri("l2_gas_price"),
         l1_data_gas_price_fri: gas_fri("l1_data_gas_price"),
         starknet_version,
+        // A freshly streamed head block is ACCEPTED_ON_L2; honour an explicit
+        // status if the payload carries one. Non-final, so it is re-probed and
+        // advances to ACCEPTED_ON_L1 on a later view.
+        status: v["status"].as_str().unwrap_or("ACCEPTED_ON_L2").to_string(),
     })
 }
 

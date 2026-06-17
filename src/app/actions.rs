@@ -182,6 +182,10 @@ pub enum Action {
         /// Block-level gas prices in FRI: (L1, L2, L1-Data). Optional in
         /// case the block fetch fails; the fee view then falls back to 0.
         block_gas_prices_fri: Option<(u128, u128, u128)>,
+        /// Block finality status, sourced from the (re-probed) block rather
+        /// than the immutably-cached receipt so it reflects L2 -> L1
+        /// transitions. `None` if the block fetch failed.
+        block_status: Option<String>,
     },
     /// Decoded execution trace for a transaction (recursive call tree).
     /// Sent after TransactionLoaded so the user sees the rest of the view

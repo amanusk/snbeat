@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use starknet::core::types::requests::{CallRequest, GetStorageAtRequest};
 use starknet::core::types::{
-    AddressFilter, BlockId, BlockTag, BlockWithTxs, ContractClass, DeclareTransaction,
+    AddressFilter, BlockId, BlockStatus, BlockTag, BlockWithTxs, ContractClass, DeclareTransaction,
     DeployAccountTransaction, EventFilter, ExecutionResult, Felt, FunctionCall, InvokeTransaction,
-    MaybePreConfirmedBlockWithTxs, StorageKey, Transaction, TransactionReceipt, TransactionTrace,
+    MaybePreConfirmedBlockWithTxHashes, MaybePreConfirmedBlockWithTxs, StorageKey, Transaction,
+    TransactionReceipt, TransactionTrace,
 };
 use starknet::core::utils::get_contract_address;
 use starknet::providers::{
@@ -235,6 +236,25 @@ impl DataSource for RpcDataSource {
                     .map(|(i, tx)| convert_transaction(tx, 0, i as u64))
                     .collect();
                 Ok((sn_block, txs))
+            }
+        }
+    }
+
+    async fn get_block_status(&self, number: u64) -> Result<String> {
+        // Lightweight finality probe: fetch the block header + tx hashes only
+        // (no full tx bodies) just to read the status field.
+        let block = self
+            .provider
+            .get_block_with_tx_hashes(BlockId::Number(number))
+            .await
+            .map_err(|e| SnbeatError::Provider(e.to_string()))?;
+
+        match block {
+            MaybePreConfirmedBlockWithTxHashes::Block(b) => {
+                Ok(block_status_str(&b.status).to_string())
+            }
+            MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(_) => {
+                Ok("PRE_CONFIRMED".to_string())
             }
         }
     }
@@ -521,6 +541,17 @@ impl DataSource for RpcDataSource {
 
 // --- Type conversion helpers ---
 
+/// Map a starknet-rs `BlockStatus` to the canonical string representation
+/// used throughout snbeat (matches the `TransactionFinalityStatus` strings in
+/// `convert_receipt`).
+fn block_status_str(status: &BlockStatus) -> &'static str {
+    match status {
+        BlockStatus::AcceptedOnL1 => "ACCEPTED_ON_L1",
+        BlockStatus::AcceptedOnL2 => "ACCEPTED_ON_L2",
+        BlockStatus::PreConfirmed => "PRE_CONFIRMED",
+    }
+}
+
 fn convert_block(b: &BlockWithTxs) -> SnBlock {
     SnBlock {
         number: b.block_number,
@@ -534,6 +565,7 @@ fn convert_block(b: &BlockWithTxs) -> SnBlock {
         l2_gas_price_fri: felt_to_u128(&b.l2_gas_price.price_in_fri),
         l1_data_gas_price_fri: felt_to_u128(&b.l1_data_gas_price.price_in_fri),
         starknet_version: b.starknet_version.clone(),
+        status: block_status_str(&b.status).to_string(),
     }
 }
 
@@ -552,6 +584,7 @@ fn convert_block_from_pre_confirmed(
         l2_gas_price_fri: felt_to_u128(&b.l2_gas_price.price_in_fri),
         l1_data_gas_price_fri: felt_to_u128(&b.l1_data_gas_price.price_in_fri),
         starknet_version: b.starknet_version.clone(),
+        status: "PRE_CONFIRMED".to_string(),
     }
 }
 

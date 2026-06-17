@@ -129,6 +129,11 @@ pub struct TxDetailState {
     /// the tx so the fee section renders correctly even when the user opens
     /// the tx without first visiting the block view.
     pub block_gas_prices_fri: Option<(u128, u128, u128)>,
+    /// Block finality status ("ACCEPTED_ON_L1" / "ACCEPTED_ON_L2" /
+    /// "PRE_CONFIRMED"), sourced from the re-probed block so the displayed
+    /// finality advances L2 -> L1 instead of being pinned to the cached
+    /// receipt's value.
+    pub block_status: Option<String>,
 }
 
 impl TxDetailState {
@@ -156,6 +161,7 @@ impl TxDetailState {
         self.nav_item_lines = Vec::new();
         self.block_timestamp = None;
         self.block_gas_prices_fri = None;
+        self.block_status = None;
     }
 
     /// Build the list of navigable items for the current transaction.

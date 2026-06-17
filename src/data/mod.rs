@@ -87,6 +87,15 @@ pub trait DataSource: Send + Sync {
     async fn get_block(&self, number: u64) -> Result<SnBlock>;
     async fn get_block_by_hash(&self, hash: Felt) -> Result<u64>;
     async fn get_block_with_txs(&self, number: u64) -> Result<(SnBlock, Vec<SnTransaction>)>;
+    /// Lightweight finality probe for a single block. Returns the block's
+    /// status string ("ACCEPTED_ON_L1" / "ACCEPTED_ON_L2" / "PRE_CONFIRMED").
+    /// Used to refresh a cached block whose status is not yet final without
+    /// re-downloading its full transaction bodies. The default implementation
+    /// falls back to a full `get_block`; `RpcDataSource` overrides it with a
+    /// cheaper `starknet_getBlockWithTxHashes` call.
+    async fn get_block_status(&self, number: u64) -> Result<String> {
+        self.get_block(number).await.map(|b| b.status)
+    }
     async fn get_transaction(&self, hash: Felt) -> Result<SnTransaction>;
     async fn get_receipt(&self, hash: Felt) -> Result<SnReceipt>;
     async fn get_nonce(&self, address: Felt) -> Result<Felt>;

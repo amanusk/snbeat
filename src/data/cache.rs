@@ -23,6 +23,14 @@ use super::types::*;
 use super::{DataSource, FilterKind};
 use crate::error::{Result, SnbeatError};
 
+/// A block/transaction finality status is final (immutable) once it reaches
+/// L1. Anything else ("ACCEPTED_ON_L2", "PRE_CONFIRMED", or an empty status
+/// from a pre-`status`-field cache row) is still subject to change and is
+/// re-probed on the next view.
+fn is_final_status(status: &str) -> bool {
+    status == "ACCEPTED_ON_L1"
+}
+
 /// Shared future output: errors are stringified so the future is `Clone`-able
 /// (SnbeatError is not Clone due to `std::io::Error`).
 type SharedTxFut =
@@ -1179,9 +1187,30 @@ impl DataSource for CachingDataSource {
     }
 
     async fn get_block(&self, number: u64) -> Result<SnBlock> {
-        if let Some(block) = self.get_cached_block(number) {
-            trace!(number, "cache hit: block");
-            return Ok(block);
+        if let Some(mut block) = self.get_cached_block(number) {
+            // Finality can advance ACCEPTED_ON_L2 -> ACCEPTED_ON_L1 (and is
+            // immutable thereafter). Serve final blocks straight from cache;
+            // re-probe anything not yet final and patch the cached status.
+            if is_final_status(&block.status) {
+                trace!(number, "cache hit: block (final)");
+                return Ok(block);
+            }
+            match self.upstream.get_block_status(number).await {
+                Ok(status) => {
+                    if status != block.status {
+                        debug!(number, %status, "block status advanced, updating cache");
+                        block.status = status;
+                        self.cache_block(&block);
+                    }
+                    return Ok(block);
+                }
+                // Probe failed — fall back to the cached (stale) block rather
+                // than forcing a full refetch or erroring the view.
+                Err(e) => {
+                    debug!(number, error = %e, "block status probe failed, serving cached");
+                    return Ok(block);
+                }
+            }
         }
         debug!(number, "cache miss: block, fetching from RPC");
         let block = self.upstream.get_block(number).await?;
@@ -1200,9 +1229,28 @@ impl DataSource for CachingDataSource {
     }
 
     async fn get_block_with_txs(&self, number: u64) -> Result<(SnBlock, Vec<SnTransaction>)> {
-        if let Some(result) = self.get_cached_block_with_txs(number) {
-            trace!(number, tx_count = result.1.len(), "cache hit: block+txs");
-            return Ok(result);
+        if let Some((mut block, txs)) = self.get_cached_block_with_txs(number) {
+            // Transactions are immutable once mined; only the block's finality
+            // can advance. When not yet final, re-probe the status alone (a
+            // light header call) and patch the cached block row — the cached
+            // tx bodies are never re-downloaded.
+            if is_final_status(&block.status) {
+                trace!(number, tx_count = txs.len(), "cache hit: block+txs (final)");
+                return Ok((block, txs));
+            }
+            match self.upstream.get_block_status(number).await {
+                Ok(status) => {
+                    if status != block.status {
+                        debug!(number, %status, "block status advanced, updating cache");
+                        block.status = status;
+                        self.cache_block(&block);
+                    }
+                }
+                Err(e) => {
+                    debug!(number, error = %e, "block status probe failed, serving cached");
+                }
+            }
+            return Ok((block, txs));
         }
         debug!(number, "cache miss: block+txs, fetching from RPC");
         let (block, txs) = self.upstream.get_block_with_txs(number).await?;
