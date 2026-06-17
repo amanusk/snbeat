@@ -504,7 +504,11 @@ fn build_header_lines(
         Span::styled(format!("  {}", block_hash_short), theme::BLOCK_HASH_STYLE),
         Span::styled(format!("  Idx: {}", tx.index()), theme::NORMAL_STYLE),
         Span::styled(
-            format!("  {}", finality_str),
+            if finality_str.is_empty() {
+                "  —".to_string()
+            } else {
+                format!("  {}", finality_str)
+            },
             theme::finality_style(&finality_str),
         ),
         Span::styled(age_suffix, theme::SUGGESTION_STYLE),
