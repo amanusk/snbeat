@@ -631,7 +631,7 @@ impl DuneClient {
             sender_hex, from_block, to_capped, limit
         );
 
-        debug!(sender = %sender_hex, from_block, to_block, "Querying Dune for account txs (windowed)");
+        debug!(sender = %sender_hex, from_block, to_block, to_capped, "Querying Dune for account txs (windowed)");
         let rows = self
             .run_shape(QueryShape::AccountTxsWindowed, params, &sql)
             .await?;
@@ -690,7 +690,7 @@ impl DuneClient {
             contract_hex, min_date_str, from_block, to_capped, limit
         );
 
-        debug!(contract = %contract_hex, from_block, to_block, ?min_block_date, "Querying Dune for contract calls (windowed)");
+        debug!(contract = %contract_hex, from_block, to_block, to_capped, ?min_block_date, "Querying Dune for contract calls (windowed)");
         let rows = self
             .run_shape(QueryShape::ContractCallsWindowed, params, &sql)
             .await?;
@@ -835,15 +835,11 @@ impl DuneClient {
             .run_shape(QueryShape::ProbeActivityDelta, params, &sql)
             .await?;
 
-        let mut probe = AddressActivityProbe::default();
-        if let Some(row) = rows.first() {
-            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            probe.callee_call_count = cnt;
-            probe.callee_min_block = min_b;
-            probe.callee_max_block = max_b;
-        }
+        // Same COUNT/MIN/MAX-over-events shape as `probe_address_activity`,
+        // so reuse its row-shaping — which parses DuneSQL's string-encoded
+        // numerics via parse_json_u64 rather than as_u64 (the latter silently
+        // reads a stringified count as 0, dropping a non-zero delta).
+        let probe = probe_from_rows(&rows);
 
         info!(
             event_count = probe.callee_call_count,
@@ -1169,7 +1165,9 @@ mod tests {
     fn with_persistent_cache_hydrates_in_memory_map() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cache.db");
-        // Seed a persisted id for the known shape.
+        // Seed persisted ids for several shapes — including ones added after
+        // the original probe shape — so a regression in `QueryShape::from_name`
+        // for the newer variants is caught, not just the probe mapping.
         {
             let db = Connection::open(&db_path).unwrap();
             db.execute_batch(
@@ -1180,12 +1178,18 @@ mod tests {
                  );",
             )
             .unwrap();
-            db.execute(
-                "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
-                params!["probe_address_activity", 4242i64, 0i64],
-            )
-            .unwrap();
+            for (shape, qid) in [
+                ("probe_address_activity", 4242i64),
+                ("contract_calls_windowed", 5151i64),
+                ("declare_tx", 6262i64),
+            ] {
+                db.execute(
+                    "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
+                     VALUES (?1, ?2, ?3)",
+                    params![shape, qid, 0i64],
+                )
+                .unwrap();
+            }
         }
 
         let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
@@ -1195,6 +1199,11 @@ mod tests {
             map.get(QueryShape::ProbeAddressActivity.name()).copied(),
             Some(4242)
         );
+        assert_eq!(
+            map.get(QueryShape::ContractCallsWindowed.name()).copied(),
+            Some(5151)
+        );
+        assert_eq!(map.get(QueryShape::DeclareTx.name()).copied(), Some(6262));
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
