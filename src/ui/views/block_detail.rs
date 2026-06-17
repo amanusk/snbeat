@@ -16,7 +16,7 @@ use crate::utils::felt_to_u64;
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // search bar
-        Constraint::Length(8), // block header
+        Constraint::Length(9), // block header
         Constraint::Min(3),    // tx list
         Constraint::Length(1), // status bar
     ])
@@ -83,6 +83,17 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 theme::BLOCK_TX_COUNT_STYLE,
             ),
             Span::raw(format!("  Version: {}", block.starknet_version)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Status: ", theme::NORMAL_STYLE),
+            Span::styled(
+                if block.status.is_empty() {
+                    "—"
+                } else {
+                    block.status.as_str()
+                },
+                theme::finality_style(&block.status),
+            ),
         ]),
     ];
 

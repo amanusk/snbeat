@@ -15,6 +15,12 @@ pub struct SnBlock {
     pub l2_gas_price_fri: u128,
     pub l1_data_gas_price_fri: u128,
     pub starknet_version: String,
+    /// Block finality: "ACCEPTED_ON_L1" / "ACCEPTED_ON_L2" / "PENDING" /
+    /// "REJECTED" / "PRE_CONFIRMED". `serde(default)` keeps blocks cached
+    /// before this field existed deserializable (they get ""), and an empty
+    /// or non-L1 status is treated as not-yet-final so it is re-probed.
+    #[serde(default)]
+    pub status: String,
 }
 
 /// Transaction types on Starknet.

@@ -30,6 +30,17 @@ pub const STATUS_REVERTED: Style = Style::new().fg(Color::Red);
 pub const STATUS_LOADING: Style = Style::new().fg(Color::Yellow);
 pub const STATUS_ERROR: Style = Style::new().fg(Color::Red);
 
+/// Style for a block/transaction finality status string. L1-final is green;
+/// not-yet-final (ACCEPTED_ON_L2 / PRE_CONFIRMED) is yellow; anything else
+/// (empty/unknown) is dimmed. Shared by the block header and tx detail views.
+pub fn finality_style(status: &str) -> Style {
+    match status {
+        "ACCEPTED_ON_L1" => STATUS_OK,
+        "ACCEPTED_ON_L2" | "PRE_CONFIRMED" | "PENDING" => STATUS_LOADING,
+        _ => Style::new().fg(Color::DarkGray),
+    }
+}
+
 // Selection
 pub const SELECTED_STYLE: Style = Style::new()
     .bg(Color::DarkGray)
