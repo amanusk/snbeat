@@ -612,12 +612,14 @@ impl DuneClient {
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
         // DuneSQL (Trino) bigint rejects literals above i64::MAX at parse
-        // time, so an open-ended `to_block` of u64::MAX must be capped — the
-        // cap is far above any real block number so the range is unchanged.
+        // time, so cap both bounds: an open-ended `to_block` of u64::MAX, and
+        // any out-of-range `from_block` (the API is u64). The cap is far above
+        // any real block number, so the range is unchanged in practice.
+        let from_capped = from_block.min(i64::MAX as u64);
         let to_capped = to_block.min(i64::MAX as u64);
         let params = serde_json::json!({
             "sender": sender_hex,
-            "from_block": from_block.to_string(),
+            "from_block": from_capped.to_string(),
             "to_block": to_capped.to_string(),
             "limit": limit.to_string(),
         });
@@ -629,10 +631,10 @@ impl DuneClient {
              AND block_number BETWEEN {} AND {} \
              ORDER BY nonce DESC \
              LIMIT {}",
-            sender_hex, from_block, to_capped, limit
+            sender_hex, from_capped, to_capped, limit
         );
 
-        debug!(sender = %sender_hex, from_block, to_block, to_capped, "Querying Dune for account txs (windowed)");
+        debug!(sender = %sender_hex, from_block, to_block, from_capped, to_capped, "Querying Dune for account txs (windowed)");
         let rows = self
             .run_shape(QueryShape::AccountTxsWindowed, params, &sql)
             .await?;
@@ -665,16 +667,18 @@ impl DuneClient {
         let min_date = min_block_date
             .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2021, 1, 1).expect("valid date"));
         let min_date_str = min_date.format("%Y-%m-%d").to_string();
-        // DuneSQL (Trino) uses bigint for block_number; any literal above i64::MAX
-        // (9_223_372_036_854_775_807) is rejected at parse time as "Invalid numeric
-        // literal" — so a caller passing u64::MAX as "no upper bound" would have
-        // the whole query fail. Cap it at the ceiling: far above any real block,
-        // so `BETWEEN from AND cap` is equivalent to an open-ended `>= from`.
+        // DuneSQL (Trino) uses bigint for block_number; any literal above
+        // i64::MAX (9_223_372_036_854_775_807) is rejected at parse time as
+        // "Invalid numeric literal". Cap both bounds — an open-ended u64::MAX
+        // `to_block` and any out-of-range `from_block` (the API is u64). The
+        // cap is far above any real block, so `BETWEEN from AND cap` stays
+        // equivalent to an open-ended `>= from`.
+        let from_capped = from_block.min(i64::MAX as u64);
         let to_capped = to_block.min(i64::MAX as u64);
         let params = serde_json::json!({
             "contract": contract_hex,
             "min_date": min_date_str,
-            "from_block": from_block.to_string(),
+            "from_block": from_capped.to_string(),
             "to_block": to_capped.to_string(),
             "limit": limit.to_string(),
         });
@@ -688,10 +692,10 @@ impl DuneClient {
              AND call_type = 'CALL' \
              ORDER BY block_number DESC \
              LIMIT {}",
-            contract_hex, min_date_str, from_block, to_capped, limit
+            contract_hex, min_date_str, from_capped, to_capped, limit
         );
 
-        debug!(contract = %contract_hex, from_block, to_block, to_capped, ?min_block_date, "Querying Dune for contract calls (windowed)");
+        debug!(contract = %contract_hex, from_block, to_block, from_capped, to_capped, ?min_block_date, "Querying Dune for contract calls (windowed)");
         let rows = self
             .run_shape(QueryShape::ContractCallsWindowed, params, &sql)
             .await?;
