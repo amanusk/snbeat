@@ -21,7 +21,7 @@ enum QueryShape {
     ProbeAddressActivity,
     /// Delta re-probe: events-from-address above a `from_block` floor.
     ProbeActivityDelta,
-    /// Full-history sender txs (non-windowed fallback).
+    /// Full-history sender txs — the non-windowed shape behind `query_account_txs`.
     AccountTxs,
     /// Sender txs scoped to a `[from_block, to_block]` range.
     AccountTxsWindowed,
@@ -1163,6 +1163,17 @@ mod tests {
     /// Guards the schema-init + hydration wiring as more `QueryShape`s land.
     #[test]
     fn with_persistent_cache_hydrates_in_memory_map() {
+        // One (shape-name, id) per QueryShape variant — keep in sync with the
+        // enum so every from_name mapping is exercised, not just a subset.
+        const SEEDED_SHAPES: [(&str, u64); 6] = [
+            ("probe_address_activity", 4242),
+            ("probe_address_activity_delta", 4343),
+            ("account_txs", 4444),
+            ("account_txs_windowed", 4545),
+            ("contract_calls_windowed", 5151),
+            ("declare_tx", 6262),
+        ];
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cache.db");
         // Seed persisted ids for several shapes — including ones added after
@@ -1178,15 +1189,11 @@ mod tests {
                  );",
             )
             .unwrap();
-            for (shape, qid) in [
-                ("probe_address_activity", 4242i64),
-                ("contract_calls_windowed", 5151i64),
-                ("declare_tx", 6262i64),
-            ] {
+            for (shape, qid) in SEEDED_SHAPES {
                 db.execute(
                     "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
                      VALUES (?1, ?2, ?3)",
-                    params![shape, qid, 0i64],
+                    params![shape, qid as i64, 0i64],
                 )
                 .unwrap();
             }
@@ -1194,16 +1201,17 @@ mod tests {
 
         let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
 
+        // Assert every seeded shape hydrated under its canonical name. Looking
+        // up by the stored string (not via from_name) means a from_name
+        // regression for any one variant surfaces as a missing key here.
         let map = client.persistent_ids.lock().unwrap();
-        assert_eq!(
-            map.get(QueryShape::ProbeAddressActivity.name()).copied(),
-            Some(4242)
-        );
-        assert_eq!(
-            map.get(QueryShape::ContractCallsWindowed.name()).copied(),
-            Some(5151)
-        );
-        assert_eq!(map.get(QueryShape::DeclareTx.name()).copied(), Some(6262));
+        for (shape, qid) in SEEDED_SHAPES {
+            assert_eq!(
+                map.get(shape).copied(),
+                Some(qid),
+                "shape {shape} not hydrated"
+            );
+        }
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
