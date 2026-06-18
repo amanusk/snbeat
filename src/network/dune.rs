@@ -44,8 +44,9 @@ impl QueryShape {
         }
     }
 
-    /// Map a persisted shape name back to its variant. Single source of
-    /// truth for hydration so adding a shape only touches `name()`/here.
+    /// Map a persisted shape name back to its variant — the single source of
+    /// truth for the hydration (name -> variant) mapping. A new shape must be
+    /// added here as well as in `name()`, `sql()`, and `display_name()`.
     fn from_name(name: &str) -> Option<QueryShape> {
         Some(match name {
             "probe_address_activity" => QueryShape::ProbeAddressActivity,
@@ -554,10 +555,10 @@ impl DuneClient {
         limit: u32,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
-        // Partition-pruning floor: kept at Starknet mainnet's first full
-        // year so Dune skips empty partitions for sender lookups, without
-        // silently dropping pre-2025 account history (the previous
-        // 2025-01-01 floor hid legitimate older txs).
+        // Partition-pruning floor: kept at the start of Starknet mainnet's
+        // launch year (2021-01-01) so Dune skips empty partitions for sender
+        // lookups, without silently dropping pre-2025 account history (the
+        // previous 2025-01-01 floor hid legitimate older txs).
         let params = serde_json::json!({
             "sender": sender_hex,
             "limit": limit.to_string(),
@@ -582,23 +583,23 @@ impl DuneClient {
     /// Query calls TO a specific contract address using starknet.calls table.
     /// Returns ContractCallSummary objects sorted by block_number descending.
     ///
-    /// Non-windowed = full mainnet history. Delegates to the windowed shape
-    /// with an open-ended range so we don't register a second persistent
-    /// query or duplicate the row-parsing logic; the 2024 partition floor is
-    /// preserved as the date hint.
+    /// Non-windowed: all calls from the 2024 `block_date` floor to the chain
+    /// tip — the same scope as the original `query_contract_calls`, not
+    /// literally full mainnet history. Delegates to the windowed shape with an
+    /// open-ended block range so we don't register a second persistent query
+    /// or duplicate the row-parsing logic.
     pub async fn query_contract_calls(
         &self,
         contract: Felt,
         limit: u32,
     ) -> Result<Vec<ContractCallSummary>, String> {
-        self.query_contract_calls_windowed(
-            contract,
-            0,
-            u64::MAX,
-            limit,
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 1),
-        )
-        .await
+        // `expect` on a hardcoded valid date: panic loudly rather than let a
+        // future typo silently degrade to the windowed helper's 2021 default
+        // and lose the intended 2024 partition floor.
+        let floor =
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("2024-01-01 is a valid date");
+        self.query_contract_calls_windowed(contract, 0, u64::MAX, limit, Some(floor))
+            .await
     }
 
     /// Windowed variant of `query_account_txs` — scoped to a block range for fast completion.
