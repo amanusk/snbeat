@@ -17,19 +17,60 @@ const DUNE_API_BASE: &str = "https://api.dune.com/api/v1";
 /// query_id stored in `dune_persistent_queries` after first creation.
 #[derive(Debug, Clone, Copy)]
 enum QueryShape {
+    /// Events-from-address COUNT + block range over all of mainnet history.
     ProbeAddressActivity,
+    /// Delta re-probe: events-from-address above a `from_block` floor.
+    ProbeActivityDelta,
+    /// Full-history sender txs — the non-windowed shape behind `query_account_txs`.
+    AccountTxs,
+    /// Sender txs scoped to a `[from_block, to_block]` range.
+    AccountTxsWindowed,
+    /// Calls TO a contract scoped to a range; also serves the non-windowed
+    /// full-history case via an open-ended range (see `query_contract_calls`).
+    ContractCallsWindowed,
+    /// First DECLARE tx for a class hash.
+    DeclareTx,
 }
 
 impl QueryShape {
     fn name(self) -> &'static str {
         match self {
             QueryShape::ProbeAddressActivity => "probe_address_activity",
+            QueryShape::ProbeActivityDelta => "probe_address_activity_delta",
+            QueryShape::AccountTxs => "account_txs",
+            QueryShape::AccountTxsWindowed => "account_txs_windowed",
+            QueryShape::ContractCallsWindowed => "contract_calls_windowed",
+            QueryShape::DeclareTx => "declare_tx",
         }
+    }
+
+    /// Map a persisted shape name back to its variant — the single source of
+    /// truth for the hydration (name -> variant) mapping. A new shape must be
+    /// added here as well as in `name()`, `sql()`, and `display_name()`.
+    fn from_name(name: &str) -> Option<QueryShape> {
+        Some(match name {
+            "probe_address_activity" => QueryShape::ProbeAddressActivity,
+            "probe_address_activity_delta" => QueryShape::ProbeActivityDelta,
+            "account_txs" => QueryShape::AccountTxs,
+            "account_txs_windowed" => QueryShape::AccountTxsWindowed,
+            "contract_calls_windowed" => QueryShape::ContractCallsWindowed,
+            "declare_tx" => QueryShape::DeclareTx,
+            _ => return None,
+        })
     }
 
     /// Parameterized SQL body. Uses Dune's `{{key}}` placeholders so we
     /// can reuse the same query_id across calls (different params) and
     /// avoid the create + archive round trips that `execute_sql` pays.
+    ///
+    /// Substitution is textual: bare `{{x}}` for numeric/hex literals
+    /// (`block_number BETWEEN {{from_block}} AND {{to_block}}`,
+    /// `from_address = {{address}}`), quoted `date '{{min_date}}'` for the
+    /// partition floor. Each `{{key}}` must be supplied by the matching
+    /// `params` map in the calling function (and mirrored in its fallback
+    /// SQL). To prune `block_date` partitions on dense tables, range
+    /// queries carry a `{{min_date}}` floor rather than relying on
+    /// `block_number` alone (which Dune cannot use for partition pruning).
     fn sql(self) -> &'static str {
         match self {
             QueryShape::ProbeAddressActivity => {
@@ -39,6 +80,49 @@ impl QueryShape {
                  WHERE from_address = {{address}} \
                  AND block_date >= date '2021-01-01'"
             }
+            QueryShape::ProbeActivityDelta => {
+                "SELECT COUNT(*) AS cnt, \
+                   MIN(block_number) AS min_block, MAX(block_number) AS max_block \
+                 FROM starknet.events \
+                 WHERE from_address = {{address}} \
+                 AND block_number > {{from_block}}"
+            }
+            QueryShape::AccountTxs => {
+                "SELECT hash, sender_address, nonce, execution_status, revert_reason, \
+                   actual_fee_amount, tip, block_number, block_time, type \
+                 FROM starknet.transactions \
+                 WHERE sender_address = {{sender}} \
+                 AND block_date >= date '2021-01-01' \
+                 ORDER BY nonce DESC \
+                 LIMIT {{limit}}"
+            }
+            QueryShape::AccountTxsWindowed => {
+                "SELECT hash, sender_address, nonce, execution_status, revert_reason, \
+                   actual_fee_amount, tip, block_number, block_time, type \
+                 FROM starknet.transactions \
+                 WHERE sender_address = {{sender}} \
+                 AND block_number BETWEEN {{from_block}} AND {{to_block}} \
+                 ORDER BY nonce DESC \
+                 LIMIT {{limit}}"
+            }
+            QueryShape::ContractCallsWindowed => {
+                "SELECT transaction_hash, caller_address, entry_point_selector, \
+                   block_number, block_time, revert_reason \
+                 FROM starknet.calls \
+                 WHERE contract_address = {{contract}} \
+                 AND block_date >= date '{{min_date}}' \
+                 AND block_number BETWEEN {{from_block}} AND {{to_block}} \
+                 AND call_type = 'CALL' \
+                 ORDER BY block_number DESC \
+                 LIMIT {{limit}}"
+            }
+            QueryShape::DeclareTx => {
+                "SELECT hash, sender_address, block_number, block_time \
+                 FROM starknet.transactions \
+                 WHERE type = 'DECLARE' AND class_hash = {{class_hash}} \
+                 ORDER BY block_number ASC \
+                 LIMIT 1"
+            }
         }
     }
 
@@ -46,6 +130,11 @@ impl QueryShape {
     fn display_name(self) -> &'static str {
         match self {
             QueryShape::ProbeAddressActivity => "snbeat_probe_address_activity",
+            QueryShape::ProbeActivityDelta => "snbeat_probe_address_activity_delta",
+            QueryShape::AccountTxs => "snbeat_account_txs",
+            QueryShape::AccountTxsWindowed => "snbeat_account_txs_windowed",
+            QueryShape::ContractCallsWindowed => "snbeat_contract_calls_windowed",
+            QueryShape::DeclareTx => "snbeat_declare_tx",
         }
     }
 }
@@ -252,13 +341,7 @@ impl DuneClient {
                     });
                     if let Ok(iter) = rows {
                         for (shape, qid) in iter.flatten() {
-                            let key = match shape.as_str() {
-                                "probe_address_activity" => {
-                                    Some(QueryShape::ProbeAddressActivity.name())
-                                }
-                                _ => None,
-                            };
-                            if let Some(k) = key {
+                            if let Some(k) = QueryShape::from_name(&shape).map(|s| s.name()) {
                                 hydrated.insert(k, qid);
                             }
                         }
@@ -424,6 +507,32 @@ impl DuneClient {
         }
     }
 
+    /// Run a query `shape`: try the persistent (parameterized) fast path,
+    /// and on any failure (cache not configured, create/execute error) fall
+    /// back to the ephemeral `execute_sql` create→archive path so semantics
+    /// are unchanged. `fallback_sql` must encode the same query as `shape`
+    /// with the `params` values substituted as literals. Returning the raw
+    /// rows lets each caller parse once instead of duplicating the parse
+    /// across both paths.
+    async fn run_shape(
+        &self,
+        shape: QueryShape,
+        params: serde_json::Value,
+        fallback_sql: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if let Some(qid) = self.get_or_create_persistent_query(shape).await {
+            if let Some(rows) = self.execute_persistent(qid, params).await {
+                debug!(shape = shape.name(), "Dune persistent query: hit");
+                return Ok(rows);
+            }
+            debug!(
+                shape = shape.name(),
+                "Dune persistent query failed; falling back to execute_sql"
+            );
+        }
+        self.execute_sql(fallback_sql).await
+    }
+
     /// Lightweight connectivity / API-key check.
     /// Fetches metadata for a well-known public query (id 1) which is fast
     /// and does not create or execute anything.
@@ -446,10 +555,14 @@ impl DuneClient {
         limit: u32,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
-        // Partition-pruning floor: kept at Starknet mainnet's first full
-        // year so Dune skips empty partitions for sender lookups, without
-        // silently dropping pre-2025 account history (the previous
-        // 2025-01-01 floor hid legitimate older txs).
+        // Partition-pruning floor: kept at the start of Starknet mainnet's
+        // launch year (2021-01-01) so Dune skips empty partitions for sender
+        // lookups, without silently dropping pre-2025 account history (the
+        // previous 2025-01-01 floor hid legitimate older txs).
+        let params = serde_json::json!({
+            "sender": sender_hex,
+            "limit": limit.to_string(),
+        });
         let sql = format!(
             "SELECT hash, sender_address, nonce, execution_status, revert_reason, actual_fee_amount, \
              tip, block_number, block_time, type \
@@ -462,79 +575,31 @@ impl DuneClient {
         );
 
         debug!(sender = %sender_hex, "Querying Dune for account txs");
-        let rows = self.execute_sql(&sql).await?;
+        let rows = self.run_shape(QueryShape::AccountTxs, params, &sql).await?;
         info!(rows = rows.len(), "Dune account txs query complete");
         Ok(parse_dune_rows(&rows))
     }
 
     /// Query calls TO a specific contract address using starknet.calls table.
     /// Returns ContractCallSummary objects sorted by block_number descending.
+    ///
+    /// Non-windowed: all calls from the 2024 `block_date` floor to the chain
+    /// tip — the same scope as the original `query_contract_calls`, not
+    /// literally full mainnet history. Delegates to the windowed shape with an
+    /// open-ended block range so we don't register a second persistent query
+    /// or duplicate the row-parsing logic.
     pub async fn query_contract_calls(
         &self,
         contract: Felt,
         limit: u32,
     ) -> Result<Vec<ContractCallSummary>, String> {
-        let contract_hex = format!("{:#066x}", contract);
-        let sql = format!(
-            "SELECT transaction_hash, caller_address, entry_point_selector, \
-             block_number, block_time, revert_reason \
-             FROM starknet.calls \
-             WHERE contract_address = {} \
-             AND block_date >= date '2024-01-01' \
-             AND call_type = 'CALL' \
-             ORDER BY block_number DESC \
-             LIMIT {}",
-            contract_hex, limit
-        );
-
-        debug!(contract = %contract_hex, "Creating Dune query for contract calls");
-
-        let rows = self.execute_sql(&sql).await?;
-        info!(rows = rows.len(), "Dune contract calls query complete");
-
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let tx_hash = Felt::from_hex(row.get("transaction_hash")?.as_str()?).ok()?;
-                let caller = Felt::from_hex(row.get("caller_address")?.as_str()?).ok()?;
-                let selector_hex = row.get("entry_point_selector")?.as_str().unwrap_or("");
-                let function_name = selector_hex.to_string(); // Will be decoded by caller
-                let block_number = row
-                    .get("block_number")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let block_time = row
-                    .get("block_time")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(s)
-                            .or_else(|_| {
-                                chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %Z")
-                            })
-                            .ok()
-                    })
-                    .map(|dt| dt.timestamp() as u64)
-                    .unwrap_or(0);
-                let revert = row
-                    .get("revert_reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let status = if revert.is_empty() { "OK" } else { "REV" }.to_string();
-
-                Some(ContractCallSummary {
-                    tx_hash,
-                    sender: caller,
-                    function_name,
-                    block_number,
-                    timestamp: block_time,
-                    total_fee_fri: 0, // Not in calls table
-                    status,
-                    nonce: None, // Not in calls table — merged in from RPC/pf path
-                    tip: 0,
-                    inner_targets: Vec::new(), // Dune lacks calldata — filled by RPC enrich path
-                })
-            })
-            .collect())
+        // `expect` on a hardcoded valid date: panic loudly rather than let a
+        // future typo silently degrade to the windowed helper's 2021 default
+        // and lose the intended 2024 partition floor.
+        let floor =
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("2024-01-01 is a valid date");
+        self.query_contract_calls_windowed(contract, 0, u64::MAX, limit, Some(floor))
+            .await
     }
 
     /// Windowed variant of `query_account_txs` — scoped to a block range for fast completion.
@@ -546,6 +611,18 @@ impl DuneClient {
         limit: u32,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
+        // DuneSQL (Trino) bigint rejects literals above i64::MAX at parse
+        // time, so cap both bounds: an open-ended `to_block` of u64::MAX, and
+        // any out-of-range `from_block` (the API is u64). The cap is far above
+        // any real block number, so the range is unchanged in practice.
+        let from_capped = from_block.min(i64::MAX as u64);
+        let to_capped = to_block.min(i64::MAX as u64);
+        let params = serde_json::json!({
+            "sender": sender_hex,
+            "from_block": from_capped.to_string(),
+            "to_block": to_capped.to_string(),
+            "limit": limit.to_string(),
+        });
         let sql = format!(
             "SELECT hash, sender_address, nonce, execution_status, revert_reason, actual_fee_amount, \
              tip, block_number, block_time, type \
@@ -554,11 +631,13 @@ impl DuneClient {
              AND block_number BETWEEN {} AND {} \
              ORDER BY nonce DESC \
              LIMIT {}",
-            sender_hex, from_block, to_block, limit
+            sender_hex, from_capped, to_capped, limit
         );
 
-        debug!(sender = %sender_hex, from_block, to_block, "Querying Dune for account txs (windowed)");
-        let rows = self.execute_sql(&sql).await?;
+        debug!(sender = %sender_hex, from_block, to_block, from_capped, to_capped, "Querying Dune for account txs (windowed)");
+        let rows = self
+            .run_shape(QueryShape::AccountTxsWindowed, params, &sql)
+            .await?;
         info!(
             rows = rows.len(),
             "Dune windowed account txs query complete"
@@ -582,33 +661,44 @@ impl DuneClient {
         min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<Vec<ContractCallSummary>, String> {
         let contract_hex = format!("{:#066x}", contract);
-        let date_clause = min_block_date
-            .map(|d| format!("AND block_date >= date '{}' ", d.format("%Y-%m-%d")))
-            .unwrap_or_default();
-        // DuneSQL (Trino) uses bigint for block_number; any literal above i64::MAX
-        // (9_223_372_036_854_775_807) is rejected at parse time as "Invalid numeric
-        // literal" — so a caller passing u64::MAX as "no upper bound" would have
-        // the whole query fail. Emit an open-ended predicate in that case.
-        let range_clause = if to_block == u64::MAX {
-            format!("AND block_number >= {}", from_block)
-        } else {
-            format!("AND block_number BETWEEN {} AND {}", from_block, to_block)
-        };
+        // The persistent shape has fixed SQL, so the date floor is always
+        // present; default a missing hint to mainnet's first year, which is
+        // equivalent to "no floor" but still lets Dune prune empty partitions.
+        let min_date = min_block_date
+            .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2021, 1, 1).expect("valid date"));
+        let min_date_str = min_date.format("%Y-%m-%d").to_string();
+        // DuneSQL (Trino) uses bigint for block_number; any literal above
+        // i64::MAX (9_223_372_036_854_775_807) is rejected at parse time as
+        // "Invalid numeric literal". Cap both bounds — an open-ended u64::MAX
+        // `to_block` and any out-of-range `from_block` (the API is u64). The
+        // cap is far above any real block, so `BETWEEN from AND cap` stays
+        // equivalent to an open-ended `>= from`.
+        let from_capped = from_block.min(i64::MAX as u64);
+        let to_capped = to_block.min(i64::MAX as u64);
+        let params = serde_json::json!({
+            "contract": contract_hex,
+            "min_date": min_date_str,
+            "from_block": from_capped.to_string(),
+            "to_block": to_capped.to_string(),
+            "limit": limit.to_string(),
+        });
         let sql = format!(
             "SELECT transaction_hash, caller_address, entry_point_selector, \
              block_number, block_time, revert_reason \
              FROM starknet.calls \
              WHERE contract_address = {} \
-             {}\
-             {} \
+             AND block_date >= date '{}' \
+             AND block_number BETWEEN {} AND {} \
              AND call_type = 'CALL' \
              ORDER BY block_number DESC \
              LIMIT {}",
-            contract_hex, date_clause, range_clause, limit
+            contract_hex, min_date_str, from_capped, to_capped, limit
         );
 
-        debug!(contract = %contract_hex, from_block, to_block, ?min_block_date, "Querying Dune for contract calls (windowed)");
-        let rows = self.execute_sql(&sql).await?;
+        debug!(contract = %contract_hex, from_block, to_block, from_capped, to_capped, ?min_block_date, "Querying Dune for contract calls (windowed)");
+        let rows = self
+            .run_shape(QueryShape::ContractCallsWindowed, params, &sql)
+            .await?;
         info!(
             rows = rows.len(),
             "Dune windowed contract calls query complete"
@@ -680,31 +770,13 @@ impl DuneClient {
         address: Felt,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
-        // Fast path: reuse a persistent parameterized query so we skip
-        // the create + archive round trips that `execute_sql` pays on
-        // every call. On any failure (no persistent cache configured,
-        // network glitch on the execute, etc.) fall through to the
-        // ephemeral `execute_sql` path so the probe still completes.
-        if let Some(qid) = self
-            .get_or_create_persistent_query(QueryShape::ProbeAddressActivity)
-            .await
-        {
-            let params = serde_json::json!({ "address": addr_hex });
-            if let Some(rows) = self.execute_persistent(qid, params).await {
-                debug!(address = %addr_hex, "Dune events probe (persistent): hit");
-                return Ok(probe_from_rows(&rows));
-            }
-            debug!(address = %addr_hex, "Dune events probe (persistent): failed; falling back to execute_sql");
-        }
-
-        // Single-shot ephemeral fallback covering all of mainnet history.
-        // Previously the probe ran a date-pruned (`>= '2024-01-01'`) COUNT
-        // first and, on empty result, ran a *second* full-range probe
-        // sequentially — two complete Dune query lifecycles for every
-        // cold/inactive address. The Starknet mainnet launch was in late
-        // 2021 so a 2021-01-01 floor preserves partition pruning (Dune
-        // skips empty pre-mainnet partitions) without ever needing the
-        // second pass.
+        // Persistent parameterized query (fast path) with the ephemeral
+        // `execute_sql` create→archive path as fallback. The fallback SQL
+        // covers all of mainnet history in a single shot: the Starknet
+        // mainnet launch was late 2021, so a 2021-01-01 floor preserves
+        // partition pruning (Dune skips empty pre-mainnet partitions)
+        // without the second full-range pass the probe used to run.
+        let params = serde_json::json!({ "address": addr_hex });
         let sql = format!(
             "SELECT COUNT(*) AS cnt, \
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
@@ -715,7 +787,9 @@ impl DuneClient {
         );
 
         debug!(address = %addr_hex, "Dune events probe: checking address activity range");
-        let rows = self.execute_sql(&sql).await?;
+        let rows = self
+            .run_shape(QueryShape::ProbeAddressActivity, params, &sql)
+            .await?;
 
         // Events-from-address counts inbound activity for account-contracts
         // and emitted events for pure contracts. Both populate callee fields;
@@ -747,6 +821,10 @@ impl DuneClient {
         from_block: u64,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
+        let params = serde_json::json!({
+            "address": addr_hex,
+            "from_block": from_block.to_string(),
+        });
         let sql = format!(
             "SELECT COUNT(*) AS cnt, \
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
@@ -758,17 +836,15 @@ impl DuneClient {
         );
 
         debug!(address = %addr_hex, from_block, "Dune events probe (delta): extending activity range");
-        let rows = self.execute_sql(&sql).await?;
+        let rows = self
+            .run_shape(QueryShape::ProbeActivityDelta, params, &sql)
+            .await?;
 
-        let mut probe = AddressActivityProbe::default();
-        if let Some(row) = rows.first() {
-            let cnt = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
-            let min_b = row.get("min_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            let max_b = row.get("max_block").and_then(|v| v.as_u64()).unwrap_or(0);
-            probe.callee_call_count = cnt;
-            probe.callee_min_block = min_b;
-            probe.callee_max_block = max_b;
-        }
+        // Same COUNT/MIN/MAX-over-events shape as `probe_address_activity`,
+        // so reuse its row-shaping — which parses DuneSQL's string-encoded
+        // numerics via parse_json_u64 rather than as_u64 (the latter silently
+        // reads a stringified count as 0, dropping a non-zero delta).
+        let probe = probe_from_rows(&rows);
 
         info!(
             event_count = probe.callee_call_count,
@@ -785,6 +861,7 @@ impl DuneClient {
         class_hash: Felt,
     ) -> Result<Option<crate::data::types::ClassDeclareInfo>, String> {
         let hash_hex = format!("{:#066x}", class_hash);
+        let params = serde_json::json!({ "class_hash": hash_hex });
         let sql = format!(
             "SELECT hash, sender_address, block_number, block_time \
              FROM starknet.transactions \
@@ -795,7 +872,7 @@ impl DuneClient {
         );
 
         debug!(class_hash = %hash_hex, "Querying Dune for declare tx");
-        let rows = self.execute_sql(&sql).await?;
+        let rows = self.run_shape(QueryShape::DeclareTx, params, &sql).await?;
 
         if let Some(row) = rows.first() {
             let tx_hash = row
@@ -1091,9 +1168,22 @@ mod tests {
     /// Guards the schema-init + hydration wiring as more `QueryShape`s land.
     #[test]
     fn with_persistent_cache_hydrates_in_memory_map() {
+        // One (shape-name, id) per QueryShape variant — keep in sync with the
+        // enum so every from_name mapping is exercised, not just a subset.
+        const SEEDED_SHAPES: [(&str, u64); 6] = [
+            ("probe_address_activity", 4242),
+            ("probe_address_activity_delta", 4343),
+            ("account_txs", 4444),
+            ("account_txs_windowed", 4545),
+            ("contract_calls_windowed", 5151),
+            ("declare_tx", 6262),
+        ];
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cache.db");
-        // Seed a persisted id for the known shape.
+        // Seed persisted ids for several shapes — including ones added after
+        // the original probe shape — so a regression in `QueryShape::from_name`
+        // for the newer variants is caught, not just the probe mapping.
         {
             let db = Connection::open(&db_path).unwrap();
             db.execute_batch(
@@ -1104,21 +1194,29 @@ mod tests {
                  );",
             )
             .unwrap();
-            db.execute(
-                "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
-                params!["probe_address_activity", 4242i64, 0i64],
-            )
-            .unwrap();
+            for (shape, qid) in SEEDED_SHAPES {
+                db.execute(
+                    "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
+                     VALUES (?1, ?2, ?3)",
+                    params![shape, qid as i64, 0i64],
+                )
+                .unwrap();
+            }
         }
 
         let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
 
+        // Assert every seeded shape hydrated under its canonical name. Looking
+        // up by the stored string (not via from_name) means a from_name
+        // regression for any one variant surfaces as a missing key here.
         let map = client.persistent_ids.lock().unwrap();
-        assert_eq!(
-            map.get(QueryShape::ProbeAddressActivity.name()).copied(),
-            Some(4242)
-        );
+        for (shape, qid) in SEEDED_SHAPES {
+            assert_eq!(
+                map.get(shape).copied(),
+                Some(qid),
+                "shape {shape} not hydrated"
+            );
+        }
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
