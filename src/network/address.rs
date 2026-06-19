@@ -3958,8 +3958,8 @@ pub(super) async fn fetch_address_contract_calls(
     // the `block_number BETWEEN` range and fails with QUERY_STATE_FAILED on
     // dense contracts. A 1-day UTC cushion guards against the cached row
     // sitting right before a day boundary.
-    let cached_calls = ds.load_cached_address_calls(&address);
-    let newest_cached_pair = cached_calls
+    let newest_cached_pair = ds
+        .load_cached_address_calls(&address)
         .iter()
         .filter(|c| c.block_number > 0)
         .max_by_key(|c| c.block_number)
@@ -4038,7 +4038,76 @@ pub(super) async fn fetch_address_contract_calls(
         None => None,
     };
 
-    let plan = pick_calls_dune_query(newest_cached_pair, deploy_floor, deploy_floor_ts);
+    // Warm cache: only fetch blocks newer than the highest cached row
+    // (TopDelta), reusing the cached row's date as a partition hint. One query,
+    // then emit.
+    if newest_cached_pair.is_some() {
+        let plan = pick_calls_dune_query(newest_cached_pair, deploy_floor, deploy_floor_ts);
+        match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
+            Ok(dune_calls) => {
+                persist_and_emit_calls(
+                    address, dune_calls, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                )
+                .await
+            }
+            Err(e) => {
+                warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls fetch failed")
+            }
+        }
+        return;
+    }
+
+    // Cold cache: show the recent tail FIRST. `starknet.calls` is partitioned by
+    // `block_date`, so a recent date floor prunes to a handful of partitions and
+    // returns in a few seconds — versus the deploy-scoped query below, which
+    // scans the contract's entire lifetime (deploy..tip) and can take 30s+ on a
+    // long-lived contract. Render recent calls immediately, then backfill older
+    // history only if the recent window didn't already fill a page (active
+    // contracts skip the expensive scan; older calls load via pagination).
+    const RECENT_CALLS_DAYS: i64 = 14;
+    let recent_min_date =
+        chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_CALLS_DAYS);
+    let recent_from = deploy_floor.unwrap_or(0);
+    let recent_filled = match dune_client
+        .query_contract_calls_windowed(
+            address,
+            recent_from,
+            u64::MAX,
+            CONTRACT_CALL_LIMIT,
+            Some(recent_min_date),
+        )
+        .await
+    {
+        Ok(recent) => {
+            let filled = recent.len() as u32 >= CONTRACT_CALL_LIMIT;
+            info!(
+                addr = %format!("{:#x}", address),
+                recent_calls = recent.len(),
+                recent_days = RECENT_CALLS_DAYS,
+                "Calls: recent-window first paint"
+            );
+            persist_and_emit_calls(
+                address, recent, abi_reg, ds, pf, action_tx, nonce, class_hash,
+            )
+            .await;
+            filled
+        }
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; falling back to full backfill");
+            false
+        }
+    };
+
+    // Recent window already filled a page → older calls load via pagination;
+    // skip the expensive lifetime scan.
+    if recent_filled {
+        return;
+    }
+
+    // Backfill older history: deploy-scoped (deploy..tip with the deploy date as
+    // partition hint) or, if the deploy block/date is unknown, the legacy
+    // unwindowed query.
+    let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
     if let CallsDuneQuery::DeployScoped {
         from_block,
         min_date,
@@ -4048,22 +4117,43 @@ pub(super) async fn fetch_address_contract_calls(
             addr = %format!("{:#x}", address),
             from_block,
             ?min_date,
-            "Calls: cold-cache windowed Dune query (deploy-scoped)"
+            "Calls: cold-cache backfill Dune query (deploy-scoped)"
         );
     }
-    let dune_calls_result = match plan {
+    match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
+        Ok(dune_calls) => {
+            info!(
+                addr = %format!("{:#x}", address),
+                calls = dune_calls.len(),
+                "Calls: Dune contract calls backfill complete"
+            );
+            persist_and_emit_calls(
+                address, dune_calls, abi_reg, ds, pf, action_tx, nonce, class_hash,
+            )
+            .await
+        }
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls backfill failed")
+        }
+    }
+}
+
+/// Execute the chosen [`CallsDuneQuery`] variant against Dune and return the
+/// raw rows. Shared by the warm-cache TopDelta path and the cold-cache
+/// deploy-scoped backfill.
+async fn run_calls_dune_plan(
+    plan: &CallsDuneQuery,
+    dune_client: &Arc<dune::DuneClient>,
+    address: starknet::core::types::Felt,
+    limit: u32,
+) -> Result<Vec<crate::data::types::ContractCallSummary>, String> {
+    match plan {
         CallsDuneQuery::TopDelta {
             from_block,
             min_date,
         } => {
             dune_client
-                .query_contract_calls_windowed(
-                    address,
-                    from_block,
-                    u64::MAX,
-                    CONTRACT_CALL_LIMIT,
-                    min_date,
-                )
+                .query_contract_calls_windowed(address, *from_block, u64::MAX, limit, *min_date)
                 .await
         }
         CallsDuneQuery::DeployScoped {
@@ -4073,47 +4163,44 @@ pub(super) async fn fetch_address_contract_calls(
             dune_client
                 .query_contract_calls_windowed(
                     address,
-                    from_block,
+                    *from_block,
                     u64::MAX,
-                    CONTRACT_CALL_LIMIT,
-                    Some(min_date),
+                    limit,
+                    Some(*min_date),
                 )
                 .await
         }
-        CallsDuneQuery::Unwindowed => {
-            dune_client
-                .query_contract_calls(address, CONTRACT_CALL_LIMIT)
-                .await
-        }
-    };
+        CallsDuneQuery::Unwindowed => dune_client.query_contract_calls(address, limit).await,
+    }
+}
 
-    let dune_calls = match dune_calls_result {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls fetch failed");
-            return;
-        }
-    };
-
+/// Enrich raw Dune contract calls, merge with the current cache, persist, and
+/// emit them to the UI. Shared by the recent-window first paint and the
+/// deploy-scoped backfill so each phase streams as soon as it lands. Reloads
+/// the cache on each call so a later phase merges on top of an earlier one.
+#[allow(clippy::too_many_arguments)]
+async fn persist_and_emit_calls(
+    address: starknet::core::types::Felt,
+    dune_calls: Vec<crate::data::types::ContractCallSummary>,
+    abi_reg: &Arc<AbiRegistry>,
+    ds: &Arc<dyn crate::data::DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+    nonce: starknet::core::types::Felt,
+    class_hash: Option<starknet::core::types::Felt>,
+) {
     // Resolve selectors, dedupe, and backfill real sender + fee + timestamp.
     // Dune's `starknet.calls.caller_address` is the immediate caller (often a
     // router like Ekubo), not the outer tx sender; `enrich_dune_calls` replaces
     // it with `fetched_tx.sender()` and fills in fee/timestamp from the receipt.
     let calls = enrich_dune_calls(address, dune_calls, abi_reg, ds, pf, action_tx).await;
 
-    info!(
-        addr = %format!("{:#x}", address),
-        calls = calls.len(),
-        "Calls: Dune contract calls complete"
-    );
-
-    // Merge the freshly fetched rows with whatever we already had cached before
-    // persisting. The windowed TopDelta path only returns rows newer than the
-    // previously seen tip, so writing just `calls` would clobber the bulk of
-    // the cache. Cold-cache path still works: `cached_calls` is empty there,
-    // and `deduplicate_contract_calls` returns the full 500-row set unchanged.
+    // Merge with whatever is already cached before persisting — a windowed
+    // fetch only returns part of the history, so writing just `calls` would
+    // clobber the rest. `deduplicate_contract_calls` collapses overlap between
+    // the recent-window and backfill phases.
     if !calls.is_empty() {
-        let mut merged = cached_calls;
+        let mut merged = ds.load_cached_address_calls(&address);
         merged.extend(calls.iter().cloned());
         let merged = crate::data::types::deduplicate_contract_calls(merged);
         ds.save_address_calls(&address, &merged);
