@@ -185,6 +185,19 @@ struct ExecutionResult {
     rows: Vec<serde_json::Value>,
 }
 
+/// Outcome of executing a persistent (parameterized) query. Distinguishes a
+/// permanently-dead `query_id` (deleted/archived externally) from an ordinary
+/// failure so `run_shape` can evict + recreate the former rather than pinning
+/// the shape to the slow path forever.
+enum PersistentOutcome {
+    Rows(Vec<serde_json::Value>),
+    /// The persisted `query_id` is no longer usable on Dune (archived → 403,
+    /// or deleted → 404/410) — evict it and recreate on the next call.
+    Stale,
+    /// Transient/other failure — fall back to `execute_sql` this call.
+    Failed,
+}
+
 /// RAII archive trigger for ephemeral queries created by `execute_sql`.
 /// Dropping this fires a detached archive POST so the query doesn't leak on
 /// the Dune account when the awaiting future is cancelled mid-poll. Cleanup
@@ -437,28 +450,46 @@ impl DuneClient {
         Some(qid)
     }
 
-    /// Execute a persistent (parameterized) Dune query and return rows.
-    /// Cheap relative to `execute_sql`: no create, no archive — just
-    /// execute + poll. Returns None on failure so callers can fall back
-    /// to `execute_sql`.
+    /// Execute a persistent (parameterized) Dune query and return its rows.
+    /// Cheap relative to `execute_sql`: no create, no archive, just an execute
+    /// then poll. If the persisted `query_id` was archived/deleted externally
+    /// the execute POST rejects it (`Stale`, so the caller can evict it); any
+    /// other failure is `Failed` (fall back).
     async fn execute_persistent(
         &self,
         query_id: u64,
-        params_map: serde_json::Value,
-    ) -> Option<Vec<serde_json::Value>> {
-        let exec_resp: ExecuteResponse = self
+        params_map: &serde_json::Value,
+    ) -> PersistentOutcome {
+        let resp = match self
             .client
             .post(format!("{}/query/{}/execute", DUNE_API_BASE, query_id))
             .header("X-Dune-API-Key", &self.api_key)
             .json(&serde_json::json!({ "query_parameters": params_map }))
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(_) => return PersistentOutcome::Failed,
+        };
+        // An archived query_id returns 403 ("Query is archived or an unsaved
+        // query"); a hard-deleted one would be 404/410. These are the signals
+        // that the cached id is permanently stale (vs a transient 5xx/timeout,
+        // which must NOT evict). Everything else falls back to execute_sql.
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::GONE
+        ) {
+            return PersistentOutcome::Stale;
+        }
+        let exec_resp: ExecuteResponse = match resp.error_for_status() {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return PersistentOutcome::Failed,
+            },
+            Err(_) => return PersistentOutcome::Failed,
+        };
         let execution_id = exec_resp.execution_id;
 
         // Same polling cadence as execute_sql — poll immediately, back
@@ -466,7 +497,7 @@ impl DuneClient {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let mut delay = Duration::from_millis(250);
         loop {
-            let status: ExecutionStatusResponse = self
+            let status: ExecutionStatusResponse = match self
                 .client
                 .get(format!(
                     "{}/execution/{}/results",
@@ -475,25 +506,29 @@ impl DuneClient {
                 .header("X-Dune-API-Key", &self.api_key)
                 .send()
                 .await
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .json()
-                .await
-                .ok()?;
+                .and_then(|r| r.error_for_status())
+            {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(_) => return PersistentOutcome::Failed,
+                },
+                Err(_) => return PersistentOutcome::Failed,
+            };
             match status.state.as_str() {
                 "QUERY_STATE_COMPLETED" => {
-                    return Some(status.result.map(|r| r.rows).unwrap_or_default());
+                    return PersistentOutcome::Rows(
+                        status.result.map(|r| r.rows).unwrap_or_default(),
+                    );
                 }
                 "QUERY_STATE_FAILED" | "QUERY_STATE_CANCELLED" | "QUERY_STATE_EXPIRED" => {
                     warn!(query_id, state = %status.state, "Dune persistent execute failed");
-                    return None;
+                    return PersistentOutcome::Failed;
                 }
                 _ => {
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
                         warn!(query_id, "Dune persistent execute timed out");
-                        return None;
+                        return PersistentOutcome::Failed;
                     }
                     // Cap the sleep to the remaining budget so a final
                     // pre-sleep deadline check just under the cap can't push
@@ -504,6 +539,24 @@ impl DuneClient {
                     delay = (delay * 2).min(Duration::from_secs(2));
                 }
             }
+        }
+    }
+
+    /// Drop a shape's cached `query_id` from both the in-memory map and the
+    /// SQLite table, so the next `get_or_create_persistent_query` recreates
+    /// it. Called when Dune reports the persisted id no longer exists.
+    fn evict_persistent_query(&self, shape: QueryShape) {
+        if let Ok(mut g) = self.persistent_ids.lock() {
+            g.remove(shape.name());
+        }
+        if let Some(db_mutex) = self.persistent_db.as_ref()
+            && let Ok(db) = db_mutex.lock()
+            && let Err(e) = db.execute(
+                "DELETE FROM dune_persistent_queries WHERE shape = ?1",
+                params![shape.name()],
+            )
+        {
+            warn!(shape = shape.name(), error = %e, "Dune persistent cache: failed to evict stale query_id");
         }
     }
 
@@ -521,14 +574,29 @@ impl DuneClient {
         fallback_sql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
         if let Some(qid) = self.get_or_create_persistent_query(shape).await {
-            if let Some(rows) = self.execute_persistent(qid, params).await {
-                debug!(shape = shape.name(), "Dune persistent query: hit");
-                return Ok(rows);
+            match self.execute_persistent(qid, &params).await {
+                PersistentOutcome::Rows(rows) => {
+                    debug!(shape = shape.name(), "Dune persistent query: hit");
+                    return Ok(rows);
+                }
+                PersistentOutcome::Stale => {
+                    // The stored id was archived/deleted externally. Evict it
+                    // so the next call recreates a fresh one; fall back to
+                    // execute_sql for this call.
+                    warn!(
+                        shape = shape.name(),
+                        query_id = qid,
+                        "Dune persistent query_id archived/deleted externally; evicting so it is recreated next call"
+                    );
+                    self.evict_persistent_query(shape);
+                }
+                PersistentOutcome::Failed => {
+                    debug!(
+                        shape = shape.name(),
+                        "Dune persistent query failed; falling back to execute_sql"
+                    );
+                }
             }
-            debug!(
-                shape = shape.name(),
-                "Dune persistent query failed; falling back to execute_sql"
-            );
         }
         self.execute_sql(fallback_sql).await
     }
@@ -1217,6 +1285,67 @@ mod tests {
                 "shape {shape} not hydrated"
             );
         }
+    }
+
+    /// `evict_persistent_query` must clear a stale id from BOTH the in-memory
+    /// map and the SQLite table — otherwise a restart re-hydrates the dead id
+    /// and the fast path never recovers (the #78 regression).
+    #[test]
+    fn evict_persistent_query_clears_memory_and_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                    shape TEXT PRIMARY KEY,
+                    query_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params!["declare_tx", 6262i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
+        // Sanity: hydrated before eviction.
+        assert_eq!(
+            client
+                .persistent_ids
+                .lock()
+                .unwrap()
+                .get("declare_tx")
+                .copied(),
+            Some(6262)
+        );
+
+        client.evict_persistent_query(QueryShape::DeclareTx);
+
+        // Gone from the in-memory map...
+        assert!(
+            client
+                .persistent_ids
+                .lock()
+                .unwrap()
+                .get("declare_tx")
+                .is_none(),
+            "stale id still in memory after evict"
+        );
+        // ...and from SQLite, so a re-hydrate won't bring it back.
+        let db = client.persistent_db.as_ref().unwrap().lock().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM dune_persistent_queries WHERE shape = 'declare_tx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale id still in SQLite after evict");
     }
 
     /// Public hybrid account (Cartridge Controller class) with both sender-side
