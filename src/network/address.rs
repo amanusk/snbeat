@@ -3965,84 +3965,12 @@ pub(super) async fn fetch_address_contract_calls(
         .max_by_key(|c| c.block_number)
         .map(|c| (c.block_number, c.timestamp));
 
-    // Cold-cache path: resolve a deploy-block floor before deciding the Dune
-    // query variant. Sources, in order: cached deploy_info → cached
-    // class_history → pf class-history (~500ms) → Voyager label (~600ms).
-    // Either pf or voyager unblocks the deploy-scoped query; the cold path
-    // works against RPC + Voyager alone when pf isn't wired up.
-    let mut deploy_floor: Option<u64> = None;
-    if newest_cached_pair.is_none() {
-        deploy_floor = ds
-            .load_cached_deploy_info(&address)
-            .map(|(_, block, _)| block)
-            .or_else(|| {
-                ds.load_cached_class_history(&address)
-                    .iter()
-                    .map(|e| e.block_number)
-                    .min()
-            });
-
-        // PF and Voyager are independent network calls (~500ms and ~600ms
-        // respectively). Run them concurrently rather than awaiting PF and
-        // only then awaiting Voyager on miss — the cold-cache path takes
-        // ~max(pf, voyager) instead of pf+voyager. PF is still preferred:
-        // we use Voyager's deploy_block only when PF returned nothing.
-        if deploy_floor.is_none() {
-            let pf_fut = async {
-                if let Some(pf_client) = pf {
-                    Some(pf_client.get_class_history(address).await)
-                } else {
-                    None
-                }
-            };
-            let voyager_fut = async {
-                if let Some(vc) = voyager_c {
-                    Some(vc.get_label(address).await)
-                } else {
-                    None
-                }
-            };
-            let (pf_result, voyager_result) = tokio::join!(pf_fut, voyager_fut);
-
-            if let Some(Ok(entries)) = &pf_result {
-                if !entries.is_empty() {
-                    ds.save_class_history(&address, entries);
-                }
-                deploy_floor = entries.iter().map(|e| e.block_number).min();
-            } else if let Some(Err(e)) = &pf_result {
-                debug!(
-                    addr = %format!("{:#x}", address),
-                    error = %e,
-                    "Calls: pf class-history fetch failed; trying Voyager"
-                );
-            }
-
-            if deploy_floor.is_none() {
-                match voyager_result {
-                    Some(Ok(label)) => deploy_floor = label.deploy_block,
-                    Some(Err(e)) => debug!(
-                        addr = %format!("{:#x}", address),
-                        error = %e,
-                        "Calls: Voyager label fetch failed"
-                    ),
-                    None => {}
-                }
-            }
-        }
-    }
-
-    // Block timestamp for the deploy floor. `ds.get_block` serves from cache
-    // or falls back to RPC, so this works without pf.
-    let deploy_floor_ts = match deploy_floor {
-        Some(b) => ds.get_block(b).await.ok().map(|blk| blk.timestamp),
-        None => None,
-    };
-
     // Warm cache: only fetch blocks newer than the highest cached row
     // (TopDelta), reusing the cached row's date as a partition hint. One query,
-    // then emit.
+    // then emit. TopDelta needs neither the deploy floor nor a recent probe, so
+    // none is resolved on this path.
     if newest_cached_pair.is_some() {
-        let plan = pick_calls_dune_query(newest_cached_pair, deploy_floor, deploy_floor_ts);
+        let plan = pick_calls_dune_query(newest_cached_pair, None, None);
         match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
             Ok(dune_calls) => {
                 persist_and_emit_calls(
@@ -4064,14 +3992,19 @@ pub(super) async fn fetch_address_contract_calls(
     // long-lived contract. Render recent calls immediately, then backfill older
     // history only if the recent window didn't already fill a page (active
     // contracts skip the expensive scan; older calls load via pagination).
+    //
+    // This query needs no deploy floor — the recent `block_date` floor does the
+    // pruning and `from_block = 0` is a harmless lower bound — so deploy-floor
+    // resolution (PF/Voyager + block timestamp) is deferred to the backfill
+    // below, keeping first paint off those round-trips and skipping them
+    // entirely when the recent window fills the page.
     const RECENT_CALLS_DAYS: i64 = 14;
     let recent_min_date =
         chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_CALLS_DAYS);
-    let recent_from = deploy_floor.unwrap_or(0);
     let recent_filled = match dune_client
         .query_contract_calls_windowed(
             address,
-            recent_from,
+            0,
             u64::MAX,
             CONTRACT_CALL_LIMIT,
             Some(recent_min_date),
@@ -4106,7 +4039,10 @@ pub(super) async fn fetch_address_contract_calls(
 
     // Backfill older history: deploy-scoped (deploy..tip with the deploy date as
     // partition hint) or, if the deploy block/date is unknown, the legacy
-    // unwindowed query.
+    // unwindowed query. The deploy floor is resolved here (not before the recent
+    // paint), so its PF/Voyager + block-timestamp round-trips only run when a
+    // backfill is actually needed.
+    let (deploy_floor, deploy_floor_ts) = resolve_deploy_floor(address, ds, pf, voyager_c).await;
     let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
     if let CallsDuneQuery::DeployScoped {
         from_block,
@@ -4136,6 +4072,82 @@ pub(super) async fn fetch_address_contract_calls(
             warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls backfill failed")
         }
     }
+}
+
+/// Resolve a contract's deploy-block floor and that block's timestamp — the
+/// partition hint for the deploy-scoped calls backfill. Sources, in order:
+/// cached deploy_info → cached class_history → pf class-history (~500ms) →
+/// Voyager label (~600ms), then the floor block's timestamp (cache or RPC).
+/// PF and Voyager are independent so they run concurrently (`~max` not sum);
+/// PF wins, Voyager's `deploy_block` is the fallback. Only called on the cold
+/// backfill path — the recent-window first paint doesn't need it.
+async fn resolve_deploy_floor(
+    address: starknet::core::types::Felt,
+    ds: &Arc<dyn crate::data::DataSource>,
+    pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
+    voyager_c: Option<&Arc<voyager::VoyagerClient>>,
+) -> (Option<u64>, Option<u64>) {
+    let mut deploy_floor: Option<u64> = ds
+        .load_cached_deploy_info(&address)
+        .map(|(_, block, _)| block)
+        .or_else(|| {
+            ds.load_cached_class_history(&address)
+                .iter()
+                .map(|e| e.block_number)
+                .min()
+        });
+
+    if deploy_floor.is_none() {
+        let pf_fut = async {
+            if let Some(pf_client) = pf {
+                Some(pf_client.get_class_history(address).await)
+            } else {
+                None
+            }
+        };
+        let voyager_fut = async {
+            if let Some(vc) = voyager_c {
+                Some(vc.get_label(address).await)
+            } else {
+                None
+            }
+        };
+        let (pf_result, voyager_result) = tokio::join!(pf_fut, voyager_fut);
+
+        if let Some(Ok(entries)) = &pf_result {
+            if !entries.is_empty() {
+                ds.save_class_history(&address, entries);
+            }
+            deploy_floor = entries.iter().map(|e| e.block_number).min();
+        } else if let Some(Err(e)) = &pf_result {
+            debug!(
+                addr = %format!("{:#x}", address),
+                error = %e,
+                "Calls: pf class-history fetch failed; trying Voyager"
+            );
+        }
+
+        if deploy_floor.is_none() {
+            match voyager_result {
+                Some(Ok(label)) => deploy_floor = label.deploy_block,
+                Some(Err(e)) => debug!(
+                    addr = %format!("{:#x}", address),
+                    error = %e,
+                    "Calls: Voyager label fetch failed"
+                ),
+                None => {}
+            }
+        }
+    }
+
+    // `ds.get_block` serves from cache or falls back to RPC, so this works
+    // without pf.
+    let deploy_floor_ts = match deploy_floor {
+        Some(b) => ds.get_block(b).await.ok().map(|blk| blk.timestamp),
+        None => None,
+    };
+
+    (deploy_floor, deploy_floor_ts)
 }
 
 /// Execute the chosen [`CallsDuneQuery`] variant against Dune and return the
