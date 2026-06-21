@@ -1276,34 +1276,41 @@ pub(super) async fn fetch_and_send_address_info(
                         }
                     }
                     None => {
-                        // Recent-first events probe. A small recent window is
-                        // partition-pruned to ~2 weeks of `block_date` and
-                        // returns in a few seconds, giving the UI an immediate
-                        // lower-bound count/range; the full-history probe then
-                        // refines it in the background. Recent <= full, so the
-                        // count only grows — publishing recent-then-full is
-                        // monotonic and never regresses the `shown / known+`
-                        // hint. The recent result is NOT persisted (only the
-                        // full probe is authoritative — see `publish`).
+                        // Recent + full events probes run CONCURRENTLY, never
+                        // serially: a recent-window probe (partition-pruned to
+                        // ~2 weeks) can give a fast lower-bound count/range, but
+                        // it must NEVER gate the authoritative full-history
+                        // probe — on a recently-inactive address the recent
+                        // probe returns 0 and only adds latency. Publish recent
+                        // only if it lands before full (full's count >= recent's,
+                        // so the `shown / known+` hint only grows, never
+                        // regresses); if full lands first, the recent probe is
+                        // dropped (cancelled). Recent is not persisted — only the
+                        // authoritative full probe is (see `publish`).
                         const RECENT_PROBE_DAYS: i64 = 14;
                         let _ = tx_probe.send(Action::LoadingStatus(
-                            "Dune: probing recent activity (events)...".into(),
+                            "Dune: probing activity range (events)...".into(),
                         ));
                         let recent_min = chrono::Utc::now().date_naive()
                             - chrono::Duration::days(RECENT_PROBE_DAYS);
-                        if let Ok(recent) = dune_c
-                            .probe_address_activity(address, Some(recent_min))
-                            .await
-                            && recent.has_activity()
-                        {
-                            publish(recent, "Dune probe (recent)", false);
-                        }
+                        let recent_fut = dune_c.probe_address_activity(address, Some(recent_min));
+                        let full_fut = dune_c.probe_address_activity(address, None);
+                        tokio::pin!(recent_fut, full_fut);
 
-                        // Full-history refine: authoritative count/range, persisted.
-                        let _ = tx_probe.send(Action::LoadingStatus(
-                            "Dune: probing full activity range (events)...".into(),
-                        ));
-                        match dune_c.probe_address_activity(address, None).await {
+                        let full_result = tokio::select! {
+                            full = &mut full_fut => full,
+                            recent = &mut recent_fut => {
+                                if let Ok(recent) = recent
+                                    && recent.has_activity()
+                                {
+                                    publish(recent, "Dune probe (recent)", false);
+                                }
+                                // Recent landed first (or errored); await the
+                                // authoritative full probe, still in flight.
+                                (&mut full_fut).await
+                            }
+                        };
+                        match full_result {
                             Ok(probe) => publish(probe, "Dune probe", true),
                             Err(e) => {
                                 warn!(error = %e, "Dune activity probe failed");
@@ -4082,78 +4089,86 @@ pub(super) async fn fetch_address_contract_calls(
         return;
     }
 
-    // Cold cache: show the recent tail FIRST. `starknet.calls` is partitioned by
-    // `block_date`, so a recent date floor prunes to a handful of partitions and
-    // returns in a few seconds — versus the deploy-scoped query below, which
-    // scans the contract's entire lifetime (deploy..tip) and can take 30s+ on a
-    // long-lived contract. Render recent calls immediately, then backfill older
-    // history only if the recent window didn't already fill a page (active
-    // contracts skip the expensive scan; older calls load via pagination).
-    //
-    // This query needs no deploy floor — the recent `block_date` floor does the
-    // pruning and `from_block = 0` is a harmless lower bound — so deploy-floor
-    // resolution (PF/Voyager + block timestamp) is deferred to the backfill
-    // below, keeping first paint off those round-trips and skipping them
-    // entirely when the recent window fills the page.
+    // Cold cache: fire the recent-window paint AND the deploy-scoped backfill
+    // CONCURRENTLY, never serially. `starknet.calls` is partitioned by
+    // `block_date`, so a recent date floor prunes to a handful of partitions —
+    // but on a recently-inactive contract that window returns 0 rows and is
+    // still a heavy scan, so gating the backfill behind it left the Calls tab
+    // empty for minutes. The deploy-scoped backfill returns the 500 most-recent
+    // calls (deploy..tip DESC) — a superset of the recent window — so whichever
+    // returns first paints something, and `persist_and_emit_calls` dedups the
+    // overlap. If the recent window fills a full page first (active contract),
+    // the backfill is cancelled to avoid the expensive lifetime scan; otherwise
+    // the backfill supersedes it. Deploy-floor resolution (PF/Voyager + block
+    // timestamp) runs inside the backfill future, so it never delays the recent
+    // first paint.
     const RECENT_CALLS_DAYS: i64 = 14;
     let recent_min_date =
         chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_CALLS_DAYS);
-    let recent_filled = match dune_client
-        .query_contract_calls_windowed(
-            address,
-            0,
-            u64::MAX,
-            CONTRACT_CALL_LIMIT,
-            Some(recent_min_date),
-        )
-        .await
-    {
-        Ok(recent) => {
-            let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
-            info!(
+    let recent_fut = dune_client.query_contract_calls_windowed(
+        address,
+        0,
+        u64::MAX,
+        CONTRACT_CALL_LIMIT,
+        Some(recent_min_date),
+    );
+    let backfill_fut = async {
+        let (deploy_floor, deploy_floor_ts) =
+            resolve_deploy_floor(address, ds, pf, voyager_c).await;
+        let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
+        if let CallsDuneQuery::DeployScoped {
+            from_block,
+            min_date,
+        } = &plan
+        {
+            debug!(
                 addr = %format!("{:#x}", address),
-                recent_calls = recent.len(),
-                recent_days = RECENT_CALLS_DAYS,
-                "Calls: recent-window first paint"
+                from_block,
+                ?min_date,
+                "Calls: cold-cache backfill Dune query (deploy-scoped)"
             );
-            persist_and_emit_calls(
-                address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
-            )
-            .await;
-            filled
         }
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; falling back to full backfill");
-            false
+        run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await
+    };
+    tokio::pin!(recent_fut, backfill_fut);
+
+    // First arm to fire wins first paint. The loop runs at most twice: once for
+    // recent (if it lands first and doesn't fill a page) and once for backfill.
+    let mut recent_done = false;
+    let backfill_result = loop {
+        tokio::select! {
+            recent = &mut recent_fut, if !recent_done => {
+                recent_done = true;
+                match recent {
+                    Ok(recent) => {
+                        let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
+                        info!(
+                            addr = %format!("{:#x}", address),
+                            recent_calls = recent.len(),
+                            recent_days = RECENT_CALLS_DAYS,
+                            "Calls: recent-window first paint"
+                        );
+                        persist_and_emit_calls(
+                            address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                        )
+                        .await;
+                        // Active contract: a full recent page already covers the
+                        // most-recent calls; cancel the backfill (drop its future
+                        // by returning) rather than re-scan the lifetime.
+                        if filled {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; relying on backfill");
+                    }
+                }
+            }
+            backfill = &mut backfill_fut => break backfill,
         }
     };
 
-    // Recent window already filled a page → older calls load via pagination;
-    // skip the expensive lifetime scan.
-    if recent_filled {
-        return;
-    }
-
-    // Backfill older history: deploy-scoped (deploy..tip with the deploy date as
-    // partition hint) or, if the deploy block/date is unknown, the legacy
-    // unwindowed query. The deploy floor is resolved here (not before the recent
-    // paint), so its PF/Voyager + block-timestamp round-trips only run when a
-    // backfill is actually needed.
-    let (deploy_floor, deploy_floor_ts) = resolve_deploy_floor(address, ds, pf, voyager_c).await;
-    let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
-    if let CallsDuneQuery::DeployScoped {
-        from_block,
-        min_date,
-    } = &plan
-    {
-        debug!(
-            addr = %format!("{:#x}", address),
-            from_block,
-            ?min_date,
-            "Calls: cold-cache backfill Dune query (deploy-scoped)"
-        );
-    }
-    match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
+    match backfill_result {
         Ok(dune_calls) => {
             info!(
                 addr = %format!("{:#x}", address),
