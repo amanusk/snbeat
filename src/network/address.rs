@@ -3958,8 +3958,8 @@ pub(super) async fn fetch_address_contract_calls(
     // the `block_number BETWEEN` range and fails with QUERY_STATE_FAILED on
     // dense contracts. A 1-day UTC cushion guards against the cached row
     // sitting right before a day boundary.
-    let newest_cached_pair = ds
-        .load_cached_address_calls(&address)
+    let cached_calls = ds.load_cached_address_calls(&address);
+    let newest_cached_pair = cached_calls
         .iter()
         .filter(|c| c.block_number > 0)
         .max_by_key(|c| c.block_number)
@@ -3973,8 +3973,18 @@ pub(super) async fn fetch_address_contract_calls(
         let plan = pick_calls_dune_query(newest_cached_pair, None, None);
         match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
             Ok(dune_calls) => {
+                // Warm path already loaded the cache for `newest_cached_pair`;
+                // hand it over so the merge doesn't re-read SQLite.
                 persist_and_emit_calls(
-                    address, dune_calls, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                    address,
+                    dune_calls,
+                    Some(cached_calls),
+                    abi_reg,
+                    ds,
+                    pf,
+                    action_tx,
+                    nonce,
+                    class_hash,
                 )
                 .await
             }
@@ -4020,7 +4030,7 @@ pub(super) async fn fetch_address_contract_calls(
                 "Calls: recent-window first paint"
             );
             persist_and_emit_calls(
-                address, recent, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
             )
             .await;
             filled
@@ -4064,7 +4074,7 @@ pub(super) async fn fetch_address_contract_calls(
                 "Calls: Dune contract calls backfill complete"
             );
             persist_and_emit_calls(
-                address, dune_calls, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                address, dune_calls, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
             )
             .await
         }
@@ -4186,14 +4196,18 @@ async fn run_calls_dune_plan(
     }
 }
 
-/// Enrich raw Dune contract calls, merge with the current cache, persist, and
-/// emit them to the UI. Shared by the recent-window first paint and the
-/// deploy-scoped backfill so each phase streams as soon as it lands. Reloads
-/// the cache on each call so a later phase merges on top of an earlier one.
+/// Enrich raw Dune contract calls, merge with the cache, persist, and emit them
+/// to the UI. Shared by the recent-window first paint and the deploy-scoped
+/// backfill so each phase streams as soon as it lands. `preloaded_cache` lets a
+/// caller that already read the cache (the warm/TopDelta path) skip a redundant
+/// read; pass `None` to reload from the data source — which the cold
+/// recent→backfill phases do, so each merges on top of the previous phase's
+/// saved rows.
 #[allow(clippy::too_many_arguments)]
 async fn persist_and_emit_calls(
     address: starknet::core::types::Felt,
     dune_calls: Vec<crate::data::types::ContractCallSummary>,
+    preloaded_cache: Option<Vec<crate::data::types::ContractCallSummary>>,
     abi_reg: &Arc<AbiRegistry>,
     ds: &Arc<dyn crate::data::DataSource>,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
@@ -4212,7 +4226,7 @@ async fn persist_and_emit_calls(
     // clobber the rest. `deduplicate_contract_calls` collapses overlap between
     // the recent-window and backfill phases.
     if !calls.is_empty() {
-        let mut merged = ds.load_cached_address_calls(&address);
+        let mut merged = preloaded_cache.unwrap_or_else(|| ds.load_cached_address_calls(&address));
         merged.extend(calls.iter().cloned());
         let merged = crate::data::types::deduplicate_contract_calls(merged);
         ds.save_address_calls(&address, &merged);
