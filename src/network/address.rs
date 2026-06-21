@@ -1180,7 +1180,7 @@ pub(super) async fn fetch_and_send_address_info(
             // Common post-success step: cache the discovered range, emit the
             // UI action, and publish on the watch channel so downstream tasks
             // can size their windows.
-            let publish = |probe: dune::AddressActivityProbe, label: &str| {
+            let publish = |probe: dune::AddressActivityProbe, label: &str, persist: bool| {
                 if probe.has_activity() {
                     let _ = tx_probe.send(Action::LoadingStatus(format!(
                         "{label}: {} events, blocks {}..{}",
@@ -1188,12 +1188,19 @@ pub(super) async fn fetch_and_send_address_info(
                         probe.min_block(),
                         probe.max_block(),
                     )));
-                    ds_probe.save_activity_range_with_count(
-                        &address,
-                        probe.min_block(),
-                        probe.max_block(),
-                        probe.callee_call_count,
-                    );
+                    // Persist only authoritative (full-history) probes. A
+                    // recent-window hint is a lower bound on lifetime activity —
+                    // caching its count/range as if complete would corrupt the
+                    // warm-path delta (min wouldn't reach the true first-activity
+                    // block; count would understate the lifetime total).
+                    if persist {
+                        ds_probe.save_activity_range_with_count(
+                            &address,
+                            probe.min_block(),
+                            probe.max_block(),
+                            probe.callee_call_count,
+                        );
+                    }
                 } else {
                     let _ =
                         tx_probe.send(Action::LoadingStatus(format!("{label}: no activity found")));
@@ -1231,8 +1238,14 @@ pub(super) async fn fetch_and_send_address_info(
                             "Dune: extending activity probe (>{} block)...",
                             cached_max
                         )));
+                        // Date floor for the delta query: `starknet.events` is
+                        // partitioned by `block_date`, so `block_number >
+                        // cached_max` alone scans every partition. The date of
+                        // `cached_max` (minus a cushion) is a safe lower bound
+                        // for rows above it. None → 2021 floor (correct, slower).
+                        let delta_min_date = block_date_floor(&ds_probe, cached_max).await;
                         match dune_c
-                            .probe_address_activity_delta(address, cached_max)
+                            .probe_address_activity_delta(address, cached_max, delta_min_date)
                             .await
                         {
                             Ok(delta) => {
@@ -1247,7 +1260,7 @@ pub(super) async fn fetch_and_send_address_info(
                                         .saturating_add(delta.callee_call_count),
                                     ..Default::default()
                                 };
-                                publish(merged, "Dune probe (delta)");
+                                publish(merged, "Dune probe (delta)", true);
                             }
                             Err(e) => {
                                 warn!(error = %e, "Dune delta activity probe failed");
@@ -1263,18 +1276,44 @@ pub(super) async fn fetch_and_send_address_info(
                         }
                     }
                     None => {
+                        // Recent-first events probe. A small recent window is
+                        // partition-pruned to ~2 weeks of `block_date` and
+                        // returns in a few seconds, giving the UI an immediate
+                        // lower-bound count/range; the full-history probe then
+                        // refines it in the background. Recent <= full, so the
+                        // count only grows — publishing recent-then-full is
+                        // monotonic and never regresses the `shown / known+`
+                        // hint. The recent result is NOT persisted (only the
+                        // full probe is authoritative — see `publish`).
+                        const RECENT_PROBE_DAYS: i64 = 14;
                         let _ = tx_probe.send(Action::LoadingStatus(
-                            "Dune: probing activity range (events)...".into(),
+                            "Dune: probing recent activity (events)...".into(),
                         ));
-                        match dune_c.probe_address_activity(address).await {
-                            Ok(probe) => publish(probe, "Dune probe"),
+                        let recent_min = chrono::Utc::now().date_naive()
+                            - chrono::Duration::days(RECENT_PROBE_DAYS);
+                        if let Ok(recent) = dune_c
+                            .probe_address_activity(address, Some(recent_min))
+                            .await
+                            && recent.has_activity()
+                        {
+                            publish(recent, "Dune probe (recent)", false);
+                        }
+
+                        // Full-history refine: authoritative count/range, persisted.
+                        let _ = tx_probe.send(Action::LoadingStatus(
+                            "Dune: probing full activity range (events)...".into(),
+                        ));
+                        match dune_c.probe_address_activity(address, None).await {
+                            Ok(probe) => publish(probe, "Dune probe", true),
                             Err(e) => {
                                 warn!(error = %e, "Dune activity probe failed");
                                 let _ = tx_probe.send(Action::LoadingStatus(format!(
                                     "Dune probe failed: {}",
                                     e
                                 )));
-                                // Leave watch at None — tasks will use default windows.
+                                // If the recent hint succeeded it's already on
+                                // the UI + watch; otherwise watch stays None and
+                                // downstream tasks use their default windows.
                             }
                         }
                     }
@@ -1419,8 +1458,18 @@ pub(super) async fn fetch_and_send_address_info(
             let latest_block = ds_b.latest_block_hint().await.unwrap_or(0);
             let from = latest_block.saturating_sub(INITIAL_WINDOW);
 
+            // `starknet.transactions` is partitioned by `block_date`; a date
+            // floor derived from `from`'s timestamp lets Dune prune partitions
+            // instead of scanning the whole table for busy senders.
+            let from_min_date = block_date_floor(&ds_b, from).await;
             let result = dune_c
-                .query_account_txs_windowed(address, from, latest_block, DUNE_PAGE_LIMIT)
+                .query_account_txs_windowed(
+                    address,
+                    from,
+                    latest_block,
+                    DUNE_PAGE_LIMIT,
+                    from_min_date,
+                )
                 .await;
 
             match result {
@@ -1468,12 +1517,14 @@ pub(super) async fn fetch_and_send_address_info(
                                 "Dune: retrying blocks {}..{} (probe-guided)...",
                                 probe_from, probe_to
                             )));
+                            let probe_min_date = block_date_floor(&ds_b, probe_from).await;
                             match dune_c
                                 .query_account_txs_windowed(
                                     address,
                                     probe_from,
                                     probe_to,
                                     DUNE_PAGE_LIMIT,
+                                    probe_min_date,
                                 )
                                 .await
                             {
@@ -2648,8 +2699,18 @@ async fn fill_specific_large_gap(
         chunk
     );
 
+    // Date floor for the gap window. The gap lies between known txs, so the
+    // known tx at or just below `from` has a `block_date` <= every row in the
+    // gap (block_date is monotonic in block_number) — a safe lower-bound floor
+    // that lets Dune prune partitions instead of scanning the whole table.
+    // None (no known tx below the gap) → 2021 floor (correct, slower).
+    let gap_min_date = known_txs
+        .iter()
+        .filter(|t| t.block_number <= from && t.timestamp > 0)
+        .max_by_key(|t| t.block_number)
+        .and_then(|t| ts_to_min_date(t.timestamp));
     match dune_c
-        .query_account_txs_windowed(address, from, to, chunk)
+        .query_account_txs_windowed(address, from, to, chunk, gap_min_date)
         .await
     {
         Ok(dune_txs) => {
@@ -3031,8 +3092,12 @@ pub(super) async fn fetch_more_address_txs(
         let Some(dune_client) = dune_source else {
             return (Vec::new(), Vec::new());
         };
+        // `from_block` is a real block bounding this page, so derive its
+        // `block_date` to prune partitions — busy-sender pagination otherwise
+        // scans the whole `starknet.transactions` table per page.
+        let from_min_date = block_date_floor(ds, from_block).await;
         match dune_client
-            .query_account_txs_windowed(address, from_block, dune_to, 100)
+            .query_account_txs_windowed(address, from_block, dune_to, 100, from_min_date)
             .await
         {
             Ok(txs) => (txs, Vec::new()),
@@ -3862,6 +3927,35 @@ pub(super) enum CallsDuneQuery {
     Unwindowed,
 }
 
+/// Convert a block's UTC timestamp to a `block_date` partition floor: the
+/// block's date minus a 1-day cushion (guards against the block sitting just
+/// before a UTC day boundary). Returns `None` for a zero/unconvertible ts.
+///
+/// The minus-1-day keeps the floor a safe *lower* bound on the block's true
+/// date, so a windowed/probe query scoped to `>= this_block` never prunes a
+/// `block_date` partition that still holds matching rows. The shared basis for
+/// every `min_block_date` hint passed to Dune (`pick_calls_dune_query`,
+/// `block_date_floor`).
+pub(super) fn ts_to_min_date(ts: u64) -> Option<chrono::NaiveDate> {
+    if ts == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.date_naive() - chrono::Duration::days(1))
+}
+
+/// Resolve the `block_date` partition floor for `block` by fetching its
+/// timestamp (`ds.get_block` serves from cache, else RPC) and converting via
+/// [`ts_to_min_date`]. `None` when the timestamp can't be resolved — callers
+/// then pass no floor (the 2021 default), which is correct but unpruned.
+pub(super) async fn block_date_floor(
+    ds: &Arc<dyn crate::data::DataSource>,
+    block: u64,
+) -> Option<chrono::NaiveDate> {
+    let ts = ds.get_block(block).await.ok().map(|b| b.timestamp)?;
+    ts_to_min_date(ts)
+}
+
 /// Choose the Dune query variant for the contract-calls fetch.
 ///
 /// The two inputs that drive the choice:
@@ -3871,36 +3965,29 @@ pub(super) enum CallsDuneQuery {
 ///   * `deploy_floor` + `deploy_floor_ts` — both `Some` to qualify for
 ///     `DeployScoped`. Either being `None` collapses to `Unwindowed`.
 ///
-/// `min_date` for the windowed variants is `block_date - 1 day` to guard
-/// against the pinning row sitting right before a UTC day boundary.
+/// `min_date` for the windowed variants is `block_date - 1 day` (see
+/// [`ts_to_min_date`]) to guard against the pinning row sitting right before a
+/// UTC day boundary.
 pub(super) fn pick_calls_dune_query(
     newest_cached_pair: Option<(u64, u64)>,
     deploy_floor: Option<u64>,
     deploy_floor_ts: Option<u64>,
 ) -> CallsDuneQuery {
     if let Some((block, ts)) = newest_cached_pair {
-        let min_date = (ts > 0)
-            .then(|| chrono::DateTime::from_timestamp(ts as i64, 0))
-            .flatten()
-            .map(|dt| dt.date_naive() - chrono::Duration::days(1));
         return CallsDuneQuery::TopDelta {
             from_block: block + 1,
-            min_date,
+            min_date: ts_to_min_date(ts),
         };
     }
 
     match (deploy_floor, deploy_floor_ts) {
-        (Some(from_block), Some(ts)) if ts > 0 => {
-            match chrono::DateTime::from_timestamp(ts as i64, 0)
-                .map(|dt| dt.date_naive() - chrono::Duration::days(1))
-            {
-                Some(min_date) => CallsDuneQuery::DeployScoped {
-                    from_block,
-                    min_date,
-                },
-                None => CallsDuneQuery::Unwindowed,
-            }
-        }
+        (Some(from_block), Some(ts)) if ts > 0 => match ts_to_min_date(ts) {
+            Some(min_date) => CallsDuneQuery::DeployScoped {
+                from_block,
+                min_date,
+            },
+            None => CallsDuneQuery::Unwindowed,
+        },
         _ => CallsDuneQuery::Unwindowed,
     }
 }
