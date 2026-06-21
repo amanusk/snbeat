@@ -4022,7 +4022,7 @@ pub(super) async fn fetch_address_contract_calls(
         .await
     {
         Ok(recent) => {
-            let filled = recent.len() as u32 >= CONTRACT_CALL_LIMIT;
+            let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
             info!(
                 addr = %format!("{:#x}", address),
                 recent_calls = recent.len(),
