@@ -139,6 +139,27 @@ impl QueryShape {
             QueryShape::DeclareTx => "snbeat_declare_tx",
         }
     }
+
+    /// The `{{key}}` parameters this shape's [`Self::sql`] references, in any
+    /// order. Dune's create-query API rejects a parameterized query (400
+    /// "keys ... do not have matching parameters") unless every placeholder is
+    /// declared at create time, so `get_or_create_persistent_query` registers
+    /// these. MUST stay in sync with the placeholders in `sql()` (and with the
+    /// `params` map each calling function builds for execute).
+    fn param_keys(self) -> &'static [&'static str] {
+        match self {
+            QueryShape::ProbeAddressActivity => &["address", "min_date"],
+            QueryShape::ProbeActivityDelta => &["address", "min_date", "from_block"],
+            QueryShape::AccountTxs => &["sender", "limit"],
+            QueryShape::AccountTxsWindowed => {
+                &["sender", "min_date", "from_block", "to_block", "limit"]
+            }
+            QueryShape::ContractCallsWindowed => {
+                &["contract", "min_date", "from_block", "to_block", "limit"]
+            }
+            QueryShape::DeclareTx => &["class_hash"],
+        }
+    }
 }
 
 /// Resolve an optional `block_date` partition floor to its `YYYY-MM-DD`
@@ -414,8 +435,14 @@ impl DuneClient {
                         warn!(shape = %shape, error = %e, "Dune persistent cache: failed to evict stale-SQL query_id");
                     }
                 }
+                let hydrated_count = hydrated.len();
                 self.persistent_ids = Mutex::new(hydrated);
                 self.persistent_db = Some(Mutex::new(db));
+                info!(
+                    hydrated = hydrated_count,
+                    evicted = stale_shapes.len(),
+                    "Dune persistent cache enabled"
+                );
             }
             Err(e) => {
                 warn!(error = %e, "Dune persistent cache: open failed; falling back to ephemeral");
@@ -446,7 +473,27 @@ impl DuneClient {
         {
             return Some(*qid);
         }
-        // Create the query on Dune and persist the id.
+        // Create the query on Dune and persist the id. Dune requires every
+        // `{{placeholder}}` in `query_sql` to be declared here, or the create
+        // is rejected 400 ("keys ... do not have matching parameters"). Declare
+        // them all as `text` so the per-call value is substituted literally —
+        // the SQL already supplies any surrounding quotes (`date '{{min_date}}'`)
+        // and bare numeric/hex contexts (`{{from_block}}`, `{{address}}`) take
+        // the raw text, matching the ephemeral `execute_sql` literal form
+        // exactly (and avoiding float precision loss on i64-range block bounds
+        // that a `number` param would risk). The default values are placeholders
+        // only — the real values arrive in `execute_persistent`'s params map.
+        let parameters: Vec<serde_json::Value> = shape
+            .param_keys()
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "key": k,
+                    "type": "text",
+                    "value": if *k == "min_date" { "2021-01-01" } else { "0" },
+                })
+            })
+            .collect();
         let body = serde_json::json!({
             "name": shape.display_name(),
             "query_sql": shape.sql(),
@@ -454,23 +501,43 @@ impl DuneClient {
             // churn the per-account private quota and the SQL has no
             // secrets (parameters carry the per-call values).
             "is_private": false,
+            "parameters": parameters,
         });
-        let resp: CreateQueryResponse = match self
+        // Surface every failure mode. The old `.send().await.ok()?
+        // .error_for_status().ok()?` swallowed transport errors and non-2xx
+        // responses with NO log, so a persistently-rejected create (e.g. a
+        // plan/permission limit on saved-query CRUD) silently degraded every
+        // call to the ephemeral `execute_sql` path forever, with nothing in the
+        // logs to explain why. Log the status + body so the cause is visible.
+        let create_resp = match self
             .client
             .post(format!("{}/query", DUNE_API_BASE))
             .header("X-Dune-API-Key", &self.api_key)
             .json(&body)
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
         {
             Ok(r) => r,
             Err(e) => {
-                warn!(shape = shape.name(), error = %e, "Dune persistent create failed");
+                warn!(shape = shape.name(), error = %e, "Dune persistent create: request failed; staying on ephemeral path");
+                return None;
+            }
+        };
+        let status = create_resp.status();
+        if !status.is_success() {
+            let body = create_resp.text().await.unwrap_or_default();
+            warn!(
+                shape = shape.name(),
+                %status,
+                body = %body,
+                "Dune persistent create rejected by Dune; staying on ephemeral path"
+            );
+            return None;
+        }
+        let resp: CreateQueryResponse = match create_resp.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(shape = shape.name(), error = %e, "Dune persistent create: response parse failed");
                 return None;
             }
         };
@@ -1275,6 +1342,41 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dune's create-query API rejects a parameterized query (400) unless every
+    /// `{{placeholder}}` in the SQL is declared. `param_keys` must therefore
+    /// match `sql`'s placeholders exactly for every shape — a drift (placeholder
+    /// added to SQL but not declared, or vice versa) silently degrades that
+    /// shape to the ephemeral path forever. This guards that invariant.
+    #[test]
+    fn param_keys_match_sql_placeholders() {
+        for shape in [
+            QueryShape::ProbeAddressActivity,
+            QueryShape::ProbeActivityDelta,
+            QueryShape::AccountTxs,
+            QueryShape::AccountTxsWindowed,
+            QueryShape::ContractCallsWindowed,
+            QueryShape::DeclareTx,
+        ] {
+            // Extract every distinct `{{key}}` from the shape's SQL.
+            let mut in_sql: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut rest = shape.sql();
+            while let Some(start) = rest.find("{{") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find("}}") else { break };
+                in_sql.insert(after[..end].to_string());
+                rest = &after[end + 2..];
+            }
+            let declared: std::collections::BTreeSet<String> =
+                shape.param_keys().iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                in_sql,
+                declared,
+                "shape {} param_keys() != its sql() placeholders",
+                shape.name()
+            );
+        }
+    }
 
     /// Both JSON forms must parse the same value: Dune serialises wide
     /// numerics (e.g. uint256 fees) as strings but smaller numerics as
