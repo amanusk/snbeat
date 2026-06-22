@@ -1180,7 +1180,7 @@ pub(super) async fn fetch_and_send_address_info(
             // Common post-success step: cache the discovered range, emit the
             // UI action, and publish on the watch channel so downstream tasks
             // can size their windows.
-            let publish = |probe: dune::AddressActivityProbe, label: &str| {
+            let publish = |probe: dune::AddressActivityProbe, label: &str, persist: bool| {
                 if probe.has_activity() {
                     let _ = tx_probe.send(Action::LoadingStatus(format!(
                         "{label}: {} events, blocks {}..{}",
@@ -1188,12 +1188,19 @@ pub(super) async fn fetch_and_send_address_info(
                         probe.min_block(),
                         probe.max_block(),
                     )));
-                    ds_probe.save_activity_range_with_count(
-                        &address,
-                        probe.min_block(),
-                        probe.max_block(),
-                        probe.callee_call_count,
-                    );
+                    // Persist only authoritative (full-history) probes. A
+                    // recent-window hint is a lower bound on lifetime activity —
+                    // caching its count/range as if complete would corrupt the
+                    // warm-path delta (min wouldn't reach the true first-activity
+                    // block; count would understate the lifetime total).
+                    if persist {
+                        ds_probe.save_activity_range_with_count(
+                            &address,
+                            probe.min_block(),
+                            probe.max_block(),
+                            probe.callee_call_count,
+                        );
+                    }
                 } else {
                     let _ =
                         tx_probe.send(Action::LoadingStatus(format!("{label}: no activity found")));
@@ -1231,8 +1238,14 @@ pub(super) async fn fetch_and_send_address_info(
                             "Dune: extending activity probe (>{} block)...",
                             cached_max
                         )));
+                        // Date floor for the delta query: `starknet.events` is
+                        // partitioned by `block_date`, so `block_number >
+                        // cached_max` alone scans every partition. The date of
+                        // `cached_max` (minus a cushion) is a safe lower bound
+                        // for rows above it. None → 2021 floor (correct, slower).
+                        let delta_min_date = block_date_floor(&ds_probe, cached_max).await;
                         match dune_c
-                            .probe_address_activity_delta(address, cached_max)
+                            .probe_address_activity_delta(address, cached_max, delta_min_date)
                             .await
                         {
                             Ok(delta) => {
@@ -1247,7 +1260,7 @@ pub(super) async fn fetch_and_send_address_info(
                                         .saturating_add(delta.callee_call_count),
                                     ..Default::default()
                                 };
-                                publish(merged, "Dune probe (delta)");
+                                publish(merged, "Dune probe (delta)", true);
                             }
                             Err(e) => {
                                 warn!(error = %e, "Dune delta activity probe failed");
@@ -1263,18 +1276,51 @@ pub(super) async fn fetch_and_send_address_info(
                         }
                     }
                     None => {
+                        // Recent + full events probes run CONCURRENTLY, never
+                        // serially: a recent-window probe (partition-pruned to
+                        // ~2 weeks) can give a fast lower-bound count/range, but
+                        // it must NEVER gate the authoritative full-history
+                        // probe — on a recently-inactive address the recent
+                        // probe returns 0 and only adds latency. Publish recent
+                        // only if it lands before full (full's count >= recent's,
+                        // so the `shown / known+` hint only grows, never
+                        // regresses); if full lands first, the recent probe is
+                        // dropped (cancelled). Recent is not persisted — only the
+                        // authoritative full probe is (see `publish`).
+                        const RECENT_PROBE_DAYS: i64 = 14;
                         let _ = tx_probe.send(Action::LoadingStatus(
                             "Dune: probing activity range (events)...".into(),
                         ));
-                        match dune_c.probe_address_activity(address).await {
-                            Ok(probe) => publish(probe, "Dune probe"),
+                        let recent_min = chrono::Utc::now().date_naive()
+                            - chrono::Duration::days(RECENT_PROBE_DAYS);
+                        let recent_fut = dune_c.probe_address_activity(address, Some(recent_min));
+                        let full_fut = dune_c.probe_address_activity(address, None);
+                        tokio::pin!(recent_fut, full_fut);
+
+                        let full_result = tokio::select! {
+                            full = &mut full_fut => full,
+                            recent = &mut recent_fut => {
+                                if let Ok(recent) = recent
+                                    && recent.has_activity()
+                                {
+                                    publish(recent, "Dune probe (recent)", false);
+                                }
+                                // Recent landed first (or errored); await the
+                                // authoritative full probe, still in flight.
+                                (&mut full_fut).await
+                            }
+                        };
+                        match full_result {
+                            Ok(probe) => publish(probe, "Dune probe", true),
                             Err(e) => {
                                 warn!(error = %e, "Dune activity probe failed");
                                 let _ = tx_probe.send(Action::LoadingStatus(format!(
                                     "Dune probe failed: {}",
                                     e
                                 )));
-                                // Leave watch at None — tasks will use default windows.
+                                // If the recent hint succeeded it's already on
+                                // the UI + watch; otherwise watch stays None and
+                                // downstream tasks use their default windows.
                             }
                         }
                     }
@@ -1419,8 +1465,18 @@ pub(super) async fn fetch_and_send_address_info(
             let latest_block = ds_b.latest_block_hint().await.unwrap_or(0);
             let from = latest_block.saturating_sub(INITIAL_WINDOW);
 
+            // `starknet.transactions` is partitioned by `block_date`; a date
+            // floor derived from `from`'s timestamp lets Dune prune partitions
+            // instead of scanning the whole table for busy senders.
+            let from_min_date = block_date_floor(&ds_b, from).await;
             let result = dune_c
-                .query_account_txs_windowed(address, from, latest_block, DUNE_PAGE_LIMIT)
+                .query_account_txs_windowed(
+                    address,
+                    from,
+                    latest_block,
+                    DUNE_PAGE_LIMIT,
+                    from_min_date,
+                )
                 .await;
 
             match result {
@@ -1468,12 +1524,14 @@ pub(super) async fn fetch_and_send_address_info(
                                 "Dune: retrying blocks {}..{} (probe-guided)...",
                                 probe_from, probe_to
                             )));
+                            let probe_min_date = block_date_floor(&ds_b, probe_from).await;
                             match dune_c
                                 .query_account_txs_windowed(
                                     address,
                                     probe_from,
                                     probe_to,
                                     DUNE_PAGE_LIMIT,
+                                    probe_min_date,
                                 )
                                 .await
                             {
@@ -2648,8 +2706,18 @@ async fn fill_specific_large_gap(
         chunk
     );
 
+    // Date floor for the gap window. The gap lies between known txs, so the
+    // known tx at or just below `from` has a `block_date` <= every row in the
+    // gap (block_date is monotonic in block_number) — a safe lower-bound floor
+    // that lets Dune prune partitions instead of scanning the whole table.
+    // None (no known tx below the gap) → 2021 floor (correct, slower).
+    let gap_min_date = known_txs
+        .iter()
+        .filter(|t| t.block_number <= from && t.timestamp > 0)
+        .max_by_key(|t| t.block_number)
+        .and_then(|t| ts_to_min_date(t.timestamp));
     match dune_c
-        .query_account_txs_windowed(address, from, to, chunk)
+        .query_account_txs_windowed(address, from, to, chunk, gap_min_date)
         .await
     {
         Ok(dune_txs) => {
@@ -3031,8 +3099,12 @@ pub(super) async fn fetch_more_address_txs(
         let Some(dune_client) = dune_source else {
             return (Vec::new(), Vec::new());
         };
+        // `from_block` is a real block bounding this page, so derive its
+        // `block_date` to prune partitions — busy-sender pagination otherwise
+        // scans the whole `starknet.transactions` table per page.
+        let from_min_date = block_date_floor(ds, from_block).await;
         match dune_client
-            .query_account_txs_windowed(address, from_block, dune_to, 100)
+            .query_account_txs_windowed(address, from_block, dune_to, 100, from_min_date)
             .await
         {
             Ok(txs) => (txs, Vec::new()),
@@ -3862,6 +3934,35 @@ pub(super) enum CallsDuneQuery {
     Unwindowed,
 }
 
+/// Convert a block's UTC timestamp to a `block_date` partition floor: the
+/// block's date minus a 1-day cushion (guards against the block sitting just
+/// before a UTC day boundary). Returns `None` for a zero/unconvertible ts.
+///
+/// The minus-1-day keeps the floor a safe *lower* bound on the block's true
+/// date, so a windowed/probe query scoped to `>= this_block` never prunes a
+/// `block_date` partition that still holds matching rows. The shared basis for
+/// every `min_block_date` hint passed to Dune (`pick_calls_dune_query`,
+/// `block_date_floor`).
+pub(super) fn ts_to_min_date(ts: u64) -> Option<chrono::NaiveDate> {
+    if ts == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.date_naive() - chrono::Duration::days(1))
+}
+
+/// Resolve the `block_date` partition floor for `block` by fetching its
+/// timestamp (`ds.get_block` serves from cache, else RPC) and converting via
+/// [`ts_to_min_date`]. `None` when the timestamp can't be resolved — callers
+/// then pass no floor (the 2021 default), which is correct but unpruned.
+pub(super) async fn block_date_floor(
+    ds: &Arc<dyn crate::data::DataSource>,
+    block: u64,
+) -> Option<chrono::NaiveDate> {
+    let ts = ds.get_block(block).await.ok().map(|b| b.timestamp)?;
+    ts_to_min_date(ts)
+}
+
 /// Choose the Dune query variant for the contract-calls fetch.
 ///
 /// The two inputs that drive the choice:
@@ -3871,36 +3972,29 @@ pub(super) enum CallsDuneQuery {
 ///   * `deploy_floor` + `deploy_floor_ts` — both `Some` to qualify for
 ///     `DeployScoped`. Either being `None` collapses to `Unwindowed`.
 ///
-/// `min_date` for the windowed variants is `block_date - 1 day` to guard
-/// against the pinning row sitting right before a UTC day boundary.
+/// `min_date` for the windowed variants is `block_date - 1 day` (see
+/// [`ts_to_min_date`]) to guard against the pinning row sitting right before a
+/// UTC day boundary.
 pub(super) fn pick_calls_dune_query(
     newest_cached_pair: Option<(u64, u64)>,
     deploy_floor: Option<u64>,
     deploy_floor_ts: Option<u64>,
 ) -> CallsDuneQuery {
     if let Some((block, ts)) = newest_cached_pair {
-        let min_date = (ts > 0)
-            .then(|| chrono::DateTime::from_timestamp(ts as i64, 0))
-            .flatten()
-            .map(|dt| dt.date_naive() - chrono::Duration::days(1));
         return CallsDuneQuery::TopDelta {
             from_block: block + 1,
-            min_date,
+            min_date: ts_to_min_date(ts),
         };
     }
 
     match (deploy_floor, deploy_floor_ts) {
-        (Some(from_block), Some(ts)) if ts > 0 => {
-            match chrono::DateTime::from_timestamp(ts as i64, 0)
-                .map(|dt| dt.date_naive() - chrono::Duration::days(1))
-            {
-                Some(min_date) => CallsDuneQuery::DeployScoped {
-                    from_block,
-                    min_date,
-                },
-                None => CallsDuneQuery::Unwindowed,
-            }
-        }
+        (Some(from_block), Some(ts)) if ts > 0 => match ts_to_min_date(ts) {
+            Some(min_date) => CallsDuneQuery::DeployScoped {
+                from_block,
+                min_date,
+            },
+            None => CallsDuneQuery::Unwindowed,
+        },
         _ => CallsDuneQuery::Unwindowed,
     }
 }
@@ -3995,78 +4089,86 @@ pub(super) async fn fetch_address_contract_calls(
         return;
     }
 
-    // Cold cache: show the recent tail FIRST. `starknet.calls` is partitioned by
-    // `block_date`, so a recent date floor prunes to a handful of partitions and
-    // returns in a few seconds — versus the deploy-scoped query below, which
-    // scans the contract's entire lifetime (deploy..tip) and can take 30s+ on a
-    // long-lived contract. Render recent calls immediately, then backfill older
-    // history only if the recent window didn't already fill a page (active
-    // contracts skip the expensive scan; older calls load via pagination).
-    //
-    // This query needs no deploy floor — the recent `block_date` floor does the
-    // pruning and `from_block = 0` is a harmless lower bound — so deploy-floor
-    // resolution (PF/Voyager + block timestamp) is deferred to the backfill
-    // below, keeping first paint off those round-trips and skipping them
-    // entirely when the recent window fills the page.
+    // Cold cache: fire the recent-window paint AND the deploy-scoped backfill
+    // CONCURRENTLY, never serially. `starknet.calls` is partitioned by
+    // `block_date`, so a recent date floor prunes to a handful of partitions —
+    // but on a recently-inactive contract that window returns 0 rows and is
+    // still a heavy scan, so gating the backfill behind it left the Calls tab
+    // empty for minutes. The deploy-scoped backfill returns the 500 most-recent
+    // calls (deploy..tip DESC) — a superset of the recent window — so whichever
+    // returns first paints something, and `persist_and_emit_calls` dedups the
+    // overlap. If the recent window fills a full page first (active contract),
+    // the backfill is cancelled to avoid the expensive lifetime scan; otherwise
+    // the backfill supersedes it. Deploy-floor resolution (PF/Voyager + block
+    // timestamp) runs inside the backfill future, so it never delays the recent
+    // first paint.
     const RECENT_CALLS_DAYS: i64 = 14;
     let recent_min_date =
         chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_CALLS_DAYS);
-    let recent_filled = match dune_client
-        .query_contract_calls_windowed(
-            address,
-            0,
-            u64::MAX,
-            CONTRACT_CALL_LIMIT,
-            Some(recent_min_date),
-        )
-        .await
-    {
-        Ok(recent) => {
-            let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
-            info!(
+    let recent_fut = dune_client.query_contract_calls_windowed(
+        address,
+        0,
+        u64::MAX,
+        CONTRACT_CALL_LIMIT,
+        Some(recent_min_date),
+    );
+    let backfill_fut = async {
+        let (deploy_floor, deploy_floor_ts) =
+            resolve_deploy_floor(address, ds, pf, voyager_c).await;
+        let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
+        if let CallsDuneQuery::DeployScoped {
+            from_block,
+            min_date,
+        } = &plan
+        {
+            debug!(
                 addr = %format!("{:#x}", address),
-                recent_calls = recent.len(),
-                recent_days = RECENT_CALLS_DAYS,
-                "Calls: recent-window first paint"
+                from_block,
+                ?min_date,
+                "Calls: cold-cache backfill Dune query (deploy-scoped)"
             );
-            persist_and_emit_calls(
-                address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
-            )
-            .await;
-            filled
         }
-        Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; falling back to full backfill");
-            false
+        run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await
+    };
+    tokio::pin!(recent_fut, backfill_fut);
+
+    // First arm to fire wins first paint. The loop runs at most twice: once for
+    // recent (if it lands first and doesn't fill a page) and once for backfill.
+    let mut recent_done = false;
+    let backfill_result = loop {
+        tokio::select! {
+            recent = &mut recent_fut, if !recent_done => {
+                recent_done = true;
+                match recent {
+                    Ok(recent) => {
+                        let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
+                        info!(
+                            addr = %format!("{:#x}", address),
+                            recent_calls = recent.len(),
+                            recent_days = RECENT_CALLS_DAYS,
+                            "Calls: recent-window first paint"
+                        );
+                        persist_and_emit_calls(
+                            address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                        )
+                        .await;
+                        // Active contract: a full recent page already covers the
+                        // most-recent calls; cancel the backfill (drop its future
+                        // by returning) rather than re-scan the lifetime.
+                        if filled {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; relying on backfill");
+                    }
+                }
+            }
+            backfill = &mut backfill_fut => break backfill,
         }
     };
 
-    // Recent window already filled a page → older calls load via pagination;
-    // skip the expensive lifetime scan.
-    if recent_filled {
-        return;
-    }
-
-    // Backfill older history: deploy-scoped (deploy..tip with the deploy date as
-    // partition hint) or, if the deploy block/date is unknown, the legacy
-    // unwindowed query. The deploy floor is resolved here (not before the recent
-    // paint), so its PF/Voyager + block-timestamp round-trips only run when a
-    // backfill is actually needed.
-    let (deploy_floor, deploy_floor_ts) = resolve_deploy_floor(address, ds, pf, voyager_c).await;
-    let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
-    if let CallsDuneQuery::DeployScoped {
-        from_block,
-        min_date,
-    } = &plan
-    {
-        debug!(
-            addr = %format!("{:#x}", address),
-            from_block,
-            ?min_date,
-            "Calls: cold-cache backfill Dune query (deploy-scoped)"
-        );
-    }
-    match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
+    match backfill_result {
         Ok(dune_calls) => {
             info!(
                 addr = %format!("{:#x}", address),

@@ -78,13 +78,14 @@ impl QueryShape {
                    MIN(block_number) AS min_block, MAX(block_number) AS max_block \
                  FROM starknet.events \
                  WHERE from_address = {{address}} \
-                 AND block_date >= date '2021-01-01'"
+                 AND block_date >= date '{{min_date}}'"
             }
             QueryShape::ProbeActivityDelta => {
                 "SELECT COUNT(*) AS cnt, \
                    MIN(block_number) AS min_block, MAX(block_number) AS max_block \
                  FROM starknet.events \
                  WHERE from_address = {{address}} \
+                 AND block_date >= date '{{min_date}}' \
                  AND block_number > {{from_block}}"
             }
             QueryShape::AccountTxs => {
@@ -101,6 +102,7 @@ impl QueryShape {
                    actual_fee_amount, tip, block_number, block_time, type \
                  FROM starknet.transactions \
                  WHERE sender_address = {{sender}} \
+                 AND block_date >= date '{{min_date}}' \
                  AND block_number BETWEEN {{from_block}} AND {{to_block}} \
                  ORDER BY nonce DESC \
                  LIMIT {{limit}}"
@@ -137,6 +139,48 @@ impl QueryShape {
             QueryShape::DeclareTx => "snbeat_declare_tx",
         }
     }
+
+    /// The `{{key}}` parameters this shape's [`Self::sql`] references, in any
+    /// order. Dune's create-query API rejects a parameterized query (400
+    /// "keys ... do not have matching parameters") unless every placeholder is
+    /// declared at create time, so `get_or_create_persistent_query` registers
+    /// these. MUST stay in sync with the placeholders in `sql()` (and with the
+    /// `params` map each calling function builds for execute).
+    fn param_keys(self) -> &'static [&'static str] {
+        match self {
+            QueryShape::ProbeAddressActivity => &["address", "min_date"],
+            QueryShape::ProbeActivityDelta => &["address", "min_date", "from_block"],
+            QueryShape::AccountTxs => &["sender", "limit"],
+            QueryShape::AccountTxsWindowed => {
+                &["sender", "min_date", "from_block", "to_block", "limit"]
+            }
+            QueryShape::ContractCallsWindowed => {
+                &["contract", "min_date", "from_block", "to_block", "limit"]
+            }
+            QueryShape::DeclareTx => &["class_hash"],
+        }
+    }
+}
+
+/// Resolve an optional `block_date` partition floor to its `YYYY-MM-DD`
+/// literal, defaulting to Starknet mainnet's launch year when absent.
+///
+/// `starknet.events` / `starknet.transactions` / `starknet.calls` are
+/// partitioned by `block_date`, so every windowed/probe shape carries a
+/// `{{min_date}}` hint: a `block_number`-only predicate cannot prune date
+/// partitions and forces a full-table scan. The 2021-01-01 default is
+/// equivalent to "no floor" (mainnet launched late 2021) but still lets Dune
+/// skip empty pre-mainnet partitions.
+///
+/// The caller must pass a floor that is a *lower* bound on the earliest row
+/// it wants — a too-late floor silently prunes partitions that still hold
+/// matching rows. Derive it from the `from_block`'s real timestamp minus a
+/// 1-day UTC cushion, never from an estimate that could overshoot.
+fn min_date_floor(min_block_date: Option<chrono::NaiveDate>) -> String {
+    min_block_date
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2021, 1, 1).expect("valid date"))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 /// Dune Analytics API client for querying Starknet transaction history.
@@ -335,33 +379,70 @@ impl DuneClient {
                     "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
                         shape TEXT PRIMARY KEY,
                         query_id INTEGER NOT NULL,
-                        created_at INTEGER NOT NULL
+                        created_at INTEGER NOT NULL,
+                        sql_text TEXT
                      );",
                 ) {
                     warn!(error = %e, "Dune persistent cache: schema init failed; falling back to ephemeral");
                     return self;
                 }
+                // Migrate tables created before `sql_text` existed so a cached
+                // query_id can be checked against the SQL it was registered
+                // with. Without this, editing a shape's SQL in-place would keep
+                // hitting the old persistent query on Dune forever — the #78
+                // eviction only fires on an external 403/404/410, not on our
+                // own SQL changes. Duplicate-column is expected on
+                // already-migrated DBs and ignored.
+                let _ = db
+                    .execute_batch("ALTER TABLE dune_persistent_queries ADD COLUMN sql_text TEXT;");
                 // Hydrate the in-memory map so the common case never
                 // touches SQLite.
                 let mut hydrated: HashMap<&'static str, u64> = HashMap::new();
+                let mut stale_shapes: Vec<String> = Vec::new();
                 if let Ok(mut stmt) =
-                    db.prepare("SELECT shape, query_id FROM dune_persistent_queries")
+                    db.prepare("SELECT shape, query_id, sql_text FROM dune_persistent_queries")
                 {
                     let rows = stmt.query_map([], |row| {
                         let shape: String = row.get(0)?;
                         let qid: i64 = row.get(1)?;
-                        Ok((shape, qid as u64))
+                        let sql_text: Option<String> = row.get(2)?;
+                        Ok((shape, qid as u64, sql_text))
                     });
                     if let Ok(iter) = rows {
-                        for (shape, qid) in iter.flatten() {
-                            if let Some(k) = QueryShape::from_name(&shape).map(|s| s.name()) {
-                                hydrated.insert(k, qid);
+                        for (shape, qid, sql_text) in iter.flatten() {
+                            // Only trust a cached query_id if the SQL it was
+                            // registered with still matches the shape's current
+                            // SQL. A mismatch (or a pre-migration NULL) means the
+                            // query body changed since it was created, so the
+                            // persisted query on Dune is stale — drop it and let
+                            // get_or_create recreate a fresh one with the new SQL.
+                            match QueryShape::from_name(&shape) {
+                                Some(s) if sql_text.as_deref() == Some(s.sql()) => {
+                                    hydrated.insert(s.name(), qid);
+                                }
+                                _ => stale_shapes.push(shape),
                             }
                         }
                     }
                 }
+                // Evict stale rows so a re-hydrate next launch doesn't resurrect
+                // them; the fast path recreates each with current SQL on demand.
+                for shape in &stale_shapes {
+                    if let Err(e) = db.execute(
+                        "DELETE FROM dune_persistent_queries WHERE shape = ?1",
+                        params![shape],
+                    ) {
+                        warn!(shape = %shape, error = %e, "Dune persistent cache: failed to evict stale-SQL query_id");
+                    }
+                }
+                let hydrated_count = hydrated.len();
                 self.persistent_ids = Mutex::new(hydrated);
                 self.persistent_db = Some(Mutex::new(db));
+                info!(
+                    hydrated = hydrated_count,
+                    evicted = stale_shapes.len(),
+                    "Dune persistent cache enabled"
+                );
             }
             Err(e) => {
                 warn!(error = %e, "Dune persistent cache: open failed; falling back to ephemeral");
@@ -392,7 +473,27 @@ impl DuneClient {
         {
             return Some(*qid);
         }
-        // Create the query on Dune and persist the id.
+        // Create the query on Dune and persist the id. Dune requires every
+        // `{{placeholder}}` in `query_sql` to be declared here, or the create
+        // is rejected 400 ("keys ... do not have matching parameters"). Declare
+        // them all as `text` so the per-call value is substituted literally —
+        // the SQL already supplies any surrounding quotes (`date '{{min_date}}'`)
+        // and bare numeric/hex contexts (`{{from_block}}`, `{{address}}`) take
+        // the raw text, matching the ephemeral `execute_sql` literal form
+        // exactly (and avoiding float precision loss on i64-range block bounds
+        // that a `number` param would risk). The default values are placeholders
+        // only — the real values arrive in `execute_persistent`'s params map.
+        let parameters: Vec<serde_json::Value> = shape
+            .param_keys()
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "key": k,
+                    "type": "text",
+                    "value": if *k == "min_date" { "2021-01-01" } else { "0" },
+                })
+            })
+            .collect();
         let body = serde_json::json!({
             "name": shape.display_name(),
             "query_sql": shape.sql(),
@@ -400,23 +501,43 @@ impl DuneClient {
             // churn the per-account private quota and the SQL has no
             // secrets (parameters carry the per-call values).
             "is_private": false,
+            "parameters": parameters,
         });
-        let resp: CreateQueryResponse = match self
+        // Surface every failure mode. The old `.send().await.ok()?
+        // .error_for_status().ok()?` swallowed transport errors and non-2xx
+        // responses with NO log, so a persistently-rejected create (e.g. a
+        // plan/permission limit on saved-query CRUD) silently degraded every
+        // call to the ephemeral `execute_sql` path forever, with nothing in the
+        // logs to explain why. Log the status + body so the cause is visible.
+        let create_resp = match self
             .client
             .post(format!("{}/query", DUNE_API_BASE))
             .header("X-Dune-API-Key", &self.api_key)
             .json(&body)
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
         {
             Ok(r) => r,
             Err(e) => {
-                warn!(shape = shape.name(), error = %e, "Dune persistent create failed");
+                warn!(shape = shape.name(), error = %e, "Dune persistent create: request failed; staying on ephemeral path");
+                return None;
+            }
+        };
+        let status = create_resp.status();
+        if !status.is_success() {
+            let body = create_resp.text().await.unwrap_or_default();
+            warn!(
+                shape = shape.name(),
+                %status,
+                body = %body,
+                "Dune persistent create rejected by Dune; staying on ephemeral path"
+            );
+            return None;
+        }
+        let resp: CreateQueryResponse = match create_resp.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(shape = shape.name(), error = %e, "Dune persistent create: response parse failed");
                 return None;
             }
         };
@@ -434,8 +555,8 @@ impl DuneClient {
                 // (extra Dune churn) on next launch with no trace why.
                 if let Err(e) = db.execute(
                     "INSERT OR REPLACE INTO dune_persistent_queries \
-                     (shape, query_id, created_at) VALUES (?1, ?2, ?3)",
-                    params![shape.name(), qid as i64, now],
+                     (shape, query_id, created_at, sql_text) VALUES (?1, ?2, ?3, ?4)",
+                    params![shape.name(), qid as i64, now, shape.sql()],
                 ) {
                     warn!(shape = shape.name(), query_id = qid, error = %e, "Dune persistent cache: failed to persist query_id; will recreate next launch");
                 }
@@ -671,14 +792,22 @@ impl DuneClient {
     }
 
     /// Windowed variant of `query_account_txs` — scoped to a block range for fast completion.
+    ///
+    /// `min_block_date` is the `block_date` partition floor (see
+    /// [`min_date_floor`]): `starknet.transactions` is partitioned by date, so
+    /// a `block_number BETWEEN` predicate alone scans every partition and is
+    /// slow for busy senders. Pass the `block_date` of `from_block` (minus a
+    /// 1-day cushion); `None` falls back to the 2021 floor (correct, slower).
     pub async fn query_account_txs_windowed(
         &self,
         sender: Felt,
         from_block: u64,
         to_block: u64,
         limit: u32,
+        min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<Vec<AddressTxSummary>, String> {
         let sender_hex = format!("{:#066x}", sender);
+        let min_date_str = min_date_floor(min_block_date);
         // DuneSQL (Trino) bigint rejects literals above i64::MAX at parse
         // time, so cap both bounds: an open-ended `to_block` of u64::MAX, and
         // any out-of-range `from_block` (the API is u64). The cap is far above
@@ -687,6 +816,7 @@ impl DuneClient {
         let to_capped = to_block.min(i64::MAX as u64);
         let params = serde_json::json!({
             "sender": sender_hex,
+            "min_date": min_date_str,
             "from_block": from_capped.to_string(),
             "to_block": to_capped.to_string(),
             "limit": limit.to_string(),
@@ -696,13 +826,14 @@ impl DuneClient {
              tip, block_number, block_time, type \
              FROM starknet.transactions \
              WHERE sender_address = {} \
+             AND block_date >= date '{}' \
              AND block_number BETWEEN {} AND {} \
              ORDER BY nonce DESC \
              LIMIT {}",
-            sender_hex, from_capped, to_capped, limit
+            sender_hex, min_date_str, from_capped, to_capped, limit
         );
 
-        debug!(sender = %sender_hex, from_block, to_block, from_capped, to_capped, "Querying Dune for account txs (windowed)");
+        debug!(sender = %sender_hex, from_block, to_block, from_capped, to_capped, %min_date_str, "Querying Dune for account txs (windowed)");
         let rows = self
             .run_shape(QueryShape::AccountTxsWindowed, params, &sql)
             .await?;
@@ -730,11 +861,9 @@ impl DuneClient {
     ) -> Result<Vec<ContractCallSummary>, String> {
         let contract_hex = format!("{:#066x}", contract);
         // The persistent shape has fixed SQL, so the date floor is always
-        // present; default a missing hint to mainnet's first year, which is
-        // equivalent to "no floor" but still lets Dune prune empty partitions.
-        let min_date = min_block_date
-            .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2021, 1, 1).expect("valid date"));
-        let min_date_str = min_date.format("%Y-%m-%d").to_string();
+        // present; `min_date_floor` defaults a missing hint to mainnet's first
+        // year (equivalent to "no floor", still prunes empty partitions).
+        let min_date_str = min_date_floor(min_block_date);
         // DuneSQL (Trino) uses bigint for block_number; any literal above
         // i64::MAX (9_223_372_036_854_775_807) is rejected at parse time as
         // "Invalid numeric literal". Cap both bounds — an open-ended u64::MAX
@@ -833,28 +962,38 @@ impl DuneClient {
     /// sender count for accounts. The UI distinguishes these two roles and
     /// must not display the events count as "sender tx total" — see
     /// `src/ui/views/address_info.rs`.
+    ///
+    /// `min_block_date` is the `block_date` partition floor (see
+    /// [`min_date_floor`]). Pass `None` for a full-history probe (mainnet
+    /// launch onward); pass a recent date for a fast recent-window probe whose
+    /// count/range is a *lower bound* on lifetime activity — the caller can
+    /// publish that as an early hint, then refine with a `None` probe in the
+    /// background (the count only grows, never regresses).
     pub async fn probe_address_activity(
         &self,
         address: Felt,
+        min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
         // Persistent parameterized query (fast path) with the ephemeral
-        // `execute_sql` create→archive path as fallback. The fallback SQL
-        // covers all of mainnet history in a single shot: the Starknet
-        // mainnet launch was late 2021, so a 2021-01-01 floor preserves
-        // partition pruning (Dune skips empty pre-mainnet partitions)
-        // without the second full-range pass the probe used to run.
-        let params = serde_json::json!({ "address": addr_hex });
+        // `execute_sql` create→archive path as fallback. With `None`, the
+        // 2021-01-01 floor covers all of mainnet history in a single shot
+        // (launch was late 2021, so empty pre-mainnet partitions are still
+        // pruned); a recent floor scopes to a handful of partitions and
+        // returns in a few seconds.
+        let min_date_str = min_date_floor(min_block_date);
+        let params = serde_json::json!({ "address": addr_hex, "min_date": min_date_str });
         let sql = format!(
             "SELECT COUNT(*) AS cnt, \
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
              FROM starknet.events \
              WHERE from_address = {addr} \
-             AND block_date >= date '2021-01-01'",
-            addr = addr_hex
+             AND block_date >= date '{min_date}'",
+            addr = addr_hex,
+            min_date = min_date_str,
         );
 
-        debug!(address = %addr_hex, "Dune events probe: checking address activity range");
+        debug!(address = %addr_hex, %min_date_str, "Dune events probe: checking address activity range");
         let rows = self
             .run_shape(QueryShape::ProbeAddressActivity, params, &sql)
             .await?;
@@ -883,14 +1022,25 @@ impl DuneClient {
     /// and `callee_max_block` is their upper bound. The caller is expected to
     /// merge this into the cached row (cache.rs `save_activity_range_with_count`
     /// handles the min-preserve / max-expand / count-max semantics).
+    ///
+    /// `min_block_date` is the `block_date` partition floor (see
+    /// [`min_date_floor`]). `starknet.events` is partitioned by date, so a
+    /// `block_number > from_block` predicate alone cannot prune partitions and
+    /// scans the whole table. Pass the `block_date` of `from_block` (minus a
+    /// 1-day cushion) — since the delta only wants rows above `from_block`,
+    /// that date is a safe floor; `None` falls back to the 2021 floor (correct,
+    /// just slower).
     pub async fn probe_address_activity_delta(
         &self,
         address: Felt,
         from_block: u64,
+        min_block_date: Option<chrono::NaiveDate>,
     ) -> Result<AddressActivityProbe, String> {
         let addr_hex = format!("{:#066x}", address);
+        let min_date_str = min_date_floor(min_block_date);
         let params = serde_json::json!({
             "address": addr_hex,
+            "min_date": min_date_str,
             "from_block": from_block.to_string(),
         });
         let sql = format!(
@@ -898,12 +1048,14 @@ impl DuneClient {
                MIN(block_number) AS min_block, MAX(block_number) AS max_block \
              FROM starknet.events \
              WHERE from_address = {addr} \
+             AND block_date >= date '{min_date}' \
              AND block_number > {from}",
             addr = addr_hex,
+            min_date = min_date_str,
             from = from_block,
         );
 
-        debug!(address = %addr_hex, from_block, "Dune events probe (delta): extending activity range");
+        debug!(address = %addr_hex, from_block, %min_date_str, "Dune events probe (delta): extending activity range");
         let rows = self
             .run_shape(QueryShape::ProbeActivityDelta, params, &sql)
             .await?;
@@ -1191,6 +1343,41 @@ fn parse_dune_rows(rows: &[serde_json::Value]) -> Vec<AddressTxSummary> {
 mod tests {
     use super::*;
 
+    /// Dune's create-query API rejects a parameterized query (400) unless every
+    /// `{{placeholder}}` in the SQL is declared. `param_keys` must therefore
+    /// match `sql`'s placeholders exactly for every shape — a drift (placeholder
+    /// added to SQL but not declared, or vice versa) silently degrades that
+    /// shape to the ephemeral path forever. This guards that invariant.
+    #[test]
+    fn param_keys_match_sql_placeholders() {
+        for shape in [
+            QueryShape::ProbeAddressActivity,
+            QueryShape::ProbeActivityDelta,
+            QueryShape::AccountTxs,
+            QueryShape::AccountTxsWindowed,
+            QueryShape::ContractCallsWindowed,
+            QueryShape::DeclareTx,
+        ] {
+            // Extract every distinct `{{key}}` from the shape's SQL.
+            let mut in_sql: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut rest = shape.sql();
+            while let Some(start) = rest.find("{{") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find("}}") else { break };
+                in_sql.insert(after[..end].to_string());
+                rest = &after[end + 2..];
+            }
+            let declared: std::collections::BTreeSet<String> =
+                shape.param_keys().iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                in_sql,
+                declared,
+                "shape {} param_keys() != its sql() placeholders",
+                shape.name()
+            );
+        }
+    }
+
     /// Both JSON forms must parse the same value: Dune serialises wide
     /// numerics (e.g. uint256 fees) as strings but smaller numerics as
     /// JSON numbers. The previous shape `as_str().or_else(|| as_u64()
@@ -1251,22 +1438,26 @@ mod tests {
         let db_path = dir.path().join("cache.db");
         // Seed persisted ids for several shapes — including ones added after
         // the original probe shape — so a regression in `QueryShape::from_name`
-        // for the newer variants is caught, not just the probe mapping.
+        // for the newer variants is caught, not just the probe mapping. Each
+        // row carries the shape's *current* SQL so it survives the SQL-match
+        // hydration check (a stale-SQL row would be evicted, not hydrated).
         {
             let db = Connection::open(&db_path).unwrap();
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
                     shape TEXT PRIMARY KEY,
                     query_id INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    sql_text TEXT
                  );",
             )
             .unwrap();
             for (shape, qid) in SEEDED_SHAPES {
+                let sql = QueryShape::from_name(shape).unwrap().sql();
                 db.execute(
-                    "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
-                     VALUES (?1, ?2, ?3)",
-                    params![shape, qid as i64, 0i64],
+                    "INSERT INTO dune_persistent_queries (shape, query_id, created_at, sql_text) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![shape, qid as i64, 0i64, sql],
                 )
                 .unwrap();
             }
@@ -1287,14 +1478,16 @@ mod tests {
         }
     }
 
-    /// `evict_persistent_query` must clear a stale id from BOTH the in-memory
-    /// map and the SQLite table — otherwise a restart re-hydrates the dead id
-    /// and the fast path never recovers (the #78 regression).
+    /// A pre-`sql_text` table (created before this column existed) must migrate
+    /// cleanly: `with_persistent_cache` adds the column via ALTER, and the
+    /// rows — whose `sql_text` is now NULL — are treated as stale and evicted
+    /// rather than hydrated, so the fast path recreates them with current SQL.
     #[test]
-    fn evict_persistent_query_clears_memory_and_db() {
+    fn with_persistent_cache_migrates_legacy_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cache.db");
         {
+            // Legacy 3-column schema, no sql_text.
             let db = Connection::open(&db_path).unwrap();
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
@@ -1308,6 +1501,124 @@ mod tests {
                 "INSERT INTO dune_persistent_queries (shape, query_id, created_at) \
                  VALUES (?1, ?2, ?3)",
                 params!["declare_tx", 6262i64, 0i64],
+            )
+            .unwrap();
+        }
+
+        let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
+
+        // NULL sql_text → not hydrated...
+        assert!(
+            client
+                .persistent_ids
+                .lock()
+                .unwrap()
+                .get("declare_tx")
+                .is_none(),
+            "legacy NULL-sql row was hydrated instead of recreated"
+        );
+        // ...and the row was evicted (and the column now exists).
+        let db = client.persistent_db.as_ref().unwrap().lock().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM dune_persistent_queries WHERE shape = 'declare_tx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "legacy row not evicted after migration");
+    }
+
+    /// A persisted query_id whose stored SQL no longer matches the shape's
+    /// current SQL (an in-place SQL edit, e.g. the issue #80 partition floor)
+    /// must NOT be hydrated, and its row must be evicted so get_or_create
+    /// recreates it with the new SQL. Matching rows still hydrate.
+    #[test]
+    fn with_persistent_cache_evicts_stale_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                    shape TEXT PRIMARY KEY,
+                    query_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    sql_text TEXT
+                 );",
+            )
+            .unwrap();
+            // Matching SQL → hydrates.
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at, sql_text) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["declare_tx", 6262i64, 0i64, QueryShape::DeclareTx.sql()],
+            )
+            .unwrap();
+            // Stale SQL → evicted.
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at, sql_text) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "account_txs_windowed",
+                    4545i64,
+                    0i64,
+                    "SELECT 1 -- pre-issue-80 SQL, no block_date floor"
+                ],
+            )
+            .unwrap();
+        }
+
+        let client = DuneClient::new("test-key".to_string(), false).with_persistent_cache(&db_path);
+
+        let map = client.persistent_ids.lock().unwrap();
+        assert_eq!(
+            map.get("declare_tx").copied(),
+            Some(6262),
+            "matching-SQL row should still hydrate"
+        );
+        assert!(
+            map.get("account_txs_windowed").is_none(),
+            "stale-SQL row was hydrated instead of recreated"
+        );
+        drop(map);
+
+        let db = client.persistent_db.as_ref().unwrap().lock().unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM dune_persistent_queries WHERE shape = 'account_txs_windowed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale-SQL row not evicted from SQLite");
+    }
+
+    /// `evict_persistent_query` must clear a stale id from BOTH the in-memory
+    /// map and the SQLite table — otherwise a restart re-hydrates the dead id
+    /// and the fast path never recovers (the #78 regression).
+    #[test]
+    fn evict_persistent_query_clears_memory_and_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dune_persistent_queries (
+                    shape TEXT PRIMARY KEY,
+                    query_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    sql_text TEXT
+                 );",
+            )
+            .unwrap();
+            // Seed with the shape's current SQL so it survives the SQL-match
+            // hydration check; this test exercises explicit eviction, not the
+            // stale-SQL self-heal.
+            db.execute(
+                "INSERT INTO dune_persistent_queries (shape, query_id, created_at, sql_text) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["declare_tx", 6262i64, 0i64, QueryShape::DeclareTx.sql()],
             )
             .unwrap();
         }
@@ -1384,7 +1695,7 @@ mod tests {
         let address = Felt::from_hex(HYBRID_TEST_ADDR).unwrap();
 
         let probe = dune
-            .probe_address_activity(address)
+            .probe_address_activity(address, None)
             .await
             .expect("probe_address_activity");
         let nonce_felt = ds.get_nonce(address).await.expect("get_nonce");
