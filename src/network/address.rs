@@ -3667,6 +3667,7 @@ pub(super) async fn fetch_address_meta_txs(
     window_size: u64,
     _limit: u32,
     ds: &Arc<dyn crate::data::DataSource>,
+    dune: Option<&Arc<dune::DuneClient>>,
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
@@ -3740,7 +3741,20 @@ pub(super) async fn fetch_address_meta_txs(
         pf,
         abi_reg,
     );
-    let (outcome_res, private_outcome) = tokio::join!(account_fut, private_fut);
+    // Cold tab entry: paint the most-recent PUBLIC meta-txs via Dune in
+    // parallel with the pf scans (mirrors the Calls fast path). It emits
+    // through the cursor-neutral `AddressMetaTxsStreamed`, so it never disturbs
+    // the pf account/pool pagination this function drives below. On ExtendDown
+    // pages (`continuation_token` = Some) the pf walk already covers older
+    // history, so Dune is not re-run.
+    let dune_fut = async {
+        if continuation_token.is_none() {
+            if let Some(d) = dune {
+                emit_recent_meta_txs_via_dune(address, d, pf, abi_reg, &ds_dyn, action_tx).await;
+            }
+        }
+    };
+    let (outcome_res, private_outcome, _) = tokio::join!(account_fut, private_fut, dune_fut);
     let PrivateDiscoveryOutcome {
         summaries: mut private_summaries,
         pool_min_searched,
@@ -3912,6 +3926,171 @@ pub(super) async fn fetch_address_meta_txs(
         next_token: combined_next_token,
         next_window_size: combined_next_window,
     });
+}
+
+/// Recent-first fast paint of PUBLIC meta-txs via Dune — the MetaTxs analogue
+/// of the Calls progressive window ladder (`fetch_address_contract_calls`).
+///
+/// A meta-tx where `address` is the intender is an `execute_from_outside*`
+/// CALL to `address`, so Dune's trace-indexed `starknet.calls` (selector-
+/// filtered, `ORDER BY block_number DESC`) jumps straight to the most-recent
+/// ones — no pf-query block-walk. Without this the cold MetaTxs tab scans the
+/// 5k-block tip and then walks `ExtendDown` backward one window at a time,
+/// which is slow and surfaces *old* meta-txs first on accounts whose meta-tx
+/// activity sits deep in history.
+///
+/// Runs a narrow (90d) and a wide (365d, hedged) window concurrently, paints
+/// each as it lands, cancels on a full page, then bulk-fetches the matching
+/// outer txs and classifies them. Emits via the cursor-neutral
+/// `AddressMetaTxsStreamed`, so the rows merge into the tab newest-first
+/// WITHOUT touching the pf scan's pagination cursor — the pf account scan +
+/// private-pool discovery still own lifetime backfill and catch what Dune's
+/// selector filter can't see (privacy-sponsored meta-txs; component-based
+/// account selectors that don't equal `starknet_keccak(name)`).
+async fn emit_recent_meta_txs_via_dune(
+    address: starknet::core::types::Felt,
+    dune_client: &Arc<dune::DuneClient>,
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+    abi_reg: &Arc<AbiRegistry>,
+    ds: &Arc<dyn crate::data::DataSource>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    use futures::FutureExt;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use starknet::core::types::Felt;
+
+    // Page size for the recent-first window. Comfortably above the UI's
+    // `AUTO_FILL_TARGET` (50) so a full page also halts the pf auto-fill
+    // walk-down on dense accounts, while staying cheap to fetch + classify.
+    const META_TX_LIMIT: u32 = 100;
+    const RECENT_DAYS: i64 = 90;
+    const WIDE_DAYS: i64 = 365;
+    const WIDE_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let today = chrono::Utc::now().date_naive();
+    let recent_min_date = today - chrono::Duration::days(RECENT_DAYS);
+    let wide_min_date = today - chrono::Duration::days(WIDE_DAYS);
+
+    let mut rungs = FuturesUnordered::new();
+    // Narrow recent window: one execution, returns fast → partial first paint.
+    {
+        let d = dune_client.clone();
+        rungs.push(
+            async move {
+                let rows = d
+                    .query_meta_tx_calls_windowed(
+                        address,
+                        0,
+                        u64::MAX,
+                        META_TX_LIMIT,
+                        Some(recent_min_date),
+                    )
+                    .await;
+                (RECENT_DAYS, rows)
+            }
+            .boxed(),
+        );
+    }
+    // Wide window: hedged against Dune's tail latency, fills the page.
+    {
+        let d = dune_client.clone();
+        rungs.push(
+            async move {
+                let rows = hedged_query(
+                    || {
+                        d.query_meta_tx_calls_windowed(
+                            address,
+                            0,
+                            u64::MAX,
+                            META_TX_LIMIT,
+                            Some(wide_min_date),
+                        )
+                    },
+                    WIDE_HEDGE_DELAY,
+                )
+                .await;
+                (WIDE_DAYS, rows)
+            }
+            .boxed(),
+        );
+    }
+
+    // Paint each rung as it lands (the narrow window usually finishes first).
+    // Dedup tx hashes across rungs (365d ⊇ 90d) so the wide rung only fetches
+    // what the narrow one didn't already paint. A full page means we have the
+    // most-recent META_TX_LIMIT meta-txs, so the wider rung can only re-return
+    // the same hashes — cancel it.
+    let mut seen: std::collections::HashSet<Felt> = std::collections::HashSet::new();
+    while let Some((days, result)) = rungs.next().await {
+        match result {
+            Ok(rows) => {
+                let n = rows.len();
+                let fresh: Vec<Felt> = rows
+                    .iter()
+                    .map(|c| c.tx_hash)
+                    .filter(|h| *h != Felt::ZERO && seen.insert(*h))
+                    .collect();
+                info!(
+                    addr = %format!("{:#x}", address),
+                    rung_days = days,
+                    meta_tx_calls = n,
+                    fresh = fresh.len(),
+                    "MetaTxs: Dune ladder rung paint"
+                );
+                paint_meta_tx_hashes(address, &fresh, pf, abi_reg, ds, action_tx).await;
+                if n >= META_TX_LIMIT as usize {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    addr = %format!("{:#x}", address),
+                    rung_days = days,
+                    error = %e,
+                    "MetaTxs: Dune ladder rung query failed"
+                );
+            }
+        }
+    }
+    drop(rungs);
+}
+
+/// Bulk-fetch `hashes` via pf-query, classify each as a meta-tx where
+/// `address` is the intender, then persist + stream the survivors to the UI.
+/// Shared tail of the Dune meta-tx fast-paint ladder; a no-op when `hashes` is
+/// empty or nothing classifies. Persists here (we hold `ds`) because
+/// `AddressMetaTxsStreamed` is a cursor-neutral merge the reducer does not
+/// persist.
+async fn paint_meta_tx_hashes(
+    address: starknet::core::types::Felt,
+    hashes: &[starknet::core::types::Felt],
+    pf: &Arc<crate::data::pathfinder::PathfinderClient>,
+    abi_reg: &Arc<AbiRegistry>,
+    ds: &Arc<dyn crate::data::DataSource>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    if hashes.is_empty() {
+        return;
+    }
+    let rows = match pf.get_txs_by_hash(hashes).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(addr = %format!("{:#x}", address), error = %e, "MetaTxs: pf txs-by-hash fetch failed");
+            return;
+        }
+    };
+    let mut summaries = Vec::new();
+    for row in &rows {
+        if let Some(s) = classify_meta_tx_candidate(address, row, abi_reg).await {
+            summaries.push(s);
+        }
+    }
+    if summaries.is_empty() {
+        return;
+    }
+    sort_meta_txs_recency(&mut summaries);
+    ds.save_meta_txs(&address, &summaries);
+    let _ = action_tx.send(Action::AddressMetaTxsStreamed { address, summaries });
 }
 
 /// Which Dune query variant the calls fetch should issue.
@@ -4383,21 +4562,39 @@ async fn hedged_contract_calls_window(
     limit: u32,
     hedge_delay: std::time::Duration,
 ) -> Result<Vec<crate::data::types::ContractCallSummary>, String> {
-    let first =
-        dune_client.query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date));
-    tokio::pin!(first);
+    hedged_query(
+        || dune_client.query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date)),
+        hedge_delay,
+    )
+    .await
+}
 
+/// Generic tail-latency hedge: run `make_attempt()`, and if it hasn't returned
+/// within `hedge_delay`, fire a second identical attempt and take whichever
+/// finishes first. Dune execution time has a heavy random tail that is
+/// independent per execution, so the odds of both attempts tailing are low —
+/// this collapses the worst case to roughly `hedge_delay` plus a median run,
+/// paying one extra attempt only when the first is already slow. The loser's
+/// poll loop simply stops; safe for side-effect-free reads (a `SELECT`).
+/// `make_attempt` only *builds* the future, so it is cheap to call twice.
+async fn hedged_query<F, Fut, T>(
+    make_attempt: F,
+    hedge_delay: std::time::Duration,
+) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let first = make_attempt();
+    tokio::pin!(first);
     tokio::select! {
         r = &mut first => r,
         _ = tokio::time::sleep(hedge_delay) => {
             debug!(
-                addr = %format!("{:#x}", address),
-                ?min_date,
                 hedge_delay_s = hedge_delay.as_secs(),
-                "Calls: wide window slow, firing hedged second execution"
+                "hedged_query: first attempt slow, firing hedged second execution"
             );
-            let second = dune_client
-                .query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date));
+            let second = make_attempt();
             tokio::pin!(second);
             tokio::select! {
                 r = &mut first => r,

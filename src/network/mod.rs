@@ -469,6 +469,7 @@ pub async fn run_network_task(
                                 window_size,
                                 limit,
                                 &ds,
+                                dune.as_ref(),
                                 pf,
                                 &abi_reg,
                                 &tx,
