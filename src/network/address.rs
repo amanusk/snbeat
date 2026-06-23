@@ -410,6 +410,11 @@ const KNOWN_TOKENS: &[(&str, &str, u8)] = &[
         "wstETH",
         18,
     ),
+    (
+        "0x05ce53b9b68fb8e9ecab9283a96d97948914733fd6ed8d9a53a276a419497841",
+        "ZEC",
+        8,
+    ),
 ];
 
 /// Fetch token balances for all known tokens for an address.
