@@ -4089,91 +4089,120 @@ pub(super) async fn fetch_address_contract_calls(
         return;
     }
 
-    // Cold cache: fire the recent-window paint AND the deploy-scoped backfill
-    // CONCURRENTLY, never serially. `starknet.calls` is partitioned by
-    // `block_date`, so a recent date floor prunes to a handful of partitions —
-    // but on a recently-inactive contract that window returns 0 rows and is
-    // still a heavy scan, so gating the backfill behind it left the Calls tab
-    // empty for minutes. The deploy-scoped backfill returns the 500 most-recent
-    // calls (deploy..tip DESC) — a superset of the recent window — so whichever
-    // returns first paints something, and `persist_and_emit_calls` dedups the
-    // overlap. If the recent window fills a full page first (active contract),
-    // the backfill is cancelled to avoid the expensive lifetime scan; otherwise
-    // the backfill supersedes it. Deploy-floor resolution (PF/Voyager + block
-    // timestamp) runs inside the backfill future, so it never delays the recent
-    // first paint.
-    const RECENT_CALLS_DAYS: i64 = 14;
-    let recent_min_date =
-        chrono::Utc::now().date_naive() - chrono::Duration::days(RECENT_CALLS_DAYS);
-    let recent_fut = dune_client.query_contract_calls_windowed(
-        address,
-        0,
-        u64::MAX,
-        CONTRACT_CALL_LIMIT,
-        Some(recent_min_date),
-    );
-    let backfill_fut = async {
-        let (deploy_floor, deploy_floor_ts) =
-            resolve_deploy_floor(address, ds, pf, voyager_c).await;
-        let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
-        if let CallsDuneQuery::DeployScoped {
-            from_block,
-            min_date,
-        } = &plan
-        {
-            debug!(
-                addr = %format!("{:#x}", address),
-                from_block,
-                ?min_date,
-                "Calls: cold-cache backfill Dune query (deploy-scoped)"
-            );
-        }
-        run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await
-    };
-    tokio::pin!(recent_fut, backfill_fut);
+    // Cold cache: no prior rows, so fetch the 500 most-recent calls and paint
+    // PROGRESSIVELY. `starknet.calls` is partitioned by `block_date`, and an
+    // `ORDER BY block_number DESC LIMIT 500` over a date floor must scan every
+    // partition from that floor to the chain tip — so a single deploy-to-tip
+    // backfill re-scans years of heavy historical partitions that are all
+    // *older* than the 500 most-recent calls (pure waste: benchmarked at ~8x the
+    // scan of a 1-year window that returns the identical page). Run two date
+    // windows CONCURRENTLY and paint each as it lands (`persist_and_emit_calls`
+    // dedups the superset overlap):
+    //   * A narrow recent window (90d) and a wide one (365d). The gap is
+    //     deliberate: Dune execution latency has a heavy random tail (a single
+    //     query can take 30-80s regardless of engine tier), so the two rungs
+    //     must differ enough in scan size that the narrow one reliably returns
+    //     FIRST — that's the fast partial first paint. A 3rd middle rung was
+    //     tried and removed: it was close in size to 365d, so under a tail the
+    //     full rung sometimes won the race and cancel-on-fill killed the only
+    //     incremental paint. Two well-separated rungs (and fewer concurrent
+    //     queries) are more robust to the tail than a denser ladder.
+    //   * Cancel-on-fill — the moment a rung returns a full page (>= LIMIT),
+    //     the other rung is dropped: those 500 are already the most-recent
+    //     calls, and the wider window would only re-return the same rows.
+    //   * Deploy fallback only when needed — if even the 365d rung returns
+    //     < LIMIT, the contract has fewer than LIMIT calls in the last year, so
+    //     fall back to the full deploy-scoped lifetime scan for completeness.
+    //     Common-path contracts never pay that scan, nor the PF/Voyager
+    //     deploy-floor resolution it requires.
+    use futures::stream::{FuturesUnordered, StreamExt};
+    const LADDER_DAYS: [i64; 2] = [90, 365];
+    let today = chrono::Utc::now().date_naive();
 
-    // First arm to fire wins first paint. The loop runs at most twice: once for
-    // recent (if it lands first and doesn't fill a page) and once for backfill.
-    let mut recent_done = false;
-    let backfill_result = loop {
-        tokio::select! {
-            recent = &mut recent_fut, if !recent_done => {
-                recent_done = true;
-                match recent {
-                    Ok(recent) => {
-                        let filled = recent.len() >= CONTRACT_CALL_LIMIT as usize;
-                        info!(
-                            addr = %format!("{:#x}", address),
-                            recent_calls = recent.len(),
-                            recent_days = RECENT_CALLS_DAYS,
-                            "Calls: recent-window first paint"
-                        );
-                        persist_and_emit_calls(
-                            address, recent, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
-                        )
-                        .await;
-                        // Active contract: a full recent page already covers the
-                        // most-recent calls; cancel the backfill (drop its future
-                        // by returning) rather than re-scan the lifetime.
-                        if filled {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(addr = %format!("{:#x}", address), error = %e, "Calls: recent-window query failed; relying on backfill");
-                    }
+    let mut rungs = FuturesUnordered::new();
+    for &days in &LADDER_DAYS {
+        let min_date = today - chrono::Duration::days(days);
+        let dune_client = dune_client.clone();
+        rungs.push(async move {
+            let rows = dune_client
+                .query_contract_calls_windowed(
+                    address,
+                    0,
+                    u64::MAX,
+                    CONTRACT_CALL_LIMIT,
+                    Some(min_date),
+                )
+                .await;
+            (days, rows)
+        });
+    }
+
+    // Paint each rung as it completes (smallest windows usually finish first, so
+    // the visible count grows monotonically). `filled` records whether any rung
+    // returned a full page; if so we break, dropping the remaining in-flight
+    // futures — that drop cancels their Dune round-trips.
+    let mut filled = false;
+    while let Some((days, result)) = rungs.next().await {
+        match result {
+            Ok(rows) => {
+                let n = rows.len();
+                info!(
+                    addr = %format!("{:#x}", address),
+                    rung_days = days,
+                    calls = n,
+                    "Calls: ladder rung paint"
+                );
+                persist_and_emit_calls(
+                    address, rows, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                )
+                .await;
+                if n >= CONTRACT_CALL_LIMIT as usize {
+                    filled = true;
+                    break;
                 }
             }
-            backfill = &mut backfill_fut => break backfill,
+            Err(e) => {
+                warn!(
+                    addr = %format!("{:#x}", address),
+                    rung_days = days,
+                    error = %e,
+                    "Calls: ladder rung query failed"
+                );
+            }
         }
-    };
+    }
+    drop(rungs);
 
-    match backfill_result {
+    // A rung filled a full page → the 500 most-recent calls are painted; done.
+    if filled {
+        return;
+    }
+
+    // No rung filled — fewer than LIMIT calls within the widest window (or a rung
+    // failed). Scan the full lifetime (deploy-scoped) so low-traffic and heavily
+    // historical contracts still get a complete most-recent page. This is the
+    // only path that resolves the deploy floor (PF/Voyager) and pays the
+    // lifetime scan, and it's reached only when the ladder couldn't fill.
+    let (deploy_floor, deploy_floor_ts) = resolve_deploy_floor(address, ds, pf, voyager_c).await;
+    let plan = pick_calls_dune_query(None, deploy_floor, deploy_floor_ts);
+    if let CallsDuneQuery::DeployScoped {
+        from_block,
+        min_date,
+    } = &plan
+    {
+        debug!(
+            addr = %format!("{:#x}", address),
+            from_block,
+            ?min_date,
+            "Calls: cold-cache deploy-scoped lifetime fallback (no rung filled)"
+        );
+    }
+    match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
         Ok(dune_calls) => {
             info!(
                 addr = %format!("{:#x}", address),
                 calls = dune_calls.len(),
-                "Calls: Dune contract calls backfill complete"
+                "Calls: deploy-scoped lifetime fallback complete"
             );
             persist_and_emit_calls(
                 address, dune_calls, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
@@ -4181,7 +4210,7 @@ pub(super) async fn fetch_address_contract_calls(
             .await
         }
         Err(e) => {
-            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: Dune contract calls backfill failed")
+            warn!(addr = %format!("{:#x}", address), error = %e, "Calls: deploy-scoped lifetime fallback failed")
         }
     }
 }
@@ -4192,7 +4221,8 @@ pub(super) async fn fetch_address_contract_calls(
 /// Voyager label (~600ms), then the floor block's timestamp (cache or RPC).
 /// PF and Voyager are independent so they run concurrently (`~max` not sum);
 /// PF wins, Voyager's `deploy_block` is the fallback. Only called on the cold
-/// backfill path — the recent-window first paint doesn't need it.
+/// deploy-scoped lifetime fallback — the progressive window ladder fills the
+/// page without it for the common case, so most fetches never resolve it.
 async fn resolve_deploy_floor(
     address: starknet::core::types::Felt,
     ds: &Arc<dyn crate::data::DataSource>,
