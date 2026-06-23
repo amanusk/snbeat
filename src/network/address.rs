@@ -4110,31 +4110,65 @@ pub(super) async fn fetch_address_contract_calls(
     //   * Cancel-on-fill — the moment a rung returns a full page (>= LIMIT),
     //     the other rung is dropped: those 500 are already the most-recent
     //     calls, and the wider window would only re-return the same rows.
-    //   * Deploy fallback only when needed — if even the 365d rung returns
+    //   * Hedge the wide window — Dune's tail is random and independent per
+    //     execution, so if the 365d query hasn't returned within
+    //     WIDE_HEDGE_DELAY we fire a second identical execution and take
+    //     whichever finishes first (see `hedged_contract_calls_window`). That
+    //     collapses the rare ~tens-of-seconds tail to ~delay + a median run,
+    //     paying one extra scan only when the first attempt is already slow.
+    //   * Deploy fallback only when needed — if even the 365d window returns
     //     < LIMIT, the contract has fewer than LIMIT calls in the last year, so
     //     fall back to the full deploy-scoped lifetime scan for completeness.
     //     Common-path contracts never pay that scan, nor the PF/Voyager
     //     deploy-floor resolution it requires.
+    use futures::FutureExt;
     use futures::stream::{FuturesUnordered, StreamExt};
-    const LADDER_DAYS: [i64; 2] = [90, 365];
+    const RECENT_DAYS: i64 = 90;
+    const WIDE_DAYS: i64 = 365;
+    // If the wide window's first execution hasn't returned within this long,
+    // fire a hedged second execution and race them.
+    const WIDE_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
     let today = chrono::Utc::now().date_naive();
+    let recent_min_date = today - chrono::Duration::days(RECENT_DAYS);
+    let wide_min_date = today - chrono::Duration::days(WIDE_DAYS);
 
     let mut rungs = FuturesUnordered::new();
-    for &days in &LADDER_DAYS {
-        let min_date = today - chrono::Duration::days(days);
+    // Narrow recent window: one execution, returns fast → partial first paint.
+    {
         let dune_client = dune_client.clone();
-        rungs.push(async move {
-            let rows = dune_client
-                .query_contract_calls_windowed(
+        rungs.push(
+            async move {
+                let rows = dune_client
+                    .query_contract_calls_windowed(
+                        address,
+                        0,
+                        u64::MAX,
+                        CONTRACT_CALL_LIMIT,
+                        Some(recent_min_date),
+                    )
+                    .await;
+                (RECENT_DAYS, rows)
+            }
+            .boxed(),
+        );
+    }
+    // Wide window: hedged against Dune's tail latency, fills the full page.
+    {
+        let dune_client = dune_client.clone();
+        rungs.push(
+            async move {
+                let rows = hedged_contract_calls_window(
+                    &dune_client,
                     address,
-                    0,
-                    u64::MAX,
+                    wide_min_date,
                     CONTRACT_CALL_LIMIT,
-                    Some(min_date),
+                    WIDE_HEDGE_DELAY,
                 )
                 .await;
-            (days, rows)
-        });
+                (WIDE_DAYS, rows)
+            }
+            .boxed(),
+        );
     }
 
     // Paint each rung as it completes (smallest windows usually finish first, so
@@ -4325,6 +4359,46 @@ async fn run_calls_dune_plan(
                 .await
         }
         CallsDuneQuery::Unwindowed => dune_client.query_contract_calls(address, limit).await,
+    }
+}
+
+/// Run the wide contract-calls window with a hedge against Dune's tail
+/// latency. Dune execution time has a heavy random tail — a single query can
+/// take tens of seconds regardless of engine tier — and the tail is
+/// independent per execution. So fire one execution, and if it hasn't returned
+/// within `hedge_delay`, fire a second identical execution and return whichever
+/// finishes first. The odds of both attempts tailing are low, so this collapses
+/// the worst case to roughly `hedge_delay` plus a median run. The extra scan is
+/// paid only when the first attempt is already slow; the loser is dropped
+/// (its poll loop simply stops — a `SELECT` has no side effects).
+async fn hedged_contract_calls_window(
+    dune_client: &Arc<dune::DuneClient>,
+    address: starknet::core::types::Felt,
+    min_date: chrono::NaiveDate,
+    limit: u32,
+    hedge_delay: std::time::Duration,
+) -> Result<Vec<crate::data::types::ContractCallSummary>, String> {
+    let first =
+        dune_client.query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date));
+    tokio::pin!(first);
+
+    tokio::select! {
+        r = &mut first => r,
+        _ = tokio::time::sleep(hedge_delay) => {
+            debug!(
+                addr = %format!("{:#x}", address),
+                ?min_date,
+                hedge_delay_s = hedge_delay.as_secs(),
+                "Calls: wide window slow, firing hedged second execution"
+            );
+            let second = dune_client
+                .query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date));
+            tokio::pin!(second);
+            tokio::select! {
+                r = &mut first => r,
+                r = &mut second => r,
+            }
+        }
     }
 }
 
