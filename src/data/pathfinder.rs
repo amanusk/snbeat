@@ -9,6 +9,13 @@ use tracing::debug;
 pub const TRANSACTION_EXECUTED_SELECTOR: &str =
     "0x01dcde06aabdbca2f80aa51392b345d7549d7757aa855f7e37f5d335ac8243b1";
 
+/// ERC-20 `Transfer` event selector (`sn_keccak("Transfer")`). Modern Starknet
+/// tokens emit it with indexed keys `[selector, from, to]`, which lets a WS
+/// `subscribeEvents` keys-filter pin the from/to slot. Shared so the WS
+/// transfer subscription and any decode path use the same value.
+pub const TRANSFER_SELECTOR: &str =
+    "0x0099cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9";
+
 /// HTTP client for the pf-query service.
 pub struct PathfinderClient {
     client: reqwest::Client,
