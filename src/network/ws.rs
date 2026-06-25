@@ -661,11 +661,13 @@ fn handle_event(
     // Carry the real `event_index` from the notification. This is essential
     // for the keyed Transfer subscriptions: a single tx can emit several
     // Transfers involving the viewed address (token in + token out, or
-    // multi-hop), and the cache + Events-tab dedup key is
-    // `(tx_hash, block, event_index)`. Hardcoding 0 here would collapse those
-    // distinct transfers into one (dropping legs) and mis-merge events that
-    // arrive from overlapping subscriptions. `EmittedEvent.event_index` is
-    // present on the subscription payload (starknet-rust 0.19+).
+    // multi-hop). The Events-tab reducer dedups by `(tx_hash, event_index)`
+    // and the cache merge by `(tx_hash, block_number, event_index)` — in both,
+    // `event_index` is the field that distinguishes the legs. Hardcoding 0
+    // here would collapse those distinct transfers into one (dropping legs)
+    // and mis-merge events that arrive from overlapping subscriptions.
+    // `EmittedEvent.event_index` is present on the subscription payload
+    // (starknet-rust 0.19+).
     let sn_event = SnEvent {
         from_address: event.emitted_event.from_address,
         keys: event.emitted_event.keys.clone(),
@@ -1051,6 +1053,13 @@ mod tests {
             "0x03a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4",
         );
         let sel = transfer_selector();
+        // Guard the hardcoded constant: a wrong selector would make the
+        // subscription silently never match. Pin it to `sn_keccak("Transfer")`.
+        assert_eq!(
+            sel,
+            starknet::core::utils::get_selector_from_name("Transfer").unwrap(),
+            "TRANSFER_SELECTOR must equal sn_keccak(\"Transfer\")"
+        );
         let [incoming, outgoing] = transfer_key_filters(address);
 
         // incoming: [[selector], [], [address]] → to == address
@@ -1110,8 +1119,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ds = test_data_source();
-        let r6: Value = serde_json::from_str(&mk("0x33068f", 6)).unwrap();
-        let r7: Value = serde_json::from_str(&mk("0x33068f", 7)).unwrap();
+        // Two different token contracts emit the two transfers (ETH in, STRK
+        // out) — distinct `from_address`, same tx, distinct `event_index`.
+        let eth = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
+        let strk = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+        let r6: Value = serde_json::from_str(&mk(eth, 6)).unwrap();
+        let r7: Value = serde_json::from_str(&mk(strk, 7)).unwrap();
         super::handle_event(&r6, address, &ds, &tx);
         super::handle_event(&r7, address, &ds, &tx);
 
