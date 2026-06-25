@@ -4,7 +4,13 @@
 //! subscriptions:
 //!   - `starknet_subscribeNewHeads` — always active, replaces polling
 //!   - `starknet_subscribeEvents` — per address, added when viewing an address
+//!     (events the address *emits*, via the `from_address` filter)
 //!   - `starknet_subscribeNewTransactions` — per account sender address
+//!   - `starknet_subscribeEvents` (keyed `Transfer`) — per address, two extra
+//!     subscriptions matching ERC-20 `Transfer` events where the address is the
+//!     `to` or `from` key. This is the only way to see activity for a contract
+//!     that moves tokens but emits no events of its own (the token contract is
+//!     the emitter), so its `from_address` subscription stays silent.
 //!
 //! Uses starknet-rust types for serialization of subscribe requests and
 //! deserialization of notification payloads. Raw connection management uses
@@ -55,8 +61,18 @@ const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 enum SubscriptionKind {
     NewHeads,
-    Events { address: Felt },
-    Transactions { address: Felt },
+    Events {
+        address: Felt,
+    },
+    Transactions {
+        address: Felt,
+    },
+    /// ERC-20 `Transfer` events keyed by the viewed address (as `to` or
+    /// `from`). Emitted by the token contract, not the viewed address, so
+    /// these surface token flows a silent contract would otherwise hide.
+    Transfers {
+        address: Felt,
+    },
 }
 
 /// Command sent to the WS task to manage subscriptions.
@@ -66,6 +82,9 @@ pub enum WsCommand {
     SubscribeEvents { address: Felt },
     /// Subscribe to new transactions sent by `address` (account view).
     SubscribeTransactions { address: Felt },
+    /// Subscribe to ERC-20 `Transfer` events where `address` is the `to` or
+    /// `from` key — token flows in/out of a (possibly event-silent) address.
+    SubscribeTransfers { address: Felt },
     /// Remove all subscriptions for `address`.
     UnsubscribeAddress { address: Felt },
 }
@@ -90,14 +109,16 @@ impl WsSubscriptionManager {
             .send(WsCommand::SubscribeTransactions { address });
     }
 
-    /// Subscribe to both events and transactions for `address`.
+    /// Subscribe to events, transactions, and token transfers for `address`.
     /// Safe to call regardless of address type — the server will send
-    /// whichever notifications match.
+    /// whichever notifications match. The transfers subscription is what makes
+    /// a token-moving but event-silent contract show live activity.
     pub fn subscribe_address(&self, address: Felt) {
         let _ = self.cmd_tx.send(WsCommand::SubscribeEvents { address });
         let _ = self
             .cmd_tx
             .send(WsCommand::SubscribeTransactions { address });
+        let _ = self.cmd_tx.send(WsCommand::SubscribeTransfers { address });
     }
 
     /// Stop all subscriptions for `address`.
@@ -251,6 +272,7 @@ impl ConnectionState {
             {
                 cmds.push(WsCommand::SubscribeEvents { address: addr });
                 cmds.push(WsCommand::SubscribeTransactions { address: addr });
+                cmds.push(WsCommand::SubscribeTransfers { address: addr });
             }
         }
         cmds
@@ -259,9 +281,9 @@ impl ConnectionState {
 
 fn kind_address(kind: &SubscriptionKind) -> Option<Felt> {
     match kind {
-        SubscriptionKind::Events { address } | SubscriptionKind::Transactions { address } => {
-            Some(*address)
-        }
+        SubscriptionKind::Events { address }
+        | SubscriptionKind::Transactions { address }
+        | SubscriptionKind::Transfers { address } => Some(*address),
         SubscriptionKind::NewHeads => None,
     }
 }
@@ -449,6 +471,32 @@ async fn send_subscribe_cmd(
                 .insert(id, SubscriptionKind::Transactions { address: *address });
             debug!(address = %format!("{:#x}", address), "Sent starknet_subscribeNewTransactions");
         }
+        WsCommand::SubscribeTransfers { address } => {
+            // Two keyed subscriptions: ERC-20 `Transfer` events where the
+            // address is the `to` key (incoming) or the `from` key (outgoing).
+            // `from_address` is left unset so the filter matches transfers
+            // emitted by *any* token contract. Both are tracked under the same
+            // `Transfers` kind/address so they re-subscribe and clean up
+            // together; the shared `handle_event` path dedups by
+            // `(tx_hash, event_index)`, so a tx with both legs still yields one
+            // Calls row and two distinct Events rows.
+            for keys in transfer_key_filters(*address) {
+                let id = state.next_id();
+                let req = SubscribeEventsRequest {
+                    from_address: None,
+                    keys: Some(keys),
+                    block_id: None,
+                    finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
+                };
+                let msg =
+                    build_subscribe_msg(id, "starknet_subscribeEvents", serde_json::to_value(req)?);
+                write.send(Message::Text(msg.into())).await?;
+                state
+                    .pending
+                    .insert(id, SubscriptionKind::Transfers { address: *address });
+            }
+            debug!(address = %format!("{:#x}", address), "Sent keyed Transfer subscriptions (in+out)");
+        }
         WsCommand::UnsubscribeAddress { .. } => {
             // Handled at the call site with access to state.remove_address()
         }
@@ -536,6 +584,15 @@ async fn handle_message(
         SubscriptionKind::Events { address } => {
             handle_event(&params.result, address, data_source, response_tx);
         }
+        SubscriptionKind::Transfers { address } => {
+            // Same handler as `Events`: the Transfer notification has the
+            // identical `EmittedEventWithFinality` shape. Routing it through
+            // `handle_event` reuses the cache merge + single `AddressWsEvent`
+            // broadcast, whose reducer dedups Calls by `tx_hash` and Events by
+            // `(tx_hash, event_index)`. The token's `Transfer` is stored under
+            // the viewed address so it surfaces in that address's tabs.
+            handle_event(&params.result, address, data_source, response_tx);
+        }
         SubscriptionKind::Transactions { address } => {
             handle_new_transaction(&params.result, address, response_tx);
         }
@@ -601,19 +658,23 @@ fn handle_event(
 
     let tx_hash = event.emitted_event.transaction_hash;
     let block_number = event.emitted_event.block_number.unwrap_or(0);
-    // event_index isn't carried in the subscription payload type; the WS
-    // notification includes it, but `EmittedEventWithFinality` doesn't expose
-    // it. Persisting it as 0 means the cache dedupe key degrades to
-    // (tx_hash, block) for WS-received events — fine in practice because the
-    // same (tx, block) never fires twice legitimately, and the reload path
-    // re-fetches the full event with its real index via pf-query.
+    // Carry the real `event_index` from the notification. This is essential
+    // for the keyed Transfer subscriptions: a single tx can emit several
+    // Transfers involving the viewed address (token in + token out, or
+    // multi-hop). The Events-tab reducer dedups by `(tx_hash, event_index)`
+    // and the cache merge by `(tx_hash, block_number, event_index)` — in both,
+    // `event_index` is the field that distinguishes the legs. Hardcoding 0
+    // here would collapse those distinct transfers into one (dropping legs)
+    // and mis-merge events that arrive from overlapping subscriptions.
+    // `EmittedEvent.event_index` is present on the subscription payload
+    // (starknet-rust 0.19+).
     let sn_event = SnEvent {
         from_address: event.emitted_event.from_address,
         keys: event.emitted_event.keys.clone(),
         data: event.emitted_event.data.clone(),
         transaction_hash: tx_hash,
         block_number,
-        event_index: 0,
+        event_index: event.emitted_event.event_index,
     };
 
     debug!(
@@ -647,6 +708,34 @@ pub(crate) fn tx_executed_selector() -> Felt {
         Felt::from_hex(crate::data::pathfinder::TRANSACTION_EXECUTED_SELECTOR)
             .expect("TRANSACTION_EXECUTED_SELECTOR is a valid felt")
     })
+}
+
+/// Cached ERC-20 `Transfer` selector as `Felt` (parsed once per process).
+/// Used to build the keyed `subscribeEvents` filter for the transfers
+/// subscription.
+fn transfer_selector() -> Felt {
+    use std::sync::OnceLock;
+    static SELECTOR: OnceLock<Felt> = OnceLock::new();
+    *SELECTOR.get_or_init(|| {
+        Felt::from_hex(crate::data::pathfinder::TRANSFER_SELECTOR)
+            .expect("TRANSFER_SELECTOR is a valid felt")
+    })
+}
+
+/// Build the two `subscribeEvents` keys-filters for `address`'s transfers
+/// subscription: `[to == address, from == address]`. ERC-20 `Transfer` keys
+/// are `[selector, from, to]`; an empty inner vec is a wildcard for that key
+/// position. Both filters are written as explicit 3-slot lists matching that
+/// layout — the incoming filter pins slot 2 (`to`) with slot 1 (`from`)
+/// wildcarded, the outgoing filter pins slot 1 (`from`) with slot 2 (`to`)
+/// wildcarded — rather than relying on the server treating a missing trailing
+/// slot as a wildcard.
+fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
+    let sel = transfer_selector();
+    [
+        vec![vec![sel], vec![], vec![address]], // to == address, any from
+        vec![vec![sel], vec![address], vec![]], // from == address, any to
+    ]
 }
 
 fn handle_new_transaction(
@@ -953,6 +1042,108 @@ mod tests {
         let v: Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(v["method"], "starknet_subscribeNewTransactions");
         assert!(v["params"]["sender_address"].is_array());
+    }
+
+    /// The keyed Transfer subscriptions must pin the Transfer selector in key
+    /// slot 0, the address in slot 2 (`to`) for the incoming filter, and in
+    /// slot 1 (`from`) for the outgoing filter — matching the on-chain
+    /// `[selector, from, to]` layout. Serializing through
+    /// `SubscribeEventsRequest` with `from_address: None` must produce a
+    /// keys-only filter (so transfers from *any* token contract match).
+    #[test]
+    fn transfer_key_filters_pin_to_and_from_slots() {
+        let address = Felt::from_hex_unchecked(
+            "0x03a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4",
+        );
+        let sel = transfer_selector();
+        // Guard the hardcoded constant: a wrong selector would make the
+        // subscription silently never match. Pin it to `sn_keccak("Transfer")`.
+        assert_eq!(
+            sel,
+            starknet::core::utils::get_selector_from_name("Transfer").unwrap(),
+            "TRANSFER_SELECTOR must equal sn_keccak(\"Transfer\")"
+        );
+        let [incoming, outgoing] = transfer_key_filters(address);
+
+        // incoming: [[selector], [], [address]] → to == address, any from
+        assert_eq!(incoming, vec![vec![sel], vec![], vec![address]]);
+        // outgoing: [[selector], [address], []] → from == address, any to
+        assert_eq!(outgoing, vec![vec![sel], vec![address], vec![]]);
+
+        // Serialized request is keys-only (no from_address) so it matches any
+        // emitting token contract.
+        let req = SubscribeEventsRequest {
+            from_address: None,
+            keys: Some(incoming),
+            block_id: None,
+            finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
+        };
+        let v = serde_json::to_value(req).unwrap();
+        assert!(v.get("from_address").is_none() || v["from_address"].is_null());
+        assert_eq!(v["keys"][0][0], format!("{sel:#x}"));
+        assert_eq!(v["keys"][2][0], format!("{address:#x}"));
+    }
+
+    /// Dedup linchpin: a WS event must be broadcast carrying its *real*
+    /// `event_index`, not a hardcoded 0. Two distinct Transfers in one tx
+    /// (token in at idx 6, token out at idx 7) must yield distinct
+    /// `(tx_hash, event_index)` keys so the cache / Events tab keep both and
+    /// the Calls tab still collapses them to one row by `tx_hash`.
+    #[test]
+    fn handle_event_carries_real_event_index() {
+        use crate::app::actions::Action;
+        use tokio::sync::mpsc;
+
+        let address = Felt::from_hex_unchecked(
+            "0x03a496b92d292386ad70dab94ae181a06d289440e3b632a2435721b4280874c4",
+        );
+        let transfer = crate::data::pathfinder::TRANSFER_SELECTOR;
+        // Same tx, two transfer events at indices 6 (in) and 7 (out), emitted
+        // by two different token contracts.
+        let mk = |from_token: &str, idx: u64| {
+            format!(
+                r#"{{
+                    "from_address": "{from_token}",
+                    "keys": ["{transfer}", "0xsomefrom", "{address:#x}"],
+                    "data": ["0x2f2c5624", "0x0"],
+                    "block_hash": "0xabc",
+                    "block_number": 11117243,
+                    "transaction_hash": "0x21a4",
+                    "transaction_index": 0,
+                    "event_index": {idx},
+                    "finality_status": "ACCEPTED_ON_L2"
+                }}"#
+            )
+            .replace(
+                "0xsomefrom",
+                "0x1b6f560def289b32e2a7b0920909615531a4d9d5636ca509045843559dc23d5",
+            )
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ds = test_data_source();
+        // Two different token contracts emit the two transfers (ETH in, STRK
+        // out) — distinct `from_address`, same tx, distinct `event_index`.
+        let eth = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
+        let strk = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+        let r6: Value = serde_json::from_str(&mk(eth, 6)).unwrap();
+        let r7: Value = serde_json::from_str(&mk(strk, 7)).unwrap();
+        super::handle_event(&r6, address, &ds, &tx);
+        super::handle_event(&r7, address, &ds, &tx);
+
+        let mut indices: Vec<u64> = Vec::new();
+        while let Ok(a) = rx.try_recv() {
+            if let Action::AddressWsEvent { event, .. } = a {
+                assert_eq!(event.transaction_hash, Felt::from_hex_unchecked("0x21a4"));
+                indices.push(event.event_index);
+            }
+        }
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![6, 7],
+            "both transfers must broadcast with their real, distinct event_index"
+        );
     }
 
     #[test]
