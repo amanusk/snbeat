@@ -725,13 +725,16 @@ fn transfer_selector() -> Felt {
 /// Build the two `subscribeEvents` keys-filters for `address`'s transfers
 /// subscription: `[to == address, from == address]`. ERC-20 `Transfer` keys
 /// are `[selector, from, to]`; an empty inner vec is a wildcard for that key
-/// position, so the incoming filter pins slot 2 (`to`) and the outgoing filter
-/// pins slot 1 (`from`).
+/// position. Both filters are written as explicit 3-slot lists matching that
+/// layout — the incoming filter pins slot 2 (`to`) with slot 1 (`from`)
+/// wildcarded, the outgoing filter pins slot 1 (`from`) with slot 2 (`to`)
+/// wildcarded — rather than relying on the server treating a missing trailing
+/// slot as a wildcard.
 fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
     let sel = transfer_selector();
     [
-        vec![vec![sel], vec![], vec![address]], // to == address
-        vec![vec![sel], vec![address]],         // from == address
+        vec![vec![sel], vec![], vec![address]], // to == address, any from
+        vec![vec![sel], vec![address], vec![]], // from == address, any to
     ]
 }
 
@@ -1062,10 +1065,10 @@ mod tests {
         );
         let [incoming, outgoing] = transfer_key_filters(address);
 
-        // incoming: [[selector], [], [address]] → to == address
+        // incoming: [[selector], [], [address]] → to == address, any from
         assert_eq!(incoming, vec![vec![sel], vec![], vec![address]]);
-        // outgoing: [[selector], [address]] → from == address
-        assert_eq!(outgoing, vec![vec![sel], vec![address]]);
+        // outgoing: [[selector], [address], []] → from == address, any to
+        assert_eq!(outgoing, vec![vec![sel], vec![address], vec![]]);
 
         // Serialized request is keys-only (no from_address) so it matches any
         // emitting token contract.
