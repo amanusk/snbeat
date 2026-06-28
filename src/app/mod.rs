@@ -540,7 +540,7 @@ impl App {
                 self.maybe_enrich_visible_address_txs();
             }
             AddressTab::Calls => {
-                self.address.calls.scroll_by(delta);
+                self.address.call_list_scroll_by(delta);
                 self.maybe_fetch_more_address_txs();
             }
             AddressTab::MetaTxs => {
@@ -622,7 +622,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
-                    self.address.calls.next();
+                    self.address.call_list_next();
                     self.maybe_fetch_more_address_txs();
                 }
                 AddressTab::MetaTxs => {
@@ -658,7 +658,7 @@ impl App {
                     self.address.tx_list_previous();
                     self.maybe_enrich_visible_address_txs();
                 }
-                AddressTab::Calls => self.address.calls.previous(),
+                AddressTab::Calls => self.address.call_list_previous(),
                 AddressTab::MetaTxs => self.address.meta_txs.previous(),
                 AddressTab::Events => self.address.events.previous(),
                 AddressTab::ClassHistory => {
@@ -685,7 +685,7 @@ impl App {
                     self.address.tx_list_select_first();
                     self.maybe_enrich_visible_address_txs();
                 }
-                AddressTab::Calls => self.address.calls.select_first(),
+                AddressTab::Calls => self.address.call_list_select_first(),
                 AddressTab::MetaTxs => self.address.meta_txs.select_first(),
                 AddressTab::Events => self.address.events.select_first(),
                 AddressTab::ClassHistory => {
@@ -723,7 +723,7 @@ impl App {
                     self.maybe_enrich_visible_address_txs();
                 }
                 AddressTab::Calls => {
-                    self.address.calls.select_last();
+                    self.address.call_list_select_last();
                     self.maybe_fetch_more_address_txs();
                 }
                 AddressTab::MetaTxs => {
@@ -827,6 +827,45 @@ impl App {
             gap: gap_clone,
         });
         true
+    }
+
+    /// Dispatch an on-demand backfill for the currently selected call-gap row
+    /// in the address Calls tab. Returns `true` if a fill was sent. No-op if no
+    /// call gap is selected, its fill is already in flight, or there is no
+    /// current address. Mirrors `dispatch_address_gap_fill`.
+    pub fn dispatch_address_call_gap_fill(&mut self) -> bool {
+        let Some(address) = self.address.context else {
+            return false;
+        };
+        let Some(sel_lo) = self.address.call_gap_selected else {
+            return false;
+        };
+        let Some(gap) = self
+            .address
+            .call_gaps
+            .iter_mut()
+            .find(|g| g.lo_block == sel_lo)
+        else {
+            return false;
+        };
+        if gap.fill_dispatched {
+            return false;
+        }
+        let gap_clone = gap.clone();
+        gap.fill_dispatched = true;
+        let _ = self.action_tx.send(Action::FillAddressCallGap {
+            address,
+            gap: gap_clone,
+            is_contract: self.address.is_contract,
+        });
+        true
+    }
+
+    /// Re-detect Calls-tab block-range gaps after a calls merge. Unlike the
+    /// nonce path there is no auto-fill — a block-range hole doesn't prove
+    /// missing calls, so every call gap waits for an explicit Enter.
+    fn refresh_address_call_gaps(&mut self) {
+        self.address.refresh_unfilled_call_gaps();
     }
 
     /// Refresh the address's nonce-gap list, then auto-dispatch fills for any
@@ -1437,6 +1476,10 @@ impl App {
                         self.address.dune_has_more = true;
                         self.address.rpc_has_more = true;
                     }
+
+                    // Surface any block-range hole between the freshly-fetched
+                    // recent window and older cached calls as a fillable gap.
+                    self.refresh_address_call_gaps();
                 }
 
                 // Set default tab based on contract type
@@ -1518,6 +1561,7 @@ impl App {
                     self.address.rpc_cursor_block = Some(oldest_block);
                     self.address.dune_has_more = has_more;
                     self.address.rpc_has_more = has_more;
+                    self.refresh_address_call_gaps();
                 }
                 self.address.fetching_more_txs = false;
             }
@@ -2083,11 +2127,41 @@ impl App {
                 {
                     self.address.calls.select_first();
                 }
+                // A merge can both close gaps (new calls bridge a hole) and
+                // surface new ones (a fresh top-of-list batch lands above the
+                // cached set). `refresh_unfilled_call_gaps` preserves any
+                // in-flight `fill_dispatched` whose range is unchanged.
+                self.refresh_address_call_gaps();
                 // Persist the merged set so it survives restarts.
                 let _ = self.action_tx.send(Action::PersistAddressCalls {
                     address,
                     calls: self.address.calls.items.clone(),
                 });
+            }
+            Action::AddressCallRangeScanned {
+                address,
+                lo_block,
+                hi_block,
+            } => {
+                if self.address.context == Some(address) {
+                    // The fill covered this whole range. Record it so a
+                    // genuinely-sparse hole inside it stops resurfacing, then
+                    // re-detect (this pass is the one that drops the gap).
+                    self.address.note_scanned_call_range(lo_block, hi_block);
+                    self.refresh_address_call_gaps();
+                }
+            }
+            Action::AddressCallScannedRangesLoaded { address, ranges } => {
+                if self.address.context == Some(address) {
+                    // Merge the persisted closed ranges into whatever's in
+                    // memory (empty on fresh entry; superset-safe on refresh),
+                    // then re-detect so any hole we already scanned-and-found-
+                    // sparse stays suppressed from first paint.
+                    for (lo, hi) in ranges {
+                        self.address.note_scanned_call_range(lo, hi);
+                    }
+                    self.refresh_address_call_gaps();
+                }
             }
             Action::AddressBalancesLoaded { address, balances } => {
                 if self.address.context == Some(address) {

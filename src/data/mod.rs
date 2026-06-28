@@ -205,6 +205,19 @@ pub trait DataSource: Send + Sync {
     fn save_address_calls(&self, _address: &Felt, _calls: &[ContractCallSummary]) {
         // Default: no-op. CachingDataSource overrides.
     }
+    /// Load the block ranges `[lo, hi]` we have *fully* scanned for contract
+    /// calls on this address via on-demand gap fills. Used to suppress
+    /// re-surfacing a genuinely-sparse hole as a Calls-tab gap after we've
+    /// already scanned it and found no (or few) calls. Persisted so the
+    /// "closed" knowledge survives re-navigation and restarts.
+    fn load_call_scanned_ranges(&self, _address: &Felt) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+    /// Record `[lo, hi]` as a fully-scanned contract-call range, coalescing it
+    /// into any existing persisted ranges for the address.
+    fn add_call_scanned_range(&self, _address: &Felt, _lo: u64, _hi: u64) {
+        // Default: no-op. CachingDataSource overrides.
+    }
     /// Load cached meta-tx (outside-execution) summaries for an address where the
     /// address is the intender.
     fn load_cached_meta_txs(&self, _address: &Felt) -> Vec<MetaTxIntenderSummary> {

@@ -782,6 +782,10 @@ fn handle_enter(app: &mut App) -> Option<Action> {
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }
                 crate::app::AddressTab::Calls => {
+                    if app.address.call_gap_selected.is_some() {
+                        app.dispatch_address_call_gap_fill();
+                        return None;
+                    }
                     let hash = app.address.calls.selected_item()?.tx_hash;
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }

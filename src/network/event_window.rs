@@ -96,8 +96,8 @@ pub enum EventWindowPolicy {
     /// successive pages (e.g. doubling on empty hits up to
     /// [`EXTEND_DOWN_MAX_WINDOW`]).
     ExtendDown { window_size: u64 },
-    /// Fetch a specific block range — used to fill a previously deferred gap.
-    #[allow(dead_code)] // wired with the gap UI task
+    /// Fetch a specific block range — used to fill a previously deferred gap
+    /// (Calls-tab on-demand gap fill, see `run_call_gap_fill`).
     FillGap { from_block: u64, to_block: u64 },
 }
 

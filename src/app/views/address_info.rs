@@ -91,6 +91,36 @@ pub struct UnfilledGap {
     pub fill_dispatched: bool,
 }
 
+/// Minimum block span between two consecutive contract calls before we treat
+/// the hole as a fillable gap in the Calls tab. Unlike nonces (a missing nonce
+/// *proves* a missing tx), a block-range hole between two calls does not prove
+/// missing calls — a contract simply may not have been called for a while. So
+/// this threshold is deliberately large: it surfaces the real "recent fetch vs
+/// stale cache" hole (the Dune `CONTRACT_CALL_LIMIT`/event-window page caps
+/// leave hundreds of thousands of blocks unscanned on revisit) without tripping
+/// on ordinary quiet stretches. Tunable — ~10k blocks is a few hours on
+/// mainnet. Filling a range that turns out empty is harmless: the gap just
+/// closes once we've scanned it.
+pub const CALL_GAP_SPAN_BLOCKS: u64 = 10_000;
+
+/// A detected, unfilled block-range hole in the Calls list, deferred for
+/// on-demand filling. The Calls analogue of [`UnfilledGap`] — keyed on block
+/// numbers instead of nonces because incoming calls have no per-address
+/// sequence. Each gap renders as its own row between the bordering calls; the
+/// user presses Enter on it to dispatch a windowed backfill of `lo..=hi`.
+#[derive(Clone, Debug)]
+pub struct UnfilledCallGap {
+    /// Block number of the call just *below* the gap (older edge, lower bound
+    /// for the backfill scan). Also the gap's stable identity across
+    /// re-detection passes.
+    pub lo_block: u64,
+    /// Block number of the call just *above* the gap (newer edge, upper bound
+    /// for the backfill scan).
+    pub hi_block: u64,
+    /// Whether a fill has already been dispatched for this gap.
+    pub fill_dispatched: bool,
+}
+
 /// All state related to the address info view.
 pub struct AddressInfoState {
     pub info: Option<SnAddressInfo>,
@@ -154,6 +184,25 @@ pub struct AddressInfoState {
     /// whenever a gap is showing. Persisted across frames to keep the viewport
     /// offset stable.
     pub txs_render_state: ratatui::widgets::ListState,
+    /// Detected block-range holes in the Calls list that have NOT been filled.
+    /// The Calls-tab analogue of `unfilled_gaps`; each renders as its own row
+    /// between the bordering calls and the user presses Enter to backfill it.
+    pub call_gaps: Vec<UnfilledCallGap>,
+    /// `Some(lo_block)` when the rendered call-gap row whose `lo_block` matches
+    /// is currently selected. Identified by `lo_block` (not vec index) so the
+    /// selection survives re-detection passes — mirrors `gap_selected`.
+    pub call_gap_selected: Option<u64>,
+    /// ListState fed to ratatui for the Calls tab. Indexed against the rendered
+    /// list (calls + optional gap rows), so it diverges from `calls.state`
+    /// whenever a gap is showing. Mirrors `txs_render_state`.
+    pub calls_render_state: ratatui::widgets::ListState,
+    /// Block ranges `[lo, hi]` we have *fully* scanned for calls via on-demand
+    /// gap fills (a windowed query that returned below its limit ⇒ the whole
+    /// range is covered). Unlike nonces, a block-range hole doesn't prove
+    /// missing calls, so once we've scanned a range and found it sparse we must
+    /// remember that — otherwise `detect_unfilled_call_gaps` would re-surface
+    /// the same quiet stretch as a gap forever. Merged intervals, kept small.
+    pub scanned_call_ranges: Vec<(u64, u64)>,
     /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
     pub meta_txs: StatefulList<MetaTxIntenderSummary>,
     /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
@@ -249,6 +298,10 @@ impl Default for AddressInfoState {
             unfilled_gaps: Vec::new(),
             gap_selected: None,
             txs_render_state: ratatui::widgets::ListState::default(),
+            call_gaps: Vec::new(),
+            call_gap_selected: None,
+            calls_render_state: ratatui::widgets::ListState::default(),
+            scanned_call_ranges: Vec::new(),
             meta_txs: StatefulList::new(),
             fetching_meta_txs: false,
             meta_tx_cursor_block: None,
@@ -294,6 +347,10 @@ impl AddressInfoState {
         self.unfilled_gaps.clear();
         self.gap_selected = None;
         self.txs_render_state = ratatui::widgets::ListState::default();
+        self.call_gaps.clear();
+        self.call_gap_selected = None;
+        self.calls_render_state = ratatui::widgets::ListState::default();
+        self.scanned_call_ranges.clear();
         self.meta_txs = StatefulList::new();
         self.fetching_meta_txs = false;
         self.meta_tx_cursor_block = None;
@@ -783,6 +840,203 @@ impl AddressInfoState {
     pub fn tx_list_scroll_by(&mut self, delta: i64) {
         self.tx_list_step(delta);
     }
+
+    // ---- Calls-tab block-range gaps (mirror the nonce-gap machinery) ----
+
+    /// Scan the current calls list for block-range holes wider than
+    /// [`CALL_GAP_SPAN_BLOCKS`]. The Calls-tab analogue of
+    /// `detect_unfilled_gaps`, keyed on block numbers (incoming calls have no
+    /// per-address nonce sequence). Distinct block numbers are considered, so
+    /// several calls sharing a block never fabricate a zero-span gap. Sorted by
+    /// `lo_block` ascending for stable render/test order.
+    pub fn detect_unfilled_call_gaps(&self) -> Vec<UnfilledCallGap> {
+        let mut blocks: Vec<u64> = self
+            .calls
+            .items
+            .iter()
+            .map(|c| c.block_number)
+            .filter(|b| *b > 0)
+            .collect();
+        if blocks.len() < 2 {
+            return Vec::new();
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+
+        let mut out = Vec::new();
+        for w in blocks.windows(2) {
+            let lo_block = w[0];
+            let hi_block = w[1];
+            if hi_block.saturating_sub(lo_block) <= CALL_GAP_SPAN_BLOCKS {
+                continue;
+            }
+            // Suppress ranges we've already fully scanned — the hole is real
+            // (no calls there), not an unfetched window, so don't nag the user.
+            if self
+                .scanned_call_ranges
+                .iter()
+                .any(|(rlo, rhi)| *rlo <= lo_block && hi_block <= *rhi)
+            {
+                continue;
+            }
+            out.push(UnfilledCallGap {
+                lo_block,
+                hi_block,
+                fill_dispatched: false,
+            });
+        }
+        out
+    }
+
+    /// Record a `[lo, hi]` block range as fully scanned for calls, merging it
+    /// into `scanned_call_ranges` (coalescing overlapping/adjacent intervals so
+    /// the list stays small). Called when an on-demand fill covered the whole
+    /// range (returned below its query limit).
+    pub fn note_scanned_call_range(&mut self, lo: u64, hi: u64) {
+        crate::utils::merge_block_interval(&mut self.scanned_call_ranges, lo, hi);
+    }
+
+    /// Re-detect call gaps and store them. Mirrors `refresh_unfilled_gaps`:
+    /// `fill_dispatched` is preserved only for gaps whose `(lo_block, hi_block)`
+    /// is unchanged — a shifted `hi_block` is evidence the lazy fill landed (it
+    /// always shrinks the gap from the newer edge), so we clear the flag and let
+    /// the user press Enter again for the next chunk. Drops a stale selection.
+    pub fn refresh_unfilled_call_gaps(&mut self) {
+        let prev_inflight: HashMap<u64, u64> = self
+            .call_gaps
+            .iter()
+            .filter(|g| g.fill_dispatched)
+            .map(|g| (g.lo_block, g.hi_block))
+            .collect();
+        let mut next = self.detect_unfilled_call_gaps();
+        for g in next.iter_mut() {
+            if let Some(prev_hi) = prev_inflight.get(&g.lo_block)
+                && *prev_hi == g.hi_block
+            {
+                g.fill_dispatched = true;
+            }
+        }
+        self.call_gaps = next;
+        if let Some(sel) = self.call_gap_selected
+            && !self.call_gaps.iter().any(|g| g.lo_block == sel)
+        {
+            self.call_gap_selected = None;
+        }
+    }
+
+    /// Render-order positions for the call-gap rows: `(call_idx, lo_block)`
+    /// sorted by `call_idx` ascending. The calls list is block-descending, so
+    /// each gap renders immediately above the first (topmost) call whose block
+    /// equals `lo_block`. Mirrors `gap_render_positions`.
+    pub fn call_gap_render_positions(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = self
+            .call_gaps
+            .iter()
+            .filter_map(|g| {
+                self.calls
+                    .items
+                    .iter()
+                    .position(|c| c.block_number == g.lo_block)
+                    .map(|p| (p, g.lo_block))
+            })
+            .collect();
+        out.sort_by_key(|(p, _)| *p);
+        out
+    }
+
+    /// Currently-selected call gap, if a gap row is the active selection.
+    pub fn selected_call_gap(&self) -> Option<&UnfilledCallGap> {
+        let lo = self.call_gap_selected?;
+        self.call_gaps.iter().find(|g| g.lo_block == lo)
+    }
+
+    fn call_rendered_len(&self, gaps: &[(usize, u64)]) -> usize {
+        self.calls.items.len() + gaps.len()
+    }
+
+    fn call_current_rendered(&self, gaps: &[(usize, u64)]) -> usize {
+        if let Some(sel_lo) = self.call_gap_selected
+            && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
+        {
+            return Self::gap_rendered_idx(gaps, g_idx);
+        }
+        let c = self.calls.state.selected().unwrap_or(0);
+        Self::tx_pos_to_rendered(c, gaps)
+    }
+
+    fn apply_call_rendered(&mut self, r: usize, gaps: &[(usize, u64)]) {
+        for (g_idx, (p, lo)) in gaps.iter().enumerate() {
+            if p + g_idx == r {
+                self.call_gap_selected = Some(*lo);
+                return;
+            }
+        }
+        self.call_gap_selected = None;
+        let c = Self::rendered_to_tx_pos(r, gaps);
+        self.calls.state.select(Some(c));
+    }
+
+    /// Move selection by `delta` rows in the rendered calls list, clamping on
+    /// the first gap row crossed. Mirrors `tx_list_step`.
+    fn call_list_step(&mut self, delta: i64) {
+        if self.calls.items.is_empty() || delta == 0 {
+            return;
+        }
+        let gaps = self.call_gap_render_positions();
+        let rendered_max = self.call_rendered_len(&gaps).saturating_sub(1);
+        let cur = self.call_current_rendered(&gaps);
+        let target = ((cur as i64) + delta).clamp(0, rendered_max as i64) as usize;
+        let final_r = Self::first_gap_crossed(&gaps, cur, target).unwrap_or(target);
+        self.apply_call_rendered(final_r, &gaps);
+    }
+
+    pub fn call_list_next(&mut self) {
+        self.call_list_step(1);
+    }
+
+    pub fn call_list_previous(&mut self) {
+        self.call_list_step(-1);
+    }
+
+    pub fn call_list_scroll_by(&mut self, delta: i64) {
+        self.call_list_step(delta);
+    }
+
+    /// Jump toward the first row, clamping on the first gap row crossed.
+    pub fn call_list_select_first(&mut self) {
+        if self.calls.items.is_empty() {
+            return;
+        }
+        let gaps = self.call_gap_render_positions();
+        let cur = self.call_current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, 0).unwrap_or(0);
+        self.apply_call_rendered(final_r, &gaps);
+    }
+
+    /// Jump toward the last row, clamping on the first gap row crossed.
+    pub fn call_list_select_last(&mut self) {
+        if self.calls.items.is_empty() {
+            return;
+        }
+        let gaps = self.call_gap_render_positions();
+        let rendered_max = self.call_rendered_len(&gaps).saturating_sub(1);
+        let cur = self.call_current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, rendered_max).unwrap_or(rendered_max);
+        self.apply_call_rendered(final_r, &gaps);
+    }
+
+    /// Rendered (gap-aware) selection index for the Calls list. Mirrors
+    /// `tx_list_rendered_selected`.
+    pub fn call_list_rendered_selected(&self) -> Option<usize> {
+        let gaps = self.call_gap_render_positions();
+        if let Some(sel_lo) = self.call_gap_selected
+            && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
+        {
+            return Some(Self::gap_rendered_idx(&gaps, g_idx));
+        }
+        let c = self.calls.state.selected()?;
+        Some(Self::tx_pos_to_rendered(c, &gaps))
+    }
 }
 
 /// Upgrade an existing tx summary with better data from an incoming one.
@@ -1170,6 +1424,203 @@ mod tests {
             tip: 0,
             inner_targets: Vec::new(),
         }
+    }
+
+    fn call_at(block: u64) -> ContractCallSummary {
+        call_summary(Felt::from(0xC0FFEE_u64), block)
+    }
+
+    fn call_state_with(calls: Vec<ContractCallSummary>) -> AddressInfoState {
+        let mut s = AddressInfoState::default();
+        // Live merge keeps calls block-descending; mirror that here.
+        s.calls.items = calls;
+        s.calls
+            .items
+            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+        s
+    }
+
+    #[test]
+    fn no_call_gap_when_dense() {
+        let state = call_state_with(vec![call_at(1000), call_at(1010), call_at(1020)]);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+    }
+
+    #[test]
+    fn no_call_gap_for_zero_block_stubs() {
+        // WS stubs land with block 0 before enrichment — they must not anchor a
+        // spurious "0..N" gap.
+        let state = call_state_with(vec![call_at(0), call_at(1_000_000)]);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+    }
+
+    #[test]
+    fn detects_call_gap_by_block_span() {
+        // Recent batch (~1.2M) vs stale cache (~1.0M): a ~195k-block hole.
+        let state = call_state_with(vec![
+            call_at(1_200_500),
+            call_at(1_200_490),
+            call_at(1_005_000),
+            call_at(1_004_990),
+        ]);
+        let gaps = state.detect_unfilled_call_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].lo_block, 1_005_000);
+        assert_eq!(gaps[0].hi_block, 1_200_490);
+        assert!(!gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn call_gap_threshold_boundary() {
+        // Exactly at the threshold → not a gap.
+        let state = call_state_with(vec![call_at(1000), call_at(1000 + CALL_GAP_SPAN_BLOCKS)]);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+        // One block over → a gap.
+        let state = call_state_with(vec![
+            call_at(1000),
+            call_at(1000 + CALL_GAP_SPAN_BLOCKS + 1),
+        ]);
+        assert_eq!(state.detect_unfilled_call_gaps().len(), 1);
+    }
+
+    #[test]
+    fn refresh_preserves_call_gap_dispatched_when_unchanged() {
+        let mut state = call_state_with(vec![call_at(1_005_000), call_at(1_200_490)]);
+        state.call_gaps = state.detect_unfilled_call_gaps();
+        state.call_gaps[0].fill_dispatched = true;
+        state.refresh_unfilled_call_gaps();
+        assert_eq!(state.call_gaps.len(), 1);
+        assert!(state.call_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn refresh_clears_call_gap_dispatched_when_gap_shrinks() {
+        // A lazy fill landed: the chunk arrived from the top of the gap,
+        // shrinking it from the newer edge (same lo_block, lower hi_block).
+        // The dispatched flag should clear so the residual row is fillable.
+        let mut state = call_state_with(vec![call_at(1_005_000), call_at(1_200_490)]);
+        state.call_gaps = state.detect_unfilled_call_gaps();
+        state.call_gaps[0].fill_dispatched = true;
+        // A row just below the old top edge (490 blocks down ≤ threshold), so
+        // the upper sub-range stays contiguous and only the wide lower hole
+        // remains — the gap shrank from its newer edge.
+        state.calls.items.push(call_at(1_200_000));
+        state
+            .calls
+            .items
+            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+        state.refresh_unfilled_call_gaps();
+        assert_eq!(state.call_gaps.len(), 1);
+        assert_eq!(state.call_gaps[0].lo_block, 1_005_000);
+        assert_eq!(state.call_gaps[0].hi_block, 1_200_000);
+        assert!(!state.call_gaps[0].fill_dispatched);
+    }
+
+    #[test]
+    fn refresh_drops_stale_call_gap_selection() {
+        let mut state = call_state_with(vec![call_at(1_005_000), call_at(1_200_490)]);
+        state.refresh_unfilled_call_gaps();
+        state.call_gap_selected = Some(1_005_000);
+        // Backfill closes the gap with intervening blocks.
+        state.calls.items = (0..=20)
+            .map(|i| call_at(1_005_000 + i * (CALL_GAP_SPAN_BLOCKS / 2)))
+            .collect();
+        state
+            .calls
+            .items
+            .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+        state.refresh_unfilled_call_gaps();
+        assert!(state.call_gaps.is_empty());
+        assert!(state.call_gap_selected.is_none());
+    }
+
+    #[test]
+    fn scanned_range_suppresses_call_gap() {
+        let mut state = call_state_with(vec![call_at(1_005_000), call_at(1_200_490)]);
+        assert_eq!(state.detect_unfilled_call_gaps().len(), 1);
+        // After fully scanning the range, the (genuinely sparse) hole must not
+        // resurface as a gap.
+        state.note_scanned_call_range(1_005_000, 1_200_490);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+    }
+
+    #[test]
+    fn note_scanned_call_range_merges_overlaps() {
+        let mut state = AddressInfoState::default();
+        state.note_scanned_call_range(100, 200);
+        state.note_scanned_call_range(150, 300); // overlaps → merge
+        state.note_scanned_call_range(301, 400); // adjacent → merge
+        state.note_scanned_call_range(1000, 1100); // disjoint
+        assert_eq!(state.scanned_call_ranges, vec![(100, 400), (1000, 1100)]);
+    }
+
+    /// Single deferred call gap; list is block-descending like the live render.
+    fn call_state_one_gap() -> AddressInfoState {
+        // Blocks 200000, 199000, 200, 190 — only the 200..199000 hole exceeds
+        // CALL_GAP_SPAN_BLOCKS, so exactly one gap (lo_block 200).
+        let mut state = call_state_with(vec![
+            call_at(200_000),
+            call_at(199_000),
+            call_at(200),
+            call_at(190),
+        ]);
+        state.refresh_unfilled_call_gaps();
+        assert_eq!(state.call_gaps.len(), 1);
+        assert_eq!(state.call_gaps[0].lo_block, 200);
+        state.calls.state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn call_next_lands_on_gap_when_crossing_forward() {
+        let mut state = call_state_one_gap();
+        // Start at block 4990 (call idx 1), just above the gap.
+        state.calls.state.select(Some(1));
+        state.call_list_next();
+        assert_eq!(state.call_gap_selected, Some(200));
+        assert_eq!(state.calls.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn call_next_off_gap_lands_on_lo_block_call() {
+        let mut state = call_state_one_gap();
+        state.call_gap_selected = Some(200);
+        state.call_list_next();
+        assert_eq!(state.call_gap_selected, None);
+        assert_eq!(state.calls.state.selected(), Some(2));
+    }
+
+    #[test]
+    fn call_scroll_by_clamps_on_gap_forward() {
+        let mut state = call_state_one_gap();
+        state.calls.state.select(Some(0));
+        state.call_list_scroll_by(10);
+        assert_eq!(state.call_gap_selected, Some(200));
+    }
+
+    #[test]
+    fn call_rendered_selected_tracks_gap_and_call_state() {
+        let mut state = call_state_one_gap();
+        // Call idx 0 (block 5000) → rendered 0.
+        state.calls.state.select(Some(0));
+        assert_eq!(state.call_list_rendered_selected(), Some(0));
+        // Call idx 2 (block 200) → rendered 3 (one gap row in front of it).
+        state.calls.state.select(Some(2));
+        assert_eq!(state.call_list_rendered_selected(), Some(3));
+        // Selecting the gap → rendered 2.
+        state.call_gap_selected = Some(200);
+        assert_eq!(state.call_list_rendered_selected(), Some(2));
+    }
+
+    #[test]
+    fn call_nav_is_noop_with_no_gap() {
+        let mut state = call_state_with(vec![call_at(1000), call_at(1010)]);
+        state.refresh_unfilled_call_gaps();
+        assert!(state.call_gaps.is_empty());
+        state.calls.state.select(Some(0));
+        state.call_list_next();
+        assert_eq!(state.call_gap_selected, None);
+        assert_eq!(state.calls.state.selected(), Some(1));
     }
 
     /// Builds a synthetic call list with `n` rows. ~30% of senders are unique

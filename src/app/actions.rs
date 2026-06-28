@@ -1,7 +1,7 @@
 use starknet::core::types::Felt;
 
 use crate::app::state::SourceStatus;
-use crate::app::views::address_info::UnfilledGap;
+use crate::app::views::address_info::{UnfilledCallGap, UnfilledGap};
 use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
@@ -76,6 +76,15 @@ pub enum Action {
         address: Felt,
         known_txs: Vec<AddressTxSummary>,
         gap: UnfilledGap,
+    },
+    /// On-demand Calls-tab block-range gap fill: dispatched when the user
+    /// presses Enter on a call-gap row. Backfills the `[lo_block, hi_block]`
+    /// window (contract → Dune `starknet.calls`; account → pf event window)
+    /// and merges the result, shrinking the gap from its newer edge.
+    FillAddressCallGap {
+        address: Felt,
+        gap: UnfilledCallGap,
+        is_contract: bool,
     },
     /// Enrich WS-streamed call stubs (missing sender/function/fee/timestamp).
     EnrichAddressCalls {
@@ -270,6 +279,22 @@ pub enum Action {
     AddressCallsMerged {
         address: Felt,
         calls: Vec<ContractCallSummary>,
+    },
+    /// An on-demand Calls-tab gap fill covered the whole `[lo_block, hi_block]`
+    /// range (the windowed query returned below its limit). The reducer records
+    /// the range as fully scanned so `detect_unfilled_call_gaps` stops
+    /// re-surfacing a genuinely-sparse hole as a fillable gap.
+    AddressCallRangeScanned {
+        address: Felt,
+        lo_block: u64,
+        hi_block: u64,
+    },
+    /// Persisted fully-scanned call ranges for an address, loaded from cache at
+    /// address entry. Seeds `scanned_call_ranges` so a previously-closed
+    /// (genuinely-sparse) gap stays suppressed across re-navigation/restart.
+    AddressCallScannedRangesLoaded {
+        address: Felt,
+        ranges: Vec<(u64, u64)>,
     },
     /// Older blocks loaded (appended to block list).
     OlderBlocksLoaded(Vec<SnBlock>),

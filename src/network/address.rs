@@ -894,6 +894,18 @@ pub(super) async fn fetch_and_send_address_info(
         });
     }
 
+    // Seed any previously-recorded fully-scanned call ranges so a closed
+    // (genuinely-sparse) Calls-tab gap stays suppressed on re-entry. Sent
+    // before the cached AddressInfoLoaded so its gap re-detect already sees
+    // them.
+    let scanned_call_ranges = ds.load_call_scanned_ranges(&address);
+    if !scanned_call_ranges.is_empty() {
+        let _ = tx.send(Action::AddressCallScannedRangesLoaded {
+            address,
+            ranges: scanned_call_ranges,
+        });
+    }
+
     // First paint. The fresh re-emit below merges its nonce/class_hash
     // in; tx_summaries / contract_calls dedupe by hash on second emit.
     let _ = tx.send(Action::AddressInfoLoaded {
@@ -2427,6 +2439,154 @@ pub(super) async fn run_nonce_gap_fill(
         address = %format!("{:#x}", address),
         "Gap fill complete"
     );
+}
+
+/// On-demand fill of a single Calls-tab block-range gap.
+///
+/// Backfills the gap's `[lo_block, hi_block]` window newest-first and merges
+/// the result via `AddressCallsMerged`, so the gap shrinks from its newer edge
+/// (lazy chunking — repeated Enter walks the range). When the windowed query
+/// returns below its limit the whole range is covered, so we also emit
+/// `AddressCallRangeScanned` to stop a genuinely-sparse hole resurfacing.
+///
+/// Contracts use Dune's trace-indexed `starknet.calls` (the Calls-tab
+/// authority); accounts fall back to the pf event window (`FillGap`), whose
+/// `tx_rows` project to the same call rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_call_gap_fill(
+    address: starknet::core::types::Felt,
+    gap: crate::app::views::address_info::UnfilledCallGap,
+    is_contract: bool,
+    ds: &Arc<dyn DataSource>,
+    dune: &Option<Arc<dune::DuneClient>>,
+    pf: &Option<Arc<crate::data::pathfinder::PathfinderClient>>,
+    abi_reg: &Arc<AbiRegistry>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+) {
+    const CALL_GAP_FILL_LIMIT: u32 = 500;
+
+    let _guard = QueryGuard::new(
+        action_tx,
+        format!("callgap:{}", query_addr_prefix(&address)),
+        "Calls gap fill".to_string(),
+    );
+    let _ = action_tx.send(Action::LoadingStatus(format!(
+        "Filling calls gap (blocks {}..{})...",
+        gap.lo_block, gap.hi_block
+    )));
+
+    info!(
+        address = %format!("{:#x}", address),
+        lo_block = gap.lo_block,
+        hi_block = gap.hi_block,
+        is_contract,
+        "Calls gap fill: backfilling block range on demand"
+    );
+
+    // (merged call rows, whether the whole range was covered in this page)
+    let (calls, fully_covered): (Vec<crate::data::types::ContractCallSummary>, bool) =
+        if is_contract && let Some(dune_client) = dune {
+            // Date hint lets Dune prune `starknet.calls` partitions instead of
+            // scanning the whole table for the bounded block window.
+            let min_date = block_date_floor(ds, gap.hi_block).await;
+            match dune_client
+                .query_contract_calls_windowed(
+                    address,
+                    gap.lo_block,
+                    gap.hi_block,
+                    CALL_GAP_FILL_LIMIT,
+                    min_date,
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let covered = rows.len() < CALL_GAP_FILL_LIMIT as usize;
+                    // Replace Dune's immediate caller with the real tx sender and
+                    // fill fee/timestamp/function name (same path as the bulk
+                    // Dune fetch).
+                    let enriched =
+                        enrich_dune_calls(address, rows, abi_reg, ds, pf.as_ref(), action_tx).await;
+                    (enriched, covered)
+                }
+                Err(e) => {
+                    warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: Dune query failed");
+                    let _ = action_tx.send(Action::LoadingStatus(String::new()));
+                    return;
+                }
+            }
+        } else if let Some(pf_client) = pf {
+            // Account (or no Dune): scan the gap's event window and project the
+            // pf tx_rows to call rows.
+            let Some(latest_block) = ds.latest_block_hint().await else {
+                warn!(addr = %format!("{:#x}", address), "Calls gap fill: no chain head available");
+                let _ = action_tx.send(Action::LoadingStatus(String::new()));
+                return;
+            };
+            match crate::network::event_window::ensure_address_events_window(
+                address,
+                EventQueryKind::Account,
+                crate::network::event_window::EventWindowPolicy::FillGap {
+                    from_block: gap.lo_block,
+                    to_block: gap.hi_block,
+                },
+                Some(pf_client),
+                ds,
+                latest_block,
+                gap.lo_block,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let covered = outcome.next_token.is_none();
+                    let _ = action_tx.send(Action::AddressEventWindowUpdated {
+                        address,
+                        min_searched: outcome.min_searched,
+                        max_searched: outcome.max_searched,
+                        deferred_gap: outcome.deferred_gap,
+                    });
+                    let calls =
+                        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg)
+                            .await;
+                    (calls, covered)
+                }
+                Err(e) => {
+                    warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: event-window scan failed");
+                    let _ = action_tx.send(Action::LoadingStatus(String::new()));
+                    return;
+                }
+            }
+        } else {
+            debug!(addr = %format!("{:#x}", address), "Calls gap fill: no Dune/pf backend available");
+            let _ = action_tx.send(Action::LoadingStatus(String::new()));
+            return;
+        };
+
+    info!(
+        address = %format!("{:#x}", address),
+        lo_block = gap.lo_block,
+        hi_block = gap.hi_block,
+        calls = calls.len(),
+        fully_covered,
+        "Calls gap fill: backend returned rows"
+    );
+
+    if !calls.is_empty() {
+        let _ = action_tx.send(Action::AddressCallsMerged { address, calls });
+    }
+    if fully_covered {
+        // Persist the scanned range so the closed gap survives re-navigation
+        // and restarts, then notify the App for the in-memory update. The
+        // AddressCallRangeScanned action is sent AFTER the merge so the App's
+        // gap re-detect (triggered by the merge) is the one that suppresses
+        // the hole.
+        ds.add_call_scanned_range(&address, gap.lo_block, gap.hi_block);
+        let _ = action_tx.send(Action::AddressCallRangeScanned {
+            address,
+            lo_block: gap.lo_block,
+            hi_block: gap.hi_block,
+        });
+    }
+    let _ = action_tx.send(Action::LoadingStatus(String::new()));
 }
 
 /// Fill only the *small* nonce gaps (≤50 blocks each) via RPC block scans.
