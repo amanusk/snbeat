@@ -2151,6 +2151,22 @@ impl App {
                     self.refresh_address_call_gaps();
                 }
             }
+            Action::AddressCallGapFillFinished { address, lo_block } => {
+                // The fill task ended (success, no-op, or error). Clear the
+                // in-flight flag so the row stops showing "loading" and Enter
+                // can re-dispatch. On a successful fill the gap may have already
+                // shrunk/closed via the merge above, in which case this is a
+                // harmless no-op.
+                if self.address.context == Some(address)
+                    && let Some(gap) = self
+                        .address
+                        .call_gaps
+                        .iter_mut()
+                        .find(|g| g.lo_block == lo_block)
+                {
+                    gap.fill_dispatched = false;
+                }
+            }
             Action::AddressCallScannedRangesLoaded { address, ranges } => {
                 if self.address.context == Some(address) {
                     // Merge the persisted closed ranges into whatever's in

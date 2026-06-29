@@ -289,6 +289,14 @@ pub enum Action {
         lo_block: u64,
         hi_block: u64,
     },
+    /// An on-demand Calls-tab gap fill finished (success, no-op, or error). The
+    /// reducer clears the matching gap's `fill_dispatched` so the row leaves the
+    /// "loading" state and Enter can re-dispatch — without this a failed fill
+    /// would leave the gap stuck forever.
+    AddressCallGapFillFinished {
+        address: Felt,
+        lo_block: u64,
+    },
     /// Persisted fully-scanned call ranges for an address, loaded from cache at
     /// address entry. Seeds `scanned_call_ranges` so a previously-closed
     /// (genuinely-sparse) gap stays suppressed across re-navigation/restart.

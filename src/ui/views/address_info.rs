@@ -809,7 +809,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         {
             if let Some((hi, dispatched)) = gap_info_for_lo(lo) {
                 let msg = if dispatched {
-                    format!(" ── calls gap (blocks {lo}..{hi}) — loading / press r to retry ──")
+                    format!(" ── calls gap (blocks {lo}..{hi}) — loading… ──")
                 } else {
                     format!(" ── calls gap (blocks {lo}..{hi}) — press Enter to load ──")
                 };
@@ -902,7 +902,7 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         if any_pending {
             format!(" — {n} gap{plural} (Enter on a gap row to load) ")
         } else {
-            format!(" — {n} gap{plural} (loading / press r to retry) ")
+            format!(" — {n} gap{plural} (loading…) ")
         }
     };
     let count = call_count_fragment(app);

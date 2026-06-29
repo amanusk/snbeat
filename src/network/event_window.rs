@@ -221,15 +221,26 @@ pub(crate) async fn ensure_address_events_window(
 
     let page = match pf {
         Some(pf_client) => {
-            fetch_address_activity(address, kind, from_block, None, EVENT_PAGE_LIMIT, pf_client)
-                .await
-                .inspect_err(|e| {
-                    warn!(
-                        address = %format!("{:#x}", address),
-                        error = %e,
-                        "event_window: fetch_address_activity failed"
-                    );
-                })?
+            // Pass `to_block` so a bounded policy (FillGap) actually scans
+            // `[from, to]` instead of running to the chain head — otherwise a
+            // gap fill keeps returning the newest page and never converges.
+            fetch_address_activity(
+                address,
+                kind,
+                from_block,
+                to_block,
+                None,
+                EVENT_PAGE_LIMIT,
+                pf_client,
+            )
+            .await
+            .inspect_err(|e| {
+                warn!(
+                    address = %format!("{:#x}", address),
+                    error = %e,
+                    "event_window: fetch_address_activity failed"
+                );
+            })?
         }
         None => {
             // RPC fallback: just events, no bulk tx_rows. Callers that need

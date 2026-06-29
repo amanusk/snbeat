@@ -301,11 +301,16 @@ pub(crate) struct AddressActivityPage {
 /// MetaTxIntenderSummary for the MetaTxs tab) are cheap CPU-bound passes over
 /// the returned page and live in their own helpers.
 ///
+/// `to_block` is an inclusive upper bound (`None` ⇒ up to chain head). Bounded
+/// windows are required for gap fills (`FillGap`) — without it pf scans from
+/// `from_block` to the tip and a `[lo, hi]` fill never converges on its range.
+///
 /// pf-query-only by design — the RPC fallback keeps the legacy per-tx flow.
 pub(crate) async fn fetch_address_activity(
     address: starknet::core::types::Felt,
     kind: EventQueryKind,
     from_block: u64,
+    to_block: Option<u64>,
     continuation_token: Option<u64>,
     limit: u32,
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
@@ -315,11 +320,18 @@ pub(crate) async fn fetch_address_activity(
     // 1. Events.
     let (events, next_token) = match kind {
         EventQueryKind::Account => pf
-            .get_events_for_address(address, from_block, None, limit, continuation_token)
+            .get_events_for_address(address, from_block, to_block, limit, continuation_token)
             .await
             .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))?,
         EventQueryKind::Contract => pf
-            .get_contract_events(address, from_block, None, &[], limit, continuation_token)
+            .get_contract_events(
+                address,
+                from_block,
+                to_block,
+                &[],
+                limit,
+                continuation_token,
+            )
             .await
             .map_err(|e| crate::error::SnbeatError::Provider(e.to_string()))?,
     };
@@ -2441,6 +2453,26 @@ pub(super) async fn run_nonce_gap_fill(
     );
 }
 
+/// On drop, notifies the App that the call-gap fill for `lo_block` has
+/// finished so the gap row's `fill_dispatched` flag is cleared and the row
+/// becomes re-dispatchable (Enter). Fires on *every* exit of
+/// `run_call_gap_fill` — including the error early-returns and a no-op page —
+/// so a failed fill never leaves the row stuck showing "loading".
+struct CallGapFillGuard {
+    action_tx: mpsc::UnboundedSender<Action>,
+    address: starknet::core::types::Felt,
+    lo_block: u64,
+}
+
+impl Drop for CallGapFillGuard {
+    fn drop(&mut self) {
+        let _ = self.action_tx.send(Action::AddressCallGapFillFinished {
+            address: self.address,
+            lo_block: self.lo_block,
+        });
+    }
+}
+
 /// On-demand fill of a single Calls-tab block-range gap.
 ///
 /// Backfills the gap's `[lo_block, hi_block]` window newest-first and merges
@@ -2450,7 +2482,8 @@ pub(super) async fn run_nonce_gap_fill(
 /// `AddressCallRangeScanned` to stop a genuinely-sparse hole resurfacing.
 ///
 /// Contracts use Dune's trace-indexed `starknet.calls` (the Calls-tab
-/// authority); accounts fall back to the pf event window (`FillGap`), whose
+/// authority); without Dune (or for accounts) we fall back to the pf event
+/// window (`FillGap`) — unkeyed for contracts, keyed for accounts — whose
 /// `tx_rows` project to the same call rows.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_call_gap_fill(
@@ -2470,6 +2503,12 @@ pub(super) async fn run_call_gap_fill(
         format!("callgap:{}", query_addr_prefix(&address)),
         "Calls gap fill".to_string(),
     );
+    // Clears the gap row's in-flight flag on any exit path (see guard docs).
+    let _finish_guard = CallGapFillGuard {
+        action_tx: action_tx.clone(),
+        address,
+        lo_block: gap.lo_block,
+    };
     let _ = action_tx.send(Action::LoadingStatus(format!(
         "Filling calls gap (blocks {}..{})...",
         gap.lo_block, gap.hi_block
@@ -2515,8 +2554,17 @@ pub(super) async fn run_call_gap_fill(
                 }
             }
         } else if let Some(pf_client) = pf {
-            // Account (or no Dune): scan the gap's event window and project the
-            // pf tx_rows to call rows.
+            // Account (or a contract with no Dune): scan the gap's event window
+            // and project the pf tx_rows to call rows. The filter kind must
+            // match the address kind — the keyed `transaction_executed` filter
+            // (`Account`) targets an address as a tx *sender* and returns the
+            // wrong activity set for a contract, so contracts use the unkeyed
+            // contract-event filter (`Contract`).
+            let kind = if is_contract {
+                EventQueryKind::Contract
+            } else {
+                EventQueryKind::Account
+            };
             let Some(latest_block) = ds.latest_block_hint().await else {
                 warn!(addr = %format!("{:#x}", address), "Calls gap fill: no chain head available");
                 let _ = action_tx.send(Action::LoadingStatus(String::new()));
@@ -2524,7 +2572,7 @@ pub(super) async fn run_call_gap_fill(
             };
             match crate::network::event_window::ensure_address_events_window(
                 address,
-                EventQueryKind::Account,
+                kind,
                 crate::network::event_window::EventWindowPolicy::FillGap {
                     from_block: gap.lo_block,
                     to_block: gap.hi_block,
@@ -5511,9 +5559,10 @@ mod shared_pipeline_tests {
         let address = Felt::from_hex(HYBRID_TEST_ADDR).unwrap();
 
         // Single pipeline call — this is the claim under test.
-        let page = fetch_address_activity(address, EventQueryKind::Account, 0, None, 100, &pf)
-            .await
-            .expect("fetch_address_activity");
+        let page =
+            fetch_address_activity(address, EventQueryKind::Account, 0, None, None, 100, &pf)
+                .await
+                .expect("fetch_address_activity");
 
         println!(
             "Pipeline page: {} events, {} tx_rows, next_token={:?}",
