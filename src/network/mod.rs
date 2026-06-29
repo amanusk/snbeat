@@ -409,6 +409,23 @@ pub async fn run_network_task(
                         )
                         .await;
                     }
+                    Action::FillAddressCallGap {
+                        address,
+                        gap,
+                        is_contract,
+                    } => {
+                        address::run_call_gap_fill(
+                            address,
+                            gap,
+                            is_contract,
+                            &ds,
+                            &dune,
+                            &pf,
+                            &abi_reg,
+                            &tx,
+                        )
+                        .await;
+                    }
                     Action::EnrichAddressCalls {
                         address,
                         hashes_with_blocks,
@@ -683,6 +700,7 @@ fn action_is_cancellable(action: &Action) -> bool {
         Action::EnrichAddressTxs { .. }
             | Action::EnrichAddressEndpoints { .. }
             | Action::FillAddressNonceGaps { .. }
+            | Action::FillAddressCallGap { .. }
             | Action::EnrichAddressCalls { .. }
             | Action::FetchAddressMetaTxs { .. }
             | Action::ClassifyPotentialMetaTx { .. }

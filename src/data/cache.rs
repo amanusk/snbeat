@@ -140,6 +140,14 @@ impl CachingDataSource {
                 PRIMARY KEY (address, call_index)
             );
             CREATE INDEX IF NOT EXISTS idx_addr_calls ON address_calls(address);
+            CREATE TABLE IF NOT EXISTS address_call_scanned_ranges (
+                address TEXT NOT NULL,
+                lo_block INTEGER NOT NULL,
+                hi_block INTEGER NOT NULL,
+                PRIMARY KEY (address, lo_block)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addr_call_scanned
+                ON address_call_scanned_ranges(address);
             CREATE TABLE IF NOT EXISTS address_activity (
                 address TEXT PRIMARY KEY,
                 min_block INTEGER NOT NULL,
@@ -1601,6 +1609,85 @@ impl DataSource for CachingDataSource {
         });
     }
 
+    fn load_call_scanned_ranges(&self, address: &Felt) -> Vec<(u64, u64)> {
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let mut stmt = match db.prepare(
+            "SELECT lo_block, hi_block FROM address_call_scanned_ranges \
+             WHERE address = ?1 ORDER BY lo_block",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![addr_hex], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .map(|(lo, hi)| (lo as u64, hi as u64))
+            .collect()
+    }
+
+    fn add_call_scanned_range(&self, address: &Felt, lo: u64, hi: u64) {
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        Self::dispatch_write(move || {
+            if let Ok(mut db) = pool.get() {
+                let tx = match db.transaction() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "add_call_scanned_range: begin transaction failed");
+                        return;
+                    }
+                };
+                // Read existing ranges, coalesce the new interval in, rewrite —
+                // keeps the persisted set sorted and minimal (same shape as the
+                // in-memory `scanned_call_ranges`).
+                let mut ranges: Vec<(u64, u64)> = {
+                    let mut stmt = match tx.prepare(
+                        "SELECT lo_block, hi_block FROM address_call_scanned_ranges \
+                         WHERE address = ?1",
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "add_call_scanned_range: prepare failed");
+                            return;
+                        }
+                    };
+                    stmt.query_map(params![&addr_hex], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map(|rs| {
+                        rs.filter_map(|r| r.ok())
+                            .map(|(lo, hi)| (lo as u64, hi as u64))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                };
+                crate::utils::merge_block_interval(&mut ranges, lo, hi);
+                let _ = tx.execute(
+                    "DELETE FROM address_call_scanned_ranges WHERE address = ?1",
+                    params![&addr_hex],
+                );
+                for (rlo, rhi) in &ranges {
+                    let _ = tx.execute(
+                        "INSERT OR REPLACE INTO address_call_scanned_ranges \
+                         (address, lo_block, hi_block) VALUES (?1, ?2, ?3)",
+                        params![&addr_hex, *rlo as i64, *rhi as i64],
+                    );
+                }
+                if let Err(e) = tx.commit() {
+                    warn!(error = %e, "add_call_scanned_range: commit failed");
+                }
+            }
+        });
+    }
+
     fn load_cached_meta_txs(&self, address: &Felt) -> Vec<MetaTxIntenderSummary> {
         let db = match self.db.get() {
             Ok(db) => db,
@@ -2478,6 +2565,38 @@ mod tests {
             ds.load_search_progress(&addr, FilterKind::Unkeyed),
             Some((3_000_000, 8_941_000))
         );
+    }
+
+    #[test]
+    fn call_scanned_ranges_persist_and_coalesce() {
+        let (ds, _d) = new_cache();
+        let addr = Felt::from_hex("0xca115").unwrap();
+
+        assert!(ds.load_call_scanned_ranges(&addr).is_empty());
+
+        ds.add_call_scanned_range(&addr, 1_000_000, 1_100_000);
+        assert_eq!(
+            ds.load_call_scanned_ranges(&addr),
+            vec![(1_000_000, 1_100_000)]
+        );
+
+        // Overlapping range coalesces into one interval.
+        ds.add_call_scanned_range(&addr, 1_050_000, 1_200_000);
+        assert_eq!(
+            ds.load_call_scanned_ranges(&addr),
+            vec![(1_000_000, 1_200_000)]
+        );
+
+        // Disjoint range stays separate, sorted ascending.
+        ds.add_call_scanned_range(&addr, 2_000_000, 2_100_000);
+        assert_eq!(
+            ds.load_call_scanned_ranges(&addr),
+            vec![(1_000_000, 1_200_000), (2_000_000, 2_100_000)]
+        );
+
+        // Other addresses are isolated.
+        let other = Felt::from_hex("0xbeef").unwrap();
+        assert!(ds.load_call_scanned_ranges(&other).is_empty());
     }
 
     #[test]
