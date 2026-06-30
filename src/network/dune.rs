@@ -28,6 +28,12 @@ enum QueryShape {
     /// Calls TO a contract scoped to a range; also serves the non-windowed
     /// full-history case via an open-ended range (see `query_contract_calls`).
     ContractCallsWindowed,
+    /// Meta-tx calls TO a contract scoped to a range: the `ContractCallsWindowed`
+    /// shape narrowed to the `execute_from_outside*` entry-point selectors. A
+    /// meta-tx where the contract is the intender is exactly such a call to it,
+    /// so this jumps straight to the most-recent meta-txs (see
+    /// `query_meta_tx_calls_windowed`).
+    ContractMetaTxCallsWindowed,
     /// First DECLARE tx for a class hash.
     DeclareTx,
 }
@@ -40,6 +46,7 @@ impl QueryShape {
             QueryShape::AccountTxs => "account_txs",
             QueryShape::AccountTxsWindowed => "account_txs_windowed",
             QueryShape::ContractCallsWindowed => "contract_calls_windowed",
+            QueryShape::ContractMetaTxCallsWindowed => "contract_meta_tx_calls_windowed",
             QueryShape::DeclareTx => "declare_tx",
         }
     }
@@ -54,6 +61,7 @@ impl QueryShape {
             "account_txs" => QueryShape::AccountTxs,
             "account_txs_windowed" => QueryShape::AccountTxsWindowed,
             "contract_calls_windowed" => QueryShape::ContractCallsWindowed,
+            "contract_meta_tx_calls_windowed" => QueryShape::ContractMetaTxCallsWindowed,
             "declare_tx" => QueryShape::DeclareTx,
             _ => return None,
         })
@@ -118,6 +126,31 @@ impl QueryShape {
                  ORDER BY block_number DESC \
                  LIMIT {{limit}}"
             }
+            QueryShape::ContractMetaTxCallsWindowed => {
+                // `ContractCallsWindowed` narrowed to the three
+                // `execute_from_outside` selectors (v1/v2/v3) — a meta-tx where
+                // `contract` is the intender is exactly such a call TO it. The
+                // selector literals are the 32-byte `starknet_keccak` of the
+                // entry-point names; `meta_tx_sql_has_correct_selectors` guards
+                // them against drift. AVNU's `execute_private_sponsored` is NOT
+                // here: it targets the forwarder, not the intender, so it never
+                // matches `contract_address = {{contract}}` (the private-pool
+                // discovery path covers those).
+                "SELECT transaction_hash, caller_address, entry_point_selector, \
+                   block_number, block_time, revert_reason \
+                 FROM starknet.calls \
+                 WHERE contract_address = {{contract}} \
+                 AND block_date >= date '{{min_date}}' \
+                 AND block_number BETWEEN {{from_block}} AND {{to_block}} \
+                 AND call_type = 'CALL' \
+                 AND entry_point_selector IN ( \
+                   0x007ec457cd7ed1630225a8328f826a29a327b19486f6b2882b4176545ebdbe3d, \
+                   0x034cc13b274446654ca3233ed2c1620d4c5d1d32fd20b47146a3371064bdc57d, \
+                   0x03dbc508ba4afd040c8dc4ff8a61113a7bcaf5eae88a6ba27b3c50578b3587e3 \
+                 ) \
+                 ORDER BY block_number DESC \
+                 LIMIT {{limit}}"
+            }
             QueryShape::DeclareTx => {
                 "SELECT hash, sender_address, block_number, block_time \
                  FROM starknet.transactions \
@@ -136,6 +169,7 @@ impl QueryShape {
             QueryShape::AccountTxs => "snbeat_account_txs",
             QueryShape::AccountTxsWindowed => "snbeat_account_txs_windowed",
             QueryShape::ContractCallsWindowed => "snbeat_contract_calls_windowed",
+            QueryShape::ContractMetaTxCallsWindowed => "snbeat_contract_meta_tx_calls_windowed",
             QueryShape::DeclareTx => "snbeat_declare_tx",
         }
     }
@@ -154,7 +188,7 @@ impl QueryShape {
             QueryShape::AccountTxsWindowed => {
                 &["sender", "min_date", "from_block", "to_block", "limit"]
             }
-            QueryShape::ContractCallsWindowed => {
+            QueryShape::ContractCallsWindowed | QueryShape::ContractMetaTxCallsWindowed => {
                 &["contract", "min_date", "from_block", "to_block", "limit"]
             }
             QueryShape::DeclareTx => &["class_hash"],
@@ -181,6 +215,88 @@ fn min_date_floor(min_block_date: Option<chrono::NaiveDate>) -> String {
         .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2021, 1, 1).expect("valid date"))
         .format("%Y-%m-%d")
         .to_string()
+}
+
+/// Build the fallback (non-persistent) SQL for the windowed meta-tx calls
+/// query — used by `run_shape` whenever the persisted `query_id` is stale or
+/// missing. Mirror of the persisted `QueryShape::ContractMetaTxCallsWindowed`
+/// shape, narrowing `starknet.calls` to the three `execute_from_outside`
+/// selectors. The selector literals MUST stay identical to the persisted copy;
+/// both are pinned against `starknet_keccak` by `meta_tx_sql_has_correct_selectors`
+/// so a drift in either path fails the build.
+fn meta_tx_calls_windowed_sql(
+    contract_hex: &str,
+    min_date: &str,
+    from_block: u64,
+    to_block: u64,
+    limit: u32,
+) -> String {
+    format!(
+        "SELECT transaction_hash, caller_address, entry_point_selector, \
+         block_number, block_time, revert_reason \
+         FROM starknet.calls \
+         WHERE contract_address = {} \
+         AND block_date >= date '{}' \
+         AND block_number BETWEEN {} AND {} \
+         AND call_type = 'CALL' \
+         AND entry_point_selector IN ( \
+           0x007ec457cd7ed1630225a8328f826a29a327b19486f6b2882b4176545ebdbe3d, \
+           0x034cc13b274446654ca3233ed2c1620d4c5d1d32fd20b47146a3371064bdc57d, \
+           0x03dbc508ba4afd040c8dc4ff8a61113a7bcaf5eae88a6ba27b3c50578b3587e3 \
+         ) \
+         ORDER BY block_number DESC \
+         LIMIT {}",
+        contract_hex, min_date, from_block, to_block, limit
+    )
+}
+
+/// Parse Dune `starknet.calls` result rows into [`ContractCallSummary`]s.
+///
+/// Shared by [`DuneClient::query_contract_calls_windowed`] and its meta-tx
+/// variant — both SELECT the identical column set. `sender` is set from
+/// `caller_address` (the immediate on-chain caller, often a router); callers
+/// that need the true outer tx sender enrich it downstream.
+fn parse_contract_call_rows(rows: &[serde_json::Value]) -> Vec<ContractCallSummary> {
+    rows.iter()
+        .filter_map(|row| {
+            let tx_hash = Felt::from_hex(row.get("transaction_hash")?.as_str()?).ok()?;
+            let caller = Felt::from_hex(row.get("caller_address")?.as_str()?).ok()?;
+            let selector_hex = row.get("entry_point_selector")?.as_str().unwrap_or("");
+            let function_name = selector_hex.to_string();
+            let block_number = row
+                .get("block_number")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let block_time = row
+                .get("block_time")
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %Z"))
+                        .ok()
+                })
+                .map(|dt| dt.timestamp() as u64)
+                .unwrap_or(0);
+            let revert = row
+                .get("revert_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let status = if revert.is_empty() { "OK" } else { "REV" }.to_string();
+
+            Some(ContractCallSummary {
+                tx_hash,
+                sender: caller,
+                function_name,
+                block_number,
+                timestamp: block_time,
+                total_fee_fri: 0,
+                status,
+                nonce: None,
+                tip: 0,
+                inner_targets: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// Dune Analytics API client for querying Starknet transaction history.
@@ -901,49 +1017,53 @@ impl DuneClient {
             "Dune windowed contract calls query complete"
         );
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let tx_hash = Felt::from_hex(row.get("transaction_hash")?.as_str()?).ok()?;
-                let caller = Felt::from_hex(row.get("caller_address")?.as_str()?).ok()?;
-                let selector_hex = row.get("entry_point_selector")?.as_str().unwrap_or("");
-                let function_name = selector_hex.to_string();
-                let block_number = row
-                    .get("block_number")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let block_time = row
-                    .get("block_time")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(s)
-                            .or_else(|_| {
-                                chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %Z")
-                            })
-                            .ok()
-                    })
-                    .map(|dt| dt.timestamp() as u64)
-                    .unwrap_or(0);
-                let revert = row
-                    .get("revert_reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let status = if revert.is_empty() { "OK" } else { "REV" }.to_string();
+        Ok(parse_contract_call_rows(&rows))
+    }
 
-                Some(ContractCallSummary {
-                    tx_hash,
-                    sender: caller,
-                    function_name,
-                    block_number,
-                    timestamp: block_time,
-                    total_fee_fri: 0,
-                    status,
-                    nonce: None,
-                    tip: 0,
-                    inner_targets: Vec::new(),
-                })
-            })
-            .collect())
+    /// Meta-tx variant of [`Self::query_contract_calls_windowed`]: identical
+    /// window/partition handling, but the persisted SQL also filters
+    /// `entry_point_selector` to the three `execute_from_outside` selectors. A
+    /// meta-tx where `contract` is the intender is exactly such a call TO it,
+    /// so this returns the most-recent meta-txs (newest-first) in one indexed
+    /// scan — the recent-first fast path the MetaTxs tab paints before the
+    /// pf-query block-walk backfills the rest. Returns the *outer* tx hashes
+    /// (in `tx_hash`); the caller fetches + classifies them.
+    pub async fn query_meta_tx_calls_windowed(
+        &self,
+        contract: Felt,
+        from_block: u64,
+        to_block: u64,
+        limit: u32,
+        min_block_date: Option<chrono::NaiveDate>,
+    ) -> Result<Vec<ContractCallSummary>, String> {
+        let contract_hex = format!("{:#066x}", contract);
+        let min_date_str = min_date_floor(min_block_date);
+        let from_capped = from_block.min(i64::MAX as u64);
+        let to_capped = to_block.min(i64::MAX as u64);
+        let params = serde_json::json!({
+            "contract": contract_hex,
+            "min_date": min_date_str,
+            "from_block": from_capped.to_string(),
+            "to_block": to_capped.to_string(),
+            "limit": limit.to_string(),
+        });
+        // Mirror of the persisted `ContractMetaTxCallsWindowed` SQL. Built via
+        // the shared `meta_tx_calls_windowed_sql` so the selector list lives in
+        // a single place that `meta_tx_sql_has_correct_selectors` pins against
+        // `starknet_keccak` — alongside the persisted copy — preventing the two
+        // from drifting.
+        let sql =
+            meta_tx_calls_windowed_sql(&contract_hex, &min_date_str, from_capped, to_capped, limit);
+
+        debug!(contract = %contract_hex, from_block, to_block, from_capped, to_capped, ?min_block_date, "Querying Dune for meta-tx calls (windowed)");
+        let rows = self
+            .run_shape(QueryShape::ContractMetaTxCallsWindowed, params, &sql)
+            .await?;
+        info!(
+            rows = rows.len(),
+            "Dune windowed meta-tx calls query complete"
+        );
+        Ok(parse_contract_call_rows(&rows))
     }
 
     /// Lightweight probe: returns the block range and count of activity for an address.
@@ -1356,6 +1476,7 @@ mod tests {
             QueryShape::AccountTxs,
             QueryShape::AccountTxsWindowed,
             QueryShape::ContractCallsWindowed,
+            QueryShape::ContractMetaTxCallsWindowed,
             QueryShape::DeclareTx,
         ] {
             // Extract every distinct `{{key}}` from the shape's SQL.
@@ -1374,6 +1495,40 @@ mod tests {
                 declared,
                 "shape {} param_keys() != its sql() placeholders",
                 shape.name()
+            );
+        }
+    }
+
+    /// The meta-tx shape hard-codes the three `execute_from_outside` selector
+    /// literals in its SQL (a persisted parameterized query can't compute them
+    /// at runtime). A wrong literal would silently drop a whole meta-tx version
+    /// from the recent-first fast path, so pin each against `starknet_keccak`
+    /// of the entry-point name. `{:#066x}` matches the 32-byte (64-hex) form
+    /// Dune stores `entry_point_selector` as — and the form the SQL must use.
+    ///
+    /// The literals live in TWO copies — the persisted `sql()` template and the
+    /// `meta_tx_calls_windowed_sql` fallback that `run_shape` uses when the
+    /// persisted `query_id` is stale/missing — so assert BOTH. Checking only
+    /// the persisted copy would let the fallback drift and silently filter on
+    /// the wrong selectors whenever the persistent query is unavailable.
+    #[test]
+    fn meta_tx_sql_has_correct_selectors() {
+        use starknet::core::utils::get_selector_from_name;
+        let persisted = QueryShape::ContractMetaTxCallsWindowed.sql();
+        let fallback = meta_tx_calls_windowed_sql("0x0", "2024-01-01", 0, i64::MAX as u64, 100);
+        for name in [
+            "execute_from_outside",
+            "execute_from_outside_v2",
+            "execute_from_outside_v3",
+        ] {
+            let sel = format!("{:#066x}", get_selector_from_name(name).unwrap());
+            assert!(
+                persisted.contains(&sel),
+                "persisted meta-tx SQL is missing the selector for {name} ({sel})"
+            );
+            assert!(
+                fallback.contains(&sel),
+                "fallback meta-tx SQL is missing the selector for {name} ({sel})"
             );
         }
     }
