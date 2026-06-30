@@ -217,6 +217,39 @@ fn min_date_floor(min_block_date: Option<chrono::NaiveDate>) -> String {
         .to_string()
 }
 
+/// Build the fallback (non-persistent) SQL for the windowed meta-tx calls
+/// query — used by `run_shape` whenever the persisted `query_id` is stale or
+/// missing. Mirror of the persisted `QueryShape::ContractMetaTxCallsWindowed`
+/// shape, narrowing `starknet.calls` to the three `execute_from_outside`
+/// selectors. The selector literals MUST stay identical to the persisted copy;
+/// both are pinned against `starknet_keccak` by `meta_tx_sql_has_correct_selectors`
+/// so a drift in either path fails the build.
+fn meta_tx_calls_windowed_sql(
+    contract_hex: &str,
+    min_date: &str,
+    from_block: u64,
+    to_block: u64,
+    limit: u32,
+) -> String {
+    format!(
+        "SELECT transaction_hash, caller_address, entry_point_selector, \
+         block_number, block_time, revert_reason \
+         FROM starknet.calls \
+         WHERE contract_address = {} \
+         AND block_date >= date '{}' \
+         AND block_number BETWEEN {} AND {} \
+         AND call_type = 'CALL' \
+         AND entry_point_selector IN ( \
+           0x007ec457cd7ed1630225a8328f826a29a327b19486f6b2882b4176545ebdbe3d, \
+           0x034cc13b274446654ca3233ed2c1620d4c5d1d32fd20b47146a3371064bdc57d, \
+           0x03dbc508ba4afd040c8dc4ff8a61113a7bcaf5eae88a6ba27b3c50578b3587e3 \
+         ) \
+         ORDER BY block_number DESC \
+         LIMIT {}",
+        contract_hex, min_date, from_block, to_block, limit
+    )
+}
+
 /// Parse Dune `starknet.calls` result rows into [`ContractCallSummary`]s.
 ///
 /// Shared by [`DuneClient::query_contract_calls_windowed`] and its meta-tx
@@ -1014,26 +1047,13 @@ impl DuneClient {
             "to_block": to_capped.to_string(),
             "limit": limit.to_string(),
         });
-        // Mirror of the persisted `ContractMetaTxCallsWindowed` SQL (the literal
-        // selector list must stay identical — `meta_tx_sql_has_correct_selectors`
-        // guards the persisted copy).
-        let sql = format!(
-            "SELECT transaction_hash, caller_address, entry_point_selector, \
-             block_number, block_time, revert_reason \
-             FROM starknet.calls \
-             WHERE contract_address = {} \
-             AND block_date >= date '{}' \
-             AND block_number BETWEEN {} AND {} \
-             AND call_type = 'CALL' \
-             AND entry_point_selector IN ( \
-               0x007ec457cd7ed1630225a8328f826a29a327b19486f6b2882b4176545ebdbe3d, \
-               0x034cc13b274446654ca3233ed2c1620d4c5d1d32fd20b47146a3371064bdc57d, \
-               0x03dbc508ba4afd040c8dc4ff8a61113a7bcaf5eae88a6ba27b3c50578b3587e3 \
-             ) \
-             ORDER BY block_number DESC \
-             LIMIT {}",
-            contract_hex, min_date_str, from_capped, to_capped, limit
-        );
+        // Mirror of the persisted `ContractMetaTxCallsWindowed` SQL. Built via
+        // the shared `meta_tx_calls_windowed_sql` so the selector list lives in
+        // a single place that `meta_tx_sql_has_correct_selectors` pins against
+        // `starknet_keccak` — alongside the persisted copy — preventing the two
+        // from drifting.
+        let sql =
+            meta_tx_calls_windowed_sql(&contract_hex, &min_date_str, from_capped, to_capped, limit);
 
         debug!(contract = %contract_hex, from_block, to_block, from_capped, to_capped, ?min_block_date, "Querying Dune for meta-tx calls (windowed)");
         let rows = self
@@ -1485,10 +1505,17 @@ mod tests {
     /// from the recent-first fast path, so pin each against `starknet_keccak`
     /// of the entry-point name. `{:#066x}` matches the 32-byte (64-hex) form
     /// Dune stores `entry_point_selector` as — and the form the SQL must use.
+    ///
+    /// The literals live in TWO copies — the persisted `sql()` template and the
+    /// `meta_tx_calls_windowed_sql` fallback that `run_shape` uses when the
+    /// persisted `query_id` is stale/missing — so assert BOTH. Checking only
+    /// the persisted copy would let the fallback drift and silently filter on
+    /// the wrong selectors whenever the persistent query is unavailable.
     #[test]
     fn meta_tx_sql_has_correct_selectors() {
         use starknet::core::utils::get_selector_from_name;
-        let sql = QueryShape::ContractMetaTxCallsWindowed.sql();
+        let persisted = QueryShape::ContractMetaTxCallsWindowed.sql();
+        let fallback = meta_tx_calls_windowed_sql("0x0", "2024-01-01", 0, i64::MAX as u64, 100);
         for name in [
             "execute_from_outside",
             "execute_from_outside_v2",
@@ -1496,8 +1523,12 @@ mod tests {
         ] {
             let sel = format!("{:#066x}", get_selector_from_name(name).unwrap());
             assert!(
-                sql.contains(&sel),
-                "meta-tx SQL is missing the selector for {name} ({sel})"
+                persisted.contains(&sel),
+                "persisted meta-tx SQL is missing the selector for {name} ({sel})"
+            );
+            assert!(
+                fallback.contains(&sel),
+                "fallback meta-tx SQL is missing the selector for {name} ({sel})"
             );
         }
     }

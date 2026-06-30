@@ -3671,6 +3671,7 @@ pub(super) async fn fetch_address_meta_txs(
     pf: &Arc<crate::data::pathfinder::PathfinderClient>,
     abi_reg: &Arc<AbiRegistry>,
     action_tx: &mpsc::UnboundedSender<Action>,
+    cancel: CancellationToken,
 ) {
     use crate::network::event_window::{
         EXTEND_DOWN_INITIAL_WINDOW, EventWindowPolicy, ensure_address_events_window,
@@ -3741,20 +3742,42 @@ pub(super) async fn fetch_address_meta_txs(
         pf,
         abi_reg,
     );
-    // Cold tab entry: paint the most-recent PUBLIC meta-txs via Dune in
-    // parallel with the pf scans (mirrors the Calls fast path). It emits
-    // through the cursor-neutral `AddressMetaTxsStreamed`, so it never disturbs
-    // the pf account/pool pagination this function drives below. On ExtendDown
-    // pages (`continuation_token` = Some) the pf walk already covers older
-    // history, so Dune is not re-run.
-    let dune_fut = async {
-        if continuation_token.is_none() {
-            if let Some(d) = dune {
-                emit_recent_meta_txs_via_dune(address, d, pf, abi_reg, &ds_dyn, action_tx).await;
-            }
+    // Cold tab entry: paint the most-recent PUBLIC meta-txs via Dune (mirrors
+    // the Calls fast path). It runs CONCURRENTLY with the pf scans for latency
+    // overlap, but as a DETACHED best-effort task — deliberately NOT inside the
+    // `join!` below — so a slow/tailing Dune window (the wide rung can hedge up
+    // to ~15s + a second execution) can't delay the terminal
+    // `AddressMetaTxsLoaded` (spinner-clear / next_token / auto-fill) once the
+    // pf scans have finished. It streams via the cursor-neutral
+    // `AddressMetaTxsStreamed`, so painting rows after the pf merge has already
+    // emitted is harmless. Guarded by the session token so navigating away
+    // cancels it just like it cancels this task. On ExtendDown pages
+    // (`continuation_token` = Some) the pf walk already covers older history, so
+    // Dune is not re-run.
+    if continuation_token.is_none() {
+        if let Some(d) = dune {
+            let d = d.clone();
+            let pf = pf.clone();
+            let abi_reg = abi_reg.clone();
+            let ds_spawn = ds_dyn.clone();
+            let tx_spawn = action_tx.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = emit_recent_meta_txs_via_dune(
+                        address, &d, &pf, &abi_reg, &ds_spawn, &tx_spawn,
+                    ) => {}
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            addr = %format!("{:#x}", address),
+                            "MetaTxs: Dune fast-paint cancelled on navigation"
+                        );
+                    }
+                }
+            });
         }
-    };
-    let (outcome_res, private_outcome, _) = tokio::join!(account_fut, private_fut, dune_fut);
+    }
+    let (outcome_res, private_outcome) = tokio::join!(account_fut, private_fut);
     let PrivateDiscoveryOutcome {
         summaries: mut private_summaries,
         pool_min_searched,
@@ -3996,6 +4019,9 @@ async fn emit_recent_meta_txs_via_dune(
         let d = dune_client.clone();
         rungs.push(
             async move {
+                use tracing::Instrument;
+                // Span keeps the generic `hedged_query`'s slow-attempt log
+                // attributable to this address/window (see Calls equivalent).
                 let rows = hedged_query(
                     || {
                         d.query_meta_tx_calls_windowed(
@@ -4008,6 +4034,11 @@ async fn emit_recent_meta_txs_via_dune(
                     },
                     WIDE_HEDGE_DELAY,
                 )
+                .instrument(tracing::debug_span!(
+                    "hedged_meta_tx",
+                    addr = %format!("{:#x}", address),
+                    min_date = %wide_min_date,
+                ))
                 .await;
                 (WIDE_DAYS, rows)
             }
@@ -4025,11 +4056,7 @@ async fn emit_recent_meta_txs_via_dune(
         match result {
             Ok(rows) => {
                 let n = rows.len();
-                let fresh: Vec<Felt> = rows
-                    .iter()
-                    .map(|c| c.tx_hash)
-                    .filter(|h| *h != Felt::ZERO && seen.insert(*h))
-                    .collect();
+                let fresh = fresh_meta_tx_hashes(&rows, &mut seen);
                 info!(
                     addr = %format!("{:#x}", address),
                     rung_days = days,
@@ -4053,6 +4080,25 @@ async fn emit_recent_meta_txs_via_dune(
         }
     }
     drop(rungs);
+}
+
+/// Filter one Dune ladder rung's rows down to the tx hashes not yet painted by
+/// an earlier rung, dropping the zero sentinel. The wide window (365d) is a
+/// superset of the narrow one (90d), so without this cross-rung dedup the wide
+/// rung would re-fetch + re-paint every hash the narrow rung already covered.
+/// `seen` accumulates across rungs and is mutated in place with the hashes this
+/// call returns. Pulled out of `emit_recent_meta_txs_via_dune`'s rung loop as a
+/// pure function so the dedup can be unit-tested without driving live Dune/pf
+/// I/O (see `fresh_meta_tx_hashes_dedups_across_rungs`).
+fn fresh_meta_tx_hashes(
+    rows: &[crate::data::types::ContractCallSummary],
+    seen: &mut std::collections::HashSet<starknet::core::types::Felt>,
+) -> Vec<starknet::core::types::Felt> {
+    use starknet::core::types::Felt;
+    rows.iter()
+        .map(|c| c.tx_hash)
+        .filter(|h| *h != Felt::ZERO && seen.insert(*h))
+        .collect()
 }
 
 /// Bulk-fetch `hashes` via pf-query, classify each as a meta-tx where
@@ -4562,10 +4608,16 @@ async fn hedged_contract_calls_window(
     limit: u32,
     hedge_delay: std::time::Duration,
 ) -> Result<Vec<crate::data::types::ContractCallSummary>, String> {
+    use tracing::Instrument;
+    // Re-scope the hedge to this address/window: `hedged_query` is generic and
+    // logs the "firing hedged second execution" line without any context, so
+    // attach `addr`/`min_date` via a span to keep slow Dune executions
+    // attributable when investigating latency.
     hedged_query(
         || dune_client.query_contract_calls_windowed(address, 0, u64::MAX, limit, Some(min_date)),
         hedge_delay,
     )
+    .instrument(tracing::debug_span!("hedged_calls", addr = %format!("{:#x}", address), ?min_date))
     .await
 }
 
@@ -5749,6 +5801,45 @@ mod tests {
     use super::*;
     use crate::data::rpc::RpcDataSource;
     use starknet::core::types::Felt;
+
+    /// The Dune meta-tx fast paint runs a narrow (90d) and a wide (365d)
+    /// window; the wide window is a superset of the narrow one, so
+    /// `fresh_meta_tx_hashes` must return only the hashes an earlier rung
+    /// hasn't already painted and must drop the zero sentinel. Guards the
+    /// cross-rung dedup pulled out of `emit_recent_meta_txs_via_dune`'s loop.
+    #[test]
+    fn fresh_meta_tx_hashes_dedups_across_rungs() {
+        fn row(h: Felt) -> crate::data::types::ContractCallSummary {
+            crate::data::types::ContractCallSummary {
+                tx_hash: h,
+                sender: Felt::ZERO,
+                function_name: String::new(),
+                block_number: 0,
+                timestamp: 0,
+                total_fee_fri: 0,
+                status: "OK".into(),
+                nonce: None,
+                tip: 0,
+                inner_targets: Vec::new(),
+            }
+        }
+
+        let (a, b, c) = (Felt::from(1u32), Felt::from(2u32), Felt::from(3u32));
+        let mut seen = std::collections::HashSet::new();
+
+        // Narrow rung lands first: returns its unique non-zero hashes in
+        // first-seen order, dropping the zero sentinel and an in-page dup.
+        let narrow = vec![row(a), row(b), row(Felt::ZERO), row(a)];
+        assert_eq!(fresh_meta_tx_hashes(&narrow, &mut seen), vec![a, b]);
+
+        // Wide rung (365d ⊇ 90d) re-returns the narrow hashes plus one new
+        // one; only the genuinely new hash survives the shared `seen` set.
+        let wide = vec![row(a), row(b), row(c)];
+        assert_eq!(fresh_meta_tx_hashes(&wide, &mut seen), vec![c]);
+
+        // `seen` now holds exactly the three distinct non-zero hashes.
+        assert_eq!(seen.len(), 3);
+    }
 
     fn rpc_ds() -> Arc<dyn DataSource> {
         dotenvy::dotenv().ok();

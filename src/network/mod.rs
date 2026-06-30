@@ -473,6 +473,7 @@ pub async fn run_network_task(
                                 pf,
                                 &abi_reg,
                                 &tx,
+                                cancel.clone(),
                             )
                             .await;
                         } else {
