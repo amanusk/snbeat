@@ -540,6 +540,9 @@ fn maybe_dispatch_meta_txs_on_entry(app: &mut App) -> Option<Action> {
     if app.address.tab != crate::app::AddressTab::MetaTxs
         || app.address.meta_txs_dispatched
         || app.address.fetching_meta_txs
+        // Undeployed addresses have no meta-txs to scan for — skip the
+        // pf-query bloom walk entirely (it can only return empty).
+        || app.address.not_deployed
     {
         return None;
     }

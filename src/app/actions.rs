@@ -406,6 +406,13 @@ pub enum Action {
         address: Felt,
         balances: Vec<TokenBalance>,
     },
+    /// The address has no class at the latest block (`get_class_hash`
+    /// errored) — it exists on-chain only as a token-transfer recipient.
+    /// The header shows a red "not deployed" note (gated on non-zero
+    /// balances) instead of a class/deploy line.
+    AddressNotDeployed {
+        address: Felt,
+    },
     /// Voyager label loaded for an address.
     VoyagerLabelLoaded {
         address: Felt,

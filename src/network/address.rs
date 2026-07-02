@@ -985,6 +985,27 @@ pub(super) async fn fetch_and_send_address_info(
     // Detect contract type: nonce == 0 + has class_hash → contract, not account.
     let is_contract = nonce == starknet::core::types::Felt::ZERO && class_hash.is_some();
 
+    // No class at the latest block means the address isn't deployed — it
+    // exists on-chain only as a token-transfer recipient (funds sent to a
+    // counterfactual / not-yet-deployed account). Signal it so the header
+    // can show a red "not deployed" note. The UI gates the note on non-zero
+    // balances, so a transient RPC error here (which also nulls balances)
+    // can't produce a false positive.
+    //
+    // Stop here: an undeployed address has no txs, calls, events, or class
+    // history, so the entire downstream enrichment (Dune activity probe,
+    // pf-query class history, event-window scans, tx/call fetches) would
+    // only burn round trips for guaranteed-empty results. Balances were
+    // already fetched above (the spawn near the top of this fn) and are all
+    // that matters until the address is deployed. This early return also
+    // covers the refresh / direct-navigation paths; the search path never
+    // reaches here (it emits the not-deployed marker itself, see
+    // `resolve_search`).
+    if class_hash.is_none() {
+        let _ = tx.send(Action::AddressNotDeployed { address });
+        return;
+    }
+
     // Nonce delta against cache. The downstream pipeline uses this to
     // narrow the missing-tx scan; gap fill runs after this point.
     let nonce_delta = if let Some((prev_nonce, _prev_block)) = &cached_nonce_info {
