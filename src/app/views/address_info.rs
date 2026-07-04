@@ -135,6 +135,11 @@ pub struct AddressInfoState {
     pub calls: StatefulList<ContractCallSummary>,
     /// Whether this address is a contract (nonce == 0) vs an account.
     pub is_contract: bool,
+    /// The address has no class at the latest block (`get_class_hash`
+    /// errored) — not deployed, exists only as a token-transfer recipient.
+    /// Set once the live class fetch confirms absence; the header renders a
+    /// red "not deployed" note (gated on non-zero balances).
+    pub not_deployed: bool,
     /// Whether header is in visual (item-selection) mode.
     pub visual_mode: bool,
     /// Navigable items in the address header (class hash, deploy tx, deploy block, deployer).
@@ -278,6 +283,7 @@ impl Default for AddressInfoState {
             deployment: None,
             calls: StatefulList::new(),
             is_contract: false,
+            not_deployed: false,
             visual_mode: false,
             nav_items: Vec::new(),
             nav_cursor: 0,
@@ -334,6 +340,7 @@ impl AddressInfoState {
         self.txs = StatefulList::new();
         self.deployment = None;
         self.calls = StatefulList::new();
+        self.not_deployed = false;
         self.fetching_more_txs = false;
         self.oldest_event_block = None;
         self.sources_pending.clear();

@@ -190,8 +190,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .is_some_and(|s| {
             app.address.info.as_ref().is_none_or(|i| s != i.address) && s != Felt::ZERO
         });
+    // The red "not deployed" note (matches the gate in `draw_header`) adds
+    // one line — reserve room for it so it isn't clipped.
+    let has_not_deployed_note = app.address.not_deployed
+        && app
+            .address
+            .info
+            .as_ref()
+            .is_some_and(|i| i.class_hash.is_none() && !i.token_balances.is_empty());
     // 2 borders + 2 base lines + 1 per deployment line (tx hash, deployer)
-    let header_height = 4 + u16::from(has_deploy) + u16::from(has_deployer);
+    // + 1 for the not-deployed note when shown.
+    let header_height =
+        4 + u16::from(has_deploy) + u16::from(has_deployer) + u16::from(has_not_deployed_note);
     let chunks = Layout::vertical([
         Constraint::Length(1),             // search bar
         Constraint::Length(header_height), // header
@@ -390,6 +400,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 },
             ]));
         }
+    }
+
+    // Not-deployed note: the address holds token balances but has no class
+    // at the latest block (funds sent to a counterfactual / not-yet-deployed
+    // account). Gated on non-zero balances so a transient RPC error can't
+    // trigger a false positive.
+    if app.address.not_deployed && info.class_hash.is_none() && !info.token_balances.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " ⚠ This contract is not deployed",
+            theme::STATUS_ERROR.add_modifier(Modifier::BOLD),
+        )));
     }
 
     let widget = Paragraph::new(lines).block(

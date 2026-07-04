@@ -109,6 +109,31 @@ pub(super) async fn resolve_search(
             return;
         }
 
+        // Last check: an address can hold token balances before it's ever
+        // deployed (funds sent to a counterfactual / not-yet-deployed
+        // account). None of the probes above match — there's no class, tx,
+        // block, or declared class — but the address still exists on-chain
+        // as a token-transfer recipient. Surface it as an address view (the
+        // header renders a red "not deployed" note) instead of "not found".
+        //
+        // Emit the balances + not-deployed marker directly rather than
+        // running `fetch_and_send_address_info`: an undeployed address has
+        // no txs, calls, events, or class history, so the full pipeline
+        // would only burn RPC/Dune/pf round trips for guaranteed-empty
+        // results. We already know the class is absent (the `get_class_hash`
+        // probe above failed), and balances are the only thing that matters
+        // until the address is deployed.
+        let balances = address::fetch_token_balances(felt, ds).await;
+        if !balances.is_empty() {
+            let _ = tx.send(Action::NavigateToAddress { address: felt });
+            let _ = tx.send(Action::AddressBalancesLoaded {
+                address: felt,
+                balances,
+            });
+            let _ = tx.send(Action::AddressNotDeployed { address: felt });
+            return;
+        }
+
         let _ = tx.send(Action::Error(
             "Not found as address, transaction, block hash, or class hash".to_string(),
         ));

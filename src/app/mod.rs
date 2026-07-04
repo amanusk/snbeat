@@ -1351,6 +1351,12 @@ impl App {
                     info.nonce == starknet::core::types::Felt::ZERO && info.class_hash.is_some();
                 self.address.is_contract = is_contract;
 
+                // A real class hash proves the address is deployed — clear any
+                // "not deployed" note a prior (class-less) emit may have set.
+                if info.class_hash.is_some() {
+                    self.address.not_deployed = false;
+                }
+
                 // Preserve any balances that may have already arrived — the
                 // balance task runs in parallel with the nonce/class_hash
                 // fetch and can land first, and every callsite constructs
@@ -2197,6 +2203,29 @@ impl App {
                         info.token_balances = balances;
                     }
                     self.dispatch_balance_price_fetch();
+                }
+            }
+            Action::AddressNotDeployed { address } => {
+                if self.address.context == Some(address) {
+                    self.address.not_deployed = true;
+                    // Seed a minimal info so the header renders even if the
+                    // balance task hasn't landed yet; `AddressBalancesLoaded`
+                    // fills token_balances in-place when it arrives.
+                    if self.address.info.is_none() {
+                        self.address.info = Some(crate::data::types::SnAddressInfo {
+                            address,
+                            nonce: starknet::core::types::Felt::ZERO,
+                            class_hash: None,
+                            recent_events: Vec::new(),
+                            token_balances: Vec::new(),
+                        });
+                    }
+                    // Loading is complete — an undeployed address has nothing
+                    // left to fetch. Clear the spinner and any pending source
+                    // so the view doesn't show a perpetual loader.
+                    self.address.sources_pending.clear();
+                    self.is_loading = false;
+                    self.loading_detail = None;
                 }
             }
             Action::PricesUpdated => {
