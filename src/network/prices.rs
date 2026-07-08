@@ -30,6 +30,7 @@ const TRACKED_TOKEN_HEX: &[&str] = &[
     "0x075afe6402ad5a5c20dd25e10ec3b3986acaa647b77e4ae24b0cbc9a54a27a87", // EKUBO
     "0x04daa17763b286d1e59b97c283c0b8c949994c361e426a28f743c67bdfe9a32f", // tBTC
     "0x0787150e306e6eae6e3f79dea881770e8bbff2c1b8eb490f969669ee945b3135", // strkBTC
+    "0x05ce53b9b68fb8e9ecab9283a96d97948914733fd6ed8d9a53a276a419497841", // ZEC
 ];
 
 /// The set of tokens we surface USD prices for. Mirrors the tokens fetched
