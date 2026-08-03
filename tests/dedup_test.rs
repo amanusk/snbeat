@@ -166,3 +166,40 @@ fn test_fee_not_overwritten_when_already_set() {
         "existing non-zero fee should not be overwritten"
     );
 }
+
+#[test]
+fn test_zero_sender_stub_upgraded_by_enriched_row() {
+    // A WS-streamed stub (sender ZERO, no name/fee) merged with the enriched
+    // row for the same tx. `merge_calls` keeps existing items first, so the
+    // stub is always the survivor — it must adopt the real sender.
+    let stub = make_call(0xaaa, 0x0, "", 100);
+    let mut enriched = make_call(0xaaa, 0x1234, "execute_from_outside_v2", 100);
+    enriched.total_fee_fri = 5000;
+    enriched.nonce = Some(42);
+
+    let result = deduplicate_contract_calls(vec![stub, enriched]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].sender,
+        Felt::from(0x1234u64),
+        "zero sender must be replaced by the real one"
+    );
+    assert_eq!(result[0].function_name, "execute_from_outside_v2");
+    assert_eq!(result[0].total_fee_fri, 5000);
+    assert_eq!(result[0].nonce, Some(42));
+}
+
+#[test]
+fn test_non_zero_sender_not_overwritten() {
+    // Dune rows carry the immediate caller; `enrich_dune_calls` replaces it
+    // deliberately. Dedupe must not second-guess a sender that is already set.
+    let first = make_call(0xaaa, 0x1, "transfer", 100);
+    let second = make_call(0xaaa, 0x2, "approve", 100);
+
+    let result = deduplicate_contract_calls(vec![first, second]);
+    assert_eq!(
+        result[0].sender,
+        Felt::from(0x1u64),
+        "existing non-zero sender should win"
+    );
+}
