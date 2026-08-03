@@ -633,34 +633,40 @@ pub(super) async fn build_tx_summaries_from_pf_rows(
 }
 
 /// Upper bound on how many incomplete call rows one address load will try to
-/// repair. `build_contract_calls_from_hashes` fires 20 tx+receipt pairs per
-/// chunk, so this caps a re-navigation at 10 chunks rather than letting a
+/// repair. `build_contract_calls_from_hashes` works in chunks of 20 tx+receipt
+/// pairs, so this caps a re-navigation at 10 chunks rather than letting a
 /// long-broken history re-fetch thousands of txs on every visit.
 const MAX_CALL_REENRICH_ROWS: usize = 200;
 
 /// Whether a cached call row is missing data that enrichment should have filled.
 ///
-/// Two independent failure modes, both from `build_contract_calls_from_hashes`:
-/// - `get_transaction` failed → the row was never built, so the WS stub survives
-///   with `sender == ZERO` and no function name.
-/// - `get_receipt` failed → the row has a sender/nonce/name but
-///   `total_fee_fri == 0` (the fee comes from the receipt, `unwrap_or(0)`).
+/// A `ZERO` sender is the one marker that is both reliable and self-clearing: it
+/// means `get_transaction` failed in `build_contract_calls_from_hashes`, so the
+/// row was never built and the WS stub survived with no sender and no function
+/// name. A successful re-fetch fills it in and the row stops matching.
 ///
-/// Mainnet INVOKEs always pay a fee, so a zero fee on a row that otherwise has a
-/// sender means the receipt leg is missing rather than the tx being free.
+/// `total_fee_fri == 0` looks like it should catch the other leg — a failed
+/// `get_receipt` leaves a row with a sender/nonce/name but no fee, since the fee
+/// comes from the receipt via `unwrap_or(0)`. It is deliberately *not* used:
+/// L1 handler txs (bridge `handle_token_deposit` / `handle_deposit_with_message`
+/// and friends) genuinely have `actual_fee == 0`, because the fee is paid on L1.
+/// Those rows are already complete, but they would match the predicate on every
+/// single load and never clear — re-running the decode and re-persisting the
+/// rows each time. On a bridge-touching address they also crowd out the
+/// `MAX_CALL_REENRICH_ROWS` budget. Measured against a real cache the trade was
+/// lopsided: the fee check flagged 349 unrepairable L1 handlers to catch 2
+/// plausible receipt-leg failures.
 ///
-/// `status` looks like the cleaner marker (a missing receipt yields `"?"`) but
-/// it can't be used: the WS stub is created with `status: "OK"` up front, and
-/// the merge only overwrites `"?"`, so a receipt-less row still reads `"OK"`.
+/// `status` is no better: a missing receipt does yield `"?"`, but the WS stub is
+/// created with `status: "OK"` up front and the merge only overwrites `"?"`, so
+/// a receipt-less row still reads `"OK"`. Distinguishing "fee-free" from
+/// "fee unknown" would need the tx type on the row, which isn't stored.
 ///
-/// The fee check is not perfectly self-clearing — a genuinely fee-free tx
-/// (e.g. an L1 handler) stays "incomplete" and is re-examined on each load. That
-/// costs nothing after the first pass: both `get_transaction` and `get_receipt`
-/// cache on success, so the repeat resolves entirely from SQLite. Callers still
-/// order zero-sender rows first (see `MAX_CALL_REENRICH_ROWS`) so such rows can
-/// never crowd genuinely-broken stubs out of the cap.
+/// Practical consequence: a row whose receipt leg failed keeps a blank fee until
+/// something else re-enriches it. That is a cosmetic gap on a row that otherwise
+/// renders correctly, unlike a `ZERO`-sender stub, which renders as an empty row.
 fn call_row_is_incomplete(c: &crate::data::types::ContractCallSummary) -> bool {
-    c.sender == starknet::core::types::Felt::ZERO || c.total_fee_fri == 0
+    c.sender == starknet::core::types::Felt::ZERO
 }
 
 /// Build ContractCallSummary entries from event tx hashes by fetching tx+receipt
@@ -690,6 +696,13 @@ pub(super) async fn build_contract_calls_from_hashes(
                 let h = *hash;
                 let bn = *block_num;
                 async move {
+                    // One permit per tx+receipt pair, same bound as
+                    // `enrich_address_txs`: this is background traffic, and
+                    // without a cap a chunk puts 40 requests in flight and
+                    // starves user-initiated clicks on the shared HTTP pool.
+                    // The permit is scoped to each attempt so a row that is
+                    // sleeping between retries isn't holding one.
+                    //
                     // Short retry: WS delivers events for the pre-confirmed
                     // block, and a node that isn't serving pre-confirmed data
                     // yet answers tx/receipt lookups with
@@ -698,8 +711,10 @@ pub(super) async fn build_contract_calls_from_hashes(
                     // good, so give the block a moment to land. Longer outages
                     // are handled by the load-time repair pass instead of
                     // holding this task open.
-                    let (mut tx_r, mut rx_r) =
-                        tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h));
+                    let (mut tx_r, mut rx_r) = {
+                        let _permit = ENRICH_RPC_SEMAPHORE.acquire().await.ok();
+                        tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h))
+                    };
                     for backoff_ms in [400u64, 1200] {
                         if tx_r.is_ok() && rx_r.is_ok() {
                             break;
@@ -708,8 +723,10 @@ pub(super) async fn build_contract_calls_from_hashes(
                         // Re-issue both legs together to keep the pair
                         // concurrent; whichever already succeeded is served
                         // from cache, so the redundant call costs no round trip.
-                        let (retry_tx, retry_rx) =
-                            tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h));
+                        let (retry_tx, retry_rx) = {
+                            let _permit = ENRICH_RPC_SEMAPHORE.acquire().await.ok();
+                            tokio::join!(ds_t.get_transaction(h), ds_r.get_receipt(h))
+                        };
                         if tx_r.is_err() {
                             tx_r = retry_tx;
                         }
@@ -1018,19 +1035,14 @@ pub(super) async fn fetch_and_send_address_info(
     //
     // The tx/receipt are fetchable again once the block is accepted, so
     // re-enrich on every address load. This is what makes `r` able to repair
-    // rows that a past outage left empty.
-    // Zero-sender rows first: those are definitely broken, whereas a fee-only
-    // miss may be a genuinely fee-free tx that will never "repair". Ordering
-    // keeps the cap from being consumed by the latter. `cached_calls` is
-    // block-descending, and `partition` is stable, so within each group the
-    // newest rows — the ones on screen — are still repaired first.
-    let (missing_sender, missing_fee): (Vec<_>, Vec<_>) = cached_calls
+    // rows that a past outage left empty. `call_row_is_incomplete` only matches
+    // rows that a successful re-fetch will clear, so on a healthy cache this
+    // finds nothing and the pass doesn't spawn. `cached_calls` is
+    // block-descending, so the newest rows — the ones on screen — are repaired
+    // first if the cap trims the list.
+    let incomplete: Vec<(starknet::core::types::Felt, u64)> = cached_calls
         .iter()
         .filter(|c| call_row_is_incomplete(c))
-        .partition(|c| c.sender == starknet::core::types::Felt::ZERO);
-    let incomplete: Vec<(starknet::core::types::Felt, u64)> = missing_sender
-        .into_iter()
-        .chain(missing_fee)
         .take(MAX_CALL_REENRICH_ROWS)
         .map(|c| (c.tx_hash, c.block_number))
         .collect();
@@ -6158,17 +6170,20 @@ mod tests {
     use crate::data::rpc::RpcDataSource;
     use starknet::core::types::Felt;
 
-    /// Both enrichment legs fail independently: a failed `get_transaction`
-    /// leaves the WS stub with a ZERO sender, a failed `get_receipt` leaves an
-    /// otherwise-good row with no fee. The load-time repair pass has to pick up
-    /// both, and must not re-fetch rows that are already complete.
+    /// The repair pass must match exactly the rows a re-fetch can clear.
+    ///
+    /// A ZERO sender means `get_transaction` failed and the WS stub survived —
+    /// re-fetching fixes it. A zero *fee* must NOT qualify: L1 handler txs
+    /// legitimately have `actual_fee == 0` (the fee is paid on L1), so flagging
+    /// them would re-enrich the same rows on every load forever and consume the
+    /// `MAX_CALL_REENRICH_ROWS` budget on bridge-touching addresses.
     #[test]
-    fn incomplete_call_rows_cover_both_enrichment_legs() {
-        fn row(sender: Felt, fee: u128) -> crate::data::types::ContractCallSummary {
+    fn incomplete_call_rows_are_only_unfetched_stubs() {
+        fn row(sender: Felt, fee: u128, name: &str) -> crate::data::types::ContractCallSummary {
             crate::data::types::ContractCallSummary {
                 tx_hash: Felt::from(1u64),
                 sender,
-                function_name: "execute_from_outside_v2".to_string(),
+                function_name: name.to_string(),
                 block_number: 100,
                 timestamp: 1000,
                 total_fee_fri: fee,
@@ -6179,12 +6194,21 @@ mod tests {
             }
         }
 
-        // tx fetch failed -> stub never upgraded
-        assert!(call_row_is_incomplete(&row(Felt::ZERO, 0)));
-        // receipt fetch failed -> sender/nonce present, fee missing
-        assert!(call_row_is_incomplete(&row(Felt::from(0x1234u64), 0)));
+        // tx fetch failed -> stub never upgraded, re-fetch will clear it
+        assert!(call_row_is_incomplete(&row(Felt::ZERO, 0, "")));
         // fully enriched -> leave it alone
-        assert!(!call_row_is_incomplete(&row(Felt::from(0x1234u64), 5000)));
+        assert!(!call_row_is_incomplete(&row(
+            Felt::from(0x1234u64),
+            5000,
+            "execute_from_outside_v2"
+        )));
+        // L1 handler: genuinely fee-free and already complete. Re-fetching can
+        // never change this row, so it must not be flagged.
+        assert!(!call_row_is_incomplete(&row(
+            Felt::from(0x1234u64),
+            0,
+            "handle_token_deposit"
+        )));
     }
 
     /// The Dune meta-tx fast paint runs a narrow (90d) and a wide (365d)
