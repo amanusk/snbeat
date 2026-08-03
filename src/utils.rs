@@ -6,6 +6,20 @@ pub fn felt_to_u64(felt: &Felt) -> u64 {
     u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8]))
 }
 
+/// Convert a felt to u64, returning `None` if it does not fit.
+///
+/// Unlike [`felt_to_u64`] this does not silently truncate. Use it when a felt
+/// that *should* hold a small number (a length, an offset, a count) might
+/// actually hold a 251-bit value: truncation can turn a contract address into
+/// a plausible-looking small integer that passes a bounds check.
+pub fn felt_to_u64_checked(felt: &Felt) -> Option<u64> {
+    let bytes = felt.to_bytes_be();
+    if bytes[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(u64::from_be_bytes(bytes[24..32].try_into().ok()?))
+}
+
 /// Convert the lower 16 bytes of a felt to u128.
 pub fn felt_to_u128(felt: &Felt) -> u128 {
     let bytes = felt.to_bytes_be();
