@@ -384,8 +384,12 @@ pub struct VoyagerLabelInfo {
 /// them into one entry:
 /// - Function names are joined with ", " (duplicates removed).
 /// - Fee, status, block, and timestamp are taken from whichever entry has data.
-/// - The sender from the first occurrence is kept; callers can overwrite it
-///   with the real tx sender later.
+/// - The sender from the first occurrence is kept, *except* when it is `ZERO`
+///   (a WS stub that enrichment hasn't filled yet) — then a later real sender
+///   wins. `merge_calls` keeps existing items first, so without this a stub
+///   would permanently mask the enriched row for the same tx. Callers can still
+///   overwrite a non-zero sender later (see `enrich_dune_calls`, which replaces
+///   Dune's immediate `caller_address` with the real tx sender).
 pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<ContractCallSummary> {
     use std::collections::HashMap;
 
@@ -415,6 +419,9 @@ pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<Contra
                 }
             }
             // Fill in missing data from later entries
+            if existing.sender == Felt::ZERO && call.sender != Felt::ZERO {
+                existing.sender = call.sender;
+            }
             if existing.total_fee_fri == 0 && call.total_fee_fri > 0 {
                 existing.total_fee_fri = call.total_fee_fri;
             }
