@@ -215,12 +215,14 @@ pub fn parse_outside_execution(
     let (inner_calls, offset_after_calls) = parse_call_array(data, header_size, num_inner_calls);
 
     let signature = if offset_after_calls < data.len() {
+        // `sig_len` is an untrusted felt: an unchecked `sig_start + sig_len`
+        // wraps in release builds and can land below `sig_start`, passing the
+        // bounds check and then panicking on a backwards slice.
         let sig_len = felt_to_u64(&data[offset_after_calls]) as usize;
         let sig_start = offset_after_calls + 1;
-        if sig_start + sig_len <= data.len() {
-            data[sig_start..sig_start + sig_len].to_vec()
-        } else {
-            data[sig_start..].to_vec()
+        match sig_start.checked_add(sig_len) {
+            Some(end) if end <= data.len() => data[sig_start..end].to_vec(),
+            _ => data[sig_start..].to_vec(),
         }
     } else {
         Vec::new()
@@ -271,9 +273,10 @@ fn try_parse_with_nonce_size(data: &[Felt], nonce_size: usize) -> Option<usize> 
     // Validate signature: remaining data should be sig_len + exactly sig_len felts
     if offset_after_calls < data.len() {
         let sig_len = felt_to_u64(&data[offset_after_calls]) as usize;
-        let expected_end = offset_after_calls + 1 + sig_len;
-        if expected_end != data.len() {
-            return None;
+        // A wrapping add could land back on `data.len()` and wrongly validate.
+        match (offset_after_calls + 1).checked_add(sig_len) {
+            Some(expected_end) if expected_end == data.len() => {}
+            _ => return None,
         }
     } else if offset_after_calls != data.len() {
         // No signature but data remaining — invalid
@@ -531,6 +534,35 @@ mod tests {
         assert_eq!(oe.inner_calls[0].selector, inner_selector);
         assert_eq!(oe.inner_calls[0].data.len(), 2);
         assert_eq!(oe.signature.len(), 2);
+    }
+
+    /// Regression: a `sig_len` felt near `u64::MAX` must not panic. The
+    /// signature length is untrusted, and the unchecked adds that consume it
+    /// overflow on the way to deciding whether the tail is a valid signature.
+    #[test]
+    fn test_parse_outside_execution_huge_sig_len_does_not_panic() {
+        let data = vec![
+            ANY_CALLER,
+            Felt::from(1u64),                              // nonce
+            Felt::from(0u64),                              // execute_after
+            Felt::from(9999u64),                           // execute_before
+            Felt::from(1u64),                              // num_inner_calls
+            felt("0xdef"),                                 // to
+            felt("0x123"),                                 // selector
+            Felt::from(0u64),                              // inner data_len
+            Felt::from_hex("0xFFFFFFFFFFFFFFFF").unwrap(), // sig_len
+        ];
+        let call = RawCall {
+            contract_address: felt("0xabc"),
+            selector: felt("0x999"),
+            data,
+            function_name: Some("execute_from_outside_v2".into()),
+            function_def: None,
+            contract_abi: None,
+        };
+        // The tail cannot be a signature of that length, so this is rejected —
+        // the point is that it is rejected rather than panicking.
+        assert!(parse_outside_execution(&call, OutsideExecutionVersion::V2).is_none());
     }
 
     #[test]
