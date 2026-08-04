@@ -165,13 +165,19 @@ pub fn parse_call_array(
         let data_len = felt_to_u64(&calldata[offset + 2]) as usize;
         offset += 3;
 
-        let data = if offset + data_len <= calldata.len() {
-            calldata[offset..offset + data_len].to_vec()
-        } else {
-            // Malformed — take what we can
-            calldata[offset..].to_vec()
+        // `data_len` comes from an untrusted felt, so it can be up to u64::MAX.
+        // An unchecked `offset + data_len` wraps in release builds and can land
+        // *below* `offset`, passing the bounds check and then panicking on a
+        // slice whose end precedes its start.
+        let data = match offset.checked_add(data_len) {
+            Some(end) if end <= calldata.len() => calldata[offset..end].to_vec(),
+            // Malformed, or a length felt too large to be a real length — take
+            // what we can.
+            _ => calldata[offset..].to_vec(),
         };
-        offset += data_len;
+        // Saturate rather than wrap: callers treat an offset past the end as
+        // "did not consume cleanly", which a wrapped small value would hide.
+        offset = offset.saturating_add(data_len);
 
         calls.push(RawCall::new(contract_address, selector, data));
     }
@@ -231,6 +237,51 @@ mod tests {
 
     fn f(v: u64) -> Felt {
         Felt::from(v)
+    }
+
+    /// Regression: a `data_len` felt near `u64::MAX` must not panic. An
+    /// unchecked `offset + data_len` wraps in release builds to a value *below*
+    /// `offset`, which slips past the `<= calldata.len()` guard and then
+    /// panics slicing backwards ("slice index starts at 4 but ends at 3").
+    /// Debug builds panic earlier still, on the overflowing add.
+    ///
+    /// Reachable through `parse_multicall`: the strict parsers reject the felt
+    /// outright, so control falls through to this lenient walk.
+    #[test]
+    fn test_parse_multicall_huge_data_len_does_not_panic() {
+        let cd = vec![
+            f(1),
+            f(0xAA1),
+            f(0xBB1),
+            Felt::from_hex("0xFFFFFFFFFFFFFFFF").unwrap(), // data_len = u64::MAX
+        ];
+        assert!(try_parse_inline_calls(&cd).is_none());
+        assert!(try_parse_legacy_call_array(&cd).is_none());
+
+        let calls = parse_multicall(&cd);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].contract_address, f(0xAA1));
+        // Nothing left after the header, so the salvaged data is empty.
+        assert!(calls[0].data.is_empty());
+    }
+
+    /// The offset returned for such a call must saturate past the end rather
+    /// than wrap to a small value — callers read "offset > len" as "did not
+    /// consume cleanly", and a wrapped value would masquerade as valid.
+    #[test]
+    fn test_parse_call_array_huge_data_len_offset_saturates() {
+        let cd = vec![
+            f(0xAA1),
+            f(0xBB1),
+            Felt::from_hex("0xFFFFFFFFFFFFFFFF").unwrap(),
+            f(0xD1),
+        ];
+        let (calls, offset) = parse_call_array(&cd, 0, 1);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            offset > cd.len(),
+            "offset must not wrap below the input len"
+        );
     }
 
     /// A synthetic legacy Cairo 0 `CallArray*` multicall:
