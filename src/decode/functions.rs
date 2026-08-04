@@ -3,7 +3,7 @@ use std::sync::Arc;
 use starknet::core::types::Felt;
 
 use super::abi::{FunctionDef, ParsedAbi};
-use crate::utils::{felt_to_u64, felt_to_u64_checked};
+use crate::utils::{felt_to_u64, felt_to_usize_checked};
 
 /// A decoded function call with human-readable name.
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ pub fn parse_multicall(calldata: &[Felt]) -> Vec<RawCall> {
 /// the array exactly, with nothing trailing. That exact-consumption check is
 /// what makes this safe to try first.
 fn try_parse_inline_calls(calldata: &[Felt]) -> Option<Vec<RawCall>> {
-    let num_calls = felt_to_u64_checked(&calldata[0])? as usize;
+    let num_calls = felt_to_usize_checked(&calldata[0])?;
     // Each call needs ≥3 felts, so cap the allocation regardless of the count.
     let mut calls = Vec::with_capacity(num_calls.min(calldata.len() / 3));
 
@@ -77,7 +77,7 @@ fn try_parse_inline_calls(calldata: &[Felt]) -> Option<Vec<RawCall>> {
         }
         let contract_address = calldata[offset];
         let selector = calldata[offset + 1];
-        let data_len = felt_to_u64_checked(&calldata[offset + 2])? as usize;
+        let data_len = felt_to_usize_checked(&calldata[offset + 2])?;
         offset += 3;
 
         let end = offset.checked_add(data_len)?;
@@ -108,7 +108,7 @@ fn try_parse_inline_calls(calldata: &[Felt]) -> Option<Vec<RawCall>> {
 /// blob, and rejecting those would drop the transaction back to the lenient
 /// inline walk — i.e. back to garbage.
 fn try_parse_legacy_call_array(calldata: &[Felt]) -> Option<Vec<RawCall>> {
-    let num_calls = felt_to_u64_checked(&calldata[0])? as usize;
+    let num_calls = felt_to_usize_checked(&calldata[0])?;
     // count felt + n × 4-felt entries → index of the blob's length felt.
     let blob_len_idx = num_calls.checked_mul(4)?.checked_add(1)?;
     let blob_start = blob_len_idx.checked_add(1)?;
@@ -116,7 +116,7 @@ fn try_parse_legacy_call_array(calldata: &[Felt]) -> Option<Vec<RawCall>> {
         return None;
     }
 
-    let blob_len = felt_to_u64_checked(&calldata[blob_len_idx])? as usize;
+    let blob_len = felt_to_usize_checked(&calldata[blob_len_idx])?;
     if blob_start.checked_add(blob_len)? != calldata.len() {
         return None;
     }
@@ -125,8 +125,8 @@ fn try_parse_legacy_call_array(calldata: &[Felt]) -> Option<Vec<RawCall>> {
     let mut calls = Vec::with_capacity(num_calls);
     for i in 0..num_calls {
         let base = 1 + i * 4;
-        let data_offset = felt_to_u64_checked(&calldata[base + 2])? as usize;
-        let data_len = felt_to_u64_checked(&calldata[base + 3])? as usize;
+        let data_offset = felt_to_usize_checked(&calldata[base + 2])?;
+        let data_len = felt_to_usize_checked(&calldata[base + 3])?;
         let end = data_offset.checked_add(data_len)?;
         if end > blob_len {
             return None;
