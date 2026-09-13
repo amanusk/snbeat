@@ -7,11 +7,16 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 use starknet::core::types::Felt;
 
 use crate::app::state::TxNavItem;
+use crate::app::views::address_info::{RenderedRow, rendered_row};
 use crate::app::{AddressTab, App};
-use crate::data::types::TokenBalance;
+use crate::data::types::{
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, TokenBalance,
+};
+use crate::registry::AddressRegistry;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::known_or_palette_style;
 use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, tx_hash_cell};
+use crate::ui::widgets::list_window::ListWindow;
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
@@ -476,6 +481,20 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect, private_holdings: &[(Felt, u1
     f.render_widget(tabs, area);
 }
 
+fn list_block(title: String) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::BORDER_STYLE)
+        .title(Span::styled(title, theme::TITLE_STYLE))
+}
+
+fn highlighted_list(items: Vec<ListItem<'static>>, block: Block<'static>) -> List<'static> {
+    List::new(items)
+        .block(block)
+        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ")
+}
+
 fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // Column headers
     let header_area = Rect { height: 1, ..area };
@@ -523,115 +542,6 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
     app.address
         .update_tx_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
 
-    // (tx_idx, lo_nonce) for each gap, sorted by tx_idx ascending. Each gap
-    // renders as its own ListItem above the lo_nonce tx.
-    let gap_positions = app.address.gap_render_positions();
-    let mut next_gap = gap_positions.iter().peekable();
-    let gap_info_for_lo = |lo: u64| -> Option<(u64, bool)> {
-        app.address
-            .unfilled_gaps
-            .iter()
-            .find(|g| g.lo_nonce == lo)
-            .map(|g| (g.missing_count, g.fill_dispatched))
-    };
-
-    let mut items: Vec<ListItem> =
-        Vec::with_capacity(app.address.txs.items.len() + gap_positions.len());
-    for (idx, tx) in app.address.txs.items.iter().enumerate() {
-        while let Some(&&(p, lo)) = next_gap.peek()
-            && p == idx
-        {
-            if let Some((missing, dispatched)) = gap_info_for_lo(lo) {
-                let msg = if dispatched {
-                    format!(" ── gap of {missing} txs — loading / press r to retry ──")
-                } else {
-                    format!(" ── {missing} txs hidden — press Enter to load ──")
-                };
-                items.push(ListItem::new(Line::from(Span::styled(
-                    msg,
-                    theme::SUGGESTION_STYLE,
-                ))));
-            }
-            next_gap.next();
-        }
-
-        let fee_str = format_strk_u128(tx.total_fee_fri)
-            .trim_end_matches(" STRK")
-            .to_string();
-        let tip_str = if tx.tip > 0 {
-            format_fri(tx.tip as u128)
-        } else {
-            "0".to_string()
-        };
-        let age = format_age(tx.timestamp);
-        let endpoint = if tx.endpoint_names.chars().count() > 30 {
-            let truncated: String = tx.endpoint_names.chars().take(29).collect();
-            format!("{truncated}…")
-        } else {
-            tx.endpoint_names.clone()
-        };
-        let contract_spans = format_called_contracts_spans(app, &tx.called_contracts);
-        // A tx is "privacy" iff any of its top-level called contracts is in the
-        // curated privacy bundle. Catches the common case (top-level pool call
-        // or pool-via-known-helper). OE-wrapped sponsored txs that only reach
-        // the pool through an inner relayer call won't be flagged here — the
-        // tx-summary level doesn't carry inner-call structure. Acceptable v1
-        // limitation; users still see the Privacy tab when they open the tx.
-        let is_privacy_tx = app
-            .search_engine
-            .as_ref()
-            .map(|e| {
-                let reg = e.registry();
-                tx.called_contracts
-                    .iter()
-                    .any(|c| reg.is_privacy_address(c))
-            })
-            .unwrap_or(false);
-
-        let status_style = match tx.status.as_str() {
-            "OK" => theme::STATUS_OK,
-            "REV" => theme::STATUS_REVERTED,
-            _ => theme::SUGGESTION_STYLE,
-        };
-
-        let type_style = match tx.tx_type.as_str() {
-            "INVOKE" => theme::TX_TYPE_INVOKE,
-            "DECLARE" => theme::TX_TYPE_DECLARE,
-            "DEPLOY_ACCOUNT" | "DEPLOY" => theme::TX_TYPE_DEPLOY,
-            "L1_HANDLER" => theme::TX_TYPE_L1HANDLER,
-            _ => theme::NORMAL_STYLE,
-        };
-
-        let tx_label = app.resolve_tx(&tx.hash);
-        let tx_hash_display = tx_hash_cell(tx_label, &tx.hash);
-        let tx_hash_style = if tx_label.is_some() {
-            theme::LABEL_STYLE
-        } else {
-            theme::TX_HASH_STYLE
-        };
-
-        let prv_marker_text = if is_privacy_tx { "🛡   " } else { "    " };
-        let mut row_spans: Vec<Span<'static>> = vec![
-            Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
-            Span::styled(format!("{:<15}", tx.tx_type), type_style),
-            Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-        ];
-        row_spans.extend(contract_spans);
-        row_spans.extend([
-            Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
-            Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
-            Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
-            Span::styled(
-                format!("#{:<9}", tx.block_number),
-                theme::BLOCK_NUMBER_STYLE,
-            ),
-            Span::styled(format!("{:<4}", &tx.status), status_style),
-            Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
-            Span::styled(age, theme::BLOCK_AGE_STYLE),
-        ]);
-        items.push(ListItem::new(Line::from(row_spans)));
-    }
-
     let gap_suffix = if app.address.unfilled_gaps.is_empty() {
         String::new()
     } else {
@@ -661,22 +571,125 @@ fn draw_transactions_tab(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" Transactions ({count}){gap_suffix} ")
     };
+    let block = list_block(title);
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::BORDER_STYLE)
-                .title(Span::styled(title, theme::TITLE_STYLE)),
-        )
-        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
+    // Build rows for the visible page only: the list can hold tens of
+    // thousands of txs and every keystroke redraws the frame.
+    let gaps = app.address.gap_render_positions();
+    let window = ListWindow::new(
+        app.address.txs.items.len() + gaps.len(),
+        app.address.tx_list_rendered_selected_with(&gaps),
+        app.address.txs_render_state.offset(),
+        block.inner(list_area).height as usize,
+    );
+    let items: Vec<ListItem> = window
+        .range()
+        .map(|r| match rendered_row(r, &gaps) {
+            RenderedRow::Gap(lo) => tx_gap_row(app, lo),
+            RenderedRow::Item(idx) => tx_row(app, registry, &app.address.txs.items[idx]),
+        })
+        .collect();
+    window.render(
+        f,
+        highlighted_list(items, block),
+        list_area,
+        &mut app.address.txs_render_state,
+    );
+}
 
-    // Sync rendered selection (gap-aware) into the persistent render state.
-    app.address
-        .txs_render_state
-        .select(app.address.tx_list_rendered_selected());
-    f.render_stateful_widget(list, list_area, &mut app.address.txs_render_state);
+fn tx_gap_row(app: &App, lo_nonce: u64) -> ListItem<'static> {
+    let msg = match app
+        .address
+        .unfilled_gaps
+        .iter()
+        .find(|g| g.lo_nonce == lo_nonce)
+    {
+        Some(g) if g.fill_dispatched => {
+            format!(
+                " ── gap of {} txs — loading / press r to retry ──",
+                g.missing_count
+            )
+        }
+        Some(g) => format!(
+            " ── {} txs hidden — press Enter to load ──",
+            g.missing_count
+        ),
+        None => " ── gap ──".to_string(),
+    };
+    ListItem::new(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)))
+}
+
+fn tx_row(
+    app: &App,
+    registry: Option<&AddressRegistry>,
+    tx: &AddressTxSummary,
+) -> ListItem<'static> {
+    let fee_str = format_strk_u128(tx.total_fee_fri)
+        .trim_end_matches(" STRK")
+        .to_string();
+    let tip_str = if tx.tip > 0 {
+        format_fri(tx.tip as u128)
+    } else {
+        "0".to_string()
+    };
+    let age = format_age(tx.timestamp);
+    let endpoint = if tx.endpoint_names.chars().count() > 30 {
+        let truncated: String = tx.endpoint_names.chars().take(29).collect();
+        format!("{truncated}…")
+    } else {
+        tx.endpoint_names.clone()
+    };
+    let contract_spans = format_called_contracts_spans(app, &tx.called_contracts);
+    // Privacy iff a top-level called contract is in the curated bundle. OE-
+    // wrapped reaches only show once the tx itself is opened.
+    let is_privacy_tx = registry.is_some_and(|reg| {
+        tx.called_contracts
+            .iter()
+            .any(|c| reg.is_privacy_address(c))
+    });
+
+    let status_style = match tx.status.as_str() {
+        "OK" => theme::STATUS_OK,
+        "REV" => theme::STATUS_REVERTED,
+        _ => theme::SUGGESTION_STYLE,
+    };
+
+    let type_style = match tx.tx_type.as_str() {
+        "INVOKE" => theme::TX_TYPE_INVOKE,
+        "DECLARE" => theme::TX_TYPE_DECLARE,
+        "DEPLOY_ACCOUNT" | "DEPLOY" => theme::TX_TYPE_DEPLOY,
+        "L1_HANDLER" => theme::TX_TYPE_L1HANDLER,
+        _ => theme::NORMAL_STYLE,
+    };
+
+    let tx_label = app.resolve_tx(&tx.hash);
+    let tx_hash_display = tx_hash_cell(tx_label, &tx.hash);
+    let tx_hash_style = if tx_label.is_some() {
+        theme::LABEL_STYLE
+    } else {
+        theme::TX_HASH_STYLE
+    };
+
+    let prv_marker_text = if is_privacy_tx { "🛡   " } else { "    " };
+    let mut row_spans: Vec<Span<'static>> = vec![
+        Span::styled(format!(" {:<8}", tx.nonce), theme::NORMAL_STYLE),
+        Span::styled(format!("{:<15}", tx.tx_type), type_style),
+        Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
+    ];
+    row_spans.extend(contract_spans);
+    row_spans.extend([
+        Span::styled(format!("{:<31}", endpoint), theme::LABEL_STYLE),
+        Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+        Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
+        Span::styled(
+            format!("#{:<9}", tx.block_number),
+            theme::BLOCK_NUMBER_STYLE,
+        ),
+        Span::styled(format!("{:<4}", tx.status), status_style),
+        Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
+        Span::styled(age, theme::BLOCK_AGE_STYLE),
+    ]);
+    ListItem::new(Line::from(row_spans))
 }
 
 /// Render the contracts-called column: up to the first two contract labels
@@ -810,110 +823,6 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(reg, info)| reg.is_privacy_address(&info.address))
         .unwrap_or(false);
 
-    // (call_idx, lo_block) for each block-range gap, sorted by call_idx. Each
-    // gap renders as its own ListItem above the first call at `lo_block`.
-    let gap_positions = app.address.call_gap_render_positions();
-    let mut next_gap = gap_positions.iter().peekable();
-    let gap_info_for_lo = |lo: u64| -> Option<(u64, bool)> {
-        app.address
-            .call_gaps
-            .iter()
-            .find(|g| g.lo_block == lo)
-            .map(|g| (g.hi_block, g.fill_dispatched))
-    };
-
-    let mut items: Vec<ListItem> =
-        Vec::with_capacity(app.address.calls.items.len() + gap_positions.len());
-    for (idx, call) in app.address.calls.items.iter().enumerate() {
-        while let Some(&&(p, lo)) = next_gap.peek()
-            && p == idx
-        {
-            if let Some((hi, dispatched)) = gap_info_for_lo(lo) {
-                let msg = if dispatched {
-                    format!(" ── calls gap (blocks {lo}..{hi}) — loading… ──")
-                } else {
-                    format!(" ── calls gap (blocks {lo}..{hi}) — press Enter to load ──")
-                };
-                items.push(ListItem::new(Line::from(Span::styled(
-                    msg,
-                    theme::SUGGESTION_STYLE,
-                ))));
-            }
-            next_gap.next();
-        }
-
-        let sender_style =
-            known_or_palette_style(&call.sender, registry, &app.address.call_color_map);
-        let sender_label = app.format_address(&call.sender);
-        let sender_display = if sender_label.chars().count() > 25 {
-            let truncated: String = sender_label.chars().take(24).collect();
-            format!("{truncated}…")
-        } else {
-            sender_label
-        };
-        let func = if call.function_name.chars().count() > 30 {
-            let truncated: String = call.function_name.chars().take(29).collect();
-            format!("{truncated}…")
-        } else {
-            call.function_name.clone()
-        };
-        let fee_str = format_strk_u128(call.total_fee_fri)
-            .trim_end_matches(" STRK")
-            .to_string();
-        let nonce_str = match call.nonce {
-            Some(n) => n.to_string(),
-            None => "—".to_string(),
-        };
-        let tip_str = if call.tip > 0 {
-            format_fri(call.tip as u128)
-        } else {
-            "0".to_string()
-        };
-        let status_style = match call.status.as_str() {
-            "OK" => theme::STATUS_OK,
-            "REV" => theme::STATUS_REVERTED,
-            _ => theme::SUGGESTION_STYLE,
-        };
-
-        let tx_label = app.resolve_tx(&call.tx_hash);
-        let tx_hash_display = tx_hash_cell(tx_label, &call.tx_hash);
-        let tx_hash_style = if tx_label.is_some() {
-            theme::LABEL_STYLE
-        } else {
-            theme::TX_HASH_STYLE
-        };
-
-        // Privacy iff the viewed contract is itself a privacy address
-        // (every incoming call is then a privacy interaction) OR any OE
-        // inner target is in the curated bundle (for non-privacy contract
-        // pages like AVNU Forwarder where the pool only appears as an
-        // inner call).
-        let is_privacy_call = viewed_is_privacy
-            || registry
-                .map(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)))
-                .unwrap_or(false);
-        let prv_marker_text = if is_privacy_call { "🛡   " } else { "    " };
-
-        let line = Line::from(vec![
-            Span::styled(format!(" {:<25} ", sender_display), sender_style),
-            Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
-            Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-            Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),
-            Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
-            Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
-            Span::styled(
-                format!("#{:<9}", call.block_number),
-                theme::BLOCK_NUMBER_STYLE,
-            ),
-            Span::styled(format!("{:<4}", &call.status), status_style),
-            Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
-            Span::styled(format_age(call.timestamp), theme::BLOCK_AGE_STYLE),
-        ]);
-        items.push(ListItem::new(line));
-    }
-
-    // Prefer the interactive block-range gap summary; fall back to the passive
-    // event-window deferred-gap hint when there are no fillable list gaps.
     let gap_suffix = if app.address.call_gaps.is_empty() {
         event_window_gap_suffix(app)
     } else {
@@ -932,22 +841,124 @@ fn draw_calls_tab(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" Calls ({count}){gap_suffix} ")
     };
+    let block = list_block(title);
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::BORDER_STYLE)
-                .title(Span::styled(title, theme::TITLE_STYLE)),
-        )
-        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
+    let gaps = app.address.call_gap_render_positions();
+    let window = ListWindow::new(
+        app.address.calls.items.len() + gaps.len(),
+        app.address.call_list_rendered_selected_with(&gaps),
+        app.address.calls_render_state.offset(),
+        block.inner(list_area).height as usize,
+    );
+    let items: Vec<ListItem> = window
+        .range()
+        .map(|r| match rendered_row(r, &gaps) {
+            RenderedRow::Gap(lo) => call_gap_row(app, lo),
+            RenderedRow::Item(idx) => call_row(
+                app,
+                registry,
+                viewed_is_privacy,
+                &app.address.calls.items[idx],
+            ),
+        })
+        .collect();
+    window.render(
+        f,
+        highlighted_list(items, block),
+        list_area,
+        &mut app.address.calls_render_state,
+    );
+}
 
-    // Sync the gap-aware rendered selection into the persistent render state.
-    app.address
-        .calls_render_state
-        .select(app.address.call_list_rendered_selected());
-    f.render_stateful_widget(list, list_area, &mut app.address.calls_render_state);
+fn call_gap_row(app: &App, lo_block: u64) -> ListItem<'static> {
+    let msg = match app
+        .address
+        .call_gaps
+        .iter()
+        .find(|g| g.lo_block == lo_block)
+    {
+        Some(g) if g.fill_dispatched => {
+            format!(
+                " ── calls gap (blocks {lo_block}..{}) — loading… ──",
+                g.hi_block
+            )
+        }
+        Some(g) => format!(
+            " ── calls gap (blocks {lo_block}..{}) — press Enter to load ──",
+            g.hi_block
+        ),
+        None => " ── calls gap ──".to_string(),
+    };
+    ListItem::new(Line::from(Span::styled(msg, theme::SUGGESTION_STYLE)))
+}
+
+fn call_row(
+    app: &App,
+    registry: Option<&AddressRegistry>,
+    viewed_is_privacy: bool,
+    call: &ContractCallSummary,
+) -> ListItem<'static> {
+    let sender_style = known_or_palette_style(&call.sender, registry, &app.address.call_color_map);
+    let sender_label = app.format_address(&call.sender);
+    let sender_display = if sender_label.chars().count() > 25 {
+        let truncated: String = sender_label.chars().take(24).collect();
+        format!("{truncated}…")
+    } else {
+        sender_label
+    };
+    let func = if call.function_name.chars().count() > 30 {
+        let truncated: String = call.function_name.chars().take(29).collect();
+        format!("{truncated}…")
+    } else {
+        call.function_name.clone()
+    };
+    let fee_str = format_strk_u128(call.total_fee_fri)
+        .trim_end_matches(" STRK")
+        .to_string();
+    let nonce_str = match call.nonce {
+        Some(n) => n.to_string(),
+        None => "—".to_string(),
+    };
+    let tip_str = if call.tip > 0 {
+        format_fri(call.tip as u128)
+    } else {
+        "0".to_string()
+    };
+    let status_style = match call.status.as_str() {
+        "OK" => theme::STATUS_OK,
+        "REV" => theme::STATUS_REVERTED,
+        _ => theme::SUGGESTION_STYLE,
+    };
+
+    let tx_label = app.resolve_tx(&call.tx_hash);
+    let tx_hash_display = tx_hash_cell(tx_label, &call.tx_hash);
+    let tx_hash_style = if tx_label.is_some() {
+        theme::LABEL_STYLE
+    } else {
+        theme::TX_HASH_STYLE
+    };
+
+    // Privacy iff the viewed contract is itself a privacy address OR an OE
+    // inner target is in the curated bundle (non-privacy forwarder pages).
+    let is_privacy_call = viewed_is_privacy
+        || registry.is_some_and(|reg| call.inner_targets.iter().any(|t| reg.is_privacy_address(t)));
+    let prv_marker_text = if is_privacy_call { "🛡   " } else { "    " };
+
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {:<25} ", sender_display), sender_style),
+        Span::styled(format!("{:<31}", func), theme::LABEL_STYLE),
+        Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
+        Span::styled(format!("{:<10}", nonce_str), theme::NORMAL_STYLE),
+        Span::styled(format!("{:<17}", fee_str), theme::TX_FEE_STYLE),
+        Span::styled(format!("{:<17}", tip_str), theme::SUGGESTION_STYLE),
+        Span::styled(
+            format!("#{:<9}", call.block_number),
+            theme::BLOCK_NUMBER_STYLE,
+        ),
+        Span::styled(format!("{:<4}", call.status), status_style),
+        Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
+        Span::styled(format_age(call.timestamp), theme::BLOCK_AGE_STYLE),
+    ]))
 }
 
 fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
@@ -992,109 +1003,6 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .address
-        .meta_txs
-        .items
-        .iter()
-        .map(|m| {
-            let age = format_age(m.timestamp);
-            let paymaster_label = app.format_address(&m.paymaster);
-            let paymaster_display = if paymaster_label.chars().count() > 20 {
-                let truncated: String = paymaster_label.chars().take(19).collect();
-                format!("{truncated}…")
-            } else {
-                paymaster_label
-            };
-
-            // Protocol column: first inner target (labeled) + " +N" if more.
-            let protocol = match m.inner_targets.first() {
-                Some(t) => {
-                    let base = app.format_address(t);
-                    let trimmed: String = if base.chars().count() > 16 {
-                        let t: String = base.chars().take(15).collect();
-                        format!("{t}…")
-                    } else {
-                        base
-                    };
-                    let extra = m.inner_targets.len().saturating_sub(1);
-                    if extra > 0 {
-                        format!("{trimmed} +{extra}")
-                    } else {
-                        trimmed
-                    }
-                }
-                None => "-".to_string(),
-            };
-            let protocol_display = if protocol.chars().count() > 20 {
-                let truncated: String = protocol.chars().take(19).collect();
-                format!("{truncated}…")
-            } else {
-                protocol
-            };
-            // Privacy detection on meta-txs uses the inner-call targets,
-            // which is precisely the place an OE-wrapped sponsored tx
-            // reaches the pool — the on-chain `tx.sender` would be a
-            // relayer.
-            let is_privacy_meta = app
-                .search_engine
-                .as_ref()
-                .map(|e| {
-                    let reg = e.registry();
-                    m.inner_targets.iter().any(|t| reg.is_privacy_address(t))
-                })
-                .unwrap_or(false);
-            let protocol_style = if is_privacy_meta {
-                theme::PRIVACY_STYLE
-            } else {
-                theme::LABEL_STYLE
-            };
-
-            let endpoint = if m.inner_endpoints.chars().count() > 34 {
-                let truncated: String = m.inner_endpoints.chars().take(33).collect();
-                format!("{truncated}…")
-            } else {
-                m.inner_endpoints.clone()
-            };
-
-            let fee_str = format_strk_u128(m.total_fee_fri)
-                .trim_end_matches(" STRK")
-                .to_string();
-
-            let status_style = match m.status.as_str() {
-                "OK" => theme::STATUS_OK,
-                "REV" => theme::STATUS_REVERTED,
-                _ => theme::SUGGESTION_STYLE,
-            };
-
-            let tx_label = app.resolve_tx(&m.hash);
-            let tx_hash_display = tx_hash_cell(tx_label, &m.hash);
-            let tx_hash_style = if tx_label.is_some() {
-                theme::LABEL_STYLE
-            } else {
-                theme::TX_HASH_STYLE
-            };
-
-            let prv_marker_text = if is_privacy_meta { "🛡   " } else { "    " };
-            let line = Line::from(vec![
-                Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
-                Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
-                Span::styled(
-                    format!("#{:<10}", m.block_number),
-                    theme::BLOCK_NUMBER_STYLE,
-                ),
-                Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
-                Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
-                Span::styled(format!("{:<21}", protocol_display), protocol_style),
-                Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
-                Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
-                Span::styled(format!("{:<4}", &m.status), status_style),
-                Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
     let gap_suffix = event_window_gap_suffix(app);
     // The body title shares the same fragment helper as the compact tab row.
     let count = meta_tx_count_fragment(app);
@@ -1112,18 +1020,118 @@ fn draw_meta_txs_tab(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!(" MetaTxs ({count}){gap_suffix} ")
     };
+    let block = list_block(title);
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::BORDER_STYLE)
-                .title(Span::styled(title, theme::TITLE_STYLE)),
-        )
-        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
+    let window = ListWindow::new(
+        app.address.meta_txs.items.len(),
+        app.address.meta_txs.state.selected(),
+        app.address.meta_txs.state.offset(),
+        block.inner(list_area).height as usize,
+    );
+    let items: Vec<ListItem> = app.address.meta_txs.items[window.range()]
+        .iter()
+        .map(|m| meta_tx_row(app, m))
+        .collect();
+    window.render(
+        f,
+        highlighted_list(items, block),
+        list_area,
+        &mut app.address.meta_txs.state,
+    );
+}
 
-    f.render_stateful_widget(list, list_area, &mut app.address.meta_txs.state);
+fn meta_tx_row(app: &App, m: &MetaTxIntenderSummary) -> ListItem<'static> {
+    let age = format_age(m.timestamp);
+    let paymaster_label = app.format_address(&m.paymaster);
+    let paymaster_display = if paymaster_label.chars().count() > 20 {
+        let truncated: String = paymaster_label.chars().take(19).collect();
+        format!("{truncated}…")
+    } else {
+        paymaster_label
+    };
+
+    // Protocol column: first inner target (labeled) + " +N" if more.
+    let protocol = match m.inner_targets.first() {
+        Some(t) => {
+            let base = app.format_address(t);
+            let trimmed: String = if base.chars().count() > 16 {
+                let t: String = base.chars().take(15).collect();
+                format!("{t}…")
+            } else {
+                base
+            };
+            let extra = m.inner_targets.len().saturating_sub(1);
+            if extra > 0 {
+                format!("{trimmed} +{extra}")
+            } else {
+                trimmed
+            }
+        }
+        None => "-".to_string(),
+    };
+    let protocol_display = if protocol.chars().count() > 20 {
+        let truncated: String = protocol.chars().take(19).collect();
+        format!("{truncated}…")
+    } else {
+        protocol
+    };
+    // Privacy detection uses the inner-call targets: that is where an
+    // OE-wrapped sponsored tx reaches the pool (the on-chain sender is a relayer).
+    let is_privacy_meta = app
+        .search_engine
+        .as_ref()
+        .map(|e| {
+            let reg = e.registry();
+            m.inner_targets.iter().any(|t| reg.is_privacy_address(t))
+        })
+        .unwrap_or(false);
+    let protocol_style = if is_privacy_meta {
+        theme::PRIVACY_STYLE
+    } else {
+        theme::LABEL_STYLE
+    };
+
+    let endpoint = if m.inner_endpoints.chars().count() > 34 {
+        let truncated: String = m.inner_endpoints.chars().take(33).collect();
+        format!("{truncated}…")
+    } else {
+        m.inner_endpoints.clone()
+    };
+
+    let fee_str = format_strk_u128(m.total_fee_fri)
+        .trim_end_matches(" STRK")
+        .to_string();
+
+    let status_style = match m.status.as_str() {
+        "OK" => theme::STATUS_OK,
+        "REV" => theme::STATUS_REVERTED,
+        _ => theme::SUGGESTION_STYLE,
+    };
+
+    let tx_label = app.resolve_tx(&m.hash);
+    let tx_hash_display = tx_hash_cell(tx_label, &m.hash);
+    let tx_hash_style = if tx_label.is_some() {
+        theme::LABEL_STYLE
+    } else {
+        theme::TX_HASH_STYLE
+    };
+
+    let prv_marker_text = if is_privacy_meta { "🛡   " } else { "    " };
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {:<5}", age), theme::BLOCK_AGE_STYLE),
+        Span::styled(format!("{:<14}", tx_hash_display), tx_hash_style),
+        Span::styled(
+            format!("#{:<10}", m.block_number),
+            theme::BLOCK_NUMBER_STYLE,
+        ),
+        Span::styled(format!("{:<21}", paymaster_display), theme::LABEL_STYLE),
+        Span::styled(format!("{:<6}", m.version), theme::SUGGESTION_STYLE),
+        Span::styled(format!("{:<21}", protocol_display), protocol_style),
+        Span::styled(format!("{:<35}", endpoint), theme::LABEL_STYLE),
+        Span::styled(format!("{:<15}", fee_str), theme::TX_FEE_STYLE),
+        Span::styled(format!("{:<4}", m.status), status_style),
+        Span::styled(prv_marker_text, theme::PRIVACY_STYLE),
+    ]))
 }
 
 fn draw_balances_tab(
@@ -1382,10 +1390,21 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .address
-        .events
-        .items
+    let count = events_count_fragment(app);
+    let title = if app.is_loading {
+        format!(" Events ({count}) fetching... ")
+    } else {
+        format!(" Events ({count}) ")
+    };
+    let block = list_block(title);
+
+    let window = ListWindow::new(
+        app.address.events.items.len(),
+        app.address.events.state.selected(),
+        app.address.events.state.offset(),
+        block.inner(list_area).height as usize,
+    );
+    let items: Vec<ListItem> = app.address.events.items[window.range()]
         .iter()
         .map(|event| {
             let contract = app.format_address(&event.contract_address);
@@ -1398,34 +1417,19 @@ fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 theme::TX_HASH_STYLE
             };
-
-            let line = Line::from(vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<20}", name), theme::LABEL_STYLE),
                 Span::styled(format!("{:<17}", contract), theme::BLOCK_HASH_STYLE),
                 Span::styled(tx_display, tx_style),
-            ]);
-            ListItem::new(line)
+            ]))
         })
         .collect();
-
-    let count = events_count_fragment(app);
-    let title = if app.is_loading {
-        format!(" Events ({count}) fetching... ")
-    } else {
-        format!(" Events ({count}) ")
-    };
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::BORDER_STYLE)
-                .title(Span::styled(title, theme::TITLE_STYLE)),
-        )
-        .highlight_style(theme::SELECTED_STYLE.add_modifier(Modifier::BOLD))
-        .highlight_symbol(">> ");
-
-    f.render_stateful_widget(list, list_area, &mut app.address.events.state);
+    window.render(
+        f,
+        highlighted_list(items, block),
+        list_area,
+        &mut app.address.events.state,
+    );
 }
 
 fn format_token_balance(bal: &TokenBalance) -> String {

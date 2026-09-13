@@ -729,25 +729,20 @@ impl AddressInfoState {
         gaps[idx_in_gaps].0 + idx_in_gaps
     }
 
-    fn rendered_to_tx_pos(r: usize, gaps: &[(usize, u64)]) -> usize {
-        let gaps_before = gaps
-            .iter()
-            .enumerate()
-            .filter(|(g_idx, (p, _))| p + g_idx < r)
-            .count();
-        r - gaps_before
-    }
-
     /// Rendered (gap-aware) selection index for the Transactions list.
     pub fn tx_list_rendered_selected(&self) -> Option<usize> {
-        let gaps = self.gap_render_positions();
+        self.tx_list_rendered_selected_with(&self.gap_render_positions())
+    }
+
+    /// Same, for callers that already hold `gap_render_positions()`.
+    pub fn tx_list_rendered_selected_with(&self, gaps: &[(usize, u64)]) -> Option<usize> {
         if let Some(sel_lo) = self.gap_selected
             && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
         {
-            return Some(Self::gap_rendered_idx(&gaps, g_idx));
+            return Some(Self::gap_rendered_idx(gaps, g_idx));
         }
         let tx_idx = self.txs.state.selected()?;
-        Some(Self::tx_pos_to_rendered(tx_idx, &gaps))
+        Some(Self::tx_pos_to_rendered(tx_idx, gaps))
     }
 
     /// Currently-selected gap, if the gap row is the active selection.
@@ -788,15 +783,13 @@ impl AddressInfoState {
     /// Apply a target rendered index to state — selects the gap row when the
     /// index lands on one, otherwise selects the corresponding tx.
     fn apply_rendered(&mut self, r: usize, gaps: &[(usize, u64)]) {
-        for (g_idx, (p, lo)) in gaps.iter().enumerate() {
-            if p + g_idx == r {
-                self.gap_selected = Some(*lo);
-                return;
+        match rendered_row(r, gaps) {
+            RenderedRow::Gap(lo) => self.gap_selected = Some(lo),
+            RenderedRow::Item(t) => {
+                self.gap_selected = None;
+                self.txs.state.select(Some(t));
             }
         }
-        self.gap_selected = None;
-        let t = Self::rendered_to_tx_pos(r, gaps);
-        self.txs.state.select(Some(t));
     }
 
     /// Move selection by `delta` rows in the rendered list, clamping on the
@@ -972,15 +965,13 @@ impl AddressInfoState {
     }
 
     fn apply_call_rendered(&mut self, r: usize, gaps: &[(usize, u64)]) {
-        for (g_idx, (p, lo)) in gaps.iter().enumerate() {
-            if p + g_idx == r {
-                self.call_gap_selected = Some(*lo);
-                return;
+        match rendered_row(r, gaps) {
+            RenderedRow::Gap(lo) => self.call_gap_selected = Some(lo),
+            RenderedRow::Item(c) => {
+                self.call_gap_selected = None;
+                self.calls.state.select(Some(c));
             }
         }
-        self.call_gap_selected = None;
-        let c = Self::rendered_to_tx_pos(r, gaps);
-        self.calls.state.select(Some(c));
     }
 
     /// Move selection by `delta` rows in the rendered calls list, clamping on
@@ -1035,15 +1026,41 @@ impl AddressInfoState {
     /// Rendered (gap-aware) selection index for the Calls list. Mirrors
     /// `tx_list_rendered_selected`.
     pub fn call_list_rendered_selected(&self) -> Option<usize> {
-        let gaps = self.call_gap_render_positions();
+        self.call_list_rendered_selected_with(&self.call_gap_render_positions())
+    }
+
+    /// Same, for callers that already hold `call_gap_render_positions()`.
+    pub fn call_list_rendered_selected_with(&self, gaps: &[(usize, u64)]) -> Option<usize> {
         if let Some(sel_lo) = self.call_gap_selected
             && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
         {
-            return Some(Self::gap_rendered_idx(&gaps, g_idx));
+            return Some(Self::gap_rendered_idx(gaps, g_idx));
         }
         let c = self.calls.state.selected()?;
-        Some(Self::tx_pos_to_rendered(c, &gaps))
+        Some(Self::tx_pos_to_rendered(c, gaps))
     }
+}
+
+/// What a gap-aware rendered index points at: a gap row (keyed by its `lo`
+/// nonce/block) or a position in the underlying items list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderedRow {
+    Gap(u64),
+    Item(usize),
+}
+
+/// Inverse of `tx_pos_to_rendered`. `gaps` is `(item_pos, lo)` sorted by
+/// `item_pos`; each gap renders directly above its item.
+pub fn rendered_row(r: usize, gaps: &[(usize, u64)]) -> RenderedRow {
+    let mut gaps_before = 0;
+    for (g_idx, (p, lo)) in gaps.iter().enumerate() {
+        match (p + g_idx).cmp(&r) {
+            std::cmp::Ordering::Equal => return RenderedRow::Gap(*lo),
+            std::cmp::Ordering::Less => gaps_before += 1,
+            std::cmp::Ordering::Greater => break,
+        }
+    }
+    RenderedRow::Item(r - gaps_before)
 }
 
 /// Upgrade an existing tx summary with better data from an incoming one.
@@ -1703,6 +1720,37 @@ mod tests {
                 n,
                 cold
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rendered_row_tests {
+    use super::*;
+
+    #[test]
+    fn no_gaps_is_identity() {
+        assert_eq!(rendered_row(7, &[]), RenderedRow::Item(7));
+    }
+
+    #[test]
+    fn gap_rows_and_items_interleave() {
+        // Gaps above item 0 and item 5 render at rows 0 and 6.
+        let gaps = [(0, 100), (5, 200)];
+        assert_eq!(rendered_row(0, &gaps), RenderedRow::Gap(100));
+        assert_eq!(rendered_row(1, &gaps), RenderedRow::Item(0));
+        assert_eq!(rendered_row(5, &gaps), RenderedRow::Item(4));
+        assert_eq!(rendered_row(6, &gaps), RenderedRow::Gap(200));
+        assert_eq!(rendered_row(7, &gaps), RenderedRow::Item(5));
+        assert_eq!(rendered_row(9, &gaps), RenderedRow::Item(7));
+    }
+
+    #[test]
+    fn round_trips_with_tx_pos_to_rendered() {
+        let gaps = [(2, 10), (2, 11), (9, 12)];
+        for pos in 0..20 {
+            let r = AddressInfoState::tx_pos_to_rendered(pos, &gaps);
+            assert_eq!(rendered_row(r, &gaps), RenderedRow::Item(pos));
         }
     }
 }
