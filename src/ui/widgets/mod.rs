@@ -2,6 +2,7 @@ pub mod address_color;
 pub mod event_tree;
 pub mod help;
 pub mod hex_display;
+pub mod list_window;
 pub mod param_display;
 pub mod price;
 pub mod search_bar;
