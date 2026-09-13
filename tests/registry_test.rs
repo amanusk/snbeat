@@ -259,3 +259,52 @@ fn test_get_decimals() {
     let usdc = Felt::from_hex(USDC_TOKEN).unwrap();
     assert_eq!(registry.get_decimals(&usdc), Some(6));
 }
+
+#[test]
+fn test_privacy_classification_survives_user_label_override() {
+    // Bundled "Privacy Pool" contract; the user shadows its name.
+    const POOL: &str = "0x040337b1af3c663e86e333bab5a4b28da8d4652a15a69beee2b677776ffe812a";
+    let labels = make_user_labels(&format!(
+        r#"
+[addresses]
+"{POOL}" = "my-pool"
+"{ETH_TOKEN}" = "My ETH"
+"#
+    ));
+    let registry =
+        snbeat::registry::AddressRegistry::load(labels.path(), std::path::Path::new("/dev/null"))
+            .unwrap()
+            .0;
+
+    let pool = Felt::from_hex(POOL).unwrap();
+    assert_eq!(registry.resolve(&pool), Some("my-pool"));
+    assert!(registry.is_known(&pool));
+    assert!(registry.is_privacy_address(&pool));
+    assert!(registry.privacy_addresses().contains(&pool));
+
+    // Known-address metadata still reachable through a user-shadowed entry.
+    let eth = Felt::from_hex(ETH_TOKEN).unwrap();
+    assert_eq!(registry.get_decimals(&eth), Some(18));
+    assert!(!registry.is_privacy_address(&eth));
+    assert!(!registry.is_known(&Felt::from(12345u64)));
+    assert_eq!(registry.get_metadata(&eth).map(|m| m.is_user), Some(true));
+}
+
+#[test]
+fn test_viewing_key_lookup_by_user() {
+    let mut keys = tempfile::NamedTempFile::new().unwrap();
+    keys.write_all(
+        br#"
+[keys]
+"0x1234" = "0xabcd"
+"#,
+    )
+    .unwrap();
+    let registry =
+        snbeat::registry::AddressRegistry::load(std::path::Path::new("/dev/null"), keys.path())
+            .unwrap()
+            .0;
+    assert!(registry.viewing_key(&Felt::from(0x1234u64)).is_some());
+    assert!(registry.viewing_key(&Felt::from(0x9999u64)).is_none());
+    assert_eq!(registry.iter_viewing_keys().count(), 1);
+}

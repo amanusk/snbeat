@@ -2,6 +2,7 @@ pub mod known_addresses;
 pub mod user_labels;
 pub mod viewing_keys;
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -35,6 +36,12 @@ pub struct AddressRegistry {
     /// Privacy-pool viewing keys keyed by user address. Deliberately NOT
     /// in the search index — secrets shouldn't surface in autocomplete.
     viewing_keys: Vec<ViewingKey>,
+    // Point-lookup indexes into the Vecs above; first occurrence wins.
+    user_by_addr: HashMap<Felt, usize>,
+    known_by_addr: HashMap<Felt, usize>,
+    tx_by_hash: HashMap<Felt, usize>,
+    viewing_key_by_user: HashMap<Felt, usize>,
+    privacy: HashSet<Felt>,
     /// Search index: sorted entries for fast lookup.
     /// Behind RwLock so Voyager labels can be added at runtime.
     search_index: RwLock<Vec<SearchEntry>>,
@@ -89,6 +96,16 @@ impl AddressRegistry {
             warnings.push(w);
         }
 
+        let user_by_addr = index_by(&user, |u| u.address);
+        let known_by_addr = index_by(&known, |k| k.address);
+        let tx_by_hash = index_by(&tx_labels, |t| t.hash);
+        let viewing_key_by_user = index_by(&viewing_keys, |vk| vk.user);
+        let privacy: HashSet<Felt> = known
+            .iter()
+            .filter(|k| k.addr_type == "Privacy")
+            .map(|k| k.address)
+            .collect();
+
         let mut search_index = Vec::with_capacity(user.len() + tx_labels.len() + known.len());
 
         // User labels first (higher priority in search results)
@@ -122,7 +139,7 @@ impl AddressRegistry {
         // Then known addresses
         for addr in &known {
             // Skip if user already has a label for this address
-            if user.iter().any(|u| u.address == addr.address) {
+            if user_by_addr.contains_key(&addr.address) {
                 continue;
             }
             let hex = format!("{:#x}", addr.address);
@@ -155,19 +172,31 @@ impl AddressRegistry {
                 tx_labels,
                 known,
                 viewing_keys,
+                user_by_addr,
+                known_by_addr,
+                tx_by_hash,
+                viewing_key_by_user,
+                privacy,
                 search_index: RwLock::new(search_index),
             },
             warnings,
         ))
     }
 
+    fn user_label(&self, address: &Felt) -> Option<&UserLabel> {
+        self.user_by_addr.get(address).map(|&i| &self.user[i])
+    }
+
+    fn known_addr(&self, address: &Felt) -> Option<&KnownAddress> {
+        self.known_by_addr.get(address).map(|&i| &self.known[i])
+    }
+
     /// Look up a user-supplied private viewing key for an address.
     /// Returns None if the user has no viewing key registered for it.
     pub fn viewing_key(&self, user: &Felt) -> Option<&SecretFelt> {
-        self.viewing_keys
-            .iter()
-            .find(|vk| vk.user == *user)
-            .map(|vk| &vk.private_key)
+        self.viewing_key_by_user
+            .get(user)
+            .map(|&i| &self.viewing_keys[i].private_key)
     }
 
     /// Iterate over all `(user_address, viewing_key)` pairs the user has
@@ -182,28 +211,21 @@ impl AddressRegistry {
 
     /// Resolve an address to its display name. User labels take priority.
     pub fn resolve(&self, address: &Felt) -> Option<&str> {
-        // Check user labels first
-        if let Some(label) = self.user.iter().find(|u| u.address == *address) {
-            return Some(&label.name);
-        }
-        // Check known addresses
-        if let Some(addr) = self.known.iter().find(|k| k.address == *address) {
-            return Some(&addr.name);
-        }
-        None
+        self.user_label(address)
+            .map(|l| l.name.as_str())
+            .or_else(|| self.known_addr(address).map(|k| k.name.as_str()))
     }
 
     /// Resolve a transaction hash to its user-supplied display name.
     pub fn resolve_tx(&self, hash: &Felt) -> Option<&str> {
-        self.tx_labels
-            .iter()
-            .find(|t| t.hash == *hash)
-            .map(|t| t.name.as_str())
+        self.tx_by_hash
+            .get(hash)
+            .map(|&i| self.tx_labels[i].name.as_str())
     }
 
     /// Get metadata for an address.
     pub fn get_metadata(&self, address: &Felt) -> Option<AddressMeta> {
-        if let Some(label) = self.user.iter().find(|u| u.address == *address) {
+        if let Some(label) = self.user_label(address) {
             return Some(AddressMeta {
                 name: label.name.clone(),
                 addr_type: String::new(),
@@ -211,7 +233,7 @@ impl AddressRegistry {
                 is_user: true,
             });
         }
-        if let Some(addr) = self.known.iter().find(|k| k.address == *address) {
+        if let Some(addr) = self.known_addr(address) {
             return Some(AddressMeta {
                 name: addr.name.clone(),
                 addr_type: addr.addr_type.clone(),
@@ -224,10 +246,7 @@ impl AddressRegistry {
 
     /// Get token decimals for an address (from known addresses).
     pub fn get_decimals(&self, address: &Felt) -> Option<u8> {
-        self.known
-            .iter()
-            .find(|k| k.address == *address)
-            .and_then(|k| k.decimals)
+        self.known_addr(address).and_then(|k| k.decimals)
     }
 
     /// Search the registry by prefix or substring. Returns up to `limit` results.
@@ -354,9 +373,7 @@ impl AddressRegistry {
     /// privacy classification comes from the bundled list and isn't
     /// something a user-label override can disclaim.
     pub fn is_privacy_address(&self, address: &Felt) -> bool {
-        self.known
-            .iter()
-            .any(|k| k.address == *address && k.addr_type == "Privacy")
+        self.privacy.contains(address)
     }
 
     /// Format an address for display: label if known, truncated hex otherwise.
@@ -376,12 +393,8 @@ impl AddressRegistry {
     /// Format an address showing both user and global labels when they differ.
     /// Returns e.g. "[My ETH] (ETH / ERC20)" or "[ETH]" or "0x49d..dc7"
     pub fn format_address_full(&self, address: &Felt) -> String {
-        let user_name = self
-            .user
-            .iter()
-            .find(|u| u.address == *address)
-            .map(|u| &u.name);
-        let known = self.known.iter().find(|k| k.address == *address);
+        let user_name = self.user_label(address).map(|u| &u.name);
+        let known = self.known_addr(address);
 
         match (user_name, known) {
             (Some(uname), Some(k)) if uname != &k.name => {
@@ -405,6 +418,16 @@ impl AddressRegistry {
             (None, None) => self.format_address(address),
         }
     }
+}
+
+/// Felt → position, first occurrence wins (same answer the linear `find`
+/// calls this replaced would give).
+fn index_by<T>(items: &[T], key: impl Fn(&T) -> Felt) -> HashMap<Felt, usize> {
+    let mut map = HashMap::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        map.entry(key(item)).or_insert(i);
+    }
+    map
 }
 
 fn format_search_result(entry: &SearchEntry) -> String {
