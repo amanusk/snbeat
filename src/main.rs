@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, EventStream, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -422,7 +423,12 @@ async fn main() -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -435,6 +441,7 @@ async fn main() -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -467,23 +474,14 @@ async fn run_loop(
         }
 
         tokio::select! {
+            // Input first: a pending key must never queue behind a response burst.
+            biased;
             maybe_event = event_stream.next() => {
                 match maybe_event {
-                    Some(Ok(Event::Key(key))) => {
-                        // Clear error on any keypress
-                        app.error_message = None;
-                        if let Some(action) = app::input::handle_key(app, key) {
-                            debug!(?action, "Dispatching action from input");
-                            app.is_loading = true;
-                            let _ = app.action_tx.send(action);
-                        }
+                    Some(Ok(event)) => {
+                        handle_terminal_event(app, event);
+                        drain_buffered_input(app)?;
                     }
-                    Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.select_previous(),
-                        MouseEventKind::ScrollDown => app.select_next(),
-                        _ => {} // ignore clicks/motion — text selection works via Shift+drag
-                    },
-                    Some(Ok(_)) => {} // resize, focus, paste — ignored
                     Some(Err(e)) => {
                         // Terminal input errors are usually fatal (closed tty,
                         // broken pipe). Log and quit cleanly so the select! arm
@@ -524,6 +522,43 @@ async fn run_loop(
             }
         }
     }
+}
+
+fn handle_terminal_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) => {
+            // Clear error on any keypress
+            app.error_message = None;
+            if let Some(action) = app::input::handle_key(app, key) {
+                debug!(?action, "Dispatching action from input");
+                app.is_loading = true;
+                let _ = app.action_tx.send(action);
+            }
+        }
+        Event::Paste(text) => {
+            debug!(len = text.len(), "Applying paste");
+            app::input::handle_paste(app, &text);
+        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => app.select_previous(),
+            MouseEventKind::ScrollDown => app.select_next(),
+            _ => {} // ignore clicks/motion — text selection works via Shift+drag
+        },
+        _ => {} // resize, focus — ignored
+    }
+}
+
+/// Apply already-buffered input before redrawing so a paste or key-repeat burst
+/// costs one frame. Sync poll on purpose: a throwaway stream poll would register a dead waker.
+fn drain_buffered_input(app: &mut App) -> io::Result<()> {
+    const MAX_INPUT_DRAIN: usize = 256;
+    for _ in 0..MAX_INPUT_DRAIN {
+        if app.should_quit || !event::poll(Duration::ZERO)? {
+            break;
+        }
+        handle_terminal_event(app, event::read()?);
+    }
+    Ok(())
 }
 
 /// Per-action logging extracted so `run_loop` can apply it both to the
