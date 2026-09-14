@@ -489,9 +489,9 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
 
         KeyCode::Backspace => {
-            if app.search_cursor > 0 {
-                app.search_cursor -= 1;
-                app.search_input.remove(app.search_cursor);
+            if let Some(start) = prev_char_start(&app.search_input, app.search_cursor) {
+                app.search_input.remove(start);
+                app.search_cursor = start;
             }
             app.search_selected = 0;
             app.update_suggestions();
@@ -499,15 +499,15 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
 
         KeyCode::Left => {
-            if app.search_cursor > 0 {
-                app.search_cursor -= 1;
+            if let Some(start) = prev_char_start(&app.search_input, app.search_cursor) {
+                app.search_cursor = start;
             }
             None
         }
 
         KeyCode::Right => {
-            if app.search_cursor < app.search_input.len() {
-                app.search_cursor += 1;
+            if let Some(c) = app.search_input[app.search_cursor..].chars().next() {
+                app.search_cursor += c.len_utf8();
             }
             None
         }
@@ -527,6 +527,11 @@ pub fn handle_paste(app: &mut App, text: &str) {
     // Copied lines carry a trailing newline; keep only printable text.
     let text: String = text.chars().filter(|c| !c.is_control()).collect();
     search_insert(app, &text);
+}
+
+/// `search_cursor` is a byte offset; step back to the start of the preceding char.
+fn prev_char_start(s: &str, cursor: usize) -> Option<usize> {
+    s[..cursor].char_indices().next_back().map(|(i, _)| i)
 }
 
 fn search_insert(app: &mut App, text: &str) {
@@ -891,6 +896,18 @@ mod paste_tests {
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.search_input.is_empty());
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn non_ascii_input_keeps_cursor_on_char_boundaries() {
+        let mut app = search_app();
+        handle_paste(&mut app, "aé");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('ß')));
+        assert_eq!(app.search_input, "aßé");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!((app.search_input.as_str(), app.search_cursor), ("aß", 3));
     }
 
     #[test]

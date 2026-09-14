@@ -18,8 +18,9 @@ pub fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             let paragraph = Paragraph::new(line);
             f.render_widget(paragraph, area);
 
-            // Place cursor
-            let cursor_x = area.x + 2 + app.search_cursor as u16;
+            // Cursor is a byte offset; the terminal column is the prefix's display width.
+            let prefix_width = Span::raw(&app.search_input[..app.search_cursor]).width();
+            let cursor_x = area.x + 2 + prefix_width as u16;
             f.set_cursor_position((cursor_x, area.y));
         }
         InputMode::Normal => {
