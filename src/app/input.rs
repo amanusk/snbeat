@@ -484,17 +484,14 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
 
         KeyCode::Char(c) => {
-            app.search_input.insert(app.search_cursor, c);
-            app.search_cursor += 1;
-            app.search_selected = 0;
-            app.update_suggestions();
+            search_insert(app, c.encode_utf8(&mut [0; 4]));
             None
         }
 
         KeyCode::Backspace => {
-            if app.search_cursor > 0 {
-                app.search_cursor -= 1;
-                app.search_input.remove(app.search_cursor);
+            if let Some(start) = prev_char_start(&app.search_input, app.search_cursor) {
+                app.search_input.remove(start);
+                app.search_cursor = start;
             }
             app.search_selected = 0;
             app.update_suggestions();
@@ -502,15 +499,15 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
         }
 
         KeyCode::Left => {
-            if app.search_cursor > 0 {
-                app.search_cursor -= 1;
+            if let Some(start) = prev_char_start(&app.search_input, app.search_cursor) {
+                app.search_cursor = start;
             }
             None
         }
 
         KeyCode::Right => {
-            if app.search_cursor < app.search_input.len() {
-                app.search_cursor += 1;
+            if let Some(c) = app.search_input[app.search_cursor..].chars().next() {
+                app.search_cursor += c.len_utf8();
             }
             None
         }
@@ -520,6 +517,28 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
 
         _ => None,
     }
+}
+
+/// Bracketed paste: the whole text lands in one insert, so one suggestion refresh and one frame.
+pub fn handle_paste(app: &mut App, text: &str) {
+    if app.input_mode != InputMode::Search {
+        return;
+    }
+    // Copied lines carry a trailing newline; keep only printable text.
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    search_insert(app, &text);
+}
+
+/// `search_cursor` is a byte offset; step back to the start of the preceding char.
+fn prev_char_start(s: &str, cursor: usize) -> Option<usize> {
+    s[..cursor].char_indices().next_back().map(|(i, _)| i)
+}
+
+fn search_insert(app: &mut App, text: &str) {
+    app.search_input.insert_str(app.search_cursor, text);
+    app.search_cursor += text.len();
+    app.search_selected = 0;
+    app.update_suggestions();
 }
 
 /// Extract the name portion from a search result display string.
@@ -836,4 +855,69 @@ fn tx_detail_has_privacy(app: &App) -> bool {
         &oe,
     )
     .is_some()
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn search_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.input_mode = InputMode::Search;
+        app
+    }
+
+    #[test]
+    fn paste_inserts_whole_text_at_cursor() {
+        let mut app = search_app();
+        handle_paste(&mut app, "0x49d3");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        handle_paste(&mut app, "ab");
+        assert_eq!(app.search_input, "0x49abd3");
+        assert_eq!(app.search_cursor, 6);
+    }
+
+    #[test]
+    fn paste_strips_control_characters() {
+        let mut app = search_app();
+        handle_paste(&mut app, "0x49d3\r\n");
+        assert_eq!(app.search_input, "0x49d3");
+        assert_eq!(app.search_cursor, 6);
+    }
+
+    #[test]
+    fn paste_in_normal_mode_is_ignored() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        handle_paste(&mut app, "q");
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_input.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn non_ascii_input_keeps_cursor_on_char_boundaries() {
+        let mut app = search_app();
+        handle_paste(&mut app, "aé");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('ß')));
+        assert_eq!(app.search_input, "aßé");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!((app.search_input.as_str(), app.search_cursor), ("aß", 3));
+    }
+
+    #[test]
+    fn paste_matches_typing_the_same_chars() {
+        let mut app = search_app();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('0')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        let typed = (app.search_input.clone(), app.search_cursor);
+        let mut app = search_app();
+        handle_paste(&mut app, "0x");
+        assert_eq!((app.search_input, app.search_cursor), typed);
+    }
 }
