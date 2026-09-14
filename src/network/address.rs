@@ -669,6 +669,27 @@ fn call_row_is_incomplete(c: &crate::data::types::ContractCallSummary) -> bool {
     c.sender == starknet::core::types::Felt::ZERO
 }
 
+/// Upsert `calls` into the address cache, field-merged with the cached rows so
+/// a sparser row (no timestamp, no name) never overwrites a richer one.
+fn persist_calls_merged(
+    ds: &Arc<dyn DataSource>,
+    address: starknet::core::types::Felt,
+    calls: &[crate::data::types::ContractCallSummary],
+    cached: Option<Vec<crate::data::types::ContractCallSummary>>,
+) {
+    if calls.is_empty() {
+        return;
+    }
+    let touched: std::collections::HashSet<_> = calls.iter().map(|c| c.tx_hash).collect();
+    let mut merged = cached.unwrap_or_else(|| ds.load_cached_address_calls(&address));
+    merged.extend(calls.iter().cloned());
+    let rows: Vec<_> = crate::data::types::deduplicate_contract_calls(merged)
+        .into_iter()
+        .filter(|c| touched.contains(&c.tx_hash))
+        .collect();
+    ds.save_address_calls(&address, &rows);
+}
+
 /// Build ContractCallSummary entries from event tx hashes by fetching tx+receipt
 /// and extracting calls to the target contract. Also backfills timestamps.
 pub(super) async fn build_contract_calls_from_hashes(
@@ -2017,6 +2038,7 @@ pub(super) async fn fetch_and_send_address_info(
                     .await
                 };
                 contract_calls_list.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                persist_calls_merged(&ds_c, address, &contract_calls_list, None);
 
                 {
                     let callers = contract_calls_list.iter().map(|c| c.sender);
@@ -2238,6 +2260,7 @@ pub(super) async fn fetch_and_send_address_info(
                                 .await;
                                 contract_calls_list
                                     .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                                persist_calls_merged(&ds_c, address, &contract_calls_list, None);
 
                                 {
                                     let callers = contract_calls_list.iter().map(|c| c.sender);
@@ -3627,9 +3650,7 @@ pub(super) async fn fetch_more_address_txs(
     if !summaries.is_empty() {
         ds.save_address_txs(&address, &summaries);
     }
-    if !all_calls.is_empty() {
-        ds.save_address_calls(&address, &all_calls);
-    }
+    persist_calls_merged(ds, address, &all_calls, None);
 
     let _ = tx.send(Action::MoreAddressTxsLoaded {
         address,
@@ -5048,16 +5069,7 @@ async fn persist_and_emit_calls(
     // it with `fetched_tx.sender()` and fills in fee/timestamp from the receipt.
     let calls = enrich_dune_calls(address, dune_calls, abi_reg, ds, pf, action_tx).await;
 
-    // Merge with whatever is already cached before persisting — a windowed
-    // fetch only returns part of the history, so writing just `calls` would
-    // clobber the rest. `deduplicate_contract_calls` collapses overlap between
-    // the recent-window and backfill phases.
-    if !calls.is_empty() {
-        let mut merged = preloaded_cache.unwrap_or_else(|| ds.load_cached_address_calls(&address));
-        merged.extend(calls.iter().cloned());
-        let merged = crate::data::types::deduplicate_contract_calls(merged);
-        ds.save_address_calls(&address, &merged);
-    }
+    persist_calls_merged(ds, address, &calls, preloaded_cache);
 
     // Emit using the same merge path the Dune bulk fetch used. An empty
     // SnAddressInfo stub keeps the `AddressInfoLoaded` reducer happy without

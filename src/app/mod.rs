@@ -1954,34 +1954,29 @@ impl App {
                 // --- Calls tab: derive a stub summary and merge (dedupe by tx_hash).
                 let tx_hash = event.transaction_hash;
                 let block_number = event.block_number;
-                let already_present = self
-                    .address
-                    .calls
-                    .items
-                    .iter()
-                    .any(|c| c.tx_hash == tx_hash);
-                if !already_present {
-                    let stub = crate::data::types::ContractCallSummary {
-                        tx_hash,
-                        sender: Felt::ZERO, // filled in by EnrichAddressCalls
-                        function_name: String::new(),
-                        block_number,
-                        timestamp: 0,
-                        total_fee_fri: 0,
-                        status: "OK".to_string(), // events only fire for successful txs
-                        nonce: None,              // filled in by EnrichAddressCalls
-                        tip: 0,
-                        inner_targets: Vec::new(), // filled in by EnrichAddressCalls
-                    };
+                let stub = crate::data::types::ContractCallSummary {
+                    tx_hash,
+                    sender: Felt::ZERO, // filled in by EnrichAddressCalls
+                    function_name: String::new(),
+                    block_number,
+                    timestamp: 0,
+                    total_fee_fri: 0,
+                    status: "OK".to_string(), // events only fire for successful txs
+                    nonce: None,              // filled in by EnrichAddressCalls
+                    tip: 0,
+                    inner_targets: Vec::new(), // filled in by EnrichAddressCalls
+                };
+                if self.address.insert_call(stub) {
                     let _ = self.action_tx.send(Action::EnrichAddressCalls {
                         address,
                         hashes_with_blocks: vec![(tx_hash, block_number)],
                     });
-                    self.address.calls.items.push(stub);
-                    self.address
-                        .calls
-                        .items
-                        .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+                    // Persist the stub too: a failed enrichment then still leaves
+                    // a row for the load-time repair pass instead of losing the tx.
+                    let _ = self.action_tx.send(Action::PersistAddressCalls {
+                        address,
+                        calls: self.address.calls_by_hash(&[tx_hash]),
+                    });
                     if self.address.calls.state.selected().is_none() {
                         self.address.calls.select_first();
                     }
@@ -2069,37 +2064,15 @@ impl App {
                     return;
                 }
                 let mut sender_changed = false;
+                let mut touched = Vec::new();
                 for enriched in calls {
-                    if let Some(existing) = self
-                        .address
-                        .calls
-                        .items
-                        .iter_mut()
-                        .find(|c| c.tx_hash == enriched.tx_hash)
-                    {
-                        // Upgrade placeholder fields with real data from RPC
-                        if existing.sender == Felt::ZERO && enriched.sender != Felt::ZERO {
-                            existing.sender = enriched.sender;
-                            sender_changed = true;
-                        }
-                        if existing.function_name.is_empty() && !enriched.function_name.is_empty() {
-                            existing.function_name = enriched.function_name;
-                        }
-                        if existing.total_fee_fri == 0 && enriched.total_fee_fri > 0 {
-                            existing.total_fee_fri = enriched.total_fee_fri;
-                        }
-                        if existing.timestamp == 0 && enriched.timestamp > 0 {
-                            existing.timestamp = enriched.timestamp;
-                        }
-                        if existing.status == "?" && enriched.status != "?" {
-                            existing.status = enriched.status;
-                        }
-                        if existing.nonce.is_none() && enriched.nonce.is_some() {
-                            existing.nonce = enriched.nonce;
-                        }
-                        if existing.tip == 0 && enriched.tip > 0 {
-                            existing.tip = enriched.tip;
-                        }
+                    let Some(existing) = self.address.find_call_mut(enriched.tx_hash) else {
+                        continue;
+                    };
+                    let prev_sender = existing.sender;
+                    if crate::data::types::merge_call_into(existing, enriched) {
+                        sender_changed |= existing.sender != prev_sender;
+                        touched.push(existing.clone());
                     }
                 }
                 // Sender mutation doesn't change `calls.items.len()`, so the
@@ -2109,11 +2082,11 @@ impl App {
                 if sender_changed {
                     self.address.invalidate_call_color_cache();
                 }
-                // Persist enriched calls to cache so they survive restarts
-                if !self.address.calls.items.is_empty() {
+                // Saves upsert by tx hash: only the rows that changed go to SQLite.
+                if !touched.is_empty() {
                     let _ = self.action_tx.send(Action::PersistAddressCalls {
                         address,
-                        calls: self.address.calls.items.clone(),
+                        calls: touched,
                     });
                 }
             }
@@ -2127,6 +2100,8 @@ impl App {
                 if self.address.context != Some(address) || calls.is_empty() {
                     return;
                 }
+                let touched: std::collections::HashSet<Felt> =
+                    calls.iter().map(|c| c.tx_hash).collect();
                 self.address.merge_calls(calls);
                 if self.address.calls.state.selected().is_none()
                     && !self.address.calls.items.is_empty()
@@ -2138,10 +2113,10 @@ impl App {
                 // cached set). `refresh_unfilled_call_gaps` preserves any
                 // in-flight `fill_dispatched` whose range is unchanged.
                 self.refresh_address_call_gaps();
-                // Persist the merged set so it survives restarts.
+                // Only the rows this batch created or enriched; saves upsert by tx hash.
                 let _ = self.action_tx.send(Action::PersistAddressCalls {
                     address,
-                    calls: self.address.calls.items.clone(),
+                    calls: self.address.calls_by_hash(&touched),
                 });
             }
             Action::AddressCallRangeScanned {

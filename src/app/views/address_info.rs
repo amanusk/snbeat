@@ -133,6 +133,8 @@ pub struct AddressInfoState {
     pub deployment: Option<AddressTxSummary>,
     /// Incoming calls to this contract (for the Calls tab).
     pub calls: StatefulList<ContractCallSummary>,
+    /// tx hash → block of each row in `calls.items`: O(1) dedup, O(log n) row lookup.
+    pub call_blocks: HashMap<Felt, u64>,
     /// Whether this address is a contract (nonce == 0) vs an account.
     pub is_contract: bool,
     /// The address has no class at the latest block (`get_class_hash`
@@ -282,6 +284,7 @@ impl Default for AddressInfoState {
             txs: StatefulList::new(),
             deployment: None,
             calls: StatefulList::new(),
+            call_blocks: HashMap::new(),
             is_contract: false,
             not_deployed: false,
             visual_mode: false,
@@ -340,6 +343,7 @@ impl AddressInfoState {
         self.txs = StatefulList::new();
         self.deployment = None;
         self.calls = StatefulList::new();
+        self.call_blocks.clear();
         self.not_deployed = false;
         self.fetching_more_txs = false;
         self.oldest_event_block = None;
@@ -616,6 +620,62 @@ impl AddressInfoState {
         self.calls
             .items
             .sort_by(|a, b| b.block_number.cmp(&a.block_number));
+        self.call_blocks = self
+            .calls
+            .items
+            .iter()
+            .map(|c| (c.tx_hash, c.block_number))
+            .collect();
+    }
+
+    /// Insert one call keeping block-descending order (after same-block rows,
+    /// like a stable sort of a push). Returns `false` if the tx hash is listed.
+    pub fn insert_call(&mut self, call: ContractCallSummary) -> bool {
+        if self.call_blocks.contains_key(&call.tx_hash) {
+            return false;
+        }
+        let idx = self
+            .calls
+            .items
+            .partition_point(|c| c.block_number >= call.block_number);
+        self.call_blocks.insert(call.tx_hash, call.block_number);
+        self.calls.items.insert(idx, call);
+        true
+    }
+
+    /// Index of the call with this tx hash: its block from the index, then a
+    /// binary search to that block's few rows.
+    pub fn call_position(&self, tx_hash: Felt) -> Option<usize> {
+        let block = *self.call_blocks.get(&tx_hash)?;
+        let start = Self::first_index_with_key(&self.calls.items, |c| c.block_number, block)?;
+        self.calls.items[start..]
+            .iter()
+            .take_while(|c| c.block_number == block)
+            .position(|c| c.tx_hash == tx_hash)
+            .map(|i| start + i)
+    }
+
+    pub fn find_call_mut(&mut self, tx_hash: Felt) -> Option<&mut ContractCallSummary> {
+        let i = self.call_position(tx_hash)?;
+        Some(&mut self.calls.items[i])
+    }
+
+    /// Clones of the rows for `hashes`; unknown hashes are skipped.
+    pub fn calls_by_hash<'a>(
+        &self,
+        hashes: impl IntoIterator<Item = &'a Felt>,
+    ) -> Vec<ContractCallSummary> {
+        hashes
+            .into_iter()
+            .filter_map(|h| self.call_position(*h))
+            .map(|i| self.calls.items[i].clone())
+            .collect()
+    }
+
+    /// First index whose key equals `target` in a list sorted by `key` descending.
+    fn first_index_with_key<T>(items: &[T], key: impl Fn(&T) -> u64, target: u64) -> Option<usize> {
+        let p = items.partition_point(|x| key(x) > target);
+        (p < items.len() && key(&items[p]) == target).then_some(p)
     }
 
     /// Scan the current tx list for *all* large nonce gaps that should be
@@ -706,10 +766,7 @@ impl AddressInfoState {
             .unfilled_gaps
             .iter()
             .filter_map(|g| {
-                self.txs
-                    .items
-                    .iter()
-                    .position(|t| t.nonce == g.lo_nonce)
+                Self::first_index_with_key(&self.txs.items, |t| t.nonce, g.lo_nonce)
                     .map(|p| (p, g.lo_nonce))
             })
             .collect();
@@ -933,10 +990,7 @@ impl AddressInfoState {
             .call_gaps
             .iter()
             .filter_map(|g| {
-                self.calls
-                    .items
-                    .iter()
-                    .position(|c| c.block_number == g.lo_block)
+                Self::first_index_with_key(&self.calls.items, |c| c.block_number, g.lo_block)
                     .map(|p| (p, g.lo_block))
             })
             .collect();
@@ -1462,6 +1516,110 @@ mod tests {
             .items
             .sort_by(|a, b| b.block_number.cmp(&a.block_number));
         s
+    }
+
+    fn call_with_hash(hash: u64, block: u64) -> ContractCallSummary {
+        ContractCallSummary {
+            tx_hash: Felt::from(hash),
+            ..call_at(block)
+        }
+    }
+
+    #[test]
+    fn insert_call_keeps_block_order_and_dedups() {
+        let mut s = AddressInfoState::default();
+        s.merge_calls(vec![call_at(100), call_at(300)]);
+        assert!(s.insert_call(call_with_hash(7, 200)));
+        // Same block as an existing row lands after it, like a stable sort of a push.
+        assert!(s.insert_call(call_with_hash(8, 300)));
+        assert!(!s.insert_call(call_with_hash(7, 999)));
+        let blocks: Vec<u64> = s.calls.items.iter().map(|c| c.block_number).collect();
+        assert_eq!(blocks, vec![300, 300, 200, 100]);
+        assert_eq!(s.calls.items[1].tx_hash, Felt::from(8_u64));
+
+        assert_eq!(s.call_position(Felt::from(8_u64)), Some(1));
+        assert_eq!(s.call_position(Felt::from(7_u64)), Some(2));
+        assert_eq!(s.call_position(call_at(100).tx_hash), Some(3));
+        assert_eq!(s.call_position(Felt::from(9_u64)), None);
+
+        s.find_call_mut(Felt::from(7_u64)).unwrap().tip = 5;
+        let rows = s.calls_by_hash(&[Felt::from(7_u64), Felt::from(9_u64)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tip, 5);
+    }
+
+    #[test]
+    fn call_gap_positions_pick_first_row_of_the_block() {
+        let mut s = AddressInfoState::default();
+        let top = 1_000 + 2 * CALL_GAP_SPAN_BLOCKS;
+        s.merge_calls(vec![call_at(1_000), call_with_hash(2, 1_000), call_at(top)]);
+        s.call_gaps = vec![
+            UnfilledCallGap {
+                lo_block: 42, // no such row: skipped
+                hi_block: 43,
+                fill_dispatched: false,
+            },
+            UnfilledCallGap {
+                lo_block: 1_000,
+                hi_block: top,
+                fill_dispatched: false,
+            },
+        ];
+        assert_eq!(s.call_gap_render_positions(), vec![(1, 1_000)]);
+    }
+
+    #[test]
+    fn tx_gap_positions_search_by_nonce() {
+        let mut s = AddressInfoState::default();
+        s.merge_tx_summaries(vec![
+            summary(10, 100),
+            summary(30, 3_000),
+            summary(21, 2_000),
+        ]);
+        let gap = |lo: u64| UnfilledGap {
+            lo_nonce: lo,
+            hi_nonce: 21,
+            lo_block: 100,
+            hi_block: 2_000,
+            missing_count: 1,
+            fill_dispatched: false,
+        };
+        s.unfilled_gaps = vec![gap(10), gap(5)];
+        assert_eq!(s.gap_render_positions(), vec![(2, 10)]);
+    }
+
+    /// `cargo test call_insert_and_lookup_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn call_insert_and_lookup_timing() {
+        let n = 50_000u64;
+        let mut s = AddressInfoState::default();
+        s.merge_calls((0..n).map(|i| call_with_hash(i, i)).collect());
+
+        let mut old = s.calls.items.clone();
+        let t = std::time::Instant::now();
+        for i in 0..100u64 {
+            let c = call_with_hash(n + 10_000 + i, n - 1 - i * 37);
+            if !old.iter().any(|x| x.tx_hash == c.tx_hash) {
+                old.push(c);
+                old.sort_by_key(|x| std::cmp::Reverse(x.block_number));
+            }
+        }
+        let old_ins = t.elapsed() / 100;
+
+        let t = std::time::Instant::now();
+        for i in 0..1_000u64 {
+            assert!(s.insert_call(call_with_hash(n + i, n - 1 - i * 37)));
+        }
+        let ins = t.elapsed() / 1_000;
+        let t = std::time::Instant::now();
+        for i in 0..1_000u64 {
+            assert!(s.find_call_mut(Felt::from(n + i)).is_some());
+        }
+        let find = t.elapsed() / 1_000;
+        eprintln!(
+            "50k rows: push+sort {old_ins:?}/row → insert_call {ins:?}/row, find_call_mut {find:?}/row"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{TransactionBehavior, params};
 use starknet::core::types::{ContractClass, Felt, TransactionTrace};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Alias so call sites read cleanly. r2d2 reuses the same `rusqlite::Connection`
 /// type under the hood — `PooledConnection` derefs to `&Connection` (reads) and
@@ -135,11 +135,11 @@ impl CachingDataSource {
             CREATE INDEX IF NOT EXISTS idx_block_tx ON block_transactions(block_number);
             CREATE TABLE IF NOT EXISTS address_calls (
                 address TEXT NOT NULL,
-                call_index INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
                 data TEXT NOT NULL,
-                PRIMARY KEY (address, call_index)
+                PRIMARY KEY (address, tx_hash)
             );
-            CREATE INDEX IF NOT EXISTS idx_addr_calls ON address_calls(address);
             CREATE TABLE IF NOT EXISTS address_call_scanned_ranges (
                 address TEXT NOT NULL,
                 lo_block INTEGER NOT NULL,
@@ -416,6 +416,43 @@ impl CachingDataSource {
             )
             .map_err(|e| SnbeatError::Config(format!("Migration v11 failed: {e}")))?;
             debug!("Migration v11: reshaped private_notes + added private_nullifiers");
+        }
+
+        // address_calls was keyed by list position, forcing a full rewrite per
+        // save; re-key by tx hash so saves upsert. Keyed on table shape rather
+        // than user_version so it runs on any DB regardless of version bumps.
+        let has_tx_hash: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('address_calls') WHERE name = 'tx_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| SnbeatError::Config(format!("address_calls table_info: {e}")))?;
+        if has_tx_hash == 0 {
+            let t0 = std::time::Instant::now();
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE address_calls_v2 (
+                     address TEXT NOT NULL,
+                     tx_hash TEXT NOT NULL,
+                     block_number INTEGER NOT NULL,
+                     data TEXT NOT NULL,
+                     PRIMARY KEY (address, tx_hash)
+                 );
+                 INSERT OR REPLACE INTO address_calls_v2 (address, tx_hash, block_number, data)
+                     SELECT address, json_extract(data, '$.tx_hash'),
+                            COALESCE(json_extract(data, '$.block_number'), 0), data
+                     FROM address_calls
+                     WHERE json_valid(data) AND json_extract(data, '$.tx_hash') IS NOT NULL;
+                 DROP TABLE address_calls;
+                 ALTER TABLE address_calls_v2 RENAME TO address_calls;
+                 COMMIT;",
+            )
+            .map_err(|e| SnbeatError::Config(format!("address_calls re-key failed: {e}")))?;
+            info!(
+                elapsed_ms = t0.elapsed().as_millis(),
+                "Re-keyed address_calls by tx hash"
+            );
         }
 
         drop(db);
@@ -1561,7 +1598,7 @@ impl DataSource for CachingDataSource {
         };
         let addr_hex = format!("{:#x}", address);
         let mut stmt = match db
-            .prepare("SELECT data FROM address_calls WHERE address = ?1 ORDER BY call_index")
+            .prepare("SELECT data FROM address_calls WHERE address = ?1 ORDER BY block_number DESC")
         {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1578,11 +1615,15 @@ impl DataSource for CachingDataSource {
     fn save_address_calls(&self, address: &Felt, calls: &[ContractCallSummary]) {
         let pool = self.db.clone();
         let addr_hex = format!("{:#x}", address);
-        let rows: Vec<(i64, String)> = calls
+        let rows: Vec<(String, i64, String)> = calls
             .iter()
-            .enumerate()
-            .filter_map(|(i, c)| serde_json::to_string(c).ok().map(|j| (i as i64, j)))
+            .filter_map(|c| {
+                serde_json::to_string(c)
+                    .ok()
+                    .map(|j| (format!("{:#x}", c.tx_hash), c.block_number as i64, j))
+            })
             .collect();
+        debug!(address = %addr_hex, rows = rows.len(), "save_address_calls: upsert");
         Self::dispatch_write(move || {
             if let Ok(mut db) = pool.get() {
                 let tx = match db.transaction() {
@@ -1592,15 +1633,19 @@ impl DataSource for CachingDataSource {
                         return;
                     }
                 };
-                let _ = tx.execute(
-                    "DELETE FROM address_calls WHERE address = ?1",
-                    params![&addr_hex],
-                );
-                for (i, json) in &rows {
-                    let _ = tx.execute(
-                        "INSERT OR REPLACE INTO address_calls (address, call_index, data) VALUES (?1, ?2, ?3)",
-                        params![&addr_hex, i, json],
-                    );
+                {
+                    let mut stmt = match tx.prepare_cached(
+                        "INSERT OR REPLACE INTO address_calls (address, tx_hash, block_number, data) VALUES (?1, ?2, ?3, ?4)",
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "save_address_calls: prepare failed");
+                            return;
+                        }
+                    };
+                    for (hash, block, json) in &rows {
+                        let _ = stmt.execute(params![&addr_hex, hash, block, json]);
+                    }
                 }
                 if let Err(e) = tx.commit() {
                     warn!(error = %e, "save_address_calls: commit failed");
@@ -2688,6 +2733,79 @@ mod tests {
         let fresh = vec![ev(1, 100, 0), ev(1, 100, 0), ev(2, 101, 0)];
         let merged = CachingDataSource::merge_events_dedup(fresh, vec![]);
         assert_eq!(merged.len(), 2);
+    }
+
+    fn call_row(hash: u64, block: u64, name: &str) -> ContractCallSummary {
+        ContractCallSummary {
+            tx_hash: Felt::from(hash),
+            sender: Felt::from(0xABC_u64),
+            function_name: name.into(),
+            block_number: block,
+            timestamp: 0,
+            total_fee_fri: 0,
+            status: "OK".into(),
+            nonce: None,
+            tip: 0,
+            inner_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn address_calls_rekey_migration_and_upsert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.db");
+        let addr = Felt::from(0x49d_u64);
+        let addr_hex = format!("{:#x}", addr);
+        {
+            // Pre-migration shape: rows keyed by list position.
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE address_calls (
+                     address TEXT NOT NULL, call_index INTEGER NOT NULL, data TEXT NOT NULL,
+                     PRIMARY KEY (address, call_index));",
+            )
+            .unwrap();
+            let old = [
+                call_row(1, 500, "a"),
+                call_row(2, 900, "b"),
+                call_row(3, 700, "c"),
+            ];
+            for (i, c) in old.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO address_calls VALUES (?1, ?2, ?3)",
+                    params![&addr_hex, i as i64, serde_json::to_string(c).unwrap()],
+                )
+                .unwrap();
+            }
+            db.execute(
+                "INSERT INTO address_calls VALUES ('0x1', 0, 'not json')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let ds = CachingDataSource::new(Arc::new(NullUpstream), &path).expect("open + migrate");
+        let blocks: Vec<u64> = ds
+            .load_cached_address_calls(&addr)
+            .iter()
+            .map(|c| c.block_number)
+            .collect();
+        assert_eq!(blocks, vec![900, 700, 500]);
+        assert!(ds.load_cached_address_calls(&Felt::from(1_u64)).is_empty());
+
+        // Upsert: the touched hash is replaced, a new one added, the rest kept.
+        ds.save_address_calls(&addr, &[call_row(1, 500, "a, x"), call_row(4, 100, "d")]);
+        let after = ds.load_cached_address_calls(&addr);
+        let name = |h: u64| {
+            after
+                .iter()
+                .find(|c| c.tx_hash == Felt::from(h))
+                .map(|c| c.function_name.clone())
+        };
+        assert_eq!(after.len(), 4);
+        assert_eq!(name(1).as_deref(), Some("a, x"));
+        assert_eq!(name(2).as_deref(), Some("b"));
+        assert_eq!(name(4).as_deref(), Some("d"));
     }
 
     /// Opens an external cache.db snapshot via env var `SNBEAT_TEST_CACHE_DB`
