@@ -377,6 +377,52 @@ pub struct VoyagerLabelInfo {
     pub deploy_block: Option<u64>,
 }
 
+/// Fill `existing`'s missing fields from `incoming` (same tx hash). Returns
+/// whether anything changed, so callers can persist only touched rows.
+pub fn merge_call_into(existing: &mut ContractCallSummary, incoming: ContractCallSummary) -> bool {
+    let mut changed = false;
+    // Union of endpoint names: the two rows may describe different calls of one multicall.
+    for name in incoming.function_name.split(", ").filter(|s| !s.is_empty()) {
+        if !existing.function_name.split(", ").any(|n| n == name) {
+            if !existing.function_name.is_empty() {
+                existing.function_name.push_str(", ");
+            }
+            existing.function_name.push_str(name);
+            changed = true;
+        }
+    }
+    // A ZERO sender is a WS stub; a later real sender wins, otherwise first wins.
+    if existing.sender == Felt::ZERO && incoming.sender != Felt::ZERO {
+        existing.sender = incoming.sender;
+        changed = true;
+    }
+    if existing.total_fee_fri == 0 && incoming.total_fee_fri > 0 {
+        existing.total_fee_fri = incoming.total_fee_fri;
+        changed = true;
+    }
+    if existing.timestamp == 0 && incoming.timestamp > 0 {
+        existing.timestamp = incoming.timestamp;
+        changed = true;
+    }
+    if existing.status == "?" && incoming.status != "?" {
+        existing.status = incoming.status;
+        changed = true;
+    }
+    if existing.nonce.is_none() && incoming.nonce.is_some() {
+        existing.nonce = incoming.nonce;
+        changed = true;
+    }
+    if existing.tip == 0 && incoming.tip > 0 {
+        existing.tip = incoming.tip;
+        changed = true;
+    }
+    if existing.inner_targets.is_empty() && !incoming.inner_targets.is_empty() {
+        existing.inner_targets = incoming.inner_targets;
+        changed = true;
+    }
+    changed
+}
+
 /// Deduplicate contract calls by transaction hash.
 ///
 /// When multiple calls share the same `tx_hash` (e.g. a single transaction
@@ -398,45 +444,7 @@ pub fn deduplicate_contract_calls(calls: Vec<ContractCallSummary>) -> Vec<Contra
 
     for call in calls {
         if let Some(&idx) = seen.get(&call.tx_hash) {
-            let existing = &mut result[idx];
-            // Merge function names, skipping duplicates
-            if !call.function_name.is_empty() {
-                let existing_names: std::collections::HashSet<String> = existing
-                    .function_name
-                    .split(", ")
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                for name in call.function_name.split(", ") {
-                    if !name.is_empty() && !existing_names.contains(name) {
-                        if existing.function_name.is_empty() {
-                            existing.function_name = name.to_string();
-                        } else {
-                            existing.function_name =
-                                format!("{}, {}", existing.function_name, name);
-                        }
-                    }
-                }
-            }
-            // Fill in missing data from later entries
-            if existing.sender == Felt::ZERO && call.sender != Felt::ZERO {
-                existing.sender = call.sender;
-            }
-            if existing.total_fee_fri == 0 && call.total_fee_fri > 0 {
-                existing.total_fee_fri = call.total_fee_fri;
-            }
-            if existing.timestamp == 0 && call.timestamp > 0 {
-                existing.timestamp = call.timestamp;
-            }
-            if existing.nonce.is_none() && call.nonce.is_some() {
-                existing.nonce = call.nonce;
-            }
-            if existing.tip == 0 && call.tip > 0 {
-                existing.tip = call.tip;
-            }
-            if existing.inner_targets.is_empty() && !call.inner_targets.is_empty() {
-                existing.inner_targets = call.inner_targets;
-            }
+            merge_call_into(&mut result[idx], call);
         } else {
             seen.insert(call.tx_hash, result.len());
             result.push(call);

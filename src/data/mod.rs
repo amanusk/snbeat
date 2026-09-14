@@ -201,7 +201,7 @@ pub trait DataSource: Send + Sync {
     fn load_cached_address_calls(&self, _address: &Felt) -> Vec<ContractCallSummary> {
         Vec::new()
     }
-    /// Save contract call summaries for an address to persistent cache.
+    /// Upsert call summaries by tx hash; the address's other cached rows are kept.
     fn save_address_calls(&self, _address: &Felt, _calls: &[ContractCallSummary]) {
         // Default: no-op. CachingDataSource overrides.
     }
