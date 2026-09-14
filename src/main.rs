@@ -481,6 +481,11 @@ async fn run_loop(
                     Some(Ok(event)) => {
                         handle_terminal_event(app, event);
                         drain_buffered_input(app)?;
+                        // Responses still progress under a sustained input flood.
+                        if let Ok(action) = response_rx.try_recv() {
+                            log_action(&action);
+                            app.handle_action(action);
+                        }
                     }
                     Some(Err(e)) => {
                         // Terminal input errors are usually fatal (closed tty,
