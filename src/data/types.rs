@@ -494,6 +494,9 @@ pub struct TokenTransfer {
     pub symbol: Option<String>,
     #[serde(default)]
     pub decimals: Option<u8>,
+    /// USD value at transfer time, as reported by the indexer.
+    #[serde(default)]
+    pub value_usd: Option<f64>,
 }
 
 impl TokenTransfer {
@@ -536,6 +539,7 @@ impl TokenTransfer {
             timestamp: 0,
             symbol: None,
             decimals: None,
+            value_usd: None,
         })
     }
 

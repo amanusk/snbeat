@@ -924,9 +924,27 @@ impl App {
     /// for any token the registry doesn't know.
     fn merge_address_transfers(&mut self, rows: Vec<crate::data::types::TokenTransfer>) -> usize {
         let tokens: Vec<Felt> = rows.iter().map(|r| r.token).collect();
+        // Rows the indexer left unpriced fall back to DefiLlama's day price;
+        // the client skips (token, day) pairs already cached.
+        let mut price_requests: Vec<(Felt, u64)> = rows
+            .iter()
+            .filter(|r| {
+                r.value_usd.is_none()
+                    && r.timestamp > 0
+                    && crate::network::prices::is_tracked(&r.token)
+            })
+            .map(|r| (r.token, r.timestamp))
+            .collect();
         let added = self.address.merge_transfers(rows);
         if added > 0 {
             self.dispatch_token_metadata_for_unknown_tokens(tokens);
+            if self.price_client.is_some() && !price_requests.is_empty() {
+                price_requests.sort_unstable();
+                price_requests.dedup();
+                let _ = self.action_tx.send(Action::FetchTokenPricesHistoric {
+                    requests: price_requests,
+                });
+            }
         }
         self.address.refresh_transfer_gaps();
         self.address.ensure_transfer_selection();

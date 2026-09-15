@@ -1388,6 +1388,7 @@ fn draw_transfers_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("    Dir  ", theme::SUGGESTION_STYLE),
         Span::styled("Token       ", theme::SUGGESTION_STYLE),
         Span::styled("             Amount ", theme::SUGGESTION_STYLE),
+        Span::styled("          USD ", theme::SUGGESTION_STYLE),
         Span::styled("From                    ", theme::SUGGESTION_STYLE),
         Span::styled("To                      ", theme::SUGGESTION_STYLE),
         Span::styled("Tx             ", theme::SUGGESTION_STYLE),
@@ -1505,6 +1506,20 @@ fn transfer_gap_row(app: &App, lo_block: u64) -> ListItem<'static> {
     )))
 }
 
+/// USD value at transfer time: the indexer's figure when it priced the row,
+/// else amount × DefiLlama's day price for tracked tokens.
+fn transfer_value_usd(app: &App, t: &TokenTransfer) -> Option<f64> {
+    if let Some(v) = t.value_usd {
+        return Some(v);
+    }
+    if t.amount_high != 0 || t.timestamp == 0 {
+        return None;
+    }
+    let decimals = app.token_decimals(&t.token).or(t.decimals)?;
+    let (_, historic) = price::token_prices(app, &t.token, Some(t.timestamp));
+    Some(t.amount_low as f64 / 10f64.powi(decimals as i32) * historic?)
+}
+
 /// Address cell for the From/To columns: the viewed address always takes the
 /// sender style so it is marked the same way in either column; the current
 /// visual-mode item overrides everything.
@@ -1556,6 +1571,10 @@ fn transfer_row(
         None => format!("0x{:x}{:032x}", t.amount_high, t.amount_low),
     };
 
+    let usd = transfer_value_usd(app, t)
+        .map(price::format_usd)
+        .unwrap_or_default();
+
     let from_style = transfer_party_style(app, registry, viewed, selected_nav, &t.from);
     let to_style = transfer_party_style(app, registry, viewed, selected_nav, &t.to);
 
@@ -1582,6 +1601,10 @@ fn transfer_row(
         Span::styled(
             format!("{:>19} ", truncate_to(&amount, 19)),
             theme::TX_HASH_STYLE,
+        ),
+        Span::styled(
+            format!("{:>13} ", truncate_to(&usd, 13)),
+            theme::SUGGESTION_STYLE,
         ),
         Span::styled(
             format!("{:<24}", truncate_to(&app.format_address(&t.from), 23)),

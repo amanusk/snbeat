@@ -1438,6 +1438,9 @@ fn upgrade_transfer(existing: &mut TokenTransfer, incoming: &TokenTransfer) -> b
     if existing.decimals.is_none() {
         existing.decimals = incoming.decimals;
     }
+    if existing.value_usd.is_none() {
+        existing.value_usd = incoming.value_usd;
+    }
     reslot
 }
 
@@ -1519,6 +1522,7 @@ mod tests {
             timestamp: 0,
             symbol: None,
             decimals: None,
+            value_usd: None,
         }
     }
 

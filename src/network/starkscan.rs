@@ -49,6 +49,14 @@ struct TransferItem {
     amount: Option<String>,
     token_symbol: Option<String>,
     token_decimals: Option<u8>,
+    #[serde(default)]
+    historical_usd: Option<HistoricalUsd>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoricalUsd {
+    value_usd: Option<String>,
 }
 
 pub struct TransfersPage {
@@ -109,6 +117,11 @@ impl TransferItem {
             timestamp,
             symbol: self.token_symbol.filter(|s| !s.is_empty()),
             decimals: self.token_decimals,
+            value_usd: self
+                .historical_usd
+                .and_then(|h| h.value_usd)
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite()),
         })
     }
 }
@@ -253,7 +266,8 @@ mod tests {
                 "logIndex":3,"txHash":"0x7294eee909df0a5343b7aa6a484e2aff23ac54778a51bbe00b421ec0bed95b9",
                 "tokenAddress":"0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
                 "fromAddress":"0x0","toAddress":"0x73314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82",
-                "amount":"56700000","rawValue":"56700000","tokenSymbol":"ETH","tokenDecimals":18}"#,
+                "amount":"56700000","rawValue":"56700000","tokenSymbol":"ETH","tokenDecimals":18,
+                "historicalUsd":{"priceUsd":"2500.5","valueUsd":"0.000141770","coverageStatus":"priced"}}"#,
         )
         .unwrap();
         let t = item.into_transfer().unwrap();
@@ -265,5 +279,17 @@ mod tests {
         assert_eq!(t.symbol.as_deref(), Some("ETH"));
         assert_eq!(t.decimals, Some(18));
         assert_eq!(t.from, Felt::ZERO);
+        assert_eq!(t.value_usd, Some(0.000_141_77));
+    }
+
+    #[test]
+    fn unpriced_item_has_no_value() {
+        let item: TransferItem = serde_json::from_str(
+            r#"{"blockNumber":1,"txIndex":0,"logIndex":0,"txHash":"0x1","tokenAddress":"0x2",
+                "fromAddress":"0x3","toAddress":"0x4","rawValue":"5",
+                "historicalUsd":{"priceUsd":null,"valueUsd":null,"coverageStatus":"unpriced"}}"#,
+        )
+        .unwrap();
+        assert_eq!(item.into_transfer().unwrap().value_usd, None);
     }
 }
