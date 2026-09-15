@@ -227,6 +227,19 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
+    // Starkscan client (optional — only if API key is set)
+    let starkscan_client: Option<Arc<network::starkscan::StarkscanClient>> = config
+        .starkscan_api_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .map(|key| {
+            info!("Starkscan API enabled");
+            Arc::new(network::starkscan::StarkscanClient::new(
+                key.clone(),
+                config.starkscan_api_url.clone(),
+            ))
+        });
+
     // Seed the search index with cached Voyager labels so they're searchable immediately
     if let Some(vc) = &voyager_client {
         let cached = vc.load_all_cached_labels();
@@ -269,6 +282,11 @@ async fn main() -> anyhow::Result<()> {
         } else {
             app::state::SourceStatus::Off
         },
+        starkscan: if starkscan_client.is_some() {
+            app::state::SourceStatus::Configured
+        } else {
+            app::state::SourceStatus::Off
+        },
         ws: app::state::SourceStatus::Off,
     };
 
@@ -293,6 +311,25 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
             }
+        });
+    }
+
+    // Probe Starkscan in background, upgrade to Live if reachable
+    if let Some(sc) = &starkscan_client {
+        let sc_c = Arc::clone(sc);
+        let resp_tx_c = response_tx.clone();
+        tokio::spawn(async move {
+            let status = match sc_c.health_check().await {
+                Ok(()) => app::state::SourceStatus::Live,
+                Err(e) => {
+                    warn!(error = %e, "Starkscan API unreachable");
+                    app::state::SourceStatus::ConnectError(e.to_string())
+                }
+            };
+            let _ = resp_tx_c.send(app::actions::Action::SourceUpdate {
+                source: app::actions::Source::Starkscan,
+                status,
+            });
         });
     }
 
@@ -355,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             pf_client,
             voyager_client,
             price_client,
+            starkscan_client,
             head_clone,
             action_rx,
             resp_tx_clone,
@@ -717,6 +755,13 @@ fn startup_checks(config: &AppConfig) -> anyhow::Result<()> {
     }
     if config.voyager_api_key.as_ref().is_none_or(|k| k.is_empty()) {
         warnings.push("VOYAGER_API_KEY not set — address metadata enrichment unavailable");
+    }
+    if config
+        .starkscan_api_key
+        .as_ref()
+        .is_none_or(|k| k.is_empty())
+    {
+        warnings.push("STARKSCAN_API_KEY not set — token transfer history limited to RPC scans");
     }
 
     // Check labels file (with XDG fallback)

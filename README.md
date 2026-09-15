@@ -108,6 +108,8 @@ All variables are optional except `APP_RPC_URL`.
 | `APP_PATHFINDER_SERVICE_URL` | -                       | URL of a running `pf-query` instance           |
 | `VOYAGER_API_KEY`            | -                       | Voyager API key for address metadata           |
 | `DUNE_API_KEY`               | -                       | Dune Analytics API key                         |
+| `STARKSCAN_API_KEY`          | -                       | Starkscan API key (indexed token-transfer history for the address Transfers tab) |
+| `STARKSCAN_API_URL`          | `https://api.starkscan.co/v1/SN_MAIN` | Starkscan REST base URL, chain included |
 | `DUNE_PRIVATE_QUERIES`       | `true`                  | Mark dynamic Dune queries private; set `false` to dodge private-query quota |
 | `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
 | `APP_VIEWING_KEYS`           | `viewing_keys.toml`     | Path to privacy-pool viewing keys (held separately because they are secrets) |

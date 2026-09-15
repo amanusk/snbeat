@@ -6,7 +6,7 @@ use crate::data::pathfinder::ClassHashEntry;
 use crate::data::types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
     MetaTxIntenderSummary, SnAddressInfo, SnBlock, SnEvent, SnReceipt, SnTransaction, TokenBalance,
-    VoyagerLabelInfo,
+    TokenTransfer, VoyagerLabelInfo,
 };
 use crate::decode::events::DecodedEvent;
 use crate::decode::functions::RawCall;
@@ -85,6 +85,23 @@ pub enum Action {
         address: Felt,
         gap: UnfilledCallGap,
         is_contract: bool,
+    },
+    /// Transfers tab entry / poll: scan from the top scanned block to head
+    /// (from `floor_block` on a cold cache).
+    FetchAddressTransfers {
+        address: Felt,
+        floor_block: u64,
+    },
+    /// Enter on a Transfers-tab gap row: backfill `[lo_block, hi_block]`.
+    FillAddressTransferGap {
+        address: Felt,
+        lo_block: u64,
+        hi_block: u64,
+    },
+    /// Persist WS-streamed transfer rows.
+    PersistAddressTransfers {
+        address: Felt,
+        rows: Vec<TokenTransfer>,
     },
     /// Enrich WS-streamed call stubs (missing sender/function/fee/timestamp).
     EnrichAddressCalls {
@@ -304,6 +321,23 @@ pub enum Action {
         address: Felt,
         ranges: Vec<(u64, u64)>,
     },
+    /// Transfer rows to merge; `scanned` is the block range this batch
+    /// fully covers (recorded so the App can derive unscanned gaps).
+    AddressTransfersLoaded {
+        address: Felt,
+        rows: Vec<TokenTransfer>,
+        scanned: Option<(u64, u64)>,
+    },
+    AddressTransferScannedRangesLoaded {
+        address: Felt,
+        ranges: Vec<(u64, u64)>,
+    },
+    /// A transfers fill ended (any outcome). `None` = the top-delta fetch;
+    /// `Some(lo)` = the gap row identified by its lower block.
+    AddressTransferFillFinished {
+        address: Felt,
+        lo_block: Option<u64>,
+    },
     /// Older blocks loaded (appended to block list).
     OlderBlocksLoaded(Vec<SnBlock>),
     /// More address transactions loaded (appended to address tx list).
@@ -468,4 +502,5 @@ pub enum Source {
     Pathfinder,
     Dune,
     Voyager,
+    Starkscan,
 }

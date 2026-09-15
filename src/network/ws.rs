@@ -730,7 +730,7 @@ fn transfer_selector() -> Felt {
 /// wildcarded, the outgoing filter pins slot 1 (`from`) with slot 2 (`to`)
 /// wildcarded — rather than relying on the server treating a missing trailing
 /// slot as a wildcard.
-fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
+pub(crate) fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
     let sel = transfer_selector();
     [
         vec![vec![sel], vec![], vec![address]], // to == address, any from

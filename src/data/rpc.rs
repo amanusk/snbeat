@@ -427,6 +427,65 @@ impl DataSource for RpcDataSource {
         .await
     }
 
+    async fn get_transfer_events(
+        &self,
+        address: Felt,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<TokenTransfer>> {
+        const CHUNK_SIZE: u64 = 1000;
+        let start = std::time::Instant::now();
+        let mut out: Vec<TokenTransfer> = Vec::new();
+        // Two keyed scans (address as `to`, then as `from`); no emitter filter
+        // so every token contract is covered. Pathfinder serves these from its
+        // per-key bloom index, so the cost is the block span, not the keys.
+        for keys in crate::network::ws::transfer_key_filters(address) {
+            let filter = EventFilter {
+                from_block: Some(BlockId::Number(from_block)),
+                to_block: Some(BlockId::Number(to_block)),
+                address: None,
+                keys: Some(keys),
+            };
+            let mut continuation_token: Option<String> = None;
+            loop {
+                let page = self
+                    .provider
+                    .get_events(filter.clone(), continuation_token.clone(), CHUNK_SIZE)
+                    .await
+                    .map_err(|e| SnbeatError::Provider(e.to_string()))?;
+                for e in &page.events {
+                    let raw = SnEvent {
+                        from_address: e.from_address,
+                        keys: e.keys.clone(),
+                        data: e.data.clone(),
+                        transaction_hash: e.transaction_hash,
+                        block_number: e.block_number.unwrap_or(0),
+                        event_index: e.event_index,
+                    };
+                    if let Some(t) = TokenTransfer::from_event(&raw, e.transaction_index) {
+                        out.push(t);
+                    }
+                }
+                match page.continuation_token {
+                    Some(token) => continuation_token = Some(token),
+                    None => break,
+                }
+            }
+        }
+        // Self-transfers match both scans.
+        out.sort_by(TokenTransfer::cmp_newest_first);
+        out.dedup_by_key(|t| t.key());
+        debug!(
+            address = %format!("{:#x}", address),
+            from_block,
+            to_block,
+            count = out.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "Fetched transfer events"
+        );
+        Ok(out)
+    }
+
     async fn call_contract(
         &self,
         contract_address: Felt,

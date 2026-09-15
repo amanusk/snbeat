@@ -468,7 +468,7 @@ pub async fn backfill_call_timestamps(
 /// Fetch timestamps for a set of block numbers. Prefers pf-query (single
 /// range query over the min..=max span) when available; falls back to
 /// per-block RPC for any gaps.
-async fn fetch_block_timestamps(
+pub(super) async fn fetch_block_timestamps(
     block_numbers: HashSet<u64>,
     ds: &Arc<dyn DataSource>,
     pf: Option<&Arc<PathfinderClient>>,

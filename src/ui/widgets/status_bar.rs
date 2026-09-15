@@ -41,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         ("PF", &ds.pathfinder),
         ("Dune", &ds.dune),
         ("Voyager", &ds.voyager),
+        ("Starkscan", &ds.starkscan),
     ];
 
     // Track the first error to show after the indicators

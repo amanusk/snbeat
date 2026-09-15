@@ -63,6 +63,8 @@ pub enum AddressTab {
     MetaTxs,
     Calls, // Incoming calls to this contract (for non-account contracts)
     Balances,
+    /// ERC-20 transfers where this address is `from` or `to`.
+    Transfers,
     Events,
     ClassHistory, // Class hash upgrades over time
 }
@@ -547,6 +549,7 @@ impl App {
                 self.address.meta_txs.scroll_by(delta);
                 self.maybe_fetch_more_meta_txs();
             }
+            AddressTab::Transfers => self.address.transfer_list_scroll_by(delta),
             _ => {}
         }
     }
@@ -629,6 +632,7 @@ impl App {
                     self.address.meta_txs.next();
                     self.maybe_fetch_more_meta_txs();
                 }
+                AddressTab::Transfers => self.address.transfer_list_next(),
                 AddressTab::Events => self.address.events.next(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll = self
@@ -660,6 +664,7 @@ impl App {
                 }
                 AddressTab::Calls => self.address.call_list_previous(),
                 AddressTab::MetaTxs => self.address.meta_txs.previous(),
+                AddressTab::Transfers => self.address.transfer_list_previous(),
                 AddressTab::Events => self.address.events.previous(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll =
@@ -687,6 +692,7 @@ impl App {
                 }
                 AddressTab::Calls => self.address.call_list_select_first(),
                 AddressTab::MetaTxs => self.address.meta_txs.select_first(),
+                AddressTab::Transfers => self.address.transfer_list_select_first(),
                 AddressTab::Events => self.address.events.select_first(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll = 0;
@@ -730,6 +736,7 @@ impl App {
                     self.address.meta_txs.select_last();
                     self.maybe_fetch_more_meta_txs();
                 }
+                AddressTab::Transfers => self.address.transfer_list_select_last(),
                 AddressTab::Events => self.address.events.select_last(),
                 AddressTab::ClassHistory => {
                     self.address.class_history_scroll =
@@ -861,6 +868,71 @@ impl App {
         true
     }
 
+    /// Enter on a Transfers-tab gap row: backfill that block range. Returns
+    /// `true` if a fill was sent.
+    pub fn dispatch_address_transfer_gap_fill(&mut self) -> bool {
+        let Some(address) = self.address.context else {
+            return false;
+        };
+        let Some(sel_lo) = self.address.transfer_gap_selected else {
+            return false;
+        };
+        let Some(gap) = self
+            .address
+            .transfer_gaps
+            .iter_mut()
+            .find(|g| g.lo_block == sel_lo)
+        else {
+            return false;
+        };
+        if gap.fill_dispatched {
+            return false;
+        }
+        gap.fill_dispatched = true;
+        let (lo_block, hi_block) = (gap.lo_block, gap.hi_block);
+        self.address.fetching_transfers = true;
+        let _ = self.action_tx.send(Action::FillAddressTransferGap {
+            address,
+            lo_block,
+            hi_block,
+        });
+        true
+    }
+
+    /// On Transfers-tab entry (and on the poll tick when WS is down): scan
+    /// from the top scanned block to head. Idempotent per address visit via
+    /// `transfers_dispatched`.
+    pub fn maybe_fetch_address_transfers(&mut self) {
+        if self.address.tab != AddressTab::Transfers
+            || self.address.transfers_dispatched
+            || self.address.fetching_transfers
+        {
+            return;
+        }
+        let Some(address) = self.address.context else {
+            return;
+        };
+        self.address.transfers_dispatched = true;
+        self.address.fetching_transfers = true;
+        let _ = self.action_tx.send(Action::FetchAddressTransfers {
+            address,
+            floor_block: self.address.transfer_floor(),
+        });
+    }
+
+    /// Merge transfer rows into the tab, re-derive gaps, and fetch metadata
+    /// for any token the registry doesn't know.
+    fn merge_address_transfers(&mut self, rows: Vec<crate::data::types::TokenTransfer>) -> usize {
+        let tokens: Vec<Felt> = rows.iter().map(|r| r.token).collect();
+        let added = self.address.merge_transfers(rows);
+        if added > 0 {
+            self.dispatch_token_metadata_for_unknown_tokens(tokens);
+        }
+        self.address.refresh_transfer_gaps();
+        self.address.ensure_transfer_selection();
+        added
+    }
+
     /// Re-detect Calls-tab block-range gaps after a calls merge. Unlike the
     /// nonce path there is no auto-fill — a block-range hole doesn't prove
     /// missing calls, so every call gap waits for an explicit Enter.
@@ -946,6 +1018,9 @@ impl App {
 
     pub fn build_address_nav_items(&mut self) {
         self.address.build_nav_items();
+        // Header changes include a newly-learned deploy block, which is the
+        // Transfers-tab gap floor.
+        self.address.refresh_transfer_gaps();
     }
 
     pub fn address_nav_step(&mut self, delta: i64) {
@@ -1990,6 +2065,18 @@ impl App {
                     }
                 }
 
+                // --- Transfers tab: a keyed Transfer leg naming this address.
+                if let Some(t) = crate::data::types::TokenTransfer::from_event(&event, 0)
+                    && (t.from == address || t.to == address)
+                {
+                    let rows = vec![t];
+                    if self.merge_address_transfers(rows.clone()) > 0 {
+                        let _ = self
+                            .action_tx
+                            .send(Action::PersistAddressTransfers { address, rows });
+                    }
+                }
+
                 // --- MetaTxs: for viewed accounts, any TRANSACTION_EXECUTED
                 // event might be an execute_from_outside. Dispatch the
                 // classifier to check and populate the MetaTxs tab live.
@@ -2160,6 +2247,41 @@ impl App {
                     self.refresh_address_call_gaps();
                 }
             }
+            Action::AddressTransfersLoaded {
+                address,
+                rows,
+                scanned,
+            } => {
+                if self.address.context == Some(address) {
+                    if let Some((lo, hi)) = scanned {
+                        self.address.note_transfer_scanned_range(lo, hi);
+                    }
+                    self.merge_address_transfers(rows);
+                }
+            }
+            Action::AddressTransferScannedRangesLoaded { address, ranges } => {
+                if self.address.context == Some(address) {
+                    for (lo, hi) in ranges {
+                        self.address.note_transfer_scanned_range(lo, hi);
+                    }
+                    self.address.refresh_transfer_gaps();
+                    self.address.ensure_transfer_selection();
+                }
+            }
+            Action::AddressTransferFillFinished { address, lo_block } => {
+                if self.address.context == Some(address) {
+                    self.address.fetching_transfers = false;
+                    if let Some(lo) = lo_block
+                        && let Some(gap) = self
+                            .address
+                            .transfer_gaps
+                            .iter_mut()
+                            .find(|g| g.lo_block == lo)
+                    {
+                        gap.fill_dispatched = false;
+                    }
+                }
+            }
             Action::AddressBalancesLoaded { address, balances } => {
                 if self.address.context == Some(address) {
                     // Balances can beat the nonce/class_hash fetch to the UI —
@@ -2231,6 +2353,7 @@ impl App {
                     Source::Pathfinder => &mut self.data_sources.pathfinder,
                     Source::Dune => &mut self.data_sources.dune,
                     Source::Voyager => &mut self.data_sources.voyager,
+                    Source::Starkscan => &mut self.data_sources.starkscan,
                 };
                 *target = status;
             }
@@ -2303,6 +2426,15 @@ impl App {
                     && let Some(address) = self.address.context
                 {
                     let _ = self.action_tx.send(Action::RefreshAddressRpc { address });
+                }
+                // Transfers tab has no WS fallback of its own: re-run the
+                // top-delta scan so new blocks show up while the user sits there.
+                if self.current_view() == View::AddressInfo
+                    && self.data_sources.ws != SourceStatus::Live
+                    && self.address.tab == AddressTab::Transfers
+                {
+                    self.address.transfers_dispatched = false;
+                    self.maybe_fetch_address_transfers();
                 }
             }
             // Request actions are not handled here (they go to the network task)

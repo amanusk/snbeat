@@ -127,6 +127,7 @@ pub struct DataSources {
     pub dune: SourceStatus,
     pub pathfinder: SourceStatus,
     pub voyager: SourceStatus,
+    pub starkscan: SourceStatus,
     pub ws: SourceStatus,
 }
 
@@ -137,6 +138,7 @@ impl Default for DataSources {
             dune: SourceStatus::Off,
             pathfinder: SourceStatus::Off,
             voyager: SourceStatus::Off,
+            starkscan: SourceStatus::Off,
             ws: SourceStatus::Off,
         }
     }

@@ -91,13 +91,17 @@ async fn decode_events_dedup(
 /// construction and clears it on drop. Every early-return path in the
 /// fetcher it guards gets the clear for free, so we can't leave a stale
 /// label in the UI.
-struct QueryGuard {
+pub(super) struct QueryGuard {
     tx: mpsc::UnboundedSender<Action>,
     key: String,
 }
 
 impl QueryGuard {
-    fn new(tx: &mpsc::UnboundedSender<Action>, key: impl Into<String>, label: String) -> Self {
+    pub(super) fn new(
+        tx: &mpsc::UnboundedSender<Action>,
+        key: impl Into<String>,
+        label: String,
+    ) -> Self {
         let key = key.into();
         let _ = tx.send(Action::SetActiveQuery {
             key: key.clone(),
@@ -122,7 +126,7 @@ impl Drop for QueryGuard {
 /// Short prefix of a Felt address used as the stable part of an
 /// [`ActiveQueries`] key. Six hex chars is enough to tell two concurrent
 /// addresses apart without bloating the status bar.
-fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
+pub(super) fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
     let hex = format!("{:064x}", address);
     hex.trim_start_matches('0')
         .chars()
@@ -1028,6 +1032,24 @@ pub(super) async fn fetch_and_send_address_info(
         let _ = tx.send(Action::AddressCallScannedRangesLoaded {
             address,
             ranges: scanned_call_ranges,
+        });
+    }
+
+    // Transfers tab: cached rows + coverage first, so the tab count and
+    // gap rows are right before any Starkscan/RPC round trip.
+    let cached_transfers = ds.load_cached_transfers(&address);
+    let transfer_ranges = ds.load_transfer_scanned_ranges(&address);
+    if !transfer_ranges.is_empty() {
+        let _ = tx.send(Action::AddressTransferScannedRangesLoaded {
+            address,
+            ranges: transfer_ranges,
+        });
+    }
+    if !cached_transfers.is_empty() {
+        let _ = tx.send(Action::AddressTransfersLoaded {
+            address,
+            rows: cached_transfers,
+            scanned: None,
         });
     }
 

@@ -148,6 +148,22 @@ impl CachingDataSource {
             );
             CREATE INDEX IF NOT EXISTS idx_addr_call_scanned
                 ON address_call_scanned_ranges(address);
+            CREATE TABLE IF NOT EXISTS address_transfers (
+                address TEXT NOT NULL,
+                tx_hash TEXT NOT NULL,
+                event_index INTEGER NOT NULL,
+                block_number INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (address, tx_hash, event_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addr_transfers
+                ON address_transfers(address, block_number);
+            CREATE TABLE IF NOT EXISTS address_transfer_scanned_ranges (
+                address TEXT NOT NULL,
+                lo_block INTEGER NOT NULL,
+                hi_block INTEGER NOT NULL,
+                PRIMARY KEY (address, lo_block)
+            );
             CREATE TABLE IF NOT EXISTS address_activity (
                 address TEXT PRIMARY KEY,
                 min_block INTEGER NOT NULL,
@@ -1203,6 +1219,102 @@ impl CachingDataSource {
     }
 }
 
+impl CachingDataSource {
+    /// Run an idempotent write, retrying while SQLite reports busy/locked.
+    /// Bulk upserts from other tabs hold the WAL write lock past
+    /// `busy_timeout`, and `BEGIN IMMEDIATE` then fails without waiting.
+    fn retry_locked(label: &str, mut f: impl FnMut() -> rusqlite::Result<()>) {
+        const ATTEMPTS: u32 = 40;
+        for attempt in 1..=ATTEMPTS {
+            match f() {
+                Ok(()) => return,
+                Err(e) if attempt < ATTEMPTS && Self::is_locked(&e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(e) => {
+                    warn!(error = %e, label, attempt, "cache write failed");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn is_locked(e: &rusqlite::Error) -> bool {
+        matches!(
+            e,
+            rusqlite::Error::SqliteFailure(f, _)
+                if matches!(
+                    f.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+
+    /// Persisted fully-scanned `[lo, hi]` block ranges for one address (sorted).
+    fn load_scanned_ranges(&self, table: &str, address: &Felt) -> Vec<(u64, u64)> {
+        let db = match self.db.get() {
+            Ok(db) => db,
+            Err(_) => return Vec::new(),
+        };
+        let addr_hex = format!("{:#x}", address);
+        let sql =
+            format!("SELECT lo_block, hi_block FROM {table} WHERE address = ?1 ORDER BY lo_block");
+        let mut stmt = match db.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![addr_hex], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok())
+            .map(|(lo, hi)| (lo as u64, hi as u64))
+            .collect()
+    }
+
+    /// Coalesce `[lo, hi]` into the persisted range set and rewrite it, so the
+    /// stored set stays sorted and minimal like the in-memory one.
+    fn add_scanned_range(&self, table: &'static str, address: &Felt, lo: u64, hi: u64) {
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        Self::dispatch_write(move || {
+            let Ok(mut db) = pool.get() else {
+                warn!(table, "add_scanned_range: pool get failed");
+                return;
+            };
+            Self::retry_locked(table, || {
+                // Read-then-rewrite must hold the write lock from the start: a
+                // deferred tx whose snapshot goes stale fails with BUSY_SNAPSHOT.
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut ranges: Vec<(u64, u64)> = tx
+                    .prepare(&format!(
+                        "SELECT lo_block, hi_block FROM {table} WHERE address = ?1"
+                    ))?
+                    .query_map(params![&addr_hex], |row| {
+                        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                crate::utils::merge_block_interval(&mut ranges, lo, hi);
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE address = ?1"),
+                    params![&addr_hex],
+                )?;
+                for (rlo, rhi) in &ranges {
+                    tx.execute(
+                        &format!(
+                            "INSERT OR REPLACE INTO {table} (address, lo_block, hi_block) VALUES (?1, ?2, ?3)"
+                        ),
+                        params![&addr_hex, *rlo as i64, *rhi as i64],
+                    )?;
+                }
+                tx.commit()
+            });
+        });
+    }
+}
+
 #[async_trait]
 impl DataSource for CachingDataSource {
     async fn get_latest_block_number(&self) -> Result<u64> {
@@ -1655,81 +1767,79 @@ impl DataSource for CachingDataSource {
     }
 
     fn load_call_scanned_ranges(&self, address: &Felt) -> Vec<(u64, u64)> {
+        self.load_scanned_ranges("address_call_scanned_ranges", address)
+    }
+
+    fn add_call_scanned_range(&self, address: &Felt, lo: u64, hi: u64) {
+        self.add_scanned_range("address_call_scanned_ranges", address, lo, hi);
+    }
+
+    fn load_transfer_scanned_ranges(&self, address: &Felt) -> Vec<(u64, u64)> {
+        self.load_scanned_ranges("address_transfer_scanned_ranges", address)
+    }
+
+    fn add_transfer_scanned_range(&self, address: &Felt, lo: u64, hi: u64) {
+        self.add_scanned_range("address_transfer_scanned_ranges", address, lo, hi);
+    }
+
+    fn load_cached_transfers(&self, address: &Felt) -> Vec<TokenTransfer> {
         let db = match self.db.get() {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
         let addr_hex = format!("{:#x}", address);
         let mut stmt = match db.prepare(
-            "SELECT lo_block, hi_block FROM address_call_scanned_ranges \
-             WHERE address = ?1 ORDER BY lo_block",
+            "SELECT data FROM address_transfers WHERE address = ?1 ORDER BY block_number DESC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = match stmt.query_map(params![addr_hex], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        }) {
+        let rows = match stmt.query_map(params![addr_hex], |row| row.get::<_, String>(0)) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
-        rows.filter_map(|r| r.ok())
-            .map(|(lo, hi)| (lo as u64, hi as u64))
-            .collect()
+        let mut out: Vec<TokenTransfer> = rows
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect();
+        out.sort_by(TokenTransfer::cmp_newest_first);
+        out
     }
 
-    fn add_call_scanned_range(&self, address: &Felt, lo: u64, hi: u64) {
+    fn save_transfers(&self, address: &Felt, rows: &[TokenTransfer]) {
         let pool = self.db.clone();
         let addr_hex = format!("{:#x}", address);
+        let encoded: Vec<(String, i64, i64, String)> = rows
+            .iter()
+            .filter_map(|t| {
+                serde_json::to_string(t).ok().map(|j| {
+                    (
+                        format!("{:#x}", t.tx_hash),
+                        t.event_index as i64,
+                        t.block_number as i64,
+                        j,
+                    )
+                })
+            })
+            .collect();
         Self::dispatch_write(move || {
-            if let Ok(mut db) = pool.get() {
-                let tx = match db.transaction() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(error = %e, "add_call_scanned_range: begin transaction failed");
-                        return;
+            let Ok(mut db) = pool.get() else {
+                warn!("save_transfers: pool get failed");
+                return;
+            };
+            Self::retry_locked("save_transfers", || {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "INSERT OR REPLACE INTO address_transfers \
+                         (address, tx_hash, event_index, block_number, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+                    for (hash, idx, block, json) in &encoded {
+                        stmt.execute(params![&addr_hex, hash, idx, block, json])?;
                     }
-                };
-                // Read existing ranges, coalesce the new interval in, rewrite —
-                // keeps the persisted set sorted and minimal (same shape as the
-                // in-memory `scanned_call_ranges`).
-                let mut ranges: Vec<(u64, u64)> = {
-                    let mut stmt = match tx.prepare(
-                        "SELECT lo_block, hi_block FROM address_call_scanned_ranges \
-                         WHERE address = ?1",
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(error = %e, "add_call_scanned_range: prepare failed");
-                            return;
-                        }
-                    };
-                    stmt.query_map(params![&addr_hex], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map(|rs| {
-                        rs.filter_map(|r| r.ok())
-                            .map(|(lo, hi)| (lo as u64, hi as u64))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-                };
-                crate::utils::merge_block_interval(&mut ranges, lo, hi);
-                let _ = tx.execute(
-                    "DELETE FROM address_call_scanned_ranges WHERE address = ?1",
-                    params![&addr_hex],
-                );
-                for (rlo, rhi) in &ranges {
-                    let _ = tx.execute(
-                        "INSERT OR REPLACE INTO address_call_scanned_ranges \
-                         (address, lo_block, hi_block) VALUES (?1, ?2, ?3)",
-                        params![&addr_hex, *rlo as i64, *rhi as i64],
-                    );
                 }
-                if let Err(e) = tx.commit() {
-                    warn!(error = %e, "add_call_scanned_range: commit failed");
-                }
-            }
+                tx.commit()
+            });
         });
     }
 
@@ -1914,6 +2024,18 @@ impl DataSource for CachingDataSource {
         // Pass through to the upstream's batched JSON-RPC implementation.
         self.upstream
             .batch_get_storage_at(contract, keys, block)
+            .await
+    }
+
+    async fn get_transfer_events(
+        &self,
+        address: Felt,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<TokenTransfer>> {
+        // Windowed scans are persisted by the caller via `save_transfers`.
+        self.upstream
+            .get_transfer_events(address, from_block, to_block)
             .await
     }
 

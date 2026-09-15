@@ -41,6 +41,18 @@ pub struct AppConfig {
     #[arg(long, env = "DUNE_PRIVATE_QUERIES", default_value_t = true)]
     pub dune_private_queries: bool,
 
+    /// Starkscan API key (enables the address Transfers tab's indexed history)
+    #[arg(long, env = "STARKSCAN_API_KEY")]
+    pub starkscan_api_key: Option<String>,
+
+    /// Starkscan REST base URL, chain included
+    #[arg(
+        long,
+        env = "STARKSCAN_API_URL",
+        default_value = "https://api.starkscan.co/v1/SN_MAIN"
+    )]
+    pub starkscan_api_url: String,
+
     /// Pathfinder query service URL (e.g. http://steak:8234)
     #[arg(long, env = "APP_PATHFINDER_SERVICE_URL")]
     pub pathfinder_service_url: Option<String>,

@@ -18,7 +18,9 @@ pub mod event_window;
 pub mod helpers;
 pub mod prices;
 mod search;
+pub mod starkscan;
 mod transaction;
+mod transfers;
 pub mod voyager;
 pub mod ws;
 
@@ -151,6 +153,7 @@ pub async fn run_network_task(
     pf_client: Option<Arc<crate::data::pathfinder::PathfinderClient>>,
     voyager_client: Option<Arc<voyager::VoyagerClient>>,
     price_client: Option<Arc<prices::PriceClient>>,
+    starkscan_client: Option<Arc<starkscan::StarkscanClient>>,
     head_block: Arc<HeadTracker>,
     mut action_rx: mpsc::UnboundedReceiver<Action>,
     response_tx: mpsc::UnboundedSender<Action>,
@@ -178,6 +181,7 @@ pub async fn run_network_task(
         let pf = pf_client.clone();
         let voyager = voyager_client.clone();
         let prices = price_client.clone();
+        let starkscan = starkscan_client.clone();
         let head = Arc::clone(&head_block);
         let tx = response_tx.clone();
         let cancel = session_token.clone();
@@ -425,6 +429,44 @@ pub async fn run_network_task(
                             &tx,
                         )
                         .await;
+                    }
+                    Action::FetchAddressTransfers {
+                        address,
+                        floor_block,
+                    } => {
+                        transfers::fetch_top_delta(
+                            address,
+                            floor_block,
+                            &head,
+                            transfers::TransferBackends {
+                                ds: &ds,
+                                starkscan: starkscan.as_ref(),
+                                pf: pf.as_ref(),
+                                tx: &tx,
+                            },
+                        )
+                        .await;
+                    }
+                    Action::FillAddressTransferGap {
+                        address,
+                        lo_block,
+                        hi_block,
+                    } => {
+                        transfers::fill_gap(
+                            address,
+                            lo_block,
+                            hi_block,
+                            transfers::TransferBackends {
+                                ds: &ds,
+                                starkscan: starkscan.as_ref(),
+                                pf: pf.as_ref(),
+                                tx: &tx,
+                            },
+                        )
+                        .await;
+                    }
+                    Action::PersistAddressTransfers { address, rows } => {
+                        ds.save_transfers(&address, &rows);
                     }
                     Action::EnrichAddressCalls {
                         address,
@@ -703,6 +745,8 @@ fn action_is_cancellable(action: &Action) -> bool {
             | Action::EnrichAddressEndpoints { .. }
             | Action::FillAddressNonceGaps { .. }
             | Action::FillAddressCallGap { .. }
+            | Action::FetchAddressTransfers { .. }
+            | Action::FillAddressTransferGap { .. }
             | Action::EnrichAddressCalls { .. }
             | Action::FetchAddressMetaTxs { .. }
             | Action::ClassifyPotentialMetaTx { .. }

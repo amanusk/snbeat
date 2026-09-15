@@ -12,7 +12,7 @@ use starknet::core::types::{ContractClass, TransactionTrace};
 use crate::error::Result;
 use types::{
     AddressTxSummary, ClassContractEntry, ClassDeclareInfo, ContractCallSummary,
-    MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt, SnTransaction,
+    MetaTxIntenderSummary, SnBlock, SnEvent, SnReceipt, SnTransaction, TokenTransfer,
 };
 
 use pathfinder::ClassHashEntry;
@@ -217,6 +217,29 @@ pub trait DataSource: Send + Sync {
     /// into any existing persisted ranges for the address.
     fn add_call_scanned_range(&self, _address: &Felt, _lo: u64, _hi: u64) {
         // Default: no-op. CachingDataSource overrides.
+    }
+    /// Cached ERC-20 transfers touching an address, newest-first.
+    fn load_cached_transfers(&self, _address: &Felt) -> Vec<TokenTransfer> {
+        Vec::new()
+    }
+    /// Upsert transfer rows for an address, keyed by `(tx_hash, event_index)`.
+    fn save_transfers(&self, _address: &Felt, _rows: &[TokenTransfer]) {}
+    /// Block ranges fully scanned for transfers (same model as the Calls tab).
+    fn load_transfer_scanned_ranges(&self, _address: &Felt) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+    fn add_transfer_scanned_range(&self, _address: &Felt, _lo: u64, _hi: u64) {}
+    /// Every `Transfer` event in `[from_block, to_block]` (inclusive) where
+    /// `address` is `from` or `to`, across all token contracts.
+    async fn get_transfer_events(
+        &self,
+        _address: Felt,
+        _from_block: u64,
+        _to_block: u64,
+    ) -> Result<Vec<TokenTransfer>> {
+        Err(crate::error::SnbeatError::Provider(
+            "get_transfer_events not implemented for this DataSource".into(),
+        ))
     }
     /// Load cached meta-tx (outside-execution) summaries for an address where the
     /// address is the intender.
