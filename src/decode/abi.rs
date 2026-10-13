@@ -106,7 +106,12 @@ pub fn parse_contract_class(class: &ContractClass) -> ParsedAbi {
 fn parse_sierra_abi(class: &FlattenedSierraClass) -> ParsedAbi {
     let mut abi = ParsedAbi::default();
 
-    let items: Vec<SierraAbiItem> = match serde_json::from_str(&class.abi) {
+    // Some declarers JSON-encode the ABI string again, occasionally more than once.
+    let mut abi_json = std::borrow::Cow::Borrowed(class.abi.as_str());
+    while let Ok(inner) = serde_json::from_str::<String>(&abi_json) {
+        abi_json = inner.into();
+    }
+    let items: Vec<SierraAbiItem> = match serde_json::from_str(&abi_json) {
         Ok(items) => items,
         Err(e) => {
             warn!(error = %e, "Failed to parse Sierra ABI JSON");
@@ -413,5 +418,36 @@ impl SierraEventDef {
             }
         }
         (keys, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use starknet::core::types::EntryPointsByType;
+
+    fn sierra_with_abi(abi: String) -> FlattenedSierraClass {
+        FlattenedSierraClass {
+            sierra_program: vec![],
+            contract_class_version: "0.1.0".into(),
+            entry_points_by_type: EntryPointsByType {
+                constructor: vec![],
+                external: vec![],
+                l1_handler: vec![],
+            },
+            abi,
+        }
+    }
+
+    #[test]
+    fn parses_plain_and_multiply_encoded_sierra_abi() {
+        let abi = r#"[{"type":"function","name":"transfer","inputs":[],"outputs":[],"state_mutability":"external"}]"#;
+        let double = serde_json::to_string(abi).unwrap();
+        let triple = serde_json::to_string(&double).unwrap();
+        let selector = get_selector_from_name("transfer").unwrap();
+        for raw in [abi.to_string(), double, triple] {
+            let parsed = parse_sierra_abi(&sierra_with_abi(raw));
+            assert_eq!(parsed.get_function(&selector).unwrap().name, "transfer");
+        }
     }
 }
