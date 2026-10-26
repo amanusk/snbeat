@@ -2228,12 +2228,16 @@ impl App {
                 address,
                 lo_block,
                 hi_block,
+                tracked_from,
             } => {
                 if self.address.context == Some(address) {
-                    // The fill covered this whole range. Record it so a
-                    // genuinely-sparse hole inside it stops resurfacing, then
-                    // re-detect (this pass is the one that drops the gap).
+                    // Record the scanned range so a genuinely-sparse hole inside
+                    // it stops resurfacing, then re-detect (this pass is the one
+                    // that drops or shrinks the gap).
                     self.address.note_scanned_call_range(lo_block, hi_block);
+                    if let Some(t) = tracked_from {
+                        self.address.note_call_tracked_from(t);
+                    }
                     self.refresh_address_call_gaps();
                 }
             }
@@ -2253,7 +2257,11 @@ impl App {
                     gap.fill_dispatched = false;
                 }
             }
-            Action::AddressCallScannedRangesLoaded { address, ranges } => {
+            Action::AddressCallScannedRangesLoaded {
+                address,
+                ranges,
+                tracked_from,
+            } => {
                 if self.address.context == Some(address) {
                     // Merge the persisted closed ranges into whatever's in
                     // memory (empty on fresh entry; superset-safe on refresh),
@@ -2261,6 +2269,9 @@ impl App {
                     // sparse stays suppressed from first paint.
                     for (lo, hi) in ranges {
                         self.address.note_scanned_call_range(lo, hi);
+                    }
+                    if let Some(t) = tracked_from {
+                        self.address.note_call_tracked_from(t);
                     }
                     self.refresh_address_call_gaps();
                 }

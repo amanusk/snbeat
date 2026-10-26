@@ -31,10 +31,13 @@ use pathfinder::ClassHashEntry;
 /// - [`FilterKind::Keyed`] — events with a specific key filter
 ///   (currently only `TRANSACTION_EXECUTED`, used by the MetaTxs tab).
 ///   Narrower than `Unkeyed`.
+/// - [`FilterKind::DuneCalls`] — not an event scan: the block span Dune
+///   contract-calls pages have tracked for the Calls tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FilterKind {
     Unkeyed,
     Keyed,
+    DuneCalls,
 }
 
 impl FilterKind {
@@ -43,6 +46,7 @@ impl FilterKind {
         match self {
             FilterKind::Unkeyed => "unkeyed",
             FilterKind::Keyed => "keyed",
+            FilterKind::DuneCalls => "dune_calls",
         }
     }
 }

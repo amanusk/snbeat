@@ -297,14 +297,14 @@ pub enum Action {
         address: Felt,
         calls: Vec<ContractCallSummary>,
     },
-    /// An on-demand Calls-tab gap fill covered the whole `[lo_block, hi_block]`
-    /// range (the windowed query returned below its limit). The reducer records
-    /// the range as fully scanned so `detect_unfilled_call_gaps` stops
-    /// re-surfacing a genuinely-sparse hole as a fillable gap.
+    /// A Dune page or gap fill fully scanned `[lo_block, hi_block]` for calls.
+    /// The reducer records it so `detect_unfilled_call_gaps` stops surfacing a
+    /// genuinely-sparse hole; `tracked_from` lowers the Dune-tracked floor.
     AddressCallRangeScanned {
         address: Felt,
         lo_block: u64,
         hi_block: u64,
+        tracked_from: Option<u64>,
     },
     /// An on-demand Calls-tab gap fill finished (success, no-op, or error). The
     /// reducer clears the matching gap's `fill_dispatched` so the row leaves the
@@ -320,6 +320,7 @@ pub enum Action {
     AddressCallScannedRangesLoaded {
         address: Felt,
         ranges: Vec<(u64, u64)>,
+        tracked_from: Option<u64>,
     },
     /// Transfer rows to merge; `scanned` is the block range this batch
     /// fully covers (recorded so the App can derive unscanned gaps).

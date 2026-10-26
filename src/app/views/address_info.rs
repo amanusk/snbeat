@@ -240,13 +240,15 @@ pub struct AddressInfoState {
     /// list (calls + optional gap rows), so it diverges from `calls.state`
     /// whenever a gap is showing. Mirrors `txs_render_state`.
     pub calls_render_state: ratatui::widgets::ListState,
-    /// Block ranges `[lo, hi]` we have *fully* scanned for calls via on-demand
-    /// gap fills (a windowed query that returned below its limit ⇒ the whole
-    /// range is covered). Unlike nonces, a block-range hole doesn't prove
+    /// Block ranges `[lo, hi]` we have *fully* scanned for calls (Dune pages
+    /// and on-demand gap fills). Unlike nonces, a block-range hole doesn't prove
     /// missing calls, so once we've scanned a range and found it sparse we must
     /// remember that — otherwise `detect_unfilled_call_gaps` would re-surface
     /// the same quiet stretch as a gap forever. Merged intervals, kept small.
     pub scanned_call_ranges: Vec<(u64, u64)>,
+    /// Lowest block of the region Dune pages have been tracking. Above it,
+    /// every block not in `scanned_call_ranges` is a gap, however short.
+    pub call_tracked_from: Option<u64>,
     /// ERC-20 transfers touching this address (Transfers tab), newest-first.
     pub transfers: StatefulList<TokenTransfer>,
     /// `(tx_hash, event_index)` → block of each row: O(1) dedup on merge.
@@ -366,6 +368,7 @@ impl Default for AddressInfoState {
             call_gap_selected: None,
             calls_render_state: ratatui::widgets::ListState::default(),
             scanned_call_ranges: Vec::new(),
+            call_tracked_from: None,
             transfers: StatefulList::new(),
             transfer_keys: HashMap::new(),
             transfer_scanned_ranges: Vec::new(),
@@ -428,6 +431,7 @@ impl AddressInfoState {
         self.call_gap_selected = None;
         self.calls_render_state = ratatui::widgets::ListState::default();
         self.scanned_call_ranges.clear();
+        self.call_tracked_from = None;
         self.transfers = StatefulList::new();
         self.transfer_keys.clear();
         self.transfer_scanned_ranges.clear();
@@ -1005,49 +1009,61 @@ impl AddressInfoState {
 
     // ---- Calls-tab block-range gaps (mirror the nonce-gap machinery) ----
 
-    /// Scan the current calls list for block-range holes wider than
-    /// [`CALL_GAP_SPAN_BLOCKS`]. The Calls-tab analogue of
-    /// `detect_unfilled_gaps`, keyed on block numbers (incoming calls have no
-    /// per-address nonce sequence). Distinct block numbers are considered, so
-    /// several calls sharing a block never fabricate a zero-span gap. Sorted by
-    /// `lo_block` ascending for stable render/test order.
+    /// Calls-tab block-range holes, sorted by `lo_block`. A gap's bounds are
+    /// the blocks bordering the hole; a fill rescans `[lo_block, hi_block]`.
+    ///
+    /// Inside the Dune-tracked region (from `call_tracked_from` up) every block
+    /// missing from `scanned_call_ranges` is a gap. Below it only holes between
+    /// calls wider than [`CALL_GAP_SPAN_BLOCKS`] are: a quiet stretch doesn't
+    /// prove a call is missing.
     pub fn detect_unfilled_call_gaps(&self) -> Vec<UnfilledCallGap> {
-        let mut blocks: Vec<u64> = self
-            .calls
-            .items
-            .iter()
-            .map(|c| c.block_number)
-            .filter(|b| *b > 0)
-            .collect();
-        if blocks.len() < 2 {
-            return Vec::new();
-        }
-        blocks.sort_unstable();
-        blocks.dedup();
-
+        let gap = |lo_block, hi_block| UnfilledCallGap {
+            lo_block,
+            hi_block,
+            fill_dispatched: false,
+        };
+        let tracked_from = self.call_tracked_from.unwrap_or(u64::MAX);
         let mut out = Vec::new();
-        for w in blocks.windows(2) {
-            let lo_block = w[0];
-            let hi_block = w[1];
-            if hi_block.saturating_sub(lo_block) <= CALL_GAP_SPAN_BLOCKS {
+
+        // `calls.items` is block-descending, so walk it oldest-first.
+        let mut prev: Option<u64> = None;
+        for b in self.calls.items.iter().rev().map(|c| c.block_number) {
+            if b == 0 || prev == Some(b) {
                 continue;
             }
-            // Suppress ranges we've already fully scanned — the hole is real
-            // (no calls there), not an unfetched window, so don't nag the user.
-            if self
-                .scanned_call_ranges
-                .iter()
-                .any(|(rlo, rhi)| *rlo <= lo_block && hi_block <= *rhi)
+            if let Some(lo_block) = prev
+                && b <= tracked_from
+                && b - lo_block > CALL_GAP_SPAN_BLOCKS
+                && !self
+                    .scanned_call_ranges
+                    .iter()
+                    .any(|(rlo, rhi)| *rlo <= lo_block && b <= *rhi)
             {
-                continue;
+                out.push(gap(lo_block, b));
             }
-            out.push(UnfilledCallGap {
-                lo_block,
-                hi_block,
-                fill_dispatched: false,
-            });
+            prev = Some(b);
         }
+
+        if let Some(t) = self.call_tracked_from {
+            // First block of the tracked region not yet known to be scanned.
+            let mut cursor = t;
+            for &(rlo, rhi) in &self.scanned_call_ranges {
+                if rhi < cursor {
+                    continue;
+                }
+                if rlo > cursor {
+                    out.push(gap(cursor.saturating_sub(1), rlo));
+                }
+                cursor = cursor.max(rhi.saturating_add(1));
+            }
+        }
+        out.sort_by_key(|g| g.lo_block);
         out
+    }
+
+    /// Lower the Dune-tracked region's floor to `from`.
+    pub fn note_call_tracked_from(&mut self, from: u64) {
+        self.call_tracked_from = Some(self.call_tracked_from.map_or(from, |t| t.min(from)));
     }
 
     /// Record a `[lo, hi]` block range as fully scanned for calls, merging it
@@ -1088,18 +1104,20 @@ impl AddressInfoState {
 
     /// Render-order positions for the call-gap rows: `(call_idx, lo_block)`
     /// sorted by `call_idx` ascending. The calls list is block-descending, so
-    /// each gap renders immediately above the first (topmost) call whose block
-    /// equals `lo_block`. Mirrors `gap_render_positions`.
+    /// each gap renders just below the calls at or above its `hi_block`.
     pub fn call_gap_render_positions(&self) -> Vec<(usize, u64)> {
         let mut out: Vec<(usize, u64)> = self
             .call_gaps
             .iter()
-            .filter_map(|g| {
-                Self::first_index_with_key(&self.calls.items, |c| c.block_number, g.lo_block)
-                    .map(|p| (p, g.lo_block))
+            .map(|g| {
+                let p = self
+                    .calls
+                    .items
+                    .partition_point(|c| c.block_number >= g.hi_block);
+                (p, g.lo_block)
             })
             .collect();
-        out.sort_by_key(|(p, _)| *p);
+        out.sort_by_key(|(p, lo)| (*p, std::cmp::Reverse(*lo)));
         out
     }
 
@@ -2002,7 +2020,7 @@ mod tests {
         s.merge_calls(vec![call_at(1_000), call_with_hash(2, 1_000), call_at(top)]);
         s.call_gaps = vec![
             UnfilledCallGap {
-                lo_block: 42, // no such row: skipped
+                lo_block: 42, // below every row: renders last
                 hi_block: 43,
                 fill_dispatched: false,
             },
@@ -2012,7 +2030,7 @@ mod tests {
                 fill_dispatched: false,
             },
         ];
-        assert_eq!(s.call_gap_render_positions(), vec![(1, 1_000)]);
+        assert_eq!(s.call_gap_render_positions(), vec![(1, 1_000), (3, 42)]);
     }
 
     #[test]
@@ -2110,6 +2128,44 @@ mod tests {
             call_at(1000 + CALL_GAP_SPAN_BLOCKS + 1),
         ]);
         assert_eq!(state.detect_unfilled_call_gaps().len(), 1);
+    }
+
+    #[test]
+    fn tracked_region_flags_every_unscanned_range() {
+        let mut state = call_state_with(vec![call_at(1_500), call_at(1_800), call_at(2_600)]);
+        state.note_call_tracked_from(1_000);
+        state.note_scanned_call_range(1_000, 2_000);
+        state.note_scanned_call_range(2_500, 3_000);
+        // A 500-block hole is far under the span threshold, but it's inside
+        // the tracked region, so it's a gap bordered by the scanned blocks.
+        let gaps = state.detect_unfilled_call_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!((gaps[0].lo_block, gaps[0].hi_block), (2_000, 2_500));
+        // It renders between the calls above and below the hole.
+        state.call_gaps = gaps;
+        assert_eq!(state.call_gap_render_positions(), vec![(1, 2_000)]);
+
+        state.note_scanned_call_range(2_000, 2_500);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+    }
+
+    #[test]
+    fn tracked_region_floor_and_older_rows() {
+        // Older cached rows below the tracked floor keep the span rule.
+        let mut state = call_state_with(vec![call_at(100), call_at(900), call_at(2_000)]);
+        state.note_call_tracked_from(1_000);
+        state.note_scanned_call_range(1_500, 3_000);
+        let gaps = state.detect_unfilled_call_gaps();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "only the unscanned bottom of the tracked region"
+        );
+        assert_eq!((gaps[0].lo_block, gaps[0].hi_block), (999, 1_500));
+
+        // The floor only moves down.
+        state.note_call_tracked_from(5_000);
+        assert_eq!(state.call_tracked_from, Some(1_000));
     }
 
     #[test]
