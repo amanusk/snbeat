@@ -119,11 +119,12 @@ impl CachingDataSource {
             );
             CREATE TABLE IF NOT EXISTS address_events (
                 address TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
                 event_index INTEGER NOT NULL,
                 data TEXT NOT NULL,
-                PRIMARY KEY (address, event_index)
+                PRIMARY KEY (address, block_number, tx_hash, event_index)
             );
-            CREATE INDEX IF NOT EXISTS idx_addr_events ON address_events(address);
             CREATE TABLE IF NOT EXISTS address_txs (
                 address TEXT NOT NULL,
                 tx_index INTEGER NOT NULL,
@@ -471,6 +472,51 @@ impl CachingDataSource {
             );
         }
 
+        // address_events was keyed by list position, so every merge rewrote the
+        // address's whole event list; re-key per event so merges upsert.
+        let events_has_tx_hash: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('address_events') WHERE name = 'tx_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| SnbeatError::Config(format!("address_events table_info: {e}")))?;
+        if events_has_tx_hash == 0 {
+            // Runs before the TUI starts; on a large cache it takes tens of seconds.
+            eprintln!("snbeat: upgrading the event cache (one-time)...");
+            let t0 = std::time::Instant::now();
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE address_events_v2 (
+                     address TEXT NOT NULL,
+                     block_number INTEGER NOT NULL,
+                     tx_hash TEXT NOT NULL,
+                     event_index INTEGER NOT NULL,
+                     data TEXT NOT NULL,
+                     PRIMARY KEY (address, block_number, tx_hash, event_index)
+                 );
+                 INSERT OR REPLACE INTO address_events_v2
+                     (address, block_number, tx_hash, event_index, data)
+                     SELECT address, json_extract(data, '$.block_number'),
+                            json_extract(data, '$.transaction_hash'),
+                            json_extract(data, '$.event_index'), data
+                     FROM address_events
+                     WHERE json_valid(data)
+                       AND json_extract(data, '$.block_number') IS NOT NULL
+                       AND json_extract(data, '$.transaction_hash') IS NOT NULL
+                       AND json_extract(data, '$.event_index') IS NOT NULL
+                     ORDER BY 1, 2, 3, 4;
+                 DROP TABLE address_events;
+                 ALTER TABLE address_events_v2 RENAME TO address_events;
+                 COMMIT;",
+            )
+            .map_err(|e| SnbeatError::Config(format!("address_events re-key failed: {e}")))?;
+            info!(
+                elapsed_ms = t0.elapsed().as_millis(),
+                "Re-keyed address_events per event"
+            );
+        }
+
         drop(db);
         Ok(Self {
             upstream,
@@ -666,9 +712,10 @@ impl CachingDataSource {
             Err(_) => return Vec::new(),
         };
         let addr_hex = format!("{:#x}", address);
-        let mut stmt = match db
-            .prepare("SELECT data FROM address_events WHERE address = ?1 ORDER BY event_index")
-        {
+        let mut stmt = match db.prepare(
+            "SELECT data FROM address_events WHERE address = ?1 \
+             ORDER BY block_number DESC, tx_hash, event_index DESC",
+        ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -681,62 +728,62 @@ impl CachingDataSource {
             .collect()
     }
 
-    fn save_address_events(&self, address: &Felt, events: &[SnEvent]) {
-        // Serialize on the caller thread, then ship the rows to a blocking
-        // worker so the DELETE + N×INSERT transaction doesn't stall the
-        // tokio worker that triggered this save.
-        let pool = self.db.clone();
-        let addr_hex = format!("{:#x}", address);
-        let rows: Vec<(i64, String)> = events
+    /// `(block_number, tx_hash, event_index, json)` rows for an `address_events` upsert.
+    fn event_rows(events: &[SnEvent]) -> Vec<(i64, String, i64, String)> {
+        events
             .iter()
-            .enumerate()
-            .filter_map(|(i, e)| serde_json::to_string(e).ok().map(|j| (i as i64, j)))
-            .collect();
-        Self::dispatch_write(move || {
-            if let Ok(mut db) = pool.get() {
-                let tx = match db.transaction() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(error = %e, "save_address_events: begin transaction failed");
-                        return;
-                    }
-                };
-                let _ = tx.execute(
-                    "DELETE FROM address_events WHERE address = ?1",
-                    params![&addr_hex],
-                );
-                for (i, json) in &rows {
-                    let _ = tx.execute(
-                        "INSERT OR REPLACE INTO address_events (address, event_index, data) VALUES (?1, ?2, ?3)",
-                        params![&addr_hex, i, json],
-                    );
-                }
-                if let Err(e) = tx.commit() {
-                    warn!(error = %e, "save_address_events: commit failed");
+            .filter_map(|e| {
+                let json = serde_json::to_string(e).ok()?;
+                Some((
+                    e.block_number as i64,
+                    format!("{:#x}", e.transaction_hash),
+                    e.event_index as i64,
+                    json,
+                ))
+            })
+            .collect()
+    }
+
+    fn upsert_event_rows(
+        db: &mut rusqlite::Connection,
+        addr_hex: &str,
+        rows: &[(i64, String, i64, String)],
+    ) {
+        Self::retry_locked("address_events", || {
+            let tx = db.transaction()?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO address_events \
+                     (address, block_number, tx_hash, event_index, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (block, hash, idx, json) in rows {
+                    stmt.execute(params![addr_hex, block, hash, idx, json])?;
                 }
             }
+            tx.commit()
         });
     }
 
-    /// Additive merge: dedupe `new_events` against what's already cached and
-    /// rewrite the combined list sorted newest-first. Unlike `save_address_events`
-    /// (which replaces everything), this preserves older cached events when a
-    /// caller only supplies a fresh top-of-tip window. Returns the merged list.
-    ///
-    /// Runs the read → merge → `DELETE` → `INSERT` entirely inside one
-    /// `BEGIN IMMEDIATE` transaction on a single pooled connection. With the
-    /// r2d2 pool in place there is no global `Mutex<Connection>` anymore, so
-    /// without this serialization two concurrent merges for the same address
-    /// (e.g. WS tick vs. address-view refresh) could each read the same
-    /// baseline, each dedupe against it, then both DELETE+INSERT — and the
-    /// second commit would drop the first's additions. `BEGIN IMMEDIATE`
-    /// acquires the SQLite reserved lock up front so the second merge blocks
-    /// until the first commits.
+    /// Fire-and-forget upsert of `events`, off the async worker.
+    fn append_address_events_impl(&self, address: &Felt, events: &[SnEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let pool = self.db.clone();
+        let addr_hex = format!("{:#x}", address);
+        let rows = Self::event_rows(events);
+        Self::dispatch_write(move || {
+            let Ok(mut db) = pool.get() else {
+                warn!("append_address_events: pool get failed");
+                return;
+            };
+            Self::upsert_event_rows(&mut db, &addr_hex, &rows);
+        });
+    }
+
     /// Merge `cached` into `fresh` newest-first, deduping by
-    /// `(tx_hash, block_number, event_index)`. O(N) — the previous form
-    /// used `Vec::iter().any(...)` per cached event, which was O(N²) and
-    /// on a hot address with 5k cached events did ~25M tuple comparisons
-    /// every merge.
+    /// `(tx_hash, block_number, event_index)`.
     fn merge_events_dedup(mut fresh: Vec<SnEvent>, cached: Vec<SnEvent>) -> Vec<SnEvent> {
         let mut seen: HashSet<(Felt, u64, u64)> =
             HashSet::with_capacity(fresh.len() + cached.len());
@@ -749,62 +796,20 @@ impl CachingDataSource {
         fresh
     }
 
+    /// Upsert `new_events`, then return the address's whole cached list newest-first.
     fn merge_address_events_impl(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
-        let addr_hex = format!("{:#x}", address);
-        let mut db = match self.db.get() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "merge_address_events: pool get failed");
-                return new_events.to_vec();
-            }
-        };
-        let tx = match db.transaction_with_behavior(TransactionBehavior::Immediate) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "merge_address_events: begin immediate failed");
-                return new_events.to_vec();
-            }
-        };
-
-        // Read existing cached events inside the transaction.
-        let cached: Vec<SnEvent> = (|| -> Vec<SnEvent> {
-            let mut stmt = match tx
-                .prepare("SELECT data FROM address_events WHERE address = ?1 ORDER BY event_index")
-            {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let rows = match stmt.query_map(params![&addr_hex], |row| row.get::<_, String>(0)) {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
-            rows.filter_map(|r| r.ok())
-                .filter_map(|json| serde_json::from_str::<SnEvent>(&json).ok())
-                .collect()
-        })();
-
-        let mut merged = Self::merge_events_dedup(new_events.to_vec(), cached);
-        merged.sort_by(|a, b| {
-            b.block_number
-                .cmp(&a.block_number)
-                .then_with(|| b.event_index.cmp(&a.event_index))
-        });
-
-        // Rewrite atomically inside the same transaction.
-        let _ = tx.execute(
-            "DELETE FROM address_events WHERE address = ?1",
-            params![&addr_hex],
-        );
-        for (i, event) in merged.iter().enumerate() {
-            if let Ok(json) = serde_json::to_string(event) {
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO address_events (address, event_index, data) VALUES (?1, ?2, ?3)",
-                    params![&addr_hex, i as i64, json],
-                );
+        if !new_events.is_empty() {
+            let addr_hex = format!("{:#x}", address);
+            match self.db.get() {
+                Ok(mut db) => {
+                    Self::upsert_event_rows(&mut db, &addr_hex, &Self::event_rows(new_events))
+                }
+                Err(e) => warn!(error = %e, "merge_address_events: pool get failed"),
             }
         }
-        if let Err(e) = tx.commit() {
-            warn!(error = %e, "merge_address_events: commit failed");
+        let merged = self.get_cached_address_events(address);
+        if merged.is_empty() {
+            return new_events.to_vec();
         }
         merged
     }
@@ -1637,14 +1642,13 @@ impl DataSource for CachingDataSource {
             .await
             .unwrap_or_default();
 
+        self.append_address_events_impl(&address, &new_events);
+
         // Merge: new + cached (new events are newest-first, cached are newest-first)
         let mut merged = Self::merge_events_dedup(new_events, cached);
 
         // Sort by block number descending (newest first)
         merged.sort_by(|a, b| b.block_number.cmp(&a.block_number));
-
-        // Cache the merged result
-        self.save_address_events(&address, &merged);
 
         Ok(merged)
     }
@@ -2165,6 +2169,10 @@ impl DataSource for CachingDataSource {
 
     fn merge_address_events(&self, address: &Felt, new_events: &[SnEvent]) -> Vec<SnEvent> {
         self.merge_address_events_impl(address, new_events)
+    }
+
+    fn append_address_events(&self, address: &Felt, events: &[SnEvent]) {
+        self.append_address_events_impl(address, events);
     }
 
     async fn get_recent_blocks(&self, count: usize) -> Result<Vec<SnBlock>> {
@@ -2928,6 +2936,87 @@ mod tests {
         assert_eq!(name(1).as_deref(), Some("a, x"));
         assert_eq!(name(2).as_deref(), Some("b"));
         assert_eq!(name(4).as_deref(), Some("d"));
+    }
+
+    fn event(tx: u64, block: u64, idx: u64) -> SnEvent {
+        SnEvent {
+            from_address: Felt::from(0x10_u64),
+            keys: vec![Felt::from(idx)],
+            data: Vec::new(),
+            transaction_hash: Felt::from(tx),
+            block_number: block,
+            event_index: idx,
+        }
+    }
+
+    fn event_ids(events: &[SnEvent]) -> Vec<(u64, u64, u64)> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e.block_number,
+                    crate::utils::felt_to_u64(&e.transaction_hash),
+                    e.event_index,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_address_events_upserts_newest_first() {
+        let (ds, _d) = new_cache();
+        let addr = Felt::from(0x49d_u64);
+
+        ds.merge_address_events(&addr, &[event(1, 100, 0), event(2, 300, 0)]);
+        // Re-sending a cached event is a no-op; a new one lands in block order.
+        let merged = ds.merge_address_events(&addr, &[event(2, 300, 0), event(3, 200, 1)]);
+        assert_eq!(
+            event_ids(&merged),
+            vec![(300, 2, 0), (200, 3, 1), (100, 1, 0)]
+        );
+        // Two legs of one tx are distinct rows.
+        ds.merge_address_events(&addr, &[event(3, 200, 0)]);
+        assert_eq!(ds.load_address_events(&addr).len(), 4);
+    }
+
+    #[test]
+    fn address_events_rekey_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.db");
+        let addr = Felt::from(0x49d_u64);
+        let addr_hex = format!("{:#x}", addr);
+        {
+            // Pre-migration shape: rows keyed by list position.
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE address_events (
+                     address TEXT NOT NULL, event_index INTEGER NOT NULL, data TEXT NOT NULL,
+                     PRIMARY KEY (address, event_index));",
+            )
+            .unwrap();
+            for (i, e) in [event(1, 900, 1), event(1, 900, 0), event(2, 500, 0)]
+                .iter()
+                .enumerate()
+            {
+                db.execute(
+                    "INSERT INTO address_events VALUES (?1, ?2, ?3)",
+                    params![&addr_hex, i as i64, serde_json::to_string(e).unwrap()],
+                )
+                .unwrap();
+            }
+            db.execute(
+                "INSERT INTO address_events VALUES ('0x1', 0, 'not json')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let ds = CachingDataSource::new(Arc::new(NullUpstream), &path).expect("open + migrate");
+        assert_eq!(
+            event_ids(&ds.load_address_events(&addr)),
+            vec![(900, 1, 1), (900, 1, 0), (500, 2, 0)]
+        );
+        assert!(ds.load_address_events(&Felt::from(1_u64)).is_empty());
     }
 
     /// Opens an external cache.db snapshot via env var `SNBEAT_TEST_CACHE_DB`

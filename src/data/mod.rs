@@ -445,6 +445,10 @@ pub trait DataSource: Send + Sync {
         new_events.to_vec()
     }
 
+    /// Persist `events` into the per-address event cache without reading it
+    /// back. Fire-and-forget, for hot paths like the WS stream.
+    fn append_address_events(&self, _address: &Felt, _events: &[SnEvent]) {}
+
     // --- Class declaration cache ---
     /// Load cached declare info for a class hash. Declarations are immutable
     /// (a class's declaration block/tx never changes), so there is no TTL.

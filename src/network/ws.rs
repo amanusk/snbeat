@@ -684,10 +684,8 @@ fn handle_event(
         "Received event via WS → cache + single broadcast"
     );
 
-    // Route through the shared event cache so subsequent helper calls
-    // (`ensure_address_events_window`, tab loaders) see the new event
-    // without a round trip.
-    data_source.merge_address_events(&address, std::slice::from_ref(&sn_event));
+    // Persist off the read loop: a slow reader makes the node drop the connection.
+    data_source.append_address_events(&address, std::slice::from_ref(&sn_event));
 
     // Single broadcast — the reducer fans out to Calls, MetaTxs classifier,
     // and Events tab. Avoids multiple per-tab streaming actions diverging.
@@ -930,8 +928,8 @@ mod tests {
     use starknet::core::types::{AddressFilter, ContractClass};
 
     /// Minimal DataSource stub for `handle_event` tests. The handler only
-    /// calls `merge_address_events` (default trait impl returns the input
-    /// unchanged) — all other methods are unused here.
+    /// calls `append_address_events` (default trait impl is a no-op) — all
+    /// other methods are unused here.
     struct TestDataSource;
 
     #[async_trait]
