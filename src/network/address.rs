@@ -37,8 +37,8 @@ where
 }
 
 use crate::app::actions::{Action, Source};
-use crate::data::DataSource;
 use crate::data::types::SnTransaction;
+use crate::data::{DataSource, FilterKind};
 use crate::decode::AbiRegistry;
 use crate::decode::events::decode_event;
 use crate::decode::functions::parse_multicall;
@@ -91,13 +91,17 @@ async fn decode_events_dedup(
 /// construction and clears it on drop. Every early-return path in the
 /// fetcher it guards gets the clear for free, so we can't leave a stale
 /// label in the UI.
-struct QueryGuard {
+pub(super) struct QueryGuard {
     tx: mpsc::UnboundedSender<Action>,
     key: String,
 }
 
 impl QueryGuard {
-    fn new(tx: &mpsc::UnboundedSender<Action>, key: impl Into<String>, label: String) -> Self {
+    pub(super) fn new(
+        tx: &mpsc::UnboundedSender<Action>,
+        key: impl Into<String>,
+        label: String,
+    ) -> Self {
         let key = key.into();
         let _ = tx.send(Action::SetActiveQuery {
             key: key.clone(),
@@ -122,7 +126,7 @@ impl Drop for QueryGuard {
 /// Short prefix of a Felt address used as the stable part of an
 /// [`ActiveQueries`] key. Six hex chars is enough to tell two concurrent
 /// addresses apart without bloating the status bar.
-fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
+pub(super) fn query_addr_prefix(address: &starknet::core::types::Felt) -> String {
     let hex = format!("{:064x}", address);
     hex.trim_start_matches('0')
         .chars()
@@ -1024,10 +1028,32 @@ pub(super) async fn fetch_and_send_address_info(
     // before the cached AddressInfoLoaded so its gap re-detect already sees
     // them.
     let scanned_call_ranges = ds.load_call_scanned_ranges(&address);
-    if !scanned_call_ranges.is_empty() {
+    let call_tracked_from = ds
+        .load_search_progress(&address, FilterKind::DuneCalls)
+        .map(|(lo, _)| lo);
+    if !scanned_call_ranges.is_empty() || call_tracked_from.is_some() {
         let _ = tx.send(Action::AddressCallScannedRangesLoaded {
             address,
             ranges: scanned_call_ranges,
+            tracked_from: call_tracked_from,
+        });
+    }
+
+    // Transfers tab: cached rows + coverage first, so the tab count and
+    // gap rows are right before any Starkscan/RPC round trip.
+    let cached_transfers = ds.load_cached_transfers(&address);
+    let transfer_ranges = ds.load_transfer_scanned_ranges(&address);
+    if !transfer_ranges.is_empty() {
+        let _ = tx.send(Action::AddressTransferScannedRangesLoaded {
+            address,
+            ranges: transfer_ranges,
+        });
+    }
+    if !cached_transfers.is_empty() {
+        let _ = tx.send(Action::AddressTransfersLoaded {
+            address,
+            rows: cached_transfers,
+            scanned: None,
         });
     }
 
@@ -2704,117 +2730,121 @@ pub(super) async fn run_call_gap_fill(
         "Calls gap fill: backfilling block range on demand"
     );
 
-    // (merged call rows, whether the whole range was covered in this page)
-    let (calls, fully_covered): (Vec<crate::data::types::ContractCallSummary>, bool) =
-        if is_contract && let Some(dune_client) = dune {
-            // Date hint lets Dune prune `starknet.calls` partitions instead of
-            // scanning the whole table for the bounded block window.
-            let min_date = block_date_floor(ds, gap.hi_block).await;
-            match dune_client
-                .query_contract_calls_windowed(
-                    address,
-                    gap.lo_block,
-                    gap.hi_block,
-                    CALL_GAP_FILL_LIMIT,
-                    min_date,
-                )
-                .await
-            {
-                Ok(rows) => {
-                    let covered = rows.len() < CALL_GAP_FILL_LIMIT as usize;
-                    // Replace Dune's immediate caller with the real tx sender and
-                    // fill fee/timestamp/function name (same path as the bulk
-                    // Dune fetch).
-                    let enriched =
-                        enrich_dune_calls(address, rows, abi_reg, ds, pf.as_ref(), action_tx).await;
-                    (enriched, covered)
-                }
-                Err(e) => {
-                    warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: Dune query failed");
-                    let _ = action_tx.send(Action::LoadingStatus(String::new()));
-                    return;
-                }
-            }
-        } else if let Some(pf_client) = pf {
-            // Account (or a contract with no Dune): scan the gap's event window
-            // and project the pf tx_rows to call rows. The filter kind must
-            // match the address kind — the keyed `transaction_executed` filter
-            // (`Account`) targets an address as a tx *sender* and returns the
-            // wrong activity set for a contract, so contracts use the unkeyed
-            // contract-event filter (`Contract`).
-            let kind = if is_contract {
-                EventQueryKind::Contract
-            } else {
-                EventQueryKind::Account
-            };
-            let Some(latest_block) = ds.latest_block_hint().await else {
-                warn!(addr = %format!("{:#x}", address), "Calls gap fill: no chain head available");
-                let _ = action_tx.send(Action::LoadingStatus(String::new()));
-                return;
-            };
-            match crate::network::event_window::ensure_address_events_window(
+    let page = CallsPage {
+        from: Some(gap.lo_block),
+        to: Some(gap.hi_block),
+        limit: CALL_GAP_FILL_LIMIT,
+        track: false,
+    };
+    // (merged call rows, the block range this page proves scanned)
+    let (calls, covered): (
+        Vec<crate::data::types::ContractCallSummary>,
+        Option<(u64, u64)>,
+    ) = if is_contract && let Some(dune_client) = dune {
+        // Date hint lets Dune prune `starknet.calls` partitions instead of
+        // scanning the whole table for the bounded block window.
+        let min_date = block_date_floor(ds, gap.hi_block).await;
+        match dune_client
+            .query_contract_calls_windowed(
                 address,
-                kind,
-                crate::network::event_window::EventWindowPolicy::FillGap {
-                    from_block: gap.lo_block,
-                    to_block: gap.hi_block,
-                },
-                Some(pf_client),
-                ds,
-                latest_block,
                 gap.lo_block,
+                gap.hi_block,
+                CALL_GAP_FILL_LIMIT,
+                min_date,
             )
             .await
-            {
-                Ok(outcome) => {
-                    let covered = outcome.next_token.is_none();
-                    let _ = action_tx.send(Action::AddressEventWindowUpdated {
-                        address,
-                        min_searched: outcome.min_searched,
-                        max_searched: outcome.max_searched,
-                        deferred_gap: outcome.deferred_gap,
-                    });
-                    let calls =
-                        build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg)
-                            .await;
-                    (calls, covered)
-                }
-                Err(e) => {
-                    warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: event-window scan failed");
-                    let _ = action_tx.send(Action::LoadingStatus(String::new()));
-                    return;
-                }
+        {
+            Ok(rows) => {
+                // A capped page still proves the range above its oldest row.
+                let blocks: Vec<u64> = rows.iter().map(|c| c.block_number).collect();
+                let covered = calls_page_coverage(page, &blocks);
+                // Replace Dune's immediate caller with the real tx sender and
+                // fill fee/timestamp/function name (same path as the bulk
+                // Dune fetch).
+                let enriched =
+                    enrich_dune_calls(address, rows, abi_reg, ds, pf.as_ref(), action_tx).await;
+                (enriched, covered)
             }
+            Err(e) => {
+                warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: Dune query failed");
+                let _ = action_tx.send(Action::LoadingStatus(String::new()));
+                return;
+            }
+        }
+    } else if let Some(pf_client) = pf {
+        // Account (or a contract with no Dune): scan the gap's event window
+        // and project the pf tx_rows to call rows. The filter kind must
+        // match the address kind — the keyed `transaction_executed` filter
+        // (`Account`) targets an address as a tx *sender* and returns the
+        // wrong activity set for a contract, so contracts use the unkeyed
+        // contract-event filter (`Contract`).
+        let kind = if is_contract {
+            EventQueryKind::Contract
         } else {
-            debug!(addr = %format!("{:#x}", address), "Calls gap fill: no Dune/pf backend available");
+            EventQueryKind::Account
+        };
+        let Some(latest_block) = ds.latest_block_hint().await else {
+            warn!(addr = %format!("{:#x}", address), "Calls gap fill: no chain head available");
             let _ = action_tx.send(Action::LoadingStatus(String::new()));
             return;
         };
+        match crate::network::event_window::ensure_address_events_window(
+            address,
+            kind,
+            crate::network::event_window::EventWindowPolicy::FillGap {
+                from_block: gap.lo_block,
+                to_block: gap.hi_block,
+            },
+            Some(pf_client),
+            ds,
+            latest_block,
+            gap.lo_block,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let covered = outcome
+                    .next_token
+                    .is_none()
+                    .then_some((gap.lo_block, gap.hi_block));
+                let _ = action_tx.send(Action::AddressEventWindowUpdated {
+                    address,
+                    min_searched: outcome.min_searched,
+                    max_searched: outcome.max_searched,
+                    deferred_gap: outcome.deferred_gap,
+                });
+                let calls =
+                    build_contract_calls_from_pf_rows(address, &outcome.page.tx_rows, abi_reg)
+                        .await;
+                (calls, covered)
+            }
+            Err(e) => {
+                warn!(addr = %format!("{:#x}", address), error = %e, "Calls gap fill: event-window scan failed");
+                let _ = action_tx.send(Action::LoadingStatus(String::new()));
+                return;
+            }
+        }
+    } else {
+        debug!(addr = %format!("{:#x}", address), "Calls gap fill: no Dune/pf backend available");
+        let _ = action_tx.send(Action::LoadingStatus(String::new()));
+        return;
+    };
 
     info!(
         address = %format!("{:#x}", address),
         lo_block = gap.lo_block,
         hi_block = gap.hi_block,
         calls = calls.len(),
-        fully_covered,
+        ?covered,
         "Calls gap fill: backend returned rows"
     );
 
     if !calls.is_empty() {
         let _ = action_tx.send(Action::AddressCallsMerged { address, calls });
     }
-    if fully_covered {
-        // Persist the scanned range so the closed gap survives re-navigation
-        // and restarts, then notify the App for the in-memory update. The
-        // AddressCallRangeScanned action is sent AFTER the merge so the App's
-        // gap re-detect (triggered by the merge) is the one that suppresses
-        // the hole.
-        ds.add_call_scanned_range(&address, gap.lo_block, gap.hi_block);
-        let _ = action_tx.send(Action::AddressCallRangeScanned {
-            address,
-            lo_block: gap.lo_block,
-            hi_block: gap.hi_block,
-        });
+    if let Some(range) = covered {
+        // Sent AFTER the merge so the App's gap re-detect sees the new rows.
+        record_calls_coverage(ds, action_tx, address, page, range);
     }
     let _ = action_tx.send(Action::LoadingStatus(String::new()));
 }
@@ -4581,11 +4611,61 @@ pub(super) async fn block_date_floor(
     ts_to_min_date(ts)
 }
 
+/// Bounds of a Dune contract-calls query, for recording what its rows prove
+/// was scanned.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CallsPage {
+    /// Lower bound; `None` for date-floored windows whose first block is unknown.
+    pub from: Option<u64>,
+    /// Upper bound; `None` when open-ended to the chain tip.
+    pub to: Option<u64>,
+    pub limit: u32,
+    /// Extend the Dune-tracked region (primary fetches, not gap fills).
+    pub track: bool,
+}
+
+/// Block range a page's rows prove fully scanned. A capped page covers only
+/// down to just above its oldest row's block; an open-ended page stops below
+/// its newest row's block, which Dune may still be ingesting.
+pub(super) fn calls_page_coverage(page: CallsPage, blocks: &[u64]) -> Option<(u64, u64)> {
+    let lo = if blocks.len() >= page.limit as usize {
+        blocks.iter().min()? + 1
+    } else {
+        page.from?
+    };
+    let hi = match page.to {
+        Some(to) => to,
+        None => blocks.iter().max()?.checked_sub(1)?,
+    };
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// Persist a page's scanned range (and tracked floor) and tell the App.
+fn record_calls_coverage(
+    ds: &Arc<dyn DataSource>,
+    action_tx: &mpsc::UnboundedSender<Action>,
+    address: starknet::core::types::Felt,
+    page: CallsPage,
+    (lo, hi): (u64, u64),
+) {
+    ds.add_call_scanned_range(&address, lo, hi);
+    let tracked_from = page.track.then(|| page.from.unwrap_or(lo).min(lo));
+    if let Some(t) = tracked_from {
+        ds.save_search_progress(&address, FilterKind::DuneCalls, t, hi);
+    }
+    let _ = action_tx.send(Action::AddressCallRangeScanned {
+        address,
+        lo_block: lo,
+        hi_block: hi,
+        tracked_from,
+    });
+}
+
 /// Choose the Dune query variant for the contract-calls fetch.
 ///
 /// The two inputs that drive the choice:
-///   * `newest_cached_pair` — `Some((block_number, timestamp))` if we have
-///     prior cached calls. `timestamp == 0` means "block known but date
+///   * `newest_cached_pair` — `Some((block_number, timestamp))` of the block
+///     to resume after. `timestamp == 0` means "block known but date
 ///     unknown" — we drop the partition hint in that case.
 ///   * `deploy_floor` + `deploy_floor_ts` — both `Some` to qualify for
 ///     `DeployScoped`. Either being `None` collapses to `Unwindowed`.
@@ -4642,6 +4722,8 @@ pub(super) async fn fetch_address_contract_calls(
     class_hash: Option<starknet::core::types::Felt>,
 ) {
     const CONTRACT_CALL_LIMIT: u32 = 500;
+    // ~1-2 days of mainnet blocks.
+    const LEGACY_CALLS_RECHECK_BLOCKS: u64 = 50_000;
 
     let Some(dune_client) = dune else {
         debug!(
@@ -4659,38 +4741,42 @@ pub(super) async fn fetch_address_contract_calls(
         "Calls fetch".to_string(),
     );
 
-    // TopDelta: if we've already cached rows for this address, only ask Dune
-    // for blocks strictly newer than the highest block we've seen. Cold cache
-    // still falls back to the unwindowed "500 most recent" fetch so first open
-    // on a long-lived contract stays cheap.
+    // Resume where Dune's own coverage ends, never at the newest cached row:
+    // WS and pf rows land above blocks Dune hasn't ingested yet, and starting
+    // past them skipped those blocks for good. An untracked cache (from before
+    // coverage was recorded) re-checks a recent window for such holes.
     //
-    // We also pull the timestamp of that newest-cached row and feed it to the
-    // windowed query as a `block_date` partition hint — `starknet.calls` is
-    // partitioned by date, so without it Dune scans every partition to resolve
-    // the `block_number BETWEEN` range and fails with QUERY_STATE_FAILED on
-    // dense contracts. A 1-day UTC cushion guards against the cached row
-    // sitting right before a day boundary.
+    // The resume block's date is the windowed query's `block_date` partition
+    // hint: without it Dune scans every partition and fails on dense contracts.
     let cached_calls = ds.load_cached_address_calls(&address);
-    let newest_cached_pair = cached_calls
-        .iter()
-        .filter(|c| c.block_number > 0)
-        .max_by_key(|c| c.block_number)
-        .map(|c| (c.block_number, c.timestamp));
+    let resume_after = match ds.load_search_progress(&address, FilterKind::DuneCalls) {
+        Some((_, hi)) => Some(hi),
+        None => cached_calls
+            .iter()
+            .map(|c| c.block_number)
+            .max()
+            .filter(|b| *b > 0)
+            .map(|b| b.saturating_sub(LEGACY_CALLS_RECHECK_BLOCKS)),
+    };
 
-    // Warm cache: only fetch blocks newer than the highest cached row
-    // (TopDelta), reusing the cached row's date as a partition hint. One query,
-    // then emit. TopDelta needs neither the deploy floor nor a recent probe, so
-    // none is resolved on this path.
-    if newest_cached_pair.is_some() {
-        let plan = pick_calls_dune_query(newest_cached_pair, None, None);
+    if let Some(after) = resume_after {
+        let ts = ds.get_block(after).await.map(|b| b.timestamp).unwrap_or(0);
+        let plan = pick_calls_dune_query(Some((after, ts)), None, None);
+        let page = CallsPage {
+            from: Some(after + 1),
+            to: None,
+            limit: CONTRACT_CALL_LIMIT,
+            track: true,
+        };
         match run_calls_dune_plan(&plan, dune_client, address, CONTRACT_CALL_LIMIT).await {
             Ok(dune_calls) => {
-                // Warm path already loaded the cache for `newest_cached_pair`;
-                // hand it over so the merge doesn't re-read SQLite.
+                // Hand over the cache we already read so the merge doesn't
+                // re-read SQLite.
                 persist_and_emit_calls(
                     address,
                     dune_calls,
                     Some(cached_calls),
+                    Some(page),
                     abi_reg,
                     ds,
                     pf,
@@ -4804,8 +4890,24 @@ pub(super) async fn fetch_address_contract_calls(
                     calls = n,
                     "Calls: ladder rung paint"
                 );
+                // Date-floored: only a capped rung proves a block range.
+                let page = CallsPage {
+                    from: None,
+                    to: None,
+                    limit: CONTRACT_CALL_LIMIT,
+                    track: true,
+                };
                 persist_and_emit_calls(
-                    address, rows, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                    address,
+                    rows,
+                    None,
+                    Some(page),
+                    abi_reg,
+                    ds,
+                    pf,
+                    action_tx,
+                    nonce,
+                    class_hash,
                 )
                 .await;
                 if n >= CONTRACT_CALL_LIMIT as usize {
@@ -4856,8 +4958,27 @@ pub(super) async fn fetch_address_contract_calls(
                 calls = dune_calls.len(),
                 "Calls: deploy-scoped lifetime fallback complete"
             );
+            let from = match plan {
+                CallsDuneQuery::DeployScoped { from_block, .. } => Some(from_block),
+                _ => None,
+            };
+            let page = CallsPage {
+                from,
+                to: None,
+                limit: CONTRACT_CALL_LIMIT,
+                track: true,
+            };
             persist_and_emit_calls(
-                address, dune_calls, None, abi_reg, ds, pf, action_tx, nonce, class_hash,
+                address,
+                dune_calls,
+                None,
+                Some(page),
+                abi_reg,
+                ds,
+                pf,
+                action_tx,
+                nonce,
+                class_hash,
             )
             .await
         }
@@ -5056,6 +5177,7 @@ async fn persist_and_emit_calls(
     address: starknet::core::types::Felt,
     dune_calls: Vec<crate::data::types::ContractCallSummary>,
     preloaded_cache: Option<Vec<crate::data::types::ContractCallSummary>>,
+    page: Option<CallsPage>,
     abi_reg: &Arc<AbiRegistry>,
     ds: &Arc<dyn crate::data::DataSource>,
     pf: Option<&Arc<crate::data::pathfinder::PathfinderClient>>,
@@ -5063,6 +5185,9 @@ async fn persist_and_emit_calls(
     nonce: starknet::core::types::Felt,
     class_hash: Option<starknet::core::types::Felt>,
 ) {
+    let blocks: Vec<u64> = dune_calls.iter().map(|c| c.block_number).collect();
+    let coverage = page.and_then(|p| Some((p, calls_page_coverage(p, &blocks)?)));
+
     // Resolve selectors, dedupe, and backfill real sender + fee + timestamp.
     // Dune's `starknet.calls.caller_address` is the immediate caller (often a
     // router like Ekubo), not the outer tx sender; `enrich_dune_calls` replaces
@@ -5086,6 +5211,10 @@ async fn persist_and_emit_calls(
         tx_summaries: Vec::new(),
         contract_calls: calls,
     });
+    // After the rows, so the App's gap re-detect sees both.
+    if let Some((p, range)) = coverage {
+        record_calls_coverage(ds, action_tx, address, p, range);
+    }
 }
 
 /// Classify a single pf-query tx row as a meta-tx where `address` is the
@@ -6380,6 +6509,52 @@ mod tests {
     fn cold_cache_without_deploy_floor_falls_back_to_unwindowed() {
         let plan = pick_calls_dune_query(None, None, None);
         assert_eq!(plan, CallsDuneQuery::Unwindowed);
+    }
+
+    #[test]
+    fn calls_page_coverage_claims_only_what_rows_prove() {
+        let page = |from, to, limit| CallsPage {
+            from,
+            to,
+            limit,
+            track: true,
+        };
+        // Open-ended, below the limit: from the query floor to just below the
+        // newest row's block (Dune may still be ingesting it).
+        assert_eq!(
+            calls_page_coverage(page(Some(100), None, 500), &[300, 150]),
+            Some((100, 299))
+        );
+        // Capped: only the newest rows came back, so nothing below the oldest.
+        assert_eq!(
+            calls_page_coverage(page(Some(100), None, 3), &[300, 200, 150]),
+            Some((151, 299))
+        );
+        // No rows from an open-ended query proves nothing (Dune lag).
+        assert_eq!(calls_page_coverage(page(Some(100), None, 500), &[]), None);
+        // All rows in the floor block: nothing below the newest block to claim.
+        assert_eq!(
+            calls_page_coverage(page(Some(100), None, 500), &[100]),
+            None
+        );
+        // Bounded window: an empty or uncapped page covers the whole window.
+        assert_eq!(
+            calls_page_coverage(page(Some(100), Some(200), 500), &[]),
+            Some((100, 200))
+        );
+        assert_eq!(
+            calls_page_coverage(page(Some(100), Some(200), 2), &[180, 150]),
+            Some((151, 200))
+        );
+        // Date-floored window: the first block is unknown unless capped.
+        assert_eq!(
+            calls_page_coverage(page(None, None, 500), &[300, 150]),
+            None
+        );
+        assert_eq!(
+            calls_page_coverage(page(None, None, 2), &[300, 150]),
+            Some((151, 299))
+        );
     }
 
     #[test]

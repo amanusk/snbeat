@@ -473,6 +473,85 @@ pub struct TokenBalance {
     pub decimals: u8,
 }
 
+/// One ERC-20 `Transfer` where the viewed address is `from` or `to`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenTransfer {
+    pub token: Felt,
+    pub from: Felt,
+    pub to: Felt,
+    pub amount_low: u128,
+    pub amount_high: u128,
+    pub tx_hash: Felt,
+    pub block_number: u64,
+    #[serde(default)]
+    pub tx_index: u64,
+    /// Index within the transaction; `(tx_hash, event_index)` identifies the row.
+    pub event_index: u64,
+    #[serde(default)]
+    pub timestamp: u64,
+    /// Indexer-reported metadata; `None` for RPC/WS-sourced rows.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub decimals: Option<u8>,
+    /// USD value at transfer time, as reported by the indexer.
+    #[serde(default)]
+    pub value_usd: Option<f64>,
+}
+
+impl TokenTransfer {
+    pub fn key(&self) -> (Felt, u64) {
+        (self.tx_hash, self.event_index)
+    }
+
+    /// Decode a `Transfer` event. Cairo 1 tokens key `from`/`to`; legacy Cairo 0
+    /// tokens put `[from, to, low, high]` in data with the selector as the only key.
+    pub fn from_event(event: &SnEvent, tx_index: u64) -> Option<Self> {
+        let selector = Felt::from_hex(crate::data::pathfinder::TRANSFER_SELECTOR).ok()?;
+        if event.keys.first() != Some(&selector) {
+            return None;
+        }
+        let (from, to, low, high) = match event.keys.len() {
+            n if n >= 3 => (
+                event.keys[1],
+                event.keys[2],
+                *event.data.first()?,
+                event.data.get(1).copied().unwrap_or(Felt::ZERO),
+            ),
+            1 if event.data.len() >= 3 => (
+                event.data[0],
+                event.data[1],
+                event.data[2],
+                event.data.get(3).copied().unwrap_or(Felt::ZERO),
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            token: event.from_address,
+            from,
+            to,
+            amount_low: crate::utils::felt_to_u128(&low),
+            amount_high: crate::utils::felt_to_u128(&high),
+            tx_hash: event.transaction_hash,
+            block_number: event.block_number,
+            tx_index,
+            event_index: event.event_index,
+            timestamp: 0,
+            symbol: None,
+            decimals: None,
+            value_usd: None,
+        })
+    }
+
+    /// Newest-first ordering shared by the in-memory list and the cache.
+    pub fn cmp_newest_first(a: &Self, b: &Self) -> std::cmp::Ordering {
+        b.block_number
+            .cmp(&a.block_number)
+            .then(b.tx_index.cmp(&a.tx_index))
+            .then(b.event_index.cmp(&a.event_index))
+    }
+}
+
 /// A contract deployed with a given class hash (for the ClassInfo view).
 #[derive(Debug, Clone)]
 pub struct ClassContractEntry {

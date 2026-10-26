@@ -27,7 +27,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use starknet::core::types::{
-    AddressFilter, EmittedEventWithFinality, Felt, L2TransactionFinalityStatus,
+    AddressFilter, ConfirmedBlockId, EmittedEventWithFinality, Felt, L2TransactionFinalityStatus,
     L2TransactionStatus, SubscriptionId, Transaction,
     requests::{
         SubscribeEventsRequest, SubscribeNewHeadsRequest, SubscribeNewTransactionsRequest,
@@ -52,6 +52,11 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// Timeout waiting for subscription confirmation.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Heads and events arrive on separate subscriptions, so replay a few blocks
+/// before the last head seen.
+const RESUME_OVERLAP_BLOCKS: u64 = 5;
+/// Stay inside the node's replay window (the spec caps it at 1024 blocks).
+const MAX_RESUME_BLOCKS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -127,6 +132,35 @@ impl WsSubscriptionManager {
     }
 }
 
+/// What a reconnect re-subscribes, and from which block. Outlives connections.
+#[derive(Default)]
+struct Resume {
+    addresses: Vec<Felt>,
+    last_head: Option<u64>,
+}
+
+impl Resume {
+    fn add(&mut self, address: Felt) {
+        if !self.addresses.contains(&address) {
+            self.addresses.push(address);
+        }
+    }
+
+    fn remove(&mut self, address: Felt) {
+        self.addresses.retain(|a| *a != address);
+    }
+
+    /// Block to replay address events from after a reconnect; `None` means
+    /// the tip. `tip` clamps the replay to the node's window.
+    fn replay_from(&self, tip: Option<u64>) -> Option<u64> {
+        let from = self.last_head?.saturating_sub(RESUME_OVERLAP_BLOCKS);
+        Some(match tip {
+            Some(tip) => from.max(tip.saturating_sub(MAX_RESUME_BLOCKS)),
+            None => from,
+        })
+    }
+}
+
 /// Spawns the WebSocket subscription task.
 ///
 /// Returns a join handle (runs indefinitely with auto-reconnect) and a
@@ -139,13 +173,18 @@ pub fn spawn_ws_subscriber(
 ) -> (tokio::task::JoinHandle<()>, WsSubscriptionManager) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsCommand>();
     let manager = WsSubscriptionManager { cmd_tx };
+    let (block_tx, block_rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(fetch_new_blocks(
+        block_rx,
+        Arc::clone(&data_source),
+        response_tx.clone(),
+    ));
 
     let handle = tokio::spawn(async move {
         let mut delay = INITIAL_RECONNECT_DELAY;
         let mut consecutive_failures: u32 = 0;
         let mut cmd_rx = cmd_rx;
-        // Active address subscriptions to re-register on reconnect
-        let mut active_address_subs: Vec<WsCommand> = Vec::new();
+        let mut resume = Resume::default();
 
         loop {
             info!(url = %ws_url, "Connecting to WebSocket");
@@ -156,14 +195,17 @@ pub fn spawn_ws_subscriber(
                 &data_source,
                 &response_tx,
                 &mut cmd_rx,
-                &active_address_subs,
+                &mut resume,
                 &head_block,
+                &block_tx,
             )
             .await
             {
-                Ok(new_subs) => {
-                    // Clean exit — update our known active subs from what was active
-                    active_address_subs = new_subs;
+                Ok(true) => {
+                    info!("WsSubscriptionManager dropped, stopping WS task");
+                    return;
+                }
+                Ok(false) => {
                     info!("WebSocket stream ended cleanly");
                     delay = INITIAL_RECONNECT_DELAY;
                     consecutive_failures = 0;
@@ -214,6 +256,10 @@ struct ConnectionState {
     address_subs: HashMap<Felt, Vec<String>>,
     /// Pending subscribe requests: JSON-RPC request id → kind being subscribed to.
     pending: HashMap<u64, SubscriptionKind>,
+    /// Same request from the tip, re-sent if the node rejects a replay block.
+    fallbacks: HashMap<u64, SubscribeEventsRequest>,
+    /// Highest new-heads block received on this connection.
+    last_head: Option<u64>,
     /// Next JSON-RPC request ID to use.
     next_id: u64,
 }
@@ -224,6 +270,8 @@ impl ConnectionState {
             subscriptions: HashMap::new(),
             address_subs: HashMap::new(),
             pending: HashMap::new(),
+            fallbacks: HashMap::new(),
+            last_head: None,
             next_id: 2, // 1 is used for the initial NewHeads subscription
         }
     }
@@ -260,22 +308,6 @@ impl ConnectionState {
 
     fn subscription_kind(&self, sub_id: &str) -> Option<&SubscriptionKind> {
         self.subscriptions.get(sub_id)
-    }
-
-    /// Collect all active address subscriptions (for reconnect re-subscribe).
-    fn active_address_commands(&self) -> Vec<WsCommand> {
-        let mut seen = std::collections::HashSet::new();
-        let mut cmds = Vec::new();
-        for kind in self.subscriptions.values() {
-            if let Some(addr) = kind_address(kind)
-                && seen.insert(addr)
-            {
-                cmds.push(WsCommand::SubscribeEvents { address: addr });
-                cmds.push(WsCommand::SubscribeTransactions { address: addr });
-                cmds.push(WsCommand::SubscribeTransfers { address: addr });
-            }
-        }
-        cmds
     }
 }
 
@@ -324,14 +356,17 @@ struct JsonRpcError {
 // Internal: connect, subscribe, and run the select! loop
 // ---------------------------------------------------------------------------
 
+/// Runs one connection until it drops. `Ok(true)` means the manager was
+/// dropped (app shutdown) and the task should stop.
 async fn connect_and_run(
     ws_url: &str,
     data_source: &Arc<dyn DataSource>,
     response_tx: &mpsc::UnboundedSender<Action>,
     cmd_rx: &mut mpsc::UnboundedReceiver<WsCommand>,
-    initial_subs: &[WsCommand],
+    resume: &mut Resume,
     head_block: &Arc<super::HeadTracker>,
-) -> Result<Vec<WsCommand>, Box<dyn std::error::Error + Send + Sync>> {
+    block_tx: &mpsc::UnboundedSender<Value>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -347,9 +382,25 @@ async fn connect_and_run(
     state.pending.insert(1, SubscriptionKind::NewHeads);
     debug!("Sent starknet_subscribeNewHeads");
 
-    // Re-subscribe to any address subscriptions from the previous connection
-    for cmd in initial_subs {
-        send_subscribe_cmd(&mut write, &mut state, cmd).await?;
+    // Re-subscribe the previous connection's addresses, replaying the blocks
+    // the drop skipped so their events aren't lost.
+    let (tip, age) = head_block.read();
+    let from_block = resume.replay_from((tip > 0 && age < 300).then_some(tip));
+    if !resume.addresses.is_empty() {
+        info!(
+            ?from_block,
+            addresses = resume.addresses.len(),
+            "Re-subscribing address streams"
+        );
+    }
+    for &address in &resume.addresses {
+        for cmd in [
+            WsCommand::SubscribeEvents { address },
+            WsCommand::SubscribeTransactions { address },
+            WsCommand::SubscribeTransfers { address },
+        ] {
+            send_subscribe_cmd(&mut write, &mut state, &cmd, from_block).await?;
+        }
     }
 
     let _ = response_tx.send(ws_source_update(SourceStatus::Live));
@@ -361,7 +412,10 @@ async fn connect_and_run(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(&text, &mut write, &mut state, data_source, response_tx, head_block).await;
+                        handle_message(&text, &mut write, &mut state, data_source, response_tx, head_block, block_tx).await;
+                        if state.last_head > resume.last_head {
+                            resume.last_head = state.last_head;
+                        }
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = write.send(Message::Pong(data)).await;
@@ -385,6 +439,7 @@ async fn connect_and_run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(WsCommand::UnsubscribeAddress { address }) => {
+                        resume.remove(address);
                         let ids = state.remove_address(address);
                         for sub_id in ids {
                             let req_id = state.next_id();
@@ -402,21 +457,29 @@ async fn connect_and_run(
                         }
                     }
                     Some(cmd) => {
-                        if let Err(e) = send_subscribe_cmd(&mut write, &mut state, &cmd).await {
+                        if let Some(address) = command_address(&cmd) {
+                            resume.add(address);
+                        }
+                        if let Err(e) = send_subscribe_cmd(&mut write, &mut state, &cmd, None).await {
                             warn!(error = %e, "Failed to send subscribe command");
                         }
                     }
-                    None => {
-                        // Manager dropped — clean shutdown
-                        info!("WsSubscriptionManager dropped, stopping WS task");
-                        return Ok(Vec::new());
-                    }
+                    None => return Ok(true),
                 }
             }
         }
     }
 
-    Ok(state.active_address_commands())
+    Ok(false)
+}
+
+fn command_address(cmd: &WsCommand) -> Option<Felt> {
+    match cmd {
+        WsCommand::SubscribeEvents { address }
+        | WsCommand::SubscribeTransactions { address }
+        | WsCommand::SubscribeTransfers { address } => Some(*address),
+        WsCommand::UnsubscribeAddress { .. } => None,
+    }
 }
 
 /// Build a JSON-RPC request string.
@@ -431,27 +494,30 @@ fn build_subscribe_msg(id: u64, method: &str, params: Value) -> String {
 }
 
 /// Send a subscribe command over the WS write half and record it in state.
+/// `from_block` replays event subscriptions from that block.
 async fn send_subscribe_cmd(
     write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     state: &mut ConnectionState,
     cmd: &WsCommand,
+    from_block: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let block_id = from_block.map(ConfirmedBlockId::Number);
     match cmd {
         WsCommand::SubscribeEvents { address } => {
-            let id = state.next_id();
             let req = SubscribeEventsRequest {
                 from_address: Some(AddressFilter::Single(*address)),
                 keys: None,
-                block_id: None,
+                block_id,
                 finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
             };
-            let msg =
-                build_subscribe_msg(id, "starknet_subscribeEvents", serde_json::to_value(req)?);
-            write.send(Message::Text(msg.into())).await?;
-            state
-                .pending
-                .insert(id, SubscriptionKind::Events { address: *address });
-            debug!(address = %format!("{:#x}", address), "Sent starknet_subscribeEvents");
+            send_events_subscription(
+                write,
+                state,
+                SubscriptionKind::Events { address: *address },
+                req,
+            )
+            .await?;
+            debug!(address = %format!("{:#x}", address), ?from_block, "Sent starknet_subscribeEvents");
         }
         WsCommand::SubscribeTransactions { address } => {
             let id = state.next_id();
@@ -481,25 +547,49 @@ async fn send_subscribe_cmd(
             // `(tx_hash, event_index)`, so a tx with both legs still yields one
             // Calls row and two distinct Events rows.
             for keys in transfer_key_filters(*address) {
-                let id = state.next_id();
                 let req = SubscribeEventsRequest {
                     from_address: None,
                     keys: Some(keys),
-                    block_id: None,
+                    block_id,
                     finality_status: Some(L2TransactionFinalityStatus::AcceptedOnL2),
                 };
-                let msg =
-                    build_subscribe_msg(id, "starknet_subscribeEvents", serde_json::to_value(req)?);
-                write.send(Message::Text(msg.into())).await?;
-                state
-                    .pending
-                    .insert(id, SubscriptionKind::Transfers { address: *address });
+                send_events_subscription(
+                    write,
+                    state,
+                    SubscriptionKind::Transfers { address: *address },
+                    req,
+                )
+                .await?;
             }
-            debug!(address = %format!("{:#x}", address), "Sent keyed Transfer subscriptions (in+out)");
+            debug!(address = %format!("{:#x}", address), ?from_block, "Sent keyed Transfer subscriptions (in+out)");
         }
         WsCommand::UnsubscribeAddress { .. } => {
             // Handled at the call site with access to state.remove_address()
         }
+    }
+    Ok(())
+}
+
+/// Send one `starknet_subscribeEvents`. A replaying request keeps a tip-only
+/// copy so a rejected replay (e.g. too many blocks back) still subscribes.
+async fn send_events_subscription(
+    write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    state: &mut ConnectionState,
+    kind: SubscriptionKind,
+    req: SubscribeEventsRequest,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let id = state.next_id();
+    let msg = build_subscribe_msg(id, "starknet_subscribeEvents", serde_json::to_value(&req)?);
+    write.send(Message::Text(msg.into())).await?;
+    state.pending.insert(id, kind);
+    if req.block_id.is_some() {
+        state.fallbacks.insert(
+            id,
+            SubscribeEventsRequest {
+                block_id: None,
+                ..req
+            },
+        );
     }
     Ok(())
 }
@@ -515,6 +605,7 @@ async fn handle_message(
     data_source: &Arc<dyn DataSource>,
     response_tx: &mpsc::UnboundedSender<Action>,
     head_block: &Arc<super::HeadTracker>,
+    block_tx: &mpsc::UnboundedSender<Value>,
 ) {
     let raw: RawMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -528,11 +619,19 @@ async fn handle_message(
     if let Some(id_val) = &raw.id {
         let req_id = id_val.as_u64().unwrap_or(0);
         if let Some(err) = &raw.error {
+            let kind = state.pending.remove(&req_id);
+            if let (Some(kind), Some(req)) = (kind, state.fallbacks.remove(&req_id)) {
+                info!(req_id, error = %err.message, "Event replay rejected; subscribing from the tip");
+                if let Err(e) = send_events_subscription(write, state, kind, req).await {
+                    warn!(error = %e, "Failed to re-send event subscription");
+                }
+                return;
+            }
             warn!(req_id, error = %err.message, "Subscribe/unsubscribe failed");
-            state.pending.remove(&req_id);
             return;
         }
         if let Some(result) = &raw.result {
+            state.fallbacks.remove(&req_id);
             // Subscription confirmation: result is the subscription ID
             if let Ok(sub_id) = serde_json::from_value::<SubscriptionId>(result.clone()) {
                 debug!(req_id, sub_id = %sub_id.0, "Subscription confirmed");
@@ -579,7 +678,9 @@ async fn handle_message(
 
     match kind {
         SubscriptionKind::NewHeads => {
-            handle_new_heads(&params.result, data_source, response_tx, head_block).await;
+            if let Some(n) = handle_new_head(params.result, head_block, block_tx) {
+                state.last_head = state.last_head.max(Some(n));
+            }
         }
         SubscriptionKind::Events { address } => {
             handle_event(&params.result, address, data_source, response_tx);
@@ -605,38 +706,49 @@ async fn handle_message(
 // Per-notification-type handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_new_heads(
-    result: &Value,
-    data_source: &Arc<dyn DataSource>,
-    response_tx: &mpsc::UnboundedSender<Action>,
+/// Publish the head and queue its block fetch. Returns the block number.
+fn handle_new_head(
+    result: Value,
     head_block: &Arc<super::HeadTracker>,
-) {
-    let block_number = match result["block_number"].as_u64() {
-        Some(n) => n,
-        None => {
-            warn!("NewHeads notification missing block_number: {result}");
-            return;
-        }
+    block_tx: &mpsc::UnboundedSender<Value>,
+) -> Option<u64> {
+    let Some(block_number) = result["block_number"].as_u64() else {
+        warn!("NewHeads notification missing block_number: {result}");
+        return None;
     };
 
-    // Publish the head to shared state before any await so other network-task
-    // sub-paths can read it synchronously without an RPC round trip. The
-    // tracker also records the timestamp so stale-detection works after a
-    // WebSocket disconnect.
+    // Publish the head to shared state so other network-task sub-paths can
+    // read it synchronously without an RPC round trip. The tracker also
+    // records the timestamp so stale-detection works after a disconnect.
     head_block.update(block_number);
 
     info!(block_number, "New block header via WebSocket");
+    let _ = block_tx.send(result);
+    Some(block_number)
+}
 
-    // Fetch full block via RPC (WS header doesn't include tx data)
-    match data_source.get_block(block_number).await {
-        Ok(block) => {
-            let _ = response_tx.send(Action::NewBlock(block));
-        }
-        Err(e) => {
-            // Fallback: build a minimal block from the notification fields
-            warn!(block_number, error = %e, "Failed to fetch full block via RPC, using WS header");
-            if let Some(block) = block_from_raw(result) {
+/// Fetch each new head's full block in arrival order, off the WS read loop:
+/// a reader stalled on RPC gets its connection dropped by the node.
+async fn fetch_new_blocks(
+    mut block_rx: mpsc::UnboundedReceiver<Value>,
+    data_source: Arc<dyn DataSource>,
+    response_tx: mpsc::UnboundedSender<Action>,
+) {
+    while let Some(raw) = block_rx.recv().await {
+        let Some(block_number) = raw["block_number"].as_u64() else {
+            continue;
+        };
+        // WS header doesn't include tx data
+        match data_source.get_block(block_number).await {
+            Ok(block) => {
                 let _ = response_tx.send(Action::NewBlock(block));
+            }
+            Err(e) => {
+                // Fallback: build a minimal block from the notification fields
+                warn!(block_number, error = %e, "Failed to fetch full block via RPC, using WS header");
+                if let Some(block) = block_from_raw(&raw) {
+                    let _ = response_tx.send(Action::NewBlock(block));
+                }
             }
         }
     }
@@ -684,10 +796,8 @@ fn handle_event(
         "Received event via WS → cache + single broadcast"
     );
 
-    // Route through the shared event cache so subsequent helper calls
-    // (`ensure_address_events_window`, tab loaders) see the new event
-    // without a round trip.
-    data_source.merge_address_events(&address, std::slice::from_ref(&sn_event));
+    // Persist off the read loop: a slow reader makes the node drop the connection.
+    data_source.append_address_events(&address, std::slice::from_ref(&sn_event));
 
     // Single broadcast — the reducer fans out to Calls, MetaTxs classifier,
     // and Events tab. Avoids multiple per-tab streaming actions diverging.
@@ -730,7 +840,7 @@ fn transfer_selector() -> Felt {
 /// wildcarded, the outgoing filter pins slot 1 (`from`) with slot 2 (`to`)
 /// wildcarded — rather than relying on the server treating a missing trailing
 /// slot as a wildcard.
-fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
+pub(crate) fn transfer_key_filters(address: Felt) -> [Vec<Vec<Felt>>; 2] {
     let sel = transfer_selector();
     [
         vec![vec![sel], vec![], vec![address]], // to == address, any from
@@ -930,8 +1040,8 @@ mod tests {
     use starknet::core::types::{AddressFilter, ContractClass};
 
     /// Minimal DataSource stub for `handle_event` tests. The handler only
-    /// calls `merge_address_events` (default trait impl returns the input
-    /// unchanged) — all other methods are unused here.
+    /// calls `append_address_events` (default trait impl is a no-op) — all
+    /// other methods are unused here.
     struct TestDataSource;
 
     #[async_trait]
@@ -1379,6 +1489,132 @@ mod tests {
             ev.keys.first().copied(),
             Some(super::tx_executed_selector()),
             "first key must NOT match TRANSACTION_EXECUTED selector"
+        );
+    }
+
+    #[test]
+    fn resume_replays_from_last_head_within_node_window() {
+        let mut r = Resume::default();
+        assert_eq!(r.replay_from(Some(1_000)), None, "nothing seen yet → tip");
+
+        r.last_head = Some(10_000);
+        assert_eq!(r.replay_from(None), Some(10_000 - RESUME_OVERLAP_BLOCKS));
+        assert_eq!(
+            r.replay_from(Some(10_100)),
+            Some(10_000 - RESUME_OVERLAP_BLOCKS)
+        );
+        // A long outage is clamped to the replay window the node accepts.
+        assert_eq!(
+            r.replay_from(Some(50_000)),
+            Some(50_000 - MAX_RESUME_BLOCKS)
+        );
+
+        let a = Felt::from(1_u64);
+        r.add(a);
+        r.add(a);
+        assert_eq!(r.addresses, vec![a]);
+        r.remove(a);
+        assert!(r.addresses.is_empty());
+    }
+
+    /// In-memory write half: records every frame sent.
+    fn test_sink() -> (
+        impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+        futures::channel::mpsc::UnboundedReceiver<Message>,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Message>();
+        let sink = tx.sink_map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+        (sink, rx)
+    }
+
+    fn sent_json(rx: &mut futures::channel::mpsc::UnboundedReceiver<Message>) -> Value {
+        match rx.try_recv().expect("a frame was sent") {
+            Message::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_subscribe_carries_block_id() {
+        let (mut sink, mut rx) = test_sink();
+        let mut state = ConnectionState::new();
+        let address = Felt::from(0x49d_u64);
+        send_subscribe_cmd(
+            &mut sink,
+            &mut state,
+            &WsCommand::SubscribeTransfers { address },
+            Some(123),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            let v = sent_json(&mut rx);
+            assert_eq!(v["params"]["block_id"]["block_number"], 123);
+        }
+        assert_eq!(
+            state.fallbacks.len(),
+            2,
+            "each replaying request keeps a fallback"
+        );
+
+        // A plain subscribe has no block_id and no fallback.
+        let mut fresh = ConnectionState::new();
+        send_subscribe_cmd(
+            &mut sink,
+            &mut fresh,
+            &WsCommand::SubscribeEvents { address },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(sent_json(&mut rx)["params"].get("block_id").is_none());
+        assert!(fresh.fallbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_replay_resubscribes_from_tip() {
+        let (mut sink, mut rx) = test_sink();
+        let mut state = ConnectionState::new();
+        let address = Felt::from(0x49d_u64);
+        send_subscribe_cmd(
+            &mut sink,
+            &mut state,
+            &WsCommand::SubscribeEvents { address },
+            Some(123),
+        )
+        .await
+        .unwrap();
+        let req_id = sent_json(&mut rx)["id"].as_u64().unwrap();
+
+        let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (block_tx, _block_rx) = tokio::sync::mpsc::unbounded_channel();
+        let head = Arc::new(crate::network::HeadTracker::new());
+        let err = format!(
+            r#"{{"jsonrpc":"2.0","error":{{"code":68,"message":"Cannot go back more than 1024 blocks"}},"id":{req_id}}}"#
+        );
+        handle_message(
+            &err,
+            &mut sink,
+            &mut state,
+            &test_data_source(),
+            &resp_tx,
+            &head,
+            &block_tx,
+        )
+        .await;
+
+        let retry = sent_json(&mut rx);
+        assert_eq!(retry["method"], "starknet_subscribeEvents");
+        assert!(retry["params"].get("block_id").is_none());
+        let retry_id = retry["id"].as_u64().unwrap();
+        assert!(matches!(
+            state.pending.get(&retry_id),
+            Some(SubscriptionKind::Events { address: a }) if *a == address
+        ));
+        assert!(
+            state.fallbacks.is_empty(),
+            "the tip retry has no further fallback"
         );
     }
 }

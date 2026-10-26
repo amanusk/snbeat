@@ -13,14 +13,15 @@ snbeat is a local, terminal based, Block explorer for the Starknet Blockchain. I
   </tr>
 </table>
 
-- Privacy first: snbeat works best with a local RPC node, and can connect directly to the Pathfinder DB. Fully local. External APIs (Dune/Voyager) can be used but are optional. It is open source. Hack any feature you need.
+- Privacy first: snbeat works best with a local RPC node, and can connect directly to the Pathfinder DB. Fully local. External APIs (Dune/Voyager/Starkscan) can be used but are optional. It is open source. Hack any feature you need.
 - Cache first: Every fetched data is cached. Any data visited is cached for subsequent queries. No unnecessary indexing of data that is never used.
 - Recency first: See recent txs first, stream incoming txs, wait longer for full data fetch.
 - Vim!
 
 ## Features
 
-- **Data backends** - RPC, WS, Pathfinder query service, Dune and Voyager can be used simultaneously to fetch data
+- **Data backends** - RPC, WS, Pathfinder query service, Dune, Voyager and Starkscan can be used simultaneously to fetch data
+- **Token transfers** - every ERC-20 transfer in or out of an address with USD values, scanned newest-first and gap-filled on demand
 - **ABI-aware decoding** - decodes calldata, events, and multicalls using on-chain class ABIs
 - **Persistent local cache** - SQLite; blocks, transactions, receipts, and ABIs are cached for instant fetch on subsequent visits
 - **Live feed** - Stream new blocks, transactions, and events as they happen (requires WebSocket support from the RPC)
@@ -108,6 +109,8 @@ All variables are optional except `APP_RPC_URL`.
 | `APP_PATHFINDER_SERVICE_URL` | -                       | URL of a running `pf-query` instance           |
 | `VOYAGER_API_KEY`            | -                       | Voyager API key for address metadata           |
 | `DUNE_API_KEY`               | -                       | Dune Analytics API key                         |
+| `STARKSCAN_API_KEY`          | -                       | Starkscan API key (indexed token-transfer history for the address Transfers tab) |
+| `STARKSCAN_API_URL`          | `https://api.starkscan.co/v1/SN_MAIN` | Starkscan REST base URL, chain included |
 | `DUNE_PRIVATE_QUERIES`       | `true`                  | Mark dynamic Dune queries private; set `false` to dodge private-query quota |
 | `APP_USER_LABELS`            | `labels.toml`           | Path to your custom labels file                |
 | `APP_VIEWING_KEYS`           | `viewing_keys.toml`     | Path to privacy-pool viewing keys (held separately because they are secrets) |
@@ -215,12 +218,13 @@ Tabs cycle in this order with `Tab` / `Shift+Tab`: **Events / Calls / Transfers 
 
 ### Address Info
 
-Tabs cycle in this order with `Tab` / `Shift+Tab`: **Transactions / MetaTxs / Calls / Balances / Events / ClassHistory**.
+Tabs cycle in this order with `Tab` / `Shift+Tab`: **Transactions / MetaTxs / Calls / Balances / Transfers / Events / ClassHistory**.
 
 | Key | Action                                                              |
 | --- | ------------------------------------------------------------------- |
 | `r` | Refresh the address                                                 |
-| `v` | Enter visual mode on the header (class, deployer, deploy tx, block) |
+| `v` | Enter visual mode on the header (class, deployer, deploy tx, block); on the Transfers tab the selected row's tx, block, addresses and token join the cycle |
+| `Enter` | Open the selected tx; on a Transfers gap row, scan that block range (the bottom row searches further back) |
 
 ### Class Info
 
@@ -244,49 +248,50 @@ snbeat can draw data from multiple sources simultaneously. Configure only the on
 
 Each cell shows the fetch priority when multiple sources provide the same data (`1` = primary, `2` = fallback, etc.). A dash means the source cannot provide this data.
 
-| Data point                        | RPC            | WS       | PF-query         | Dune | Voyager |
-| --------------------------------- | -------------- | -------- | ---------------- | ---- | ------- |
-| **Blocks**                        |                |          |                  |      |         |
-| Latest block number               | 1 (poll)       | 1 (push) | -                | -    | -       |
-| Block header                      | 1              | -        | -                | -    | -       |
-| Block transactions                | 1              | -        | 1                | -    | -       |
-| **Transactions**                  |                |          |                  |      |         |
-| Transaction by hash               | 1              | -        | -                | -    | -       |
-| Transaction receipt (fee, status) | 1              | -        | -                | -    | -       |
-| Tx hash → block + index lookup    | -              | -        | 1                | -    | -       |
-| Calldata                          | 1              | -        | -                | -    | -       |
-| Multicall decoding                | 1              | -        | -                | -    | -       |
-| **Address - Account history**     |                |          |                  |      |         |
-| Account tx history                | 3 (events)     | -        | 1                | 2    | -       |
-| Nonce history (timeline)          | -              | -        | 1                | -    | -       |
-| Current nonce                     | 1              | -        | -                | -    | -       |
-| **Address - Contract history**    |                |          |                  |      |         |
-| Contract call history             | 2 (events)     | -        | -                | 1    | -       |
-| Contract events                   | 1              | -        | 1                | -    | -       |
-| Activity range probe              | -              | -        | -                | 1    | -       |
-| **Address - General**             |                |          |                  |      |         |
-| Class hash at address             | 1              | -        | -                | -    | -       |
-| Token balances (ETH, STRK, …)     | 1 (call)       | -        | -                | -    | -       |
-| Address label / metadata          | -              | -        | -                | -    | 1       |
-| Deploy tx detection               | 1              | -        | -                | -    | -       |
-| **Classes & ABIs**                |                |          |                  |      |         |
-| Class definition (Sierra ABI)     | 1              | -        | -                | -    | -       |
-| Selector → function/event name    | 1 (via ABI)    | -        | -                | -    | -       |
-| Class declaration block           | -              | -        | 1                | 2    | -       |
-| Declare tx info                   | 1 (block scan) | -        | 1 (block lookup) | 2    | -       |
-| Contracts deployed with class     | -              | -        | 1                | -    | -       |
-| Class upgrade history             | -              | -        | 1                | -    | -       |
-| **WebSocket subscriptions**       |                |          |                  |      |         |
-| New block headers (live)          | -              | 1        | -                | -    | -       |
-| Live events for address           | -              | 1        | -                | -    | -       |
-| Live transactions from address    | -              | 1        | -                | -    | -       |
-| **Search**                        |                |          |                  |      |         |
-| Block number lookup               | 1              | -        | -                | -    | -       |
-| Transaction hash search           | 1              | -        | -                | -    | -       |
-| Address resolution                | 1              | -        | -                | -    | -       |
-| Class hash search                 | 1              | -        | -                | -    | -       |
-| Block hash search                 | 1              | -        | -                | -    | -       |
-| Label / tag search                | -              | -        | -                | -    | -       |
+| Data point                        | RPC            | WS       | PF-query         | Dune | Voyager | Starkscan |
+| --------------------------------- | -------------- | -------- | ---------------- | ---- | ------- | --------- |
+| **Blocks**                        |                |          |                  |      |         |           |
+| Latest block number               | 1 (poll)       | 1 (push) | -                | -    | -       | -         |
+| Block header                      | 1              | -        | -                | -    | -       | -         |
+| Block transactions                | 1              | -        | 1                | -    | -       | -         |
+| **Transactions**                  |                |          |                  |      |         |           |
+| Transaction by hash               | 1              | -        | -                | -    | -       | -         |
+| Transaction receipt (fee, status) | 1              | -        | -                | -    | -       | -         |
+| Tx hash → block + index lookup    | -              | -        | 1                | -    | -       | -         |
+| Calldata                          | 1              | -        | -                | -    | -       | -         |
+| Multicall decoding                | 1              | -        | -                | -    | -       | -         |
+| **Address - Account history**     |                |          |                  |      |         |           |
+| Account tx history                | 3 (events)     | -        | 1                | 2    | -       | -         |
+| Nonce history (timeline)          | -              | -        | 1                | -    | -       | -         |
+| Current nonce                     | 1              | -        | -                | -    | -       | -         |
+| **Address - Contract history**    |                |          |                  |      |         |           |
+| Contract call history             | 2 (events)     | -        | -                | 1    | -       | -         |
+| Contract events                   | 1              | -        | 1                | -    | -       | -         |
+| Activity range probe              | -              | -        | -                | 1    | -       | -         |
+| **Address - General**             |                |          |                  |      |         |           |
+| Class hash at address             | 1              | -        | -                | -    | -       | -         |
+| Token balances (ETH, STRK, …)     | 1 (call)       | -        | -                | -    | -       | -         |
+| Token transfers in/out (+USD)     | 2 (events)     | 1 (push) | -                | -    | -       | 1         |
+| Address label / metadata          | -              | -        | -                | -    | 1       | -         |
+| Deploy tx detection               | 1              | -        | -                | -    | -       | -         |
+| **Classes & ABIs**                |                |          |                  |      |         |           |
+| Class definition (Sierra ABI)     | 1              | -        | -                | -    | -       | -         |
+| Selector → function/event name    | 1 (via ABI)    | -        | -                | -    | -       | -         |
+| Class declaration block           | -              | -        | 1                | 2    | -       | -         |
+| Declare tx info                   | 1 (block scan) | -        | 1 (block lookup) | 2    | -       | -         |
+| Contracts deployed with class     | -              | -        | 1                | -    | -       | -         |
+| Class upgrade history             | -              | -        | 1                | -    | -       | -         |
+| **WebSocket subscriptions**       |                |          |                  |      |         |           |
+| New block headers (live)          | -              | 1        | -                | -    | -       | -         |
+| Live events for address           | -              | 1        | -                | -    | -       | -         |
+| Live transactions from address    | -              | 1        | -                | -    | -       | -         |
+| **Search**                        |                |          |                  |      |         |           |
+| Block number lookup               | 1              | -        | -                | -    | -       | -         |
+| Transaction hash search           | 1              | -        | -                | -    | -       | -         |
+| Address resolution                | 1              | -        | -                | -    | -       | -         |
+| Class hash search                 | 1              | -        | -                | -    | -       | -         |
+| Block hash search                 | 1              | -        | -                | -    | -       | -         |
+| Label / tag search                | -              | -        | -                | -    | -       | -         |
 
 > **Note:** All fetched data is cached locally in SQLite. Subsequent visits serve from cache with no network round-trip. Label/tag search is powered by the local registry (`labels.toml` + built-in known addresses) with no external data source.
 
@@ -333,6 +338,20 @@ Connect to Voyager API to optionally get Voyager tags for addresses, classes etc
 ```
 VOYAGER_API_KEY=your_key_here
 ```
+
+### Starkscan API (optional)
+
+A Starkscan API key powers the address **Transfers** tab: every ERC-20 transfer where the address is sender or recipient, newest-first, with token symbol, decimals and the USD value at transfer time as indexed by Starkscan.
+
+The key is the only setting required. snbeat sends it as the `X-Starkscan-Api-Key` header to `https://api.starkscan.co/v1/SN_MAIN/address/{address}/transfers`:
+
+```
+STARKSCAN_API_KEY=your_key_here
+```
+
+`STARKSCAN_API_URL` overrides the REST base URL (chain included) and is only needed for a non-mainnet chain. The status bar shows `Starkscan` in green once the API answers.
+
+How the tab uses it: each fetch pulls at most 200 rows (two requests) and records the covered block range; the unscanned remainder shows as gap rows that load on `Enter`. The transfers route is rate limited to 60 requests per minute per key. Without a key the tab still works from RPC `Transfer` event scans, but old history is slow to walk and rows carry no USD value.
 
 ---
 

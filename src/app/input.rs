@@ -125,10 +125,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                     crate::app::AddressTab::Transactions => crate::app::AddressTab::MetaTxs,
                     crate::app::AddressTab::MetaTxs => crate::app::AddressTab::Calls,
                     crate::app::AddressTab::Calls => crate::app::AddressTab::Balances,
-                    crate::app::AddressTab::Balances => crate::app::AddressTab::Events,
+                    crate::app::AddressTab::Balances => crate::app::AddressTab::Transfers,
+                    crate::app::AddressTab::Transfers => crate::app::AddressTab::Events,
                     crate::app::AddressTab::Events => crate::app::AddressTab::ClassHistory,
                     crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Transactions,
                 };
+                app.maybe_fetch_address_transfers();
                 return maybe_dispatch_meta_txs_on_entry(app);
             }
             if app.current_view() == View::TxDetail {
@@ -144,9 +146,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
                     crate::app::AddressTab::MetaTxs => crate::app::AddressTab::Transactions,
                     crate::app::AddressTab::Calls => crate::app::AddressTab::MetaTxs,
                     crate::app::AddressTab::Balances => crate::app::AddressTab::Calls,
-                    crate::app::AddressTab::Events => crate::app::AddressTab::Balances,
+                    crate::app::AddressTab::Transfers => crate::app::AddressTab::Balances,
+                    crate::app::AddressTab::Events => crate::app::AddressTab::Transfers,
                     crate::app::AddressTab::ClassHistory => crate::app::AddressTab::Events,
                 };
+                app.maybe_fetch_address_transfers();
                 return maybe_dispatch_meta_txs_on_entry(app);
             }
             if app.current_view() == View::TxDetail {
@@ -207,11 +211,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Option<Action> {
             None
         }
 
-        // v: enter visual mode in AddressInfo header (cycle through class, deploy tx, block, deployer)
+        // v: enter visual mode in AddressInfo: header items (class, deploy tx,
+        // block, deployer) plus, on the Transfers tab, the selected row's items.
         KeyCode::Char('v') if app.current_view() == View::AddressInfo => {
+            app.address.build_nav_items();
             if !app.address.nav_items.is_empty() {
                 app.address.visual_mode = true;
-                app.address.nav_cursor = 0;
             }
             None
         }
@@ -813,6 +818,14 @@ fn handle_enter(app: &mut App) -> Option<Action> {
                 }
                 crate::app::AddressTab::Events => {
                     let hash = app.address.events.selected_item()?.raw.transaction_hash;
+                    return app.navigate_to(NavTarget::Transaction(hash));
+                }
+                crate::app::AddressTab::Transfers => {
+                    if app.address.transfer_gap_selected.is_some() {
+                        app.dispatch_address_transfer_gap_fill();
+                        return None;
+                    }
+                    let hash = app.address.transfers.selected_item()?.tx_hash;
                     return app.navigate_to(NavTarget::Transaction(hash));
                 }
                 crate::app::AddressTab::MetaTxs => {

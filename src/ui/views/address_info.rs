@@ -10,13 +10,14 @@ use crate::app::state::TxNavItem;
 use crate::app::views::address_info::{RenderedRow, rendered_row};
 use crate::app::{AddressTab, App};
 use crate::data::types::{
-    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, TokenBalance,
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, TokenBalance, TokenTransfer,
 };
 use crate::registry::AddressRegistry;
 use crate::ui::theme;
 use crate::ui::widgets::address_color::known_or_palette_style;
-use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, tx_hash_cell};
+use crate::ui::widgets::hex_display::{format_fri, format_strk_u128, short_address, tx_hash_cell};
 use crate::ui::widgets::list_window::ListWindow;
+use crate::ui::widgets::param_display::format_token_amount;
 use crate::ui::widgets::price;
 use crate::ui::widgets::{search_bar, status_bar};
 use crate::utils::{felt_to_u64, felt_to_u128};
@@ -135,6 +136,18 @@ fn events_count_fragment(app: &App) -> String {
     count_fragment(count, bound)
 }
 
+/// Count fragment for the Transfers tab: exact once the scanned ranges run
+/// contiguously from the deploy floor (no gap rows left), a lower bound before.
+fn transfers_count_fragment(app: &App) -> String {
+    let count = app.address.transfers.items.len() as u64;
+    let bound = if app.address.transfers_fully_scanned() {
+        CountBound::Exact(count)
+    } else {
+        CountBound::LowerBound { hint: None }
+    };
+    count_fragment(count, bound)
+}
+
 /// Count fragment for the MetaTxs tab.
 ///
 /// Per the revamp spec we can only claim [`CountBound::Exact`] once the
@@ -237,6 +250,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         AddressTab::MetaTxs => draw_meta_txs_tab(f, app, chunks[3]),
         AddressTab::Calls => draw_calls_tab(f, app, chunks[3]),
         AddressTab::Balances => draw_balances_tab(f, app, chunks[3], &private_holdings),
+        AddressTab::Transfers => draw_transfers_tab(f, app, chunks[3]),
         AddressTab::Events => draw_events_tab(f, app, chunks[3]),
         AddressTab::ClassHistory => draw_class_history_tab(f, app, chunks[3]),
     }
@@ -461,6 +475,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect, private_holdings: &[(Felt, u1
         Line::from(Span::raw(call_label)),
         balances_title,
         Line::from(Span::raw(format!(
+            " Transfers ({}) ",
+            transfers_count_fragment(app)
+        ))),
+        Line::from(Span::raw(format!(
             " Events ({}) ",
             events_count_fragment(app)
         ))),
@@ -471,8 +489,9 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect, private_holdings: &[(Felt, u1
         AddressTab::MetaTxs => 1,
         AddressTab::Calls => 2,
         AddressTab::Balances => 3,
-        AddressTab::Events => 4,
-        AddressTab::ClassHistory => 5,
+        AddressTab::Transfers => 4,
+        AddressTab::Events => 5,
+        AddressTab::ClassHistory => 6,
     };
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -1356,6 +1375,252 @@ fn balance_usd_value(app: &App, bal: &TokenBalance) -> Option<f64> {
     let raw = felt_to_u128(&bal.balance_raw) as f64;
     let scale = 10f64.powi(bal.decimals as i32);
     Some(raw / scale * price)
+}
+
+fn draw_transfers_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let header_area = Rect { height: 1, ..area };
+    let list_area = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("    Dir  ", theme::SUGGESTION_STYLE),
+        Span::styled("Token       ", theme::SUGGESTION_STYLE),
+        Span::styled("             Amount ", theme::SUGGESTION_STYLE),
+        Span::styled("          USD ", theme::SUGGESTION_STYLE),
+        Span::styled("From                    ", theme::SUGGESTION_STYLE),
+        Span::styled("To                      ", theme::SUGGESTION_STYLE),
+        Span::styled("Tx             ", theme::SUGGESTION_STYLE),
+        Span::styled("Block      ", theme::SUGGESTION_STYLE),
+        Span::styled("Age  ", theme::SUGGESTION_STYLE),
+    ]));
+    f.render_widget(header, header_area);
+
+    let gaps = app.address.transfer_gap_render_positions();
+    if app.address.transfers.items.is_empty() && gaps.is_empty() {
+        let msg = if app.address.fetching_transfers {
+            " Loading transfers..."
+        } else if app.address.transfers_dispatched {
+            " No transfers found"
+        } else {
+            " Press Tab to reach this tab; transfers load on entry"
+        };
+        f.render_widget(
+            Paragraph::new(msg).style(theme::SUGGESTION_STYLE).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::BORDER_STYLE),
+            ),
+            list_area,
+        );
+        return;
+    }
+
+    let registry = app.search_engine.as_ref().map(|e| e.registry());
+    app.address
+        .update_transfer_color_map(|addr| registry.is_some_and(|r| r.is_known(addr)));
+
+    let gap_suffix = if app.address.transfer_gaps.is_empty() {
+        String::new()
+    } else {
+        let n = app.address.transfer_gaps.len();
+        let plural = if n == 1 { "" } else { "s" };
+        if app.address.transfer_gaps.iter().any(|g| !g.fill_dispatched) {
+            format!(" — {n} gap{plural} (Enter on a gap row to load) ")
+        } else {
+            format!(" — {n} gap{plural} (loading…) ")
+        }
+    };
+    let count = transfers_count_fragment(app);
+    let title = if app.address.fetching_transfers {
+        format!(" Transfers ({count}) fetching...{gap_suffix} ")
+    } else {
+        format!(" Transfers ({count}){gap_suffix} ")
+    };
+    let block = list_block(title);
+
+    let viewed = app.address.context.unwrap_or(Felt::ZERO);
+    let selected_nav: Option<&TxNavItem> = if app.address.visual_mode {
+        app.address.nav_items.get(app.address.nav_cursor)
+    } else {
+        None
+    };
+    let window = ListWindow::new(
+        app.address.transfers.items.len() + gaps.len(),
+        app.address.transfer_list_rendered_selected_with(&gaps),
+        app.address.transfers_render_state.offset(),
+        block.inner(list_area).height as usize,
+    );
+    let items: Vec<ListItem> = window
+        .range()
+        .map(|r| match rendered_row(r, &gaps) {
+            RenderedRow::Gap(lo) => transfer_gap_row(app, lo),
+            RenderedRow::Item(idx) => transfer_row(
+                app,
+                registry,
+                viewed,
+                selected_nav,
+                &app.address.transfers.items[idx],
+            ),
+        })
+        .collect();
+    window.render(
+        f,
+        highlighted_list(items, block),
+        list_area,
+        &mut app.address.transfers_render_state,
+    );
+}
+
+fn transfer_gap_row(app: &App, lo_block: u64) -> ListItem<'static> {
+    let Some(g) = app
+        .address
+        .transfer_gaps
+        .iter()
+        .find(|g| g.lo_block == lo_block)
+    else {
+        return ListItem::new(Line::from(Span::styled(
+            " ── transfers gap ──",
+            theme::SUGGESTION_STYLE,
+        )));
+    };
+    let is_bottom = g.lo_block == app.address.transfer_floor();
+    let span = g.hi_block.saturating_sub(g.lo_block).saturating_add(1);
+    let what = if is_bottom {
+        format!(
+            "{span} older blocks unsearched (below block {})",
+            g.hi_block + 1
+        )
+    } else {
+        format!("transfers gap (blocks {}..{})", g.lo_block, g.hi_block)
+    };
+    let action = match (g.fill_dispatched, is_bottom) {
+        (true, _) => "loading…",
+        (false, true) => "press Enter to search further",
+        (false, false) => "press Enter to load",
+    };
+    ListItem::new(Line::from(Span::styled(
+        format!(" ── {what} — {action} ──"),
+        theme::SUGGESTION_STYLE,
+    )))
+}
+
+/// USD value at transfer time: the indexer's figure when it priced the row,
+/// else amount × DefiLlama's day price for tracked tokens.
+fn transfer_value_usd(app: &App, t: &TokenTransfer) -> Option<f64> {
+    if let Some(v) = t.value_usd {
+        return Some(v);
+    }
+    if t.amount_high != 0 || t.timestamp == 0 {
+        return None;
+    }
+    let decimals = app.token_decimals(&t.token).or(t.decimals)?;
+    let (_, historic) = price::token_prices(app, &t.token, Some(t.timestamp));
+    Some(t.amount_low as f64 / 10f64.powi(decimals as i32) * historic?)
+}
+
+/// Address cell for the From/To columns: the viewed address always takes the
+/// sender style so it is marked the same way in either column; the current
+/// visual-mode item overrides everything.
+fn transfer_party_style(
+    app: &App,
+    registry: Option<&AddressRegistry>,
+    viewed: Felt,
+    selected_nav: Option<&TxNavItem>,
+    addr: &Felt,
+) -> ratatui::style::Style {
+    if matches!(selected_nav, Some(TxNavItem::Address(a)) if a == addr) {
+        return theme::VISUAL_SELECTED_STYLE;
+    }
+    if *addr == viewed {
+        return theme::TX_SENDER_STYLE;
+    }
+    known_or_palette_style(addr, registry, &app.address.transfer_color_map)
+}
+
+fn transfer_row(
+    app: &App,
+    registry: Option<&AddressRegistry>,
+    viewed: Felt,
+    selected_nav: Option<&TxNavItem>,
+    t: &TokenTransfer,
+) -> ListItem<'static> {
+    let (dir, dir_style) = match (t.from == viewed, t.to == viewed) {
+        (true, true) => ("SELF", theme::SUGGESTION_STYLE),
+        (false, true) => ("IN", theme::STATUS_OK),
+        (true, false) => ("OUT", theme::STATUS_REVERTED),
+        (false, false) => ("?", theme::SUGGESTION_STYLE),
+    };
+
+    let token_label = app
+        .token_symbol(&t.token)
+        .or_else(|| t.symbol.clone())
+        .unwrap_or_else(|| short_address(&t.token));
+    let token_style = if matches!(selected_nav, Some(TxNavItem::Address(a)) if *a == t.token) {
+        theme::VISUAL_SELECTED_STYLE
+    } else if registry.is_some_and(|r| r.is_known(&t.token)) {
+        theme::LABEL_STYLE
+    } else {
+        theme::NORMAL_STYLE
+    };
+
+    let amount = match app.token_decimals(&t.token).or(t.decimals) {
+        Some(d) => format_token_amount(t.amount_low, t.amount_high, d),
+        None if t.amount_high == 0 => t.amount_low.to_string(),
+        None => format!("0x{:x}{:032x}", t.amount_high, t.amount_low),
+    };
+
+    let usd = transfer_value_usd(app, t)
+        .map(price::format_usd)
+        .unwrap_or_default();
+
+    let from_style = transfer_party_style(app, registry, viewed, selected_nav, &t.from);
+    let to_style = transfer_party_style(app, registry, viewed, selected_nav, &t.to);
+
+    let tx_label = app.resolve_tx(&t.tx_hash);
+    let tx_style = if matches!(selected_nav, Some(TxNavItem::Transaction(h)) if *h == t.tx_hash) {
+        theme::VISUAL_SELECTED_STYLE
+    } else if tx_label.is_some() {
+        theme::LABEL_STYLE
+    } else {
+        theme::TX_HASH_STYLE
+    };
+    let block_style = if matches!(selected_nav, Some(TxNavItem::Block(b)) if *b == t.block_number) {
+        theme::VISUAL_SELECTED_STYLE
+    } else {
+        theme::BLOCK_NUMBER_STYLE
+    };
+
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {dir:<4} "), dir_style),
+        Span::styled(
+            format!("{:<12}", truncate_to(&token_label, 11)),
+            token_style,
+        ),
+        Span::styled(
+            format!("{:>19} ", truncate_to(&amount, 19)),
+            theme::TX_HASH_STYLE,
+        ),
+        Span::styled(
+            format!("{:>13} ", truncate_to(&usd, 13)),
+            theme::SUGGESTION_STYLE,
+        ),
+        Span::styled(
+            format!("{:<24}", truncate_to(&app.format_address(&t.from), 23)),
+            from_style,
+        ),
+        Span::styled(
+            format!("{:<24}", truncate_to(&app.format_address(&t.to), 23)),
+            to_style,
+        ),
+        Span::styled(
+            format!("{:<15}", tx_hash_cell(tx_label, &t.tx_hash)),
+            tx_style,
+        ),
+        Span::styled(format!("{:<11}", t.block_number), block_style),
+        Span::styled(format_age(t.timestamp), theme::BLOCK_AGE_STYLE),
+    ]))
 }
 
 fn draw_events_tab(f: &mut Frame, app: &mut App, area: Rect) {

@@ -8,7 +8,7 @@ use crate::app::AddressTab;
 use crate::app::actions::Source;
 use crate::app::state::TxNavItem;
 use crate::data::types::{
-    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnAddressInfo,
+    AddressTxSummary, ContractCallSummary, MetaTxIntenderSummary, SnAddressInfo, TokenTransfer,
 };
 use crate::decode::events::DecodedEvent;
 use crate::network::dune::AddressActivityProbe;
@@ -121,6 +121,43 @@ pub struct UnfilledCallGap {
     pub fill_dispatched: bool,
 }
 
+/// Unscanned block range in the Transfers tab: the complement of the scanned
+/// ranges, down to the deploy floor. Renders as a row; Enter dispatches a fill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferGap {
+    pub lo_block: u64,
+    pub hi_block: u64,
+    pub fill_dispatched: bool,
+}
+
+/// Gaps between `ranges` (sorted, disjoint) and below the lowest one down to
+/// `floor`, oldest first. Nothing scanned yet ⇒ no gaps (the top-delta fetch
+/// is still pending).
+pub fn scanned_range_gaps(ranges: &[(u64, u64)], floor: u64) -> Vec<TransferGap> {
+    let mut out = Vec::new();
+    let Some(&(min_lo, _)) = ranges.first() else {
+        return out;
+    };
+    if min_lo > floor {
+        out.push(TransferGap {
+            lo_block: floor,
+            hi_block: min_lo - 1,
+            fill_dispatched: false,
+        });
+    }
+    for w in ranges.windows(2) {
+        let (a_hi, b_lo) = (w[0].1, w[1].0);
+        if b_lo > a_hi + 1 {
+            out.push(TransferGap {
+                lo_block: a_hi + 1,
+                hi_block: b_lo - 1,
+                fill_dispatched: false,
+            });
+        }
+    }
+    out
+}
+
 /// All state related to the address info view.
 pub struct AddressInfoState {
     pub info: Option<SnAddressInfo>,
@@ -203,13 +240,33 @@ pub struct AddressInfoState {
     /// list (calls + optional gap rows), so it diverges from `calls.state`
     /// whenever a gap is showing. Mirrors `txs_render_state`.
     pub calls_render_state: ratatui::widgets::ListState,
-    /// Block ranges `[lo, hi]` we have *fully* scanned for calls via on-demand
-    /// gap fills (a windowed query that returned below its limit ⇒ the whole
-    /// range is covered). Unlike nonces, a block-range hole doesn't prove
+    /// Block ranges `[lo, hi]` we have *fully* scanned for calls (Dune pages
+    /// and on-demand gap fills). Unlike nonces, a block-range hole doesn't prove
     /// missing calls, so once we've scanned a range and found it sparse we must
     /// remember that — otherwise `detect_unfilled_call_gaps` would re-surface
     /// the same quiet stretch as a gap forever. Merged intervals, kept small.
     pub scanned_call_ranges: Vec<(u64, u64)>,
+    /// Lowest block of the region Dune pages have been tracking. Above it,
+    /// every block not in `scanned_call_ranges` is a gap, however short.
+    pub call_tracked_from: Option<u64>,
+    /// ERC-20 transfers touching this address (Transfers tab), newest-first.
+    pub transfers: StatefulList<TokenTransfer>,
+    /// `(tx_hash, event_index)` → block of each row: O(1) dedup on merge.
+    pub transfer_keys: HashMap<(Felt, u64), u64>,
+    /// Fully scanned `[lo, hi]` block ranges; gaps are their complement.
+    pub transfer_scanned_ranges: Vec<(u64, u64)>,
+    pub transfer_gaps: Vec<TransferGap>,
+    /// `Some(lo_block)` when a transfer-gap row is the active selection.
+    pub transfer_gap_selected: Option<u64>,
+    /// ListState for the rendered (rows + gap rows) Transfers list.
+    pub transfers_render_state: ratatui::widgets::ListState,
+    /// The on-entry top-delta fetch has been dispatched for this address.
+    pub transfers_dispatched: bool,
+    pub fetching_transfers: bool,
+    /// Counterparty color slots; the viewed address is pinned to the sender style.
+    pub transfer_color_map: AddressColorMap,
+    pub transfer_counts: HashMap<Felt, usize>,
+    pub transfer_color_processed_len: usize,
     /// Meta-transactions (SNIP-9 outside executions) where this address is the intender.
     pub meta_txs: StatefulList<MetaTxIntenderSummary>,
     /// Pagination flag for MetaTxs tab (prevent duplicate fetches).
@@ -311,6 +368,18 @@ impl Default for AddressInfoState {
             call_gap_selected: None,
             calls_render_state: ratatui::widgets::ListState::default(),
             scanned_call_ranges: Vec::new(),
+            call_tracked_from: None,
+            transfers: StatefulList::new(),
+            transfer_keys: HashMap::new(),
+            transfer_scanned_ranges: Vec::new(),
+            transfer_gaps: Vec::new(),
+            transfer_gap_selected: None,
+            transfers_render_state: ratatui::widgets::ListState::default(),
+            transfers_dispatched: false,
+            fetching_transfers: false,
+            transfer_color_map: AddressColorMap::new(),
+            transfer_counts: HashMap::new(),
+            transfer_color_processed_len: 0,
             meta_txs: StatefulList::new(),
             fetching_meta_txs: false,
             meta_tx_cursor_block: None,
@@ -362,6 +431,18 @@ impl AddressInfoState {
         self.call_gap_selected = None;
         self.calls_render_state = ratatui::widgets::ListState::default();
         self.scanned_call_ranges.clear();
+        self.call_tracked_from = None;
+        self.transfers = StatefulList::new();
+        self.transfer_keys.clear();
+        self.transfer_scanned_ranges.clear();
+        self.transfer_gaps.clear();
+        self.transfer_gap_selected = None;
+        self.transfers_render_state = ratatui::widgets::ListState::default();
+        self.transfers_dispatched = false;
+        self.fetching_transfers = false;
+        self.transfer_color_map = AddressColorMap::new();
+        self.transfer_counts.clear();
+        self.transfer_color_processed_len = 0;
         self.meta_txs = StatefulList::new();
         self.fetching_meta_txs = false;
         self.meta_tx_cursor_block = None;
@@ -497,8 +578,36 @@ impl AddressInfoState {
             }
         }
 
+        // Transfers tab: the selected row's tx, block, counterparties and
+        // token join the header items; the cursor starts on the row.
+        let header_len = items.len();
+        if self.tab == AddressTab::Transfers
+            && let Some(row) = self.transfers.selected_item()
+        {
+            for item in [
+                TxNavItem::Transaction(row.tx_hash),
+                TxNavItem::Block(row.block_number),
+                TxNavItem::Address(row.from),
+                TxNavItem::Address(row.to),
+                TxNavItem::Address(row.token),
+            ] {
+                let skip = match &item {
+                    TxNavItem::Address(a) => Some(*a) == self.context || *a == Felt::ZERO,
+                    TxNavItem::Block(b) => *b == 0,
+                    _ => false,
+                };
+                if !skip && !items.contains(&item) {
+                    items.push(item);
+                }
+            }
+        }
+
+        self.nav_cursor = if items.len() > header_len {
+            header_len
+        } else {
+            0
+        };
         self.nav_items = items;
-        self.nav_cursor = 0;
     }
 
     /// Step the visual-mode cursor by `delta` (wrapping).
@@ -900,49 +1009,61 @@ impl AddressInfoState {
 
     // ---- Calls-tab block-range gaps (mirror the nonce-gap machinery) ----
 
-    /// Scan the current calls list for block-range holes wider than
-    /// [`CALL_GAP_SPAN_BLOCKS`]. The Calls-tab analogue of
-    /// `detect_unfilled_gaps`, keyed on block numbers (incoming calls have no
-    /// per-address nonce sequence). Distinct block numbers are considered, so
-    /// several calls sharing a block never fabricate a zero-span gap. Sorted by
-    /// `lo_block` ascending for stable render/test order.
+    /// Calls-tab block-range holes, sorted by `lo_block`. A gap's bounds are
+    /// the blocks bordering the hole; a fill rescans `[lo_block, hi_block]`.
+    ///
+    /// Inside the Dune-tracked region (from `call_tracked_from` up) every block
+    /// missing from `scanned_call_ranges` is a gap. Below it only holes between
+    /// calls wider than [`CALL_GAP_SPAN_BLOCKS`] are: a quiet stretch doesn't
+    /// prove a call is missing.
     pub fn detect_unfilled_call_gaps(&self) -> Vec<UnfilledCallGap> {
-        let mut blocks: Vec<u64> = self
-            .calls
-            .items
-            .iter()
-            .map(|c| c.block_number)
-            .filter(|b| *b > 0)
-            .collect();
-        if blocks.len() < 2 {
-            return Vec::new();
-        }
-        blocks.sort_unstable();
-        blocks.dedup();
-
+        let gap = |lo_block, hi_block| UnfilledCallGap {
+            lo_block,
+            hi_block,
+            fill_dispatched: false,
+        };
+        let tracked_from = self.call_tracked_from.unwrap_or(u64::MAX);
         let mut out = Vec::new();
-        for w in blocks.windows(2) {
-            let lo_block = w[0];
-            let hi_block = w[1];
-            if hi_block.saturating_sub(lo_block) <= CALL_GAP_SPAN_BLOCKS {
+
+        // `calls.items` is block-descending, so walk it oldest-first.
+        let mut prev: Option<u64> = None;
+        for b in self.calls.items.iter().rev().map(|c| c.block_number) {
+            if b == 0 || prev == Some(b) {
                 continue;
             }
-            // Suppress ranges we've already fully scanned — the hole is real
-            // (no calls there), not an unfetched window, so don't nag the user.
-            if self
-                .scanned_call_ranges
-                .iter()
-                .any(|(rlo, rhi)| *rlo <= lo_block && hi_block <= *rhi)
+            if let Some(lo_block) = prev
+                && b <= tracked_from
+                && b - lo_block > CALL_GAP_SPAN_BLOCKS
+                && !self
+                    .scanned_call_ranges
+                    .iter()
+                    .any(|(rlo, rhi)| *rlo <= lo_block && b <= *rhi)
             {
-                continue;
+                out.push(gap(lo_block, b));
             }
-            out.push(UnfilledCallGap {
-                lo_block,
-                hi_block,
-                fill_dispatched: false,
-            });
+            prev = Some(b);
         }
+
+        if let Some(t) = self.call_tracked_from {
+            // First block of the tracked region not yet known to be scanned.
+            let mut cursor = t;
+            for &(rlo, rhi) in &self.scanned_call_ranges {
+                if rhi < cursor {
+                    continue;
+                }
+                if rlo > cursor {
+                    out.push(gap(cursor.saturating_sub(1), rlo));
+                }
+                cursor = cursor.max(rhi.saturating_add(1));
+            }
+        }
+        out.sort_by_key(|g| g.lo_block);
         out
+    }
+
+    /// Lower the Dune-tracked region's floor to `from`.
+    pub fn note_call_tracked_from(&mut self, from: u64) {
+        self.call_tracked_from = Some(self.call_tracked_from.map_or(from, |t| t.min(from)));
     }
 
     /// Record a `[lo, hi]` block range as fully scanned for calls, merging it
@@ -983,18 +1104,20 @@ impl AddressInfoState {
 
     /// Render-order positions for the call-gap rows: `(call_idx, lo_block)`
     /// sorted by `call_idx` ascending. The calls list is block-descending, so
-    /// each gap renders immediately above the first (topmost) call whose block
-    /// equals `lo_block`. Mirrors `gap_render_positions`.
+    /// each gap renders just below the calls at or above its `hi_block`.
     pub fn call_gap_render_positions(&self) -> Vec<(usize, u64)> {
         let mut out: Vec<(usize, u64)> = self
             .call_gaps
             .iter()
-            .filter_map(|g| {
-                Self::first_index_with_key(&self.calls.items, |c| c.block_number, g.lo_block)
-                    .map(|p| (p, g.lo_block))
+            .map(|g| {
+                let p = self
+                    .calls
+                    .items
+                    .partition_point(|c| c.block_number >= g.hi_block);
+                (p, g.lo_block)
             })
             .collect();
-        out.sort_by_key(|(p, _)| *p);
+        out.sort_by_key(|(p, lo)| (*p, std::cmp::Reverse(*lo)));
         out
     }
 
@@ -1095,6 +1218,250 @@ impl AddressInfoState {
     }
 }
 
+impl AddressInfoState {
+    // ---- Transfers tab ----
+
+    /// Merge rows newest-first, deduping on `(tx_hash, event_index)`. A row
+    /// already present is upgraded field-wise (WS rows arrive without
+    /// tx_index / timestamp / token metadata). Returns the number of new rows.
+    pub fn merge_transfers(&mut self, incoming: Vec<TokenTransfer>) -> usize {
+        let mut added = 0;
+        for t in incoming {
+            if self.transfer_keys.contains_key(&t.key()) {
+                if let Some(i) = self.transfer_position(&t)
+                    && upgrade_transfer(&mut self.transfers.items[i], &t)
+                {
+                    // tx_index changed: re-slot so same-block order stays sorted.
+                    let row = self.transfers.items.remove(i);
+                    self.insert_transfer_sorted(row);
+                }
+                continue;
+            }
+            self.transfer_keys.insert(t.key(), t.block_number);
+            self.insert_transfer_sorted(t);
+            added += 1;
+        }
+        added
+    }
+
+    fn insert_transfer_sorted(&mut self, t: TokenTransfer) {
+        let idx = self.transfers.items.partition_point(|x| {
+            TokenTransfer::cmp_newest_first(x, &t) == std::cmp::Ordering::Less
+        });
+        self.transfers.items.insert(idx, t);
+    }
+
+    fn transfer_position(&self, t: &TokenTransfer) -> Option<usize> {
+        let block = *self.transfer_keys.get(&t.key())?;
+        let start = Self::first_index_with_key(&self.transfers.items, |r| r.block_number, block)?;
+        self.transfers.items[start..]
+            .iter()
+            .take_while(|r| r.block_number == block)
+            .position(|r| r.key() == t.key())
+            .map(|i| start + i)
+    }
+
+    pub fn note_transfer_scanned_range(&mut self, lo: u64, hi: u64) {
+        crate::utils::merge_block_interval(&mut self.transfer_scanned_ranges, lo, hi);
+    }
+
+    /// Lowest block a transfers scan needs to reach: the deploy block when
+    /// known, else genesis.
+    pub fn transfer_floor(&self) -> u64 {
+        self.deployment
+            .as_ref()
+            .map(|d| d.block_number)
+            .unwrap_or(0)
+    }
+
+    /// True once the scanned ranges run contiguously from the floor up: the
+    /// row count is then exact for everything below the top scanned block.
+    pub fn transfers_fully_scanned(&self) -> bool {
+        !self.transfer_scanned_ranges.is_empty() && self.transfer_gaps.is_empty()
+    }
+
+    /// Re-derive gaps from the scanned ranges. `fill_dispatched` survives only
+    /// for a gap whose bounds are unchanged (a shrunk gap means its fill landed
+    /// and the user may press Enter again). Drops a stale selection.
+    pub fn refresh_transfer_gaps(&mut self) {
+        let inflight: HashMap<u64, u64> = self
+            .transfer_gaps
+            .iter()
+            .filter(|g| g.fill_dispatched)
+            .map(|g| (g.lo_block, g.hi_block))
+            .collect();
+        let mut next = scanned_range_gaps(&self.transfer_scanned_ranges, self.transfer_floor());
+        for g in next.iter_mut() {
+            g.fill_dispatched = inflight.get(&g.lo_block) == Some(&g.hi_block);
+        }
+        self.transfer_gaps = next;
+        if let Some(sel) = self.transfer_gap_selected
+            && !self.transfer_gaps.iter().any(|g| g.lo_block == sel)
+        {
+            self.transfer_gap_selected = None;
+        }
+    }
+
+    /// Land the selection somewhere useful after the first data arrives: the
+    /// top row, or the only gap row when nothing has been found yet.
+    pub fn ensure_transfer_selection(&mut self) {
+        if self.transfer_gap_selected.is_some() || self.transfers.state.selected().is_some() {
+            return;
+        }
+        if !self.transfers.items.is_empty() {
+            self.transfers.select_first();
+        } else if let Some((_, lo)) = self.transfer_gap_render_positions().first() {
+            self.transfer_gap_selected = Some(*lo);
+        }
+    }
+
+    /// `(row_idx, lo_block)` per gap sorted by row index: a gap renders above
+    /// the first row older than it (after the last row for the bottom gap).
+    /// Gaps sharing a position render newest first.
+    pub fn transfer_gap_render_positions(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = self
+            .transfer_gaps
+            .iter()
+            .map(|g| {
+                let p = self
+                    .transfers
+                    .items
+                    .partition_point(|r| r.block_number > g.hi_block);
+                (p, g.lo_block)
+            })
+            .collect();
+        out.sort_by_key(|(p, lo)| (*p, std::cmp::Reverse(*lo)));
+        out
+    }
+
+    pub fn selected_transfer_gap(&self) -> Option<&TransferGap> {
+        let lo = self.transfer_gap_selected?;
+        self.transfer_gaps.iter().find(|g| g.lo_block == lo)
+    }
+
+    pub fn transfer_list_rendered_selected_with(&self, gaps: &[(usize, u64)]) -> Option<usize> {
+        if let Some(sel_lo) = self.transfer_gap_selected
+            && let Some(g_idx) = gaps.iter().position(|(_, lo)| *lo == sel_lo)
+        {
+            return Some(Self::gap_rendered_idx(gaps, g_idx));
+        }
+        let i = self.transfers.state.selected()?;
+        Some(Self::tx_pos_to_rendered(i, gaps))
+    }
+
+    fn transfer_current_rendered(&self, gaps: &[(usize, u64)]) -> usize {
+        self.transfer_list_rendered_selected_with(gaps)
+            .unwrap_or_else(|| Self::tx_pos_to_rendered(0, gaps))
+    }
+
+    fn apply_transfer_rendered(&mut self, r: usize, gaps: &[(usize, u64)]) {
+        match rendered_row(r, gaps) {
+            RenderedRow::Gap(lo) => self.transfer_gap_selected = Some(lo),
+            RenderedRow::Item(i) => {
+                self.transfer_gap_selected = None;
+                self.transfers.state.select(Some(i));
+            }
+        }
+    }
+
+    /// Move by `delta` rendered rows, clamping on the first gap row crossed.
+    /// Unlike the Calls list this works with zero rows: a lone gap row must
+    /// still be selectable so Enter can start the first scan.
+    fn transfer_list_step(&mut self, delta: i64) {
+        let gaps = self.transfer_gap_render_positions();
+        let len = self.transfers.items.len() + gaps.len();
+        if len == 0 || delta == 0 {
+            return;
+        }
+        let cur = self.transfer_current_rendered(&gaps);
+        let target = ((cur as i64) + delta).clamp(0, len as i64 - 1) as usize;
+        let final_r = Self::first_gap_crossed(&gaps, cur, target).unwrap_or(target);
+        self.apply_transfer_rendered(final_r, &gaps);
+    }
+
+    pub fn transfer_list_next(&mut self) {
+        self.transfer_list_step(1);
+    }
+
+    pub fn transfer_list_previous(&mut self) {
+        self.transfer_list_step(-1);
+    }
+
+    pub fn transfer_list_scroll_by(&mut self, delta: i64) {
+        self.transfer_list_step(delta);
+    }
+
+    pub fn transfer_list_select_first(&mut self) {
+        let gaps = self.transfer_gap_render_positions();
+        if self.transfers.items.len() + gaps.len() == 0 {
+            return;
+        }
+        let cur = self.transfer_current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, 0).unwrap_or(0);
+        self.apply_transfer_rendered(final_r, &gaps);
+    }
+
+    pub fn transfer_list_select_last(&mut self) {
+        let gaps = self.transfer_gap_render_positions();
+        let len = self.transfers.items.len() + gaps.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.transfer_current_rendered(&gaps);
+        let final_r = Self::first_gap_crossed(&gaps, cur, len - 1).unwrap_or(len - 1);
+        self.apply_transfer_rendered(final_r, &gaps);
+    }
+
+    /// Palette slots for counterparties seen twice or more; the viewed address
+    /// is pinned to the sender style so both columns mark it the same way.
+    pub fn update_transfer_color_map(&mut self, is_known: impl Fn(&Felt) -> bool) {
+        if self.transfer_color_processed_len == self.transfers.items.len() {
+            return;
+        }
+        let Some(viewed) = self.context else {
+            return;
+        };
+        self.transfer_color_map.set_sender(viewed);
+        self.transfer_counts.clear();
+        for t in &self.transfers.items {
+            for a in [t.from, t.to] {
+                if a == viewed {
+                    continue;
+                }
+                let count = self.transfer_counts.entry(a).or_insert(0);
+                *count += 1;
+                if *count == 2 && !is_known(&a) {
+                    self.transfer_color_map.register(a);
+                }
+            }
+        }
+        self.transfer_color_processed_len = self.transfers.items.len();
+    }
+}
+
+/// Fill the zero/None fields of `existing` from `incoming`. Returns true when
+/// `tx_index` changed (the row's sort position may have moved).
+fn upgrade_transfer(existing: &mut TokenTransfer, incoming: &TokenTransfer) -> bool {
+    let mut reslot = false;
+    if existing.tx_index == 0 && incoming.tx_index != 0 {
+        existing.tx_index = incoming.tx_index;
+        reslot = true;
+    }
+    if existing.timestamp == 0 {
+        existing.timestamp = incoming.timestamp;
+    }
+    if existing.symbol.is_none() {
+        existing.symbol.clone_from(&incoming.symbol);
+    }
+    if existing.decimals.is_none() {
+        existing.decimals = incoming.decimals;
+    }
+    if existing.value_usd.is_none() {
+        existing.value_usd = incoming.value_usd;
+    }
+    reslot
+}
+
 /// What a gap-aware rendered index points at: a gap row (keyed by its `lo`
 /// nonce/block) or a position in the underlying items list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1158,6 +1525,104 @@ mod tests {
     use super::*;
     use crate::data::types::AddressTxSummary;
     use starknet::core::types::Felt;
+
+    fn transfer(block: u64, tx_index: u64, event_index: u64) -> TokenTransfer {
+        TokenTransfer {
+            token: Felt::from(7u64),
+            from: Felt::from(1u64),
+            to: Felt::from(2u64),
+            amount_low: 1,
+            amount_high: 0,
+            tx_hash: Felt::from(block * 1000 + tx_index),
+            block_number: block,
+            tx_index,
+            event_index,
+            timestamp: 0,
+            symbol: None,
+            decimals: None,
+            value_usd: None,
+        }
+    }
+
+    #[test]
+    fn scanned_range_gaps_cover_bottom_and_middle() {
+        assert!(scanned_range_gaps(&[], 0).is_empty());
+        let gaps = scanned_range_gaps(&[(100, 200), (301, 400)], 0);
+        assert_eq!(
+            gaps.iter()
+                .map(|g| (g.lo_block, g.hi_block))
+                .collect::<Vec<_>>(),
+            vec![(0, 99), (201, 300)]
+        );
+        // Floor at/above the lowest scanned block: no bottom gap.
+        let gaps = scanned_range_gaps(&[(100, 200)], 100);
+        assert!(gaps.is_empty());
+        let gaps = scanned_range_gaps(&[(100, 200)], 150);
+        assert!(gaps.is_empty());
+        // Adjacent ranges are not a gap.
+        assert!(scanned_range_gaps(&[(0, 10), (11, 20)], 0).is_empty());
+    }
+
+    #[test]
+    fn merge_transfers_dedups_sorts_and_upgrades() {
+        let mut st = AddressInfoState::default();
+        assert_eq!(
+            st.merge_transfers(vec![transfer(10, 0, 1), transfer(12, 3, 0)]),
+            2
+        );
+        // Duplicate key, but carrying tx_index: upgraded in place, no new row.
+        let mut better = transfer(10, 0, 1);
+        better.tx_index = 5;
+        better.timestamp = 99;
+        assert_eq!(st.merge_transfers(vec![better]), 0);
+        assert_eq!(st.merge_transfers(vec![transfer(11, 0, 0)]), 1);
+        let blocks: Vec<u64> = st.transfers.items.iter().map(|t| t.block_number).collect();
+        assert_eq!(blocks, vec![12, 11, 10]);
+        let row = &st.transfers.items[2];
+        assert_eq!((row.tx_index, row.timestamp), (5, 99));
+    }
+
+    #[test]
+    fn transfer_gap_rows_render_between_and_below_rows() {
+        let mut st = AddressInfoState::default();
+        st.merge_transfers(vec![transfer(500, 0, 0), transfer(150, 0, 0)]);
+        st.note_transfer_scanned_range(100, 200);
+        st.note_transfer_scanned_range(400, 600);
+        st.refresh_transfer_gaps();
+        // Bottom gap [0,99] renders after both rows; middle gap [201,399] between them.
+        assert_eq!(st.transfer_gap_render_positions(), vec![(1, 201), (2, 0)]);
+        assert_eq!(st.transfer_gaps.len(), 2);
+
+        st.ensure_transfer_selection();
+        assert_eq!(st.transfers.state.selected(), Some(0));
+        st.transfer_list_next();
+        assert_eq!(st.transfer_gap_selected, Some(201));
+        st.transfer_list_next();
+        assert_eq!(st.transfers.state.selected(), Some(1));
+        assert_eq!(st.transfer_gap_selected, None);
+        st.transfer_list_select_last();
+        assert_eq!(st.transfer_gap_selected, Some(0));
+
+        // A fill that closes the middle gap drops it and keeps the selection sane.
+        st.transfer_gap_selected = Some(201);
+        st.note_transfer_scanned_range(201, 399);
+        st.refresh_transfer_gaps();
+        assert_eq!(st.transfer_gaps.len(), 1);
+        assert_eq!(st.transfer_gap_selected, None);
+    }
+
+    #[test]
+    fn lone_gap_row_is_selectable_without_rows() {
+        let mut st = AddressInfoState::default();
+        st.note_transfer_scanned_range(900, 1000);
+        st.refresh_transfer_gaps();
+        st.ensure_transfer_selection();
+        assert_eq!(st.transfer_gap_selected, Some(0));
+        assert_eq!(
+            st.transfer_list_rendered_selected_with(&st.transfer_gap_render_positions()),
+            Some(0)
+        );
+    }
 
     fn summary(nonce: u64, block: u64) -> AddressTxSummary {
         AddressTxSummary {
@@ -1555,7 +2020,7 @@ mod tests {
         s.merge_calls(vec![call_at(1_000), call_with_hash(2, 1_000), call_at(top)]);
         s.call_gaps = vec![
             UnfilledCallGap {
-                lo_block: 42, // no such row: skipped
+                lo_block: 42, // below every row: renders last
                 hi_block: 43,
                 fill_dispatched: false,
             },
@@ -1565,7 +2030,7 @@ mod tests {
                 fill_dispatched: false,
             },
         ];
-        assert_eq!(s.call_gap_render_positions(), vec![(1, 1_000)]);
+        assert_eq!(s.call_gap_render_positions(), vec![(1, 1_000), (3, 42)]);
     }
 
     #[test]
@@ -1663,6 +2128,44 @@ mod tests {
             call_at(1000 + CALL_GAP_SPAN_BLOCKS + 1),
         ]);
         assert_eq!(state.detect_unfilled_call_gaps().len(), 1);
+    }
+
+    #[test]
+    fn tracked_region_flags_every_unscanned_range() {
+        let mut state = call_state_with(vec![call_at(1_500), call_at(1_800), call_at(2_600)]);
+        state.note_call_tracked_from(1_000);
+        state.note_scanned_call_range(1_000, 2_000);
+        state.note_scanned_call_range(2_500, 3_000);
+        // A 500-block hole is far under the span threshold, but it's inside
+        // the tracked region, so it's a gap bordered by the scanned blocks.
+        let gaps = state.detect_unfilled_call_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!((gaps[0].lo_block, gaps[0].hi_block), (2_000, 2_500));
+        // It renders between the calls above and below the hole.
+        state.call_gaps = gaps;
+        assert_eq!(state.call_gap_render_positions(), vec![(1, 2_000)]);
+
+        state.note_scanned_call_range(2_000, 2_500);
+        assert!(state.detect_unfilled_call_gaps().is_empty());
+    }
+
+    #[test]
+    fn tracked_region_floor_and_older_rows() {
+        // Older cached rows below the tracked floor keep the span rule.
+        let mut state = call_state_with(vec![call_at(100), call_at(900), call_at(2_000)]);
+        state.note_call_tracked_from(1_000);
+        state.note_scanned_call_range(1_500, 3_000);
+        let gaps = state.detect_unfilled_call_gaps();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "only the unscanned bottom of the tracked region"
+        );
+        assert_eq!((gaps[0].lo_block, gaps[0].hi_block), (999, 1_500));
+
+        // The floor only moves down.
+        state.note_call_tracked_from(5_000);
+        assert_eq!(state.call_tracked_from, Some(1_000));
     }
 
     #[test]
