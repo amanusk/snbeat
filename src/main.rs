@@ -71,8 +71,16 @@ fn init_logging(config: &AppConfig) -> tracing_appender::non_blocking::WorkerGua
     guard
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run());
+    // Don't let a task stuck in synchronous work (a SQLite write, a large
+    // cache load) hold the process open after the UI has exited.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     // Load .env: try CWD first, then ~/.config/snbeat/.env
     if dotenvy::dotenv().is_err() {
         let global_env = snbeat_config_dir().join(".env");
